@@ -101,6 +101,11 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   (CI); Pocket ID authz = audience only (groups managed in Pocket ID);
   GitHub authz = owner_id match; browse requires OIDC, pull anonymous;
   no auth-disable flag.
+- [S3 storage layout](issues/08-storage-layout.md) — Puller proxies bytes
+  (Garage stays internal; 256 KiB buffers, Range passthrough); flat
+  `nar/<hash>.nar.zst` keys; multipart above 100 MiB with 64 MiB parts,
+  ≤4 in flight, permit-before-read; cleanup via GC sweeps, no lifecycle
+  rules.
 
 ## Not yet specified
 
