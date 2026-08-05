@@ -106,6 +106,10 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   `nar/<hash>.nar.zst` keys; multipart above 100 MiB with 64 MiB parts,
   ≤4 in flight, permit-before-read; cleanup via GC sweeps, no lifecycle
   rules.
+- [Narinfo signing and key management](issues/10-signing-keys.md) — sign
+  on write (sigs stored; Puller does zero crypto); multi-key overlap
+  rotation with `garret-admin resign`; nix-format keys as secret files,
+  never in the nix store.
 
 ## Not yet specified
 
