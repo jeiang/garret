@@ -91,6 +91,11 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   writes; Puller reads plus >24h-debounced async last-accessed bumps;
   upload state in memory only with the row-exists⇒blob-exists invariant
   (no pending rows); normalized refs table for dependency trees.
+- [GC: quota + LRU design](issues/11-gc-design.md) — root-first
+  closure-safe eviction (only unreferenced objects evictable, LRU order,
+  loop until low watermark); 95%/85% watermarks on a maintained counter;
+  runs inside the Pusher; row-then-blob deletes with a weekly orphan
+  sweep.
 
 ## Not yet specified
 
