@@ -96,6 +96,11 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   loop until low watermark); 95%/85% watermarks on a maintained counter;
   runs inside the Pusher; row-then-blob deletes with a weekly orphan
   sweep.
+- [Auth flows and claims policy](issues/09-auth-flows.md) — device flow
+  (CLI), per-machine client_credentials (watcher), per-request re-mint
+  (CI); Pocket ID authz = audience only (groups managed in Pocket ID);
+  GitHub authz = owner_id match; browse requires OIDC, pull anonymous;
+  no auth-disable flag.
 
 ## Not yet specified
 
