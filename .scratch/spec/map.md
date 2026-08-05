@@ -123,6 +123,11 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   dedicated internal metrics ports (9091/9092); bounded labels only,
   never per-object; full per-subsystem catalog in the ticket; structured
   logs via tracing (JSON option), no OTLP in v1.
+- [Benchmark harness](issues/16-benchmark-harness.md) — seeded synthetic
+  corpus from the measured distribution; garret-bench reuses the client
+  library; 20 pushers with cap-relative memory pass/fail + large-body and
+  pull scenarios; nix-provisioned local Garage; JSON baselines, no CI
+  gating.
 
 ## Not yet specified
 
