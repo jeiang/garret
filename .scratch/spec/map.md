@@ -1,0 +1,97 @@
+# Wayfinder map: garret design spec
+
+Label: wayfinder:map
+
+## Destination
+
+A full design spec in this repo — every architectural decision locked and written
+down (architecture docs, ADRs, glossary), ready to hand to implementation
+sessions. Implementation itself is a separate effort, out of this map's scope.
+
+Garret is a from-scratch, single-tenant Nix binary cache replacing attic for
+Aidan's infrastructure: a **Pusher** service (OIDC-protected, accepts NARs via a
+custom high-throughput protocol) and a **Puller** service (public, standard Nix
+substituter protocol), colocated on one host sharing SQLite + S3.
+
+## Notes
+
+- Domain: Nix binary caching. Prior art lives at `/Users/aidanp/Projects/attic`
+  — especially `OPTIMIZATIONS.md` (throughput levers), `OPTIMIZATION_PLAN.md`
+  (OOM history and fixes, all landed), and `CONTEXT.md` (attic-era glossary).
+  Consult these before resolving any performance-adjacent ticket.
+- Skills every session should consult: `/grilling` + `/domain-modeling` for
+  grilling tickets; `/research` for research tickets.
+- Standing preferences: max throughput, parallel uploads, minimum protocol
+  round-trips, bounded memory under load, extensive Prometheus metrics
+  (VictoriaMetrics consumer).
+- Research findings are written to `.scratch/spec/research/<slug>.md` and linked
+  from their ticket (no branches — repo has no initial commit yet).
+- The spec-assembly ticket mints the ADRs; charting decisions below that meet
+  the ADR bar (SQLite+same-host topology, multi-issuer OIDC, chunking outcome)
+  get ADRs there.
+
+## Decisions so far
+
+Charting-session decisions (no ticket — resolved while drawing the map):
+
+- Destination — full design spec; implementation is a separate effort.
+- Storage backend — S3-compatible (Garage/MinIO); no local-filesystem backend.
+- Metadata store — SQLite in WAL mode.
+- Language — Rust; HTTP framework deliberately reopened (research ticket).
+- Topology — Pusher and Puller on the same host sharing the SQLite file and S3
+  bucket; the service split is about exposure/auth, not placement.
+- Auth — multi-issuer JWT validation at the Pusher: Pocket ID and GitHub
+  Actions OIDC trusted directly via their JWKS; no token-exchange service.
+- Features retained — store watcher, cache listing, configurable multi-threaded
+  push, Prometheus metrics, garbage collection, admin CLI, NixOS modules +
+  flake, dependency-tree browse.
+- Benchmark target — N concurrent pushers with flat/bounded memory and no
+  timeouts (graceful-under-load, not link-saturation).
+- Client shape — Puller speaks the standard substituter protocol (server-side
+  ed25519 narinfo signing, works from any nix.conf); Pusher gets a
+  purpose-built garret CLI (push, watch-store, list).
+- GC policy — storage quota + LRU eviction ("store everything" bounded by a
+  size budget).
+- Migration — none; garret starts empty, attic retires after garret is proven.
+- Deployment — NixOS host, native systemd services via the NixOS module; no
+  container packaging.
+
+<!-- one line per closed ticket: title link + one-line gist -->
+
+- [HTTP framework choice](issues/01-http-framework.md) — axum 0.8 on hyper 1.x
+  (fallback: raw hyper + tower); throughput hinges on HTTP/2 flow-control
+  tuning, not framework choice.
+- [Chunk-dedup state of the art](issues/02-chunking-state-of-the-art.md) —
+  chunking is a storage win (6.55× vs 2.69× at nixbuild.net), not a
+  push-throughput win; leaning: whole-NAR baseline unless ticket 03's
+  measurements justify the read-path and metadata costs.
+- [Pocket ID + GitHub OIDC capabilities](issues/04-pocket-id-oidc.md) — all
+  three caller types work: device flow (CLI), client_credentials (watcher
+  daemon), GitHub OIDC with 5-min TTL (CI must re-mint or exchange);
+  audience via RFC 8707; pin Pocket ID past CVE-2026-43983.
+- [Store-path detection mechanisms](issues/12-store-watcher-mechanisms.md) —
+  hybrid recommended: persisted-cursor poll of the Nix DB (ValidPaths.id is
+  monotonic — complete, with free catch-up/backlog) plus inotify lock-file
+  events as the latency wakeup.
+
+## Not yet specified
+
+- Admin CLI command surface — sharpens once GC, signing, and schema tickets
+  resolve.
+- NixOS module option surface and flake output layout — after the component
+  boundaries settle.
+- Repo/workspace crate layout — decide at spec assembly.
+- Compression codec and level defaults — falls out of the chunking decision;
+  may spawn its own benchmark ticket.
+- Rate limiting / abuse posture for the public Puller endpoint.
+- Upload resumability semantics — the push-protocol ticket may graduate this
+  into its own ticket if it grows.
+
+## Out of scope
+
+- Multi-cache / multi-tenancy — garret is single-cache by charter.
+- Attic protocol or token compatibility — clean break.
+- Data migration from the attic deployment — decided: start empty.
+- Container / k8s packaging — deployment is a native NixOS host.
+- Custom pull-side client or protocol — the Puller stays a standard substituter.
+- Implementing garret — beyond this map's destination (the spec).
