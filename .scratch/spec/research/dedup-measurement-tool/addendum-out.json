@@ -1,0 +1,84 @@
+{
+ "size_mismatches": 0,
+ "gguf": {
+  "paths": [
+   "/nix/store/2b1mcx0lb932r1rsiabdgxrnrpzqjh9l-ornith-1.0-9b-Q6_K.gguf",
+   "/nix/store/7z40s2cg4hzyfvgl5r649m96zrv1pfp9-gemma-4-12b-it-Q6_K.gguf",
+   "/nix/store/jim98hjp410pqg7i3731b769rz78pixv-Qwen3.5-9B-Q8_0.gguf",
+   "/nix/store/k3500y7wdazp3agj17zcw0q9cca291yr-nvidia_NVIDIA-Nemotron-Nano-12B-v2-Q6_K.gguf"
+  ],
+  "total_bytes": 36786162080
+ },
+ "gguf_dedup": {
+  "16-64-256": {
+   "total": 36786162080,
+   "unique": 36773939869
+  },
+  "64-256-1024": {
+   "total": 36786162080,
+   "unique": 36775382526
+  },
+  "256-1024-4096": {
+   "total": 36786162080,
+   "unique": 36777714494
+  },
+  "512-2048-8192": {
+   "total": 36786162080,
+   "unique": 36780602754
+  }
+ },
+ "non_gguf_corpus": {
+  "paths": 5130,
+  "bytes": 37784188912,
+  "per_set": {
+   "16-64-256": 25359959012,
+   "64-256-1024": 27256106643,
+   "256-1024-4096": 29501757442,
+   "512-2048-8192": 30747840396
+  }
+ },
+ "non_gguf_incremental_after_gen116": {
+  "path_identity": 19872733352,
+  "narhash": 19217192008,
+  "chunked": {
+   "16-64-256": 9628031471,
+   "64-256-1024": 10925165816,
+   "256-1024-4096": 12544040508,
+   "512-2048-8192": 13495050287
+  }
+ },
+ "gen128_new_big": [
+  [
+   7359259184,
+   "/nix/store/2b1mcx0lb932r1rsiabdgxrnrpzqjh9l-ornith-1.0-9b-Q6_K.gguf"
+  ],
+  [
+   137555512,
+   "/nix/store/x7v1z3n55iyby6g3pasrbv7jknil7wwj-source"
+  ],
+  [
+   91361992,
+   "/nix/store/x4bzq36qkdk3fdhlq7hry1fxkn7504qv-llama-cpp-9925"
+  ],
+  [
+   31997544,
+   "/nix/store/f2fksgy3r5irm11rgnz8g2i4lvmbpb7f-llama-swap-224"
+  ],
+  [
+   7378632,
+   "/nix/store/lv8d47214fwbz26rhjl8vr0lacs12rd6-source"
+  ],
+  [
+   254632,
+   "/nix/store/cwvkx488plxq6dfiv6yvy4cdvbi85g82-nixos-system-artemis-26.11.20260718.61b7c44"
+  ],
+  [
+   186384,
+   "/nix/store/czidc3v514b1dd7jzfjx8ci25d58lvw0-system-units"
+  ],
+  [
+   51112,
+   "/nix/store/3cxpdy5si7m91nnzby67qr0kkxr4i6sg-etc"
+  ]
+ ]
+}

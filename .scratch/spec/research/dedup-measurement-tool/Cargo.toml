@@ -1,0 +1,13 @@
+[package]
+name = "chunkmeter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fastcdc = "3"
+blake3 = "1"
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = true

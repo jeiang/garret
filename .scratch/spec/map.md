@@ -73,6 +73,11 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   hybrid recommended: persisted-cursor poll of the Nix DB (ValidPaths.id is
   monotonic — complete, with free catch-up/backlog) plus inotify lock-file
   events as the latency wakeup.
+- [Measure dedup ratio on real closures](issues/03-dedup-measurement.md) —
+  20 real system generations: chunking cuts rebuild-churn storage
+  1.6–1.9× vs whole-NAR zstd, but only ~8% end-to-end on the actual store
+  (model weights dominate); whole-NAR-hash dedup is worthless (1.009×);
+  if chunking, use ≥1 MiB average chunks, not attic's 64 KiB.
 
 ## Not yet specified
 
