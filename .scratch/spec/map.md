@@ -78,6 +78,10 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   1.6–1.9× vs whole-NAR zstd, but only ~8% end-to-end on the actual store
   (model weights dominate); whole-NAR-hash dedup is worthless (1.009×);
   if chunking, use ≥1 MiB average chunks, not attic's 64 KiB.
+- [Chunking model decision](issues/05-chunking-decision.md) — whole-NAR:
+  one zstd-compressed NAR per object in S3, keyed by store path hash; no
+  chunking, no content dedup, no refcounting; presigned redirects always
+  possible; path-level negotiation only.
 
 ## Not yet specified
 
@@ -86,8 +90,8 @@ Charting-session decisions (no ticket — resolved while drawing the map):
 - NixOS module option surface and flake output layout — after the component
   boundaries settle.
 - Repo/workspace crate layout — decide at spec assembly.
-- Compression codec and level defaults — falls out of the chunking decision;
-  may spawn its own benchmark ticket.
+- Compression level and client-vs-server placement — codec locked to zstd by
+  the chunking decision; the rest now lives in the push-protocol ticket.
 - Rate limiting / abuse posture for the public Puller endpoint.
 - Upload resumability semantics — the push-protocol ticket may graduate this
   into its own ticket if it grows.
