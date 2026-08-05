@@ -110,6 +110,11 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   on write (sigs stored; Puller does zero crypto); multi-key overlap
   rotation with `garret-admin resign`; nix-format keys as secret files,
   never in the nix store.
+- [Garret client CLI design](issues/13-client-cli.md) — five commands
+  (login/push/watch-store/list/tree) + separate garret-admin; watcher is
+  a root service on a ValidPaths.id cursor with inotify wakeup, bare-path
+  pushes, .drv+upstream-signed filtering, capped-retry skip-list, MAX(id)
+  bootstrap.
 
 ## Not yet specified
 
@@ -128,3 +133,6 @@ Charting-session decisions (no ticket — resolved while drawing the map):
 - Container / k8s packaging — deployment is a native NixOS host.
 - Custom pull-side client or protocol — the Puller stays a standard substituter.
 - Implementing garret — beyond this map's destination (the spec).
+- post-build-hook socket ingestion (cachix-daemon pattern) — ruled out of
+  v1 by the client CLI ticket; the NixOS fleet's cursor watcher covers all
+  ingestion. Revisit only if non-NixOS machines join the fleet.
