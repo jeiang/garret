@@ -119,6 +119,10 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   Puller with OIDC on browse routes only; four JSON endpoints (search,
   detail, tree, referrers) with keyset pagination, all served by ticket
   07's indices.
+- [Metrics and observability](issues/15-metrics-observability.md) —
+  dedicated internal metrics ports (9091/9092); bounded labels only,
+  never per-object; full per-subsystem catalog in the ticket; structured
+  logs via tracing (JSON option), no OTLP in v1.
 
 ## Not yet specified
 
