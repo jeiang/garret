@@ -115,6 +115,10 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   a root service on a ValidPaths.id cursor with inotify wakeup, bare-path
   pushes, .drv+upstream-signed filtering, capped-retry skip-list, MAX(id)
   bootstrap.
+- [Listing and browse API](issues/14-browse-api.md) — hosted on the
+  Puller with OIDC on browse routes only; four JSON endpoints (search,
+  detail, tree, referrers) with keyset pagination, all served by ticket
+  07's indices.
 
 ## Not yet specified
 
