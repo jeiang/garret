@@ -87,6 +87,10 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   preamble + zstd stream); client compresses, server trusts NarHash;
   429-based backpressure with global byte/upload caps; fully idempotent;
   no resume in v1.
+- [SQLite schema and concurrency](issues/07-db-schema.md) — Pusher owns
+  writes; Puller reads plus >24h-debounced async last-accessed bumps;
+  upload state in memory only with the row-exists⇒blob-exists invariant
+  (no pending rows); normalized refs table for dependency trees.
 
 ## Not yet specified
 
