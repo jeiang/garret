@@ -82,6 +82,11 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   one zstd-compressed NAR per object in S3, keyed by store path hash; no
   chunking, no content dedup, no refcounting; presigned redirects always
   possible; path-level negotiation only.
+- [Push protocol design](issues/06-push-protocol.md) — one batch
+  missing-paths round-trip, then parallel self-contained PUTs (JSON
+  preamble + zstd stream); client compresses, server trusts NarHash;
+  429-based backpressure with global byte/upload caps; fully idempotent;
+  no resume in v1.
 
 ## Not yet specified
 
@@ -90,11 +95,7 @@ Charting-session decisions (no ticket — resolved while drawing the map):
 - NixOS module option surface and flake output layout — after the component
   boundaries settle.
 - Repo/workspace crate layout — decide at spec assembly.
-- Compression level and client-vs-server placement — codec locked to zstd by
-  the chunking decision; the rest now lives in the push-protocol ticket.
 - Rate limiting / abuse posture for the public Puller endpoint.
-- Upload resumability semantics — the push-protocol ticket may graduate this
-  into its own ticket if it grows.
 
 ## Out of scope
 
