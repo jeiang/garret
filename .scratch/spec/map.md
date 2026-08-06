@@ -8,6 +8,10 @@ A full design spec in this repo — every architectural decision locked and writ
 down (architecture docs, ADRs, glossary), ready to hand to implementation
 sessions. Implementation itself is a separate effort, out of this map's scope.
 
+**DESTINATION REACHED (2026-08-05).** The spec lives at `docs/spec/`
+(index: `docs/spec/00-overview.md`) with ADRs in `docs/adr/`. All 17
+tickets resolved; no open tickets remain.
+
 Garret is a from-scratch, single-tenant Nix binary cache replacing attic for
 Aidan's infrastructure: a **Pusher** service (OIDC-protected, accepts NARs via a
 custom high-throughput protocol) and a **Puller** service (public, standard Nix
@@ -128,15 +132,20 @@ Charting-session decisions (no ticket — resolved while drawing the map):
   library; 20 pushers with cap-relative memory pass/fail + large-body and
   pull scenarios; nix-provisioned local Garage; JSON baselines, no CI
   gating.
+- [Assemble the design spec](issues/17-assemble-spec.md) — spec written
+  to docs/spec/ (11 documents) + 4 ADRs; assembly decided the crate
+  layout, unix-socket admin API, and NixOS module surface. Destination
+  reached.
 
 ## Not yet specified
 
-- Admin CLI command surface — sharpens once GC, signing, and schema tickets
-  resolve.
-- NixOS module option surface and flake output layout — after the component
-  boundaries settle.
-- Repo/workspace crate layout — decide at spec assembly.
-- Rate limiting / abuse posture for the public Puller endpoint.
+(Emptied at spec assembly — admin CLI, NixOS modules, and crate layout
+were decided in ticket 17. One item graduated out of this effort:)
+
+- Rate limiting / abuse posture for the public Puller endpoint — never
+  sharpened into a ticket; nothing in the spec precludes fronting the
+  Puller with standard reverse-proxy rate limiting. Revisit during
+  implementation or operation if abuse appears.
 
 ## Out of scope
 

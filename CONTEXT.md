@@ -32,3 +32,30 @@ built store paths to the Pusher automatically.
 The unit of content in the cache: one Nix store path mapped into the cache,
 keyed by its store path hash. (Carried over from the attic-era glossary;
 garret drops the multi-cache dimension.)
+
+## Blob
+
+The stored form of an object: a single compressed NAR. Exactly one blob
+per object; a blob exists if and only if its object does.
+
+## Negotiation
+
+The pre-upload exchange in which a client asks which of a batch of store
+paths the cache is missing, and pushes only those.
+
+## Watcher Cursor
+
+The store watcher's persisted position in the local Nix store's history of
+validated paths. Everything after the cursor is yet to be pushed; an old
+cursor is a backlog, not an error.
+
+## Quota
+
+The configured storage budget for the cache. Eviction reclaims space when
+usage crosses it; nothing is deleted while usage stays below it.
+
+## Eviction
+
+Removing an object (and its blob) to reclaim quota. Only objects no
+surviving object references may be evicted, least-recently-accessed first
+— so every closure the cache still serves remains complete.
