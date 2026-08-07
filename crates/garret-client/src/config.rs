@@ -14,6 +14,49 @@ pub struct Config {
     pub zstd_level: i32,
     #[serde(default = "max_retries")]
     pub max_retries: u32,
+    /// Puller base URL — `list` and `tree` query the browse API, not the Pusher.
+    pub puller_endpoint: Option<String>,
+    #[serde(default)]
+    pub watch: Watch,
+}
+
+/// Store watcher settings; only the daemon reads these.
+#[derive(Debug, Deserialize, Default)]
+pub struct Watch {
+    /// `client_id:client_secret` for this machine's confidential client.
+    pub credentials_file: Option<String>,
+    #[serde(default = "nix_db")]
+    pub nix_db: String,
+    #[serde(default = "cursor_path")]
+    pub cursor_path: String,
+    #[serde(default = "poll_interval")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "upstream_keys")]
+    pub upstream_keys: Vec<String>,
+    #[serde(default)]
+    pub exclude_patterns: Vec<String>,
+    #[serde(default = "max_attempts")]
+    pub max_attempts: u32,
+}
+
+fn nix_db() -> String {
+    "/nix/var/nix/db/db.sqlite".into()
+}
+
+fn cursor_path() -> String {
+    "/var/lib/garret/watcher-cursor".into()
+}
+
+fn poll_interval() -> u64 {
+    30
+}
+
+fn upstream_keys() -> Vec<String> {
+    vec!["cache.nixos.org-1".into()]
+}
+
+fn max_attempts() -> u32 {
+    5
 }
 
 #[derive(Debug, Deserialize)]

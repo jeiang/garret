@@ -2,9 +2,14 @@
 //! M3 slice — negotiation, streamed multipart upload, signing, OIDC,
 //! backpressure and metrics. No GC yet (M4).
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bytes::Bytes;
+
+mod gc;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -32,7 +37,7 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 
 struct AppState {
-    conn: Mutex<rusqlite::Connection>,
+    conn: Arc<Mutex<rusqlite::Connection>>,
     storage: Storage,
     keys: Vec<SigningKeyFile>,
     store_dir: String,
@@ -69,7 +74,7 @@ async fn main() -> Result<()> {
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
 
     let state = Arc::new(AppState {
-        conn: Mutex::new(conn),
+        conn: Arc::new(Mutex::new(conn)),
         storage: Storage::new(&cfg.s3).await?,
         keys: garret_server::load_signing_keys(&cfg.signing_key_files)?,
         store_dir: cfg.store_dir,
@@ -89,6 +94,39 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_uploads_limit").set(cfg.limits.max_concurrent_uploads as f64);
     metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
+
+    if let Some(gc_cfg) = cfg.gc.clone() {
+        let collector = gc::Gc {
+            conn: state.conn.clone(),
+            storage: state.storage.clone(),
+            in_flight: state.in_flight.clone(),
+            cfg: gc_cfg.clone(),
+        };
+        tokio::spawn(async move {
+            // Startup sweep first, then a tick loop. Each tick is a counter
+            // check; eviction only happens past the high watermark (spec 05).
+            if let Err(e) = collector.sweep_orphans().await {
+                tracing::error!("startup orphan sweep failed: {e:#}");
+            }
+            let mut ticker = tokio::time::interval(Duration::from_secs(gc_cfg.interval_secs));
+            let mut since_sweep = Duration::ZERO;
+            loop {
+                ticker.tick().await;
+                if let Err(e) = collector.tick().await {
+                    tracing::error!("GC pass failed: {e:#}");
+                }
+                since_sweep += Duration::from_secs(gc_cfg.interval_secs);
+                if since_sweep >= Duration::from_secs(7 * 24 * 60 * 60) {
+                    since_sweep = Duration::ZERO;
+                    if let Err(e) = collector.sweep_orphans().await {
+                        tracing::error!("weekly orphan sweep failed: {e:#}");
+                    }
+                }
+            }
+        });
+    } else {
+        tracing::warn!("no [gc] section: the cache is unbounded and will never evict");
+    }
 
     let app = Router::new()
         .route("/api/v1/missing-paths", post(missing_paths))

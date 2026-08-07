@@ -2,7 +2,7 @@
 
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -11,7 +11,7 @@ use aws_sdk_s3::{
     config::Credentials,
     presigning::PresigningConfig,
     primitives::ByteStream,
-    types::{CompletedMultipartUpload, CompletedPart},
+    types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
 };
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt, stream::FuturesUnordered};
@@ -338,6 +338,110 @@ impl Storage {
             .part_number(part_number)
             .set_e_tag(output.e_tag)
             .build())
+    }
+
+    /// Every blob under `nar/`, with its age. Paginated — the bucket outgrows
+    /// one response long before the cache is interesting.
+    pub async fn list_blobs(&self) -> Result<Vec<(String, Duration)>> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix("nar/")
+                .set_continuation_token(token.take())
+                .send()
+                .await
+                .context("listing blobs")?;
+
+            for object in page.contents() {
+                let Some(key) = object.key() else { continue };
+                let age = object
+                    .last_modified()
+                    .and_then(|t| SystemTime::try_from(*t).ok())
+                    .and_then(|t| SystemTime::now().duration_since(t).ok())
+                    .unwrap_or(Duration::ZERO);
+                out.push((key.to_owned(), age));
+            }
+
+            token = page.next_continuation_token().map(str::to_owned);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batched at 1,000 keys — the S3 limit for a single `DeleteObjects`.
+    pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        for batch in keys.chunks(1000) {
+            let objects: Vec<ObjectIdentifier> = batch
+                .iter()
+                .filter_map(|k| ObjectIdentifier::builder().key(k).build().ok())
+                .collect();
+            if objects.is_empty() {
+                continue;
+            }
+            self.client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(Delete::builder().set_objects(Some(objects)).build()?)
+                .send()
+                .await
+                .context("deleting blobs")?;
+            metrics::counter!("garret_s3_deletes_total").increment(batch.len() as u64);
+        }
+        Ok(())
+    }
+
+    /// Aborts multipart uploads older than `grace` that no live upload owns.
+    /// Consulting the in-flight set is why GC lives inside the Pusher (spec 05).
+    pub async fn abort_stale_multiparts(
+        &self,
+        grace: Duration,
+        in_flight: &crate::inflight::InFlight,
+    ) -> Result<usize> {
+        let uploads = self
+            .client
+            .list_multipart_uploads()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .context("listing multipart uploads")?;
+
+        let mut aborted = 0;
+        for upload in uploads.uploads() {
+            let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
+                continue;
+            };
+            let hash = key
+                .strip_prefix("nar/")
+                .and_then(|k| k.strip_suffix(".nar.zst"))
+                .unwrap_or_default();
+            if in_flight.contains(hash) {
+                continue;
+            }
+            let age = upload
+                .initiated()
+                .and_then(|t| SystemTime::try_from(*t).ok())
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .unwrap_or(Duration::ZERO);
+            if age < grace {
+                continue;
+            }
+            self.client
+                .abort_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .with_context(|| format!("aborting stale multipart for {key}"))?;
+            aborted += 1;
+        }
+        Ok(aborted)
     }
 
     /// The Puller redirects here instead of proxying bytes (ADR-0005).

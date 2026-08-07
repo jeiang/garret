@@ -2,5 +2,7 @@
 //! reuses this so benchmarks exercise the real protocol.
 
 pub mod auth;
+pub mod browse;
 pub mod config;
 pub mod push;
+pub mod watcher;

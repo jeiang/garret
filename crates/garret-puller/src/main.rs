@@ -16,15 +16,19 @@ use axum::{
     routing::get,
 };
 use garret_server::{
+    auth::Authenticator,
+    browse,
     config::PullerConfig,
-    db, metrics as garret_metrics, narinfo,
+    db, metrics as garret_metrics, narinfo, now,
     storage::{self, Storage},
 };
+use serde::Deserialize;
 
 struct AppState {
     conn: Mutex<rusqlite::Connection>,
     storage: Storage,
     presign_ttl: Duration,
+    bump_debounce: i64,
 }
 
 #[tokio::main]
@@ -39,6 +43,7 @@ async fn main() -> Result<()> {
         conn: Mutex::new(db::open(&cfg.db_path, false)?),
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
+        bump_debounce: cfg.bump_debounce_secs,
     });
 
     let metrics_handle = garret_metrics::install("puller")?;
@@ -50,6 +55,27 @@ async fn main() -> Result<()> {
     });
 
     let store_dir = cfg.store_dir.clone();
+    // Browse routes are the only authenticated surface here, and they are
+    // simply absent when no issuer is configured (spec 07).
+    let browse_routes = match &cfg.browse_oidc {
+        Some(issuer) => {
+            let auth = Arc::new(Authenticator::new(vec![issuer.clone()])?);
+            Router::new()
+                .route("/api/v1/objects", get(list_objects))
+                .route("/api/v1/objects/{hash}", get(object_detail))
+                .route("/api/v1/objects/{hash}/tree", get(object_tree))
+                .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
+                .layer(axum::middleware::from_fn_with_state(
+                    auth,
+                    require_browse_oidc,
+                ))
+        }
+        None => {
+            tracing::info!("no browse_oidc configured: the browse API is not served");
+            Router::new()
+        }
+    };
+
     let app = Router::new()
         .route(
             "/nix-cache-info",
@@ -61,6 +87,7 @@ async fn main() -> Result<()> {
         // axum 0.8 wants whole-segment params, so the suffix is split here.
         .route("/{file}", get(narinfo_route))
         .route("/nar/{file}", get(nar_route))
+        .merge(browse_routes)
         .layer(axum::middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
 
@@ -72,15 +99,29 @@ async fn main() -> Result<()> {
 }
 
 async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
-    let Some(hash) = file.strip_suffix(".narinfo") else {
+    let Some(hash) = file.strip_suffix(".narinfo").map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let object = { db::get_object(&state.conn.lock().unwrap(), hash) };
+    let object = { db::get_object(&state.conn.lock().unwrap(), &hash) };
     metrics::counter!(
         "garret_narinfo_requests_total",
         "outcome" => if matches!(object, Ok(Some(_))) { "hit" } else { "miss" },
     )
     .increment(1);
+
+    // Fire-and-forget: LRU only needs day granularity, so a bump must never
+    // sit on the request path or hold up a substituter (spec 02-database).
+    if matches!(object, Ok(Some(_))) {
+        let state = state.clone();
+        let hash = hash.clone();
+        tokio::spawn(async move {
+            let conn = state.conn.lock().unwrap();
+            if let Err(e) = db::bump_last_accessed(&conn, &hash, now(), state.bump_debounce) {
+                metrics::counter!("garret_bump_failures_total").increment(1);
+                tracing::warn!("last-accessed bump for {hash} failed: {e:#}");
+            }
+        });
+    }
     match object {
         Ok(Some(obj)) => (
             [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
@@ -124,4 +165,92 @@ async fn nar_route(State(state): State<Arc<AppState>>, Path(file): Path<String>)
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Pocket ID only, and only here — narinfo and NAR stay anonymous so any
+/// machine's nix.conf works untouched (spec 04-auth).
+async fn require_browse_oidc(
+    State(auth): State<Arc<Authenticator>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let token = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match token {
+        Some(token) if auth.authenticate(token).await.is_ok() => next.run(request).await,
+        _ => {
+            metrics::counter!("garret_browse_auth_failures_total").increment(1);
+            (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+                "unauthorized",
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ListQuery {
+    q: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: usize,
+    cursor: Option<String>,
+}
+
+fn default_limit() -> usize {
+    50
+}
+
+fn browse_response<T: serde::Serialize>(
+    endpoint: &'static str,
+    result: anyhow::Result<Option<T>>,
+) -> Response {
+    metrics::counter!("garret_browse_requests_total", "endpoint" => endpoint).increment(1);
+    match result {
+        Ok(Some(value)) => axum::Json(value).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!("browse {endpoint}: {e:#}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn list_objects(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<ListQuery>,
+) -> Response {
+    let conn = state.conn.lock().unwrap();
+    browse_response(
+        "objects",
+        browse::list(
+            &conn,
+            query.q.as_deref(),
+            query.limit,
+            query.cursor.as_deref(),
+        )
+        .map(Some),
+    )
+}
+
+async fn object_detail(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
+    let conn = state.conn.lock().unwrap();
+    browse_response("object", db::get_object(&conn, &hash))
+}
+
+async fn object_tree(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
+    let conn = state.conn.lock().unwrap();
+    browse_response("tree", browse::tree(&conn, &hash, 64))
+}
+
+async fn object_referrers(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+) -> Response {
+    let conn = state.conn.lock().unwrap();
+    browse_response("referrers", browse::referrers(&conn, &hash).map(Some))
 }

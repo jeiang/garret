@@ -96,6 +96,50 @@ fn puller_metrics_listen() -> String {
     "127.0.0.1:9092".into()
 }
 
+/// Quota and eviction policy (spec 05-gc).
+#[derive(Debug, Deserialize, Clone)]
+pub struct GcConfig {
+    pub quota_bytes: u64,
+    #[serde(default = "high_watermark")]
+    pub high_watermark: f64,
+    #[serde(default = "low_watermark")]
+    pub low_watermark: f64,
+    #[serde(default = "gc_interval")]
+    pub interval_secs: u64,
+    /// How long a blob with no row, or an idle multipart, must persist before
+    /// the sweep removes it — long enough that no live upload is caught.
+    #[serde(default = "orphan_grace")]
+    pub orphan_grace_secs: u64,
+}
+
+impl GcConfig {
+    /// Eviction starts here.
+    pub fn high(&self) -> i64 {
+        (self.quota_bytes as f64 * self.high_watermark) as i64
+    }
+
+    /// And runs until here, so passes are infrequent rather than constant.
+    pub fn low(&self) -> i64 {
+        (self.quota_bytes as f64 * self.low_watermark) as i64
+    }
+}
+
+fn high_watermark() -> f64 {
+    0.95
+}
+
+fn low_watermark() -> f64 {
+    0.85
+}
+
+fn gc_interval() -> u64 {
+    300
+}
+
+fn orphan_grace() -> u64 {
+    24 * 60 * 60
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PusherConfig {
     #[serde(default = "pusher_listen")]
@@ -109,6 +153,8 @@ pub struct PusherConfig {
     pub oidc: Vec<IssuerConfig>,
     #[serde(default)]
     pub limits: Limits,
+    /// Absent means no quota is enforced and GC never evicts.
+    pub gc: Option<GcConfig>,
     #[serde(default = "pusher_metrics_listen")]
     pub metrics_listen: String,
 }
@@ -125,6 +171,16 @@ pub struct PullerConfig {
     pub presign_ttl_secs: u64,
     #[serde(default = "puller_metrics_listen")]
     pub metrics_listen: String,
+    /// Browse routes require Pocket ID; narinfo/NAR stay anonymous (spec 04).
+    /// Absent means the browse API is not served at all.
+    pub browse_oidc: Option<IssuerConfig>,
+    /// Skip a last-accessed write if the stored value is newer than this.
+    #[serde(default = "bump_debounce")]
+    pub bump_debounce_secs: i64,
+}
+
+fn bump_debounce() -> i64 {
+    24 * 60 * 60
 }
 
 fn puller_listen() -> String {
@@ -138,4 +194,26 @@ fn presign_ttl() -> u64 {
 pub fn load<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
     toml::from_str(&text).with_context(|| format!("parsing config {path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watermarks_are_fractions_of_the_quota() {
+        let cfg = GcConfig {
+            quota_bytes: 1000,
+            high_watermark: 0.95,
+            low_watermark: 0.85,
+            interval_secs: 300,
+            orphan_grace_secs: 86400,
+        };
+        assert_eq!(cfg.high(), 950);
+        assert_eq!(cfg.low(), 850);
+        // Nothing is evicted while usage stays below the high watermark.
+        assert!(949 < cfg.high());
+        // And a pass always frees a margin, so passes stay infrequent.
+        assert!(cfg.low() < cfg.high());
+    }
 }

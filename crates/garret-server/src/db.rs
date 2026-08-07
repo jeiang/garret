@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Object {
     pub store_path_hash: String,
     pub store_path: String,
@@ -186,6 +186,89 @@ pub fn exists(conn: &Connection, hash: &str) -> Result<bool> {
         .is_some())
 }
 
+pub fn total_bytes(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row("SELECT total_bytes FROM stats WHERE id = 1", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
+/// Re-derives the maintained counter from the rows themselves (spec 05: done
+/// once per GC pass, so drift from any bug is corrected rather than compounded).
+pub fn reconcile_total_bytes(conn: &Connection) -> Result<i64> {
+    let actual: i64 =
+        conn.query_row("SELECT COALESCE(SUM(file_size), 0) FROM objects", [], |r| {
+            r.get(0)
+        })?;
+    conn.execute(
+        "UPDATE stats SET total_bytes = ?1 WHERE id = 1",
+        params![actual],
+    )?;
+    Ok(actual)
+}
+
+/// Objects no surviving object in the cache references, least-recently-accessed
+/// first. Everything returned is evictable *together*: removing one unreferenced
+/// object cannot make another referenced (spec 05).
+pub fn evictable(conn: &Connection, limit: usize) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT o.store_path_hash, o.file_size FROM objects o
+         WHERE NOT EXISTS (
+             SELECT 1 FROM object_refs r WHERE r.reference_hash = o.store_path_hash
+         )
+         ORDER BY o.last_accessed_at ASC, o.store_path_hash ASC
+         LIMIT ?1",
+    )?;
+    Ok(stmt
+        .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Removes the row and its refs, and debits the usage counter, in one
+/// transaction. The blob is deleted after this returns — row-then-blob, so a
+/// failure leaves an orphan for the sweep rather than a row with no blob.
+pub fn delete_object(conn: &mut Connection, hash: &str) -> Result<i64> {
+    let tx = conn.transaction()?;
+    let size: i64 = tx
+        .query_row(
+            "SELECT file_size FROM objects WHERE store_path_hash = ?1",
+            params![hash],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    tx.execute(
+        "DELETE FROM objects WHERE store_path_hash = ?1",
+        params![hash],
+    )?;
+    tx.execute(
+        "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
+        params![size],
+    )?;
+    tx.commit()?;
+    Ok(size)
+}
+
+/// Every object key, for the orphan sweep to diff the bucket against.
+pub fn all_hashes(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT store_path_hash FROM objects")?;
+    Ok(stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Debounced last-accessed bump (spec 02): day granularity is enough for LRU,
+/// so a row touched in the last `stale_after` seconds is left alone.
+pub fn bump_last_accessed(conn: &Connection, hash: &str, now: i64, stale_after: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE objects SET last_accessed_at = ?2
+         WHERE store_path_hash = ?1 AND last_accessed_at < ?2 - ?3",
+        params![hash, now, stale_after],
+    )?;
+    Ok(())
+}
+
 /// Negotiation: the subset of `hashes` the cache does not hold.
 pub fn missing(conn: &Connection, hashes: &[String]) -> Result<Vec<String>> {
     hashes
@@ -275,6 +358,78 @@ mod tests {
             .query_row("SELECT total_bytes FROM stats", [], |r| r.get(0))
             .unwrap();
         assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn only_unreferenced_objects_are_evictable_and_lru_first() {
+        let mut conn = db();
+        let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        // a → b, so b is pinned by a. c is loose.
+        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 300).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&c, &[]), 200).unwrap();
+
+        let candidates = evictable(&conn, 10).unwrap();
+        let hashes: Vec<&str> = candidates.iter().map(|(h, _)| h.as_str()).collect();
+        // b is referenced, so it must not appear at any price.
+        assert!(
+            !hashes.contains(&b.as_str()),
+            "referenced object is evictable"
+        );
+        // c (200) is older than a (300), so it goes first.
+        assert_eq!(hashes, vec![c.as_str(), a.as_str()]);
+
+        // Evicting the root frees its dependency for the next pass — this is
+        // what makes root-first eviction reclaim whole closures.
+        delete_object(&mut conn, &a).unwrap();
+        let after: Vec<String> = evictable(&conn, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert!(after.contains(&b));
+    }
+
+    #[test]
+    fn deleting_debits_usage_and_reconciles() {
+        let mut conn = db();
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        assert_eq!(total_bytes(&conn).unwrap(), 10);
+
+        assert_eq!(delete_object(&mut conn, &a).unwrap(), 5);
+        assert_eq!(total_bytes(&conn).unwrap(), 5);
+
+        // Drift in the counter is corrected from the rows, not compounded.
+        conn.execute("UPDATE stats SET total_bytes = 9999", [])
+            .unwrap();
+        assert_eq!(reconcile_total_bytes(&conn).unwrap(), 5);
+        assert_eq!(total_bytes(&conn).unwrap(), 5);
+    }
+
+    #[test]
+    fn last_accessed_bumps_are_debounced() {
+        let mut conn = db();
+        let a = "a".repeat(32);
+        insert_object(&mut conn, &object(&a, &[]), 1000).unwrap();
+
+        // Within the debounce window: no write at all.
+        bump_last_accessed(&conn, &a, 1001, 86400).unwrap();
+        assert_eq!(last_accessed(&conn, &a), 1000);
+
+        // Past it: the row moves.
+        bump_last_accessed(&conn, &a, 1000 + 86401, 86400).unwrap();
+        assert_eq!(last_accessed(&conn, &a), 1000 + 86401);
+    }
+
+    fn last_accessed(conn: &Connection, hash: &str) -> i64 {
+        conn.query_row(
+            "SELECT last_accessed_at FROM objects WHERE store_path_hash = ?1",
+            params![hash],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     #[test]

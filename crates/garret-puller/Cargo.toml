@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 metrics = "0.24"
 garret-server.workspace = true
 anyhow = "1"
-axum = "0.8"
+axum = { version = "0.8", features = ["query"] }
 rusqlite = "0.37"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tracing = "0.1"

@@ -106,6 +106,13 @@ part_size = 5242880
 max_parts_in_flight = 2
 max_concurrent_uploads = 4
 
+[gc]
+# Roomy: GC must not evict the corpus out from under the earlier stages.
+# The GC stage below restarts the Pusher with a deliberately tiny quota.
+quota_bytes = 10737418240
+interval_secs = 1
+orphan_grace_secs = 0
+
 [[oidc]]
 issuer = "https://dev.garret.test"
 audience = "garret"
@@ -115,16 +122,28 @@ EOF
 
 cat > "$root/client.toml" <<EOF
 endpoint = "http://127.0.0.1:18080"
+puller_endpoint = "http://127.0.0.1:18081"
 
 [oidc]
 issuer = "https://dev.garret.test"
 client_id = "garret-cli"
 audience = "garret"
+
+[watch]
+nix_db = "/nix/var/nix/db/db.sqlite"
+cursor_path = "$root/watcher-cursor"
+poll_interval_secs = 1
 EOF
 cat > "$root/puller.toml" <<EOF
 listen = "127.0.0.1:18081"
 metrics_listen = "127.0.0.1:19092"
 db_path = "$root/garret.db"
+bump_debounce_secs = 0
+
+[browse_oidc]
+issuer = "https://dev.garret.test"
+audience = "garret"
+jwks_url = "$root/jwks.json"
 $s3_block
 EOF
 
@@ -144,6 +163,7 @@ wait_for() {
 
 # The Pusher owns the schema, so it must exist before the Puller opens it.
 ./target/debug/garret-pusher "$root/pusher.toml" &
+pusher_pid=$!
 wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
 ./target/debug/garret-puller "$root/puller.toml" &
 wait_for puller "http://127.0.0.1:18081/nix-cache-info"
@@ -253,5 +273,104 @@ nix copy --from "http://127.0.0.1:18081" --to "$dest" "$path" \
 # nix walks the closure itself, so both paths must have arrived and verified.
 diff <(cat "$dest/$path") <(cat "$path")
 diff <(cat "$dest/$leaf") <(cat "$leaf")
+
+say "browse API"
+# Anonymous pull must keep working while browse demands a token (spec 04).
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18081/api/v1/objects")
+echo "  browse without a token -> $code"
+[ "$code" = "401" ] || { echo "browse must require OIDC, got $code"; exit 1; }
+
+authed() { curl -sf -H "Authorization: Bearer $GARRET_TOKEN" "$@"; }
+authed "http://127.0.0.1:18081/api/v1/objects?limit=50" > "$root/objects.json"
+python3 -c "
+import json, sys
+page = json.load(open('$root/objects.json'))
+names = sorted(o['name'] for o in page['objects'])
+print('  objects:', names)
+assert 'garret-e2e-root' in names and 'garret-e2e-leaf' in names, names
+"
+authed "http://127.0.0.1:18081/api/v1/objects?q=leaf" | grep -q garret-e2e-leaf
+authed "http://127.0.0.1:18081/api/v1/objects/$hash" | grep -q '"pushed_by"'
+
+leaf_hash=$(basename "$leaf" | cut -c1-32)
+garret tree "$hash" | tee "$root/tree.out"
+grep -q "garret-e2e-leaf" "$root/tree.out"
+# The leaf's referrer is the root — the reverse index, end to end.
+authed "http://127.0.0.1:18081/api/v1/objects/$leaf_hash/referrers" | grep -q "garret-e2e-root"
+garret list leaf | grep -q garret-e2e-leaf
+
+say "store watcher"
+# The cursor bootstraps at MAX(id), so only paths built *after* this starts
+# are pushed — that is the whole point of the bootstrap rule.
+./target/debug/garret --config "$root/client.toml" watch-store > "$root/watch.log" 2>&1 &
+watch_pid=$!
+sleep 2
+watched=$(nix build --impure --no-link --print-out-paths --expr "
+derivation {
+  name = \"garret-e2e-watched\"; system = builtins.currentSystem;
+  builder = \"/bin/sh\"; args = [ \"-c\" \"echo watched $stamp > \$out\" ];
+}")
+watched_hash=$(basename "$watched" | cut -c1-32)
+echo "  built $watched"
+for _ in $(seq 40); do
+  curl -sf "http://127.0.0.1:18081/$watched_hash.narinfo" >/dev/null 2>&1 && break
+  sleep 0.5
+done
+kill $watch_pid 2>/dev/null || true
+curl -sf "http://127.0.0.1:18081/$watched_hash.narinfo" >/dev/null || {
+  echo "watcher never pushed the new path"; sed -n '1,40p' "$root/watch.log"; exit 1; }
+echo "  watcher pushed it without being asked"
+# .drv paths must never be pushed.
+drv_hash=$(basename "$(nix path-info --derivation "$watched" 2>/dev/null || echo x-x)" | cut -c1-32)
+if curl -sf "http://127.0.0.1:18081/$drv_hash.narinfo" >/dev/null 2>&1; then
+  echo "watcher pushed a .drv, which the filter must exclude"; exit 1
+fi
+
+say "garbage collection"
+# Restart the Pusher under a quota the corpus already exceeds. Only one
+# process ever writes the DB, so the old one goes first.
+kill $pusher_pid 2>/dev/null || true
+wait $pusher_pid 2>/dev/null || true
+# 1000 bytes: the 12 MB path must go, the small closure need not — so there
+# are survivors whose references can be checked.
+sed 's/^quota_bytes = .*/quota_bytes = 1000/; s/^interval_secs = .*/interval_secs = 1\nlow_watermark = 0.5/' \
+  "$root/pusher.toml" > "$root/pusher-gc.toml"
+grep -q "quota_bytes = 1000" "$root/pusher-gc.toml"
+./target/debug/garret-pusher "$root/pusher-gc.toml" &
+wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
+
+before=$(metric 19091 garret_gc_usage_bytes)
+echo "  usage before: $before (quota 1000)"
+for _ in $(seq 30); do
+  evicted=$(metric 19091 garret_gc_evicted_objects_total)
+  [ "${evicted:-0}" != "0" ] && break
+  sleep 1
+done
+echo "  evicted objects: ${evicted:-0}"
+[ "${evicted:-0}" != "0" ] || { echo "GC never evicted despite exceeding quota"; exit 1; }
+# The invariant, checked over whatever actually survived: no surviving object
+# may reference an object GC removed. Which objects go is GC's business; broken
+# closures are not.
+authed "http://127.0.0.1:18081/api/v1/objects?limit=500" > "$root/after-gc.json"
+pushed="$hash $leaf_hash $watched_hash"
+GARRET_PUSHED="$pushed" python3 -c "
+import json, os, urllib.request
+token = os.environ['GARRET_TOKEN']
+survivors = {o['hash'] for o in json.load(open('$root/after-gc.json'))['objects']}
+pushed = set(os.environ['GARRET_PUSHED'].split())
+print('  survivors:', len(survivors), 'of', len(pushed) + 1, 'pushed')
+assert survivors, 'GC evicted everything, including unreferenced roots it should have stopped at'
+for h in survivors:
+    req = urllib.request.Request(
+        f'http://127.0.0.1:18081/api/v1/objects/{h}',
+        headers={'Authorization': f'Bearer {token}'})
+    obj = json.load(urllib.request.urlopen(req))
+    for ref in obj['references']:
+        ref_hash = ref[:32]
+        if ref_hash in pushed and ref_hash not in survivors:
+            raise SystemExit(
+                f'closure broken: {obj[\"name\"]} survives but its reference {ref} was evicted')
+print('  every surviving object still has its full closure')
+"
 
 say "PASS — authenticated push via the client, signed, redirected, and substituted back verified"

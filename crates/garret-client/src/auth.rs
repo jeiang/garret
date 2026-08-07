@@ -209,6 +209,45 @@ async fn github_token(http: &reqwest::Client, audience: &str) -> Result<Option<S
     Ok(Some(token.value))
 }
 
+/// Watcher daemons: a per-machine confidential client, secret in a root-owned
+/// file wired by the NixOS module (spec 04-auth).
+pub async fn client_credentials(
+    http: &reqwest::Client,
+    issuer: &str,
+    client_id: &str,
+    client_secret: &str,
+    audience: &str,
+) -> Result<String> {
+    let endpoints = discover(http, issuer).await?;
+    let response: TokenResponse = http
+        .post(&endpoints.token_endpoint)
+        .form(&[
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "client_credentials"),
+            ("resource", audience),
+        ])
+        .send()
+        .await?
+        .error_for_status()
+        .context("requesting a client_credentials token")?
+        .json()
+        .await?;
+    Ok(response.access_token)
+}
+
+/// Reads `id:secret` from a mode-0600 file rather than taking it on argv,
+/// where every process on the box could read it.
+pub fn read_client_credentials(path: &str) -> Result<(String, String)> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading client credentials {path}"))?;
+    let (id, secret) = text
+        .trim()
+        .split_once(':')
+        .context("credentials file must contain `client_id:client_secret`")?;
+    Ok((id.to_owned(), secret.to_owned()))
+}
+
 /// Resolves a bearer token from whatever this environment provides.
 pub async fn bearer_token(http: &reqwest::Client, audience: &str) -> Result<String> {
     if let Ok(token) = std::env::var("GARRET_TOKEN") {
