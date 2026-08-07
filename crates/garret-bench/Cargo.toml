@@ -9,6 +9,7 @@ name = "garret-bench"
 path = "src/main.rs"
 
 [dependencies]
+garret-client.workspace = true
 garret-common.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

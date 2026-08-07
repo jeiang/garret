@@ -1288,6 +1288,7 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
+ "garret-client",
  "garret-common",
  "reqwest",
  "serde",
