@@ -5,6 +5,18 @@ let
   cfg = config.services.garret.puller;
   inherit (lib) mkEnableOption mkOption mkIf types;
 
+  # `pkgs.formats.toml` has no representation for null, and every nullable
+  # option here (`s3.region`, `s3.endpointUrl`, `browseOidc.jwks_url`) reaches
+  # this attrset as `null` when unset -- which fails the build with
+  # "unsupported unit type" rather than being omitted. Serde already defaults
+  # every one of these on the Rust side, so dropping the key is exactly right.
+  stripNulls = value:
+    if lib.isAttrs value
+    then lib.mapAttrs (_: stripNulls) (lib.filterAttrs (_: v: v != null) value)
+    else if lib.isList value
+    then map stripNulls value
+    else value;
+
   settings = {
     listen = cfg.listen;
     metrics_listen = cfg.metricsListen;
@@ -19,7 +31,7 @@ let
     };
   } // lib.optionalAttrs (cfg.browseOidc != null) { browse_oidc = cfg.browseOidc; };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" settings;
+  configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" (stripNulls settings);
 in
 {
   options.services.garret.puller = {

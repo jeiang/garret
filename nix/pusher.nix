@@ -7,6 +7,21 @@ let
 
   # Secrets stay out of the store: the unit renders the config at start-up,
   # substituting AWS credentials from an EnvironmentFile (agenix/sops-friendly).
+  #
+  # `pkgs.formats.toml` has no representation for null, and every nullable
+  # option here (`s3.region`, `s3.endpointUrl`, and each issuer's
+  # `github_owner_id`/`jwks_url`) reaches this attrset as `null` when unset --
+  # which fails the build with "unsupported unit type" rather than being
+  # omitted. Serde already defaults every one of these on the Rust side, so
+  # dropping the key is exactly right: a Pocket ID issuer, for instance, has no
+  # `github_owner_id` by definition.
+  stripNulls = value:
+    if lib.isAttrs value
+    then lib.mapAttrs (_: stripNulls) (lib.filterAttrs (_: v: v != null) value)
+    else if lib.isList value
+    then map stripNulls value
+    else value;
+
   settings = {
     listen = cfg.listen;
     metrics_listen = cfg.metricsListen;
@@ -35,7 +50,7 @@ let
     };
   };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-pusher.toml" settings;
+  configFile = (pkgs.formats.toml { }).generate "garret-pusher.toml" (stripNulls settings);
 in
 {
   options.services.garret.pusher = {
