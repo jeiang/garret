@@ -10,6 +10,11 @@ trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$root"' EXIT
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
+# GARRET_BIN points at a directory of already-built binaries (CI passes the nix
+# build's result/bin), so the run does not compile the workspace a second time.
+# Unset means the usual local flow: build the workspace in debug below.
+bin=${GARRET_BIN:-./target/debug}
+
 # A leftover Garage on 3901 answers with a different RPC secret and the failure
 # looks like a handshake bug rather than a stale process. Fail clearly instead.
 for port in 3900 3901 18080 18081 19091 19092; do
@@ -90,7 +95,9 @@ def mint(name, **overrides):
 
 mint("token")
 mint("token-wrong-audience", aud="somebody-else")
-mint("token-expired", exp=int(time.time()) - 60)
+# Well past the server's 60s skew allowance: expired by exactly the leeway is
+# a coin flip on sub-second timing, not a test.
+mint("token-expired", exp=int(time.time()) - 3600)
 PY
 
 cat > "$root/pusher.toml" <<EOF
@@ -149,8 +156,13 @@ $s3_block
 EOF
 
 say "starting garret"
-cargo build --quiet -p garret-pusher -p garret-puller -p garret-client \
-  -p garret-admin -p garret-bench
+if [ -z "${GARRET_BIN:-}" ]; then
+  cargo build --quiet -p garret-pusher -p garret-puller -p garret-client \
+    -p garret-admin -p garret-bench
+fi
+for exe in garret garret-pusher garret-puller garret-admin garret-bench; do
+  [ -x "$bin/$exe" ] || { echo "missing $bin/$exe" >&2; exit 1; }
+done
 
 # Bounded: a service that dies on startup should fail the run, not hang it.
 wait_for() {
@@ -164,10 +176,10 @@ wait_for() {
 }
 
 # The Pusher owns the schema, so it must exist before the Puller opens it.
-./target/debug/garret-pusher "$root/pusher.toml" &
+"$bin"/garret-pusher "$root/pusher.toml" &
 pusher_pid=$!
 wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
-./target/debug/garret-puller "$root/puller.toml" &
+"$bin"/garret-puller "$root/puller.toml" &
 wait_for puller "http://127.0.0.1:18081/nix-cache-info"
 
 say "unauthenticated and bad tokens are refused"
@@ -203,7 +215,7 @@ echo "leaf: $leaf"
 say "pushing the closure with the garret client"
 export GARRET_TOKEN
 GARRET_TOKEN=$(cat "$root/token")
-garret() { ./target/debug/garret --config "$root/client.toml" "$@"; }
+garret() { "$bin"/garret --config "$root/client.toml" "$@"; }
 
 garret push "$path" | tee "$root/push.out"
 grep -q "2 path(s) in closure, 2 missing" "$root/push.out"
@@ -303,7 +315,7 @@ garret list leaf | grep -q garret-e2e-leaf
 say "store watcher"
 # The cursor bootstraps at MAX(id), so only paths built *after* this starts
 # are pushed — that is the whole point of the bootstrap rule.
-./target/debug/garret --config "$root/client.toml" watch-store > "$root/watch.log" 2>&1 &
+"$bin"/garret --config "$root/client.toml" watch-store > "$root/watch.log" 2>&1 &
 watch_pid=$!
 sleep 2
 watched=$(fixture watched)
@@ -324,7 +336,7 @@ if curl -sf "http://127.0.0.1:18081/$drv_hash.narinfo" >/dev/null 2>&1; then
 fi
 
 say "admin socket"
-admin() { ./target/debug/garret-admin --socket "$root/admin.sock" "$@"; }
+admin() { "$bin"/garret-admin --socket "$root/admin.sock" "$@"; }
 admin status | tee "$root/status.out"
 grep -q "^objects:" "$root/status.out"
 
@@ -364,7 +376,7 @@ echo "  unknown hash is reported rather than swallowed"
 garret push "$path" >/dev/null
 
 say "benchmark harness"
-./target/debug/garret-bench --endpoint "http://127.0.0.1:18080" \
+"$bin"/garret-bench --endpoint "http://127.0.0.1:18080" \
   --concurrency 4 --count 12 --json "$root/bench.json" | tail -20
 python3 -c "
 import json
@@ -376,7 +388,7 @@ assert r['uncontended_median_ms'] > 0, 'baseline must actually be measured'
 assert r['p99_slowdown'] > 0, 'slowdown must be measured even though it is not a gate'
 "
 # The same seed must produce the same corpus on any machine.
-./target/debug/garret-bench --endpoint "http://127.0.0.1:18080" \
+"$bin"/garret-bench --endpoint "http://127.0.0.1:18080" \
   --concurrency 2 --count 12 --json "$root/bench2.json" >/dev/null
 python3 -c "
 import json
@@ -395,7 +407,7 @@ wait $pusher_pid 2>/dev/null || true
 sed 's/^quota_bytes = .*/quota_bytes = 1000/; s/^interval_secs = .*/interval_secs = 1\nlow_watermark = 0.5/' \
   "$root/pusher.toml" > "$root/pusher-gc.toml"
 grep -q "quota_bytes = 1000" "$root/pusher-gc.toml"
-./target/debug/garret-pusher "$root/pusher-gc.toml" &
+"$bin"/garret-pusher "$root/pusher-gc.toml" &
 wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
 
 # GC on demand through the admin socket, rather than waiting on the timer.
