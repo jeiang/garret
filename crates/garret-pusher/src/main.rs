@@ -1,42 +1,30 @@
 //! Pusher: accepts NARs over the garret push protocol (spec 01-push-protocol).
-//! M1 slice — negotiation + upload + signing. No auth yet (M2), no multipart
-//! (M3), no GC (M4).
+//! M2 slice — negotiation, upload, signing, OIDC. No multipart (M3), no GC (M4).
 
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{post, put},
 };
 use futures::StreamExt;
+use garret_common::Preamble;
 use garret_server::{
+    auth::{Authenticator, Subject},
     config::PusherConfig,
     db::{self, Object},
     narinfo::{self, SigningKeyFile},
     nix_base32, now,
     storage::{self, Storage},
 };
-use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-
-/// The JSON preamble that prefixes every uploaded NAR.
-#[derive(Debug, Deserialize)]
-struct Preamble {
-    store_path: String,
-    nar_hash: String,
-    nar_size: i64,
-    /// Full store paths — narinfo prints reference *names*, and the signature
-    /// covers them, so hashes alone are not enough (see docs/spec/01).
-    references: Vec<String>,
-    deriver: Option<String>,
-    ca: Option<String>,
-}
 
 struct AppState {
     conn: Mutex<rusqlite::Connection>,
@@ -44,6 +32,7 @@ struct AppState {
     keys: Vec<SigningKeyFile>,
     store_dir: String,
     max_body_bytes: u64,
+    auth: Authenticator,
 }
 
 #[tokio::main]
@@ -54,15 +43,10 @@ async fn main() -> Result<()> {
         .context("usage: garret-pusher <config.toml>")?;
     let cfg: PusherConfig = garret_server::config::load(&path)?;
 
-    // No auth until M2, and deliberately no auth-disable flag ever (spec 04):
-    // refuse to listen anywhere but loopback while the door is open.
     let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
-    if !addr.ip().is_loopback() {
-        bail!(
-            "refusing to bind {addr}: OIDC validation is not implemented yet (M2), \
-             so the Pusher may only listen on loopback"
-        );
-    }
+    // Authenticator::new refuses an empty issuer list, so this cannot start
+    // unauthenticated (spec 04: no auth-disable flag).
+    let auth = Authenticator::new(cfg.oidc.clone())?;
 
     let conn = db::open(&cfg.db_path, true)?;
     db::migrate(&conn)?;
@@ -74,11 +58,13 @@ async fn main() -> Result<()> {
         keys: garret_server::load_signing_keys(&cfg.signing_key_files)?,
         store_dir: cfg.store_dir,
         max_body_bytes: cfg.max_body_bytes,
+        auth,
     });
 
     let app = Router::new()
         .route("/api/v1/missing-paths", post(missing_paths))
         .route("/api/v1/nar/{hash}", put(upload))
+        .layer(middleware::from_fn_with_state(state.clone(), require_oidc))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -102,6 +88,42 @@ impl From<anyhow::Error> for Error {
     }
 }
 
+/// Every Pusher endpoint requires a valid token from a configured issuer.
+async fn require_oidc(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return unauthorized("missing bearer token");
+    };
+    match state.auth.authenticate(token).await {
+        Ok(subject) => {
+            request.extensions_mut().insert(subject);
+            next.run(request).await
+        }
+        // The reason stays in the log; the caller learns only that it failed.
+        Err(e) => {
+            tracing::warn!("rejected token: {e:#}");
+            unauthorized("invalid token")
+        }
+    }
+}
+
+fn unauthorized(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(json!({ "error": message })),
+    )
+        .into_response()
+}
+
 async fn missing_paths(
     State(state): State<Arc<AppState>>,
     Json(hashes): Json<Vec<String>>,
@@ -113,6 +135,7 @@ async fn missing_paths(
 async fn upload(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
+    axum::Extension(subject): axum::Extension<Subject>,
     body: Body,
 ) -> Result<Response, Error> {
     // Idempotency: answered before the body is read, so `Expect: 100-continue`
@@ -145,7 +168,7 @@ async fn upload(
     })?;
     let compressed = buf; // take_preamble drained it off the front
 
-    let object = build_object(&hash, &preamble, &compressed, &state)?;
+    let object = build_object(&hash, &preamble, &compressed, &state, &subject)?;
     state
         .storage
         .put(&storage::key_for(&hash), compressed)
@@ -182,6 +205,7 @@ fn build_object(
     preamble: &Preamble,
     compressed: &[u8],
     state: &AppState,
+    subject: &Subject,
 ) -> Result<Object, Error> {
     let name = preamble
         .store_path
@@ -202,7 +226,10 @@ fn build_object(
         store_path_hash: hash.to_owned(),
         store_path: preamble.store_path.clone(),
         name,
-        nar_hash: preamble.nar_hash.clone(),
+        // Normalised on the way in, so the DB, narinfo and fingerprint all
+        // agree on the spelling nix signs over.
+        nar_hash: narinfo::normalize_hash(&preamble.nar_hash)
+            .map_err(|e| Error(StatusCode::BAD_REQUEST, format!("{e:#}")))?,
         nar_size: preamble.nar_size,
         // Server-computed over exactly the bytes stored — the only integrity
         // check in the system now that the Puller redirects (ADR-0005).
@@ -212,7 +239,7 @@ fn build_object(
         ca: preamble.ca.clone(),
         references: preamble.references.iter().cloned().map(basename).collect(),
         sigs: vec![],
-        pushed_by: None, // M2: the OIDC subject
+        pushed_by: Some(subject.0.clone()),
     };
     object.references.sort();
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;

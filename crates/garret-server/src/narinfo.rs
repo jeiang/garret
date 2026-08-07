@@ -47,6 +47,42 @@ impl SigningKeyFile {
     }
 }
 
+/// Nix prints hashes as `sha256:<nix-base32>` in narinfo and in the signed
+/// fingerprint, but `nix path-info` reports SRI (`sha256-<base64>`). Both name
+/// the same bytes, and a signature over the wrong spelling verifies as forged —
+/// so everything is normalised here, on the way in.
+///
+/// Content-addressed paths hide this: nix trusts their hash directly and never
+/// checks the signature. Only input-addressed paths fail, which is why this
+/// survived until the e2e pushed a built derivation.
+pub fn normalize_hash(hash: &str) -> Result<String> {
+    if let Some(rest) = hash.strip_prefix("sha256:") {
+        return Ok(format!("sha256:{}", normalize_digest(rest)?));
+    }
+    if let Some(rest) = hash.strip_prefix("sha256-") {
+        return Ok(format!("sha256:{}", normalize_digest(rest)?));
+    }
+    bail!("unsupported hash format: {hash}")
+}
+
+fn normalize_digest(digest: &str) -> Result<String> {
+    // 52 base32 characters is an already-canonical sha256.
+    if digest.len() == 52
+        && digest
+            .bytes()
+            .all(|b| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&b))
+    {
+        return Ok(digest.to_owned());
+    }
+    let bytes = B64
+        .decode(digest)
+        .with_context(|| format!("hash is neither nix-base32 nor base64: {digest}"))?;
+    if bytes.len() != 32 {
+        bail!("expected a 32-byte sha256, got {} bytes", bytes.len());
+    }
+    Ok(crate::nix_base32::encode(&bytes))
+}
+
 /// Nix's signed fingerprint. References are full store paths, sorted — nix
 /// holds them in a sorted set, so any other order verifies as a bad signature.
 fn fingerprint(obj: &Object, store_dir: &str) -> String {
@@ -156,6 +192,27 @@ mod tests {
              sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73;4096;\
              /nix/store/cccccccccccccccccccccccccccccccc-b"
         );
+    }
+
+    #[test]
+    fn hashes_normalise_to_the_form_nix_signs_over() {
+        // Same 32 bytes (sha256 of ""), spelled three ways.
+        let base32 = "0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73";
+        let sri = "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+        assert_eq!(normalize_hash(sri).unwrap(), format!("sha256:{base32}"));
+        assert_eq!(
+            normalize_hash(&format!("sha256:{base32}")).unwrap(),
+            format!("sha256:{base32}")
+        );
+        assert_eq!(
+            normalize_hash("sha256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=").unwrap(),
+            format!("sha256:{base32}")
+        );
+
+        assert!(normalize_hash("md5:abc").is_err());
+        assert!(normalize_hash("sha256-not-base64!!").is_err());
+        // Right encoding, wrong length: must not silently produce a short hash.
+        assert!(normalize_hash("sha256-YWJj").is_err());
     }
 
     #[test]

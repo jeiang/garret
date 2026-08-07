@@ -60,11 +60,58 @@ path_style = true
 access_key_id = \"$key_id\"
 secret_access_key = \"$key_secret\"
 "
+say "minting dev-issuer keys and a token"
+# The dev issuer is a static JWKS on disk (spec 04-auth) — the sanctioned local
+# override. There is no auth-disable flag to reach for instead.
+GARRET_E2E_ROOT="$root" python3 - <<'PY'
+import json, os, time
+import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+root = os.environ["GARRET_E2E_ROOT"]
+key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
+jwk.update({"kid": "dev-1", "use": "sig", "alg": "RS256"})
+with open(f"{root}/jwks.json", "w") as f:
+    json.dump({"keys": [jwk]}, f)
+
+def mint(name, **overrides):
+    claims = {
+        "iss": "https://dev.garret.test",
+        "aud": "garret",
+        "sub": "dev-user",
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+    }
+    claims.update(overrides)
+    token = jwt.encode(claims, key, algorithm="RS256", headers={"kid": "dev-1"})
+    with open(f"{root}/{name}", "w") as f:
+        f.write(token)
+
+mint("token")
+mint("token-wrong-audience", aud="somebody-else")
+mint("token-expired", exp=int(time.time()) - 60)
+PY
+
 cat > "$root/pusher.toml" <<EOF
 listen = "127.0.0.1:18080"
 db_path = "$root/garret.db"
 signing_key_files = ["$root/signing.key"]
+
+[[oidc]]
+issuer = "https://dev.garret.test"
+audience = "garret"
+jwks_url = "$root/jwks.json"
 $s3_block
+EOF
+
+cat > "$root/client.toml" <<EOF
+endpoint = "http://127.0.0.1:18080"
+
+[oidc]
+issuer = "https://dev.garret.test"
+client_id = "garret-cli"
+audience = "garret"
 EOF
 cat > "$root/puller.toml" <<EOF
 listen = "127.0.0.1:18081"
@@ -73,7 +120,7 @@ $s3_block
 EOF
 
 say "starting garret"
-cargo build --quiet -p garret-pusher -p garret-puller
+cargo build --quiet -p garret-pusher -p garret-puller -p garret-client
 
 # Bounded: a service that dies on startup should fail the run, not hang it.
 wait_for() {
@@ -92,47 +139,59 @@ wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
 ./target/debug/garret-puller "$root/puller.toml" &
 wait_for puller "http://127.0.0.1:18081/nix-cache-info"
 
-say "pushing a store path"
-echo "garret e2e $(date)" > "$root/payload"
-path=$(nix store add-path "$root/payload" --name garret-e2e-payload)
+say "unauthenticated and bad tokens are refused"
+check_401() {
+  local what=$1 code
+  shift
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' -d '[]' "$@" \
+    "http://127.0.0.1:18080/api/v1/missing-paths")
+  echo "  $what -> $code"
+  [ "$code" = "401" ] || { echo "expected 401 for $what, got $code"; exit 1; }
+}
+check_401 "no token"
+check_401 "garbage token"   -H "Authorization: Bearer not-a-jwt"
+check_401 "wrong audience"  -H "Authorization: Bearer $(cat "$root/token-wrong-audience")"
+check_401 "expired token"   -H "Authorization: Bearer $(cat "$root/token-expired")"
+
+say "building a two-path closure"
+# A real reference, not a lone path: this is what exercises closure discovery,
+# the narinfo References line, and the signature computed over it. `nix store
+# add-path` will not do — it does not scan for references.
+stamp=$(date +%s)
+path=$(nix build --impure --no-link --print-out-paths --expr "
+let
+  leaf = derivation {
+    name = \"garret-e2e-leaf\"; system = builtins.currentSystem;
+    builder = \"/bin/sh\"; args = [ \"-c\" \"echo leaf $stamp > \$out\" ];
+  };
+in derivation {
+  name = \"garret-e2e-root\"; system = builtins.currentSystem;
+  builder = \"/bin/sh\"; args = [ \"-c\" \"echo \${leaf} > \$out\" ];
+}")
 hash=$(basename "$path" | cut -c1-32)
-echo "$path"
+leaf=$(nix path-info --recursive "$path" | grep -- '-garret-e2e-leaf$')
+echo "root: $path"
+echo "leaf: $leaf"
 
-info=$(nix path-info --json "$path")
-python3 - "$path" "$info" "$root" <<'PY'
-import json, subprocess, sys, urllib.request
-path, info, root = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
-meta = info[0] if isinstance(info, list) else info[path]
-nar = subprocess.run(["nix", "nar", "dump-path", path], capture_output=True, check=True).stdout
-comp = subprocess.run(["zstd", "-3", "-c"], input=nar, capture_output=True, check=True).stdout
-preamble = json.dumps({
-    "store_path": path,
-    "nar_hash": meta["narHash"],
-    "nar_size": meta["narSize"],
-    "references": meta.get("references", []),
-    "deriver": meta.get("deriver"),
-    "ca": meta.get("ca"),
-}).encode()
-body = len(preamble).to_bytes(4, "little") + preamble + comp
-h = path.split("/")[-1][:32]
+say "pushing the closure with the garret client"
+export GARRET_TOKEN
+GARRET_TOKEN=$(cat "$root/token")
+garret() { ./target/debug/garret --config "$root/client.toml" "$@"; }
 
-missing = urllib.request.urlopen(urllib.request.Request(
-    "http://127.0.0.1:18080/api/v1/missing-paths", data=json.dumps([h]).encode(),
-    headers={"Content-Type": "application/json"}, method="POST")).read()
-print("missing-paths ->", missing.decode())
-assert json.loads(missing) == [h], "negotiation should report the path missing"
+garret push "$path" | tee "$root/push.out"
+grep -q "2 path(s) in closure, 2 missing" "$root/push.out"
+grep -q "done: 2 path(s) uploaded" "$root/push.out"
 
-for expected in ("created", "exists"):  # second PUT must be idempotent
-    r = urllib.request.urlopen(urllib.request.Request(
-        f"http://127.0.0.1:18080/api/v1/nar/{h}", data=body, method="PUT"))
-    got = json.loads(r.read())["status"]
-    print(f"PUT -> {r.status} {got}")
-    assert got == expected, f"expected {expected}, got {got}"
-PY
+# Re-pushing must be a no-op: idempotency is normal operation, not an error.
+garret push "$path" | tee "$root/push2.out"
+grep -q "2 path(s) in closure, 0 missing" "$root/push2.out"
 
 say "narinfo"
 curl -sf "http://127.0.0.1:18081/$hash.narinfo" | tee "$root/narinfo"
 grep -q "^Sig: garret-e2e-1:" "$root/narinfo"
+# The reference must appear by *name*, which a bare hash could not reconstruct.
+grep -q "^References: $(basename "$leaf")\$" "$root/narinfo"
 
 say "NAR request redirects (ADR-0005)"
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18081/nar/$hash.nar.zst")
@@ -146,6 +205,8 @@ nix copy --from "http://127.0.0.1:18081" --to "$dest" "$path" \
   --option trusted-public-keys "$pubkey" \
   --option require-sigs true \
   --option substitute false --refresh
-diff <(cat "$dest/$path") "$root/payload"
+# nix walks the closure itself, so both paths must have arrived and verified.
+diff <(cat "$dest/$path") <(cat "$path")
+diff <(cat "$dest/$leaf") <(cat "$leaf")
 
-say "PASS — pushed, signed, redirected, and substituted back with signature verification"
+say "PASS — authenticated push via the client, signed, redirected, and substituted back verified"

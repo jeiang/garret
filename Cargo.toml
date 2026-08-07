@@ -8,4 +8,5 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+garret-common = { path = "crates/garret-common" }
 garret-server = { path = "crates/garret-server" }

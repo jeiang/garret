@@ -25,8 +25,26 @@ fn store_dir() -> String {
 }
 
 fn pusher_listen() -> String {
-    // Loopback until M2 wires OIDC — see the bind check in garret-pusher.
     "127.0.0.1:8080".into()
+}
+
+/// One trusted OIDC issuer. Pocket ID and GitHub Actions differ only in the
+/// authorization fields they populate (spec 04-auth).
+#[derive(Debug, Deserialize, Clone)]
+pub struct IssuerConfig {
+    pub issuer: String,
+    pub audience: String,
+    /// Skips discovery. An `http(s)` URL, or a path to a static JWKS file —
+    /// the sanctioned local-dev override.
+    pub jwks_url: Option<String>,
+    /// GitHub only: the immutable numeric owner id this issuer is scoped to.
+    pub github_owner_id: Option<String>,
+    /// GitHub only, optional: `refs/heads/main`, `refs/tags/*`, …
+    #[serde(default)]
+    pub ref_patterns: Vec<String>,
+    /// Defense-in-depth, default off — group membership lives in Pocket ID.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +56,8 @@ pub struct PusherConfig {
     #[serde(default = "store_dir")]
     pub store_dir: String,
     pub signing_key_files: Vec<String>,
+    /// At least one is required; there is no auth-disable flag (spec 04).
+    pub oidc: Vec<IssuerConfig>,
     /// Bodies above this are refused until multipart lands (M3).
     #[serde(default = "max_body")]
     pub max_body_bytes: u64,

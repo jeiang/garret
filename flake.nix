@@ -23,7 +23,7 @@
             zstd
             curl
             openssl
-            python3
+            (python3.withPackages (ps: [ ps.pyjwt ps.cryptography ]))
           ];
         };
       });
