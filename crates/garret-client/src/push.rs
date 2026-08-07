@@ -80,17 +80,26 @@ impl Pusher {
             .iter()
             .map(|p| hash_of_store_path(&p.path))
             .collect();
-        let missing: Vec<String> = self
+        let response = self
             .http
             .post(format!("{}/api/v1/missing-paths", self.endpoint))
             .bearer_auth(&self.token)
             .json(&hashes)
             .send()
-            .await?
-            .error_for_status()
-            .context("negotiating missing paths")?
+            .await
+            .context("negotiating missing paths")?;
+
+        // `error_for_status` drops the body, which is where the server explains
+        // itself — a bare "401 Unauthorized" says nothing a log can act on.
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!("negotiation rejected with {status}: {}", body.trim());
+        }
+        let missing: Vec<String> = response
             .json()
-            .await?;
+            .await
+            .context("parsing the negotiation response")?;
 
         Ok(closure
             .iter()
