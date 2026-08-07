@@ -19,7 +19,11 @@
         meta.description = "A single-tenant Nix binary cache";
       };
 
-      only = pkgs: name: pkgs.runCommand "garret-${name}" { } ''
+      # mainProgram is required, not cosmetic: the derivation is named
+      # `garret-${name}` while the binary inside it is `${name}`, so without it
+      # `nix run .#garret-admin` looks for a `garret-garret-admin` that does not
+      # exist and fails with "unable to execute".
+      only = pkgs: name: pkgs.runCommand "garret-${name}" { meta.mainProgram = name; } ''
         mkdir -p $out/bin
         ln -s ${garret pkgs}/bin/${name} $out/bin/${name}
       '';
