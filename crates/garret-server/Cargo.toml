@@ -9,7 +9,7 @@ bytes = "1"
 futures = "0.3"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 axum = "0.8"
 tracing = "0.1"
 garret-common.workspace = true

@@ -185,6 +185,14 @@ pub struct PullerConfig {
     /// Skip a last-accessed write if the stored value is newer than this.
     #[serde(default = "bump_debounce")]
     pub bump_debounce_secs: i64,
+    /// How long to wait for the Pusher to create the database at boot before
+    /// giving up. Until then the Puller serves 503s and `/ready` says so.
+    #[serde(default = "db_wait_timeout")]
+    pub db_wait_timeout_secs: u64,
+}
+
+fn db_wait_timeout() -> u64 {
+    300
 }
 
 fn bump_debounce() -> i64 {

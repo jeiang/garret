@@ -3,7 +3,7 @@
 //! M1 slice — no browse API (M4), no last-accessed bumps (M4).
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -25,10 +25,23 @@ use garret_server::{
 use serde::Deserialize;
 
 struct AppState {
-    conn: Mutex<rusqlite::Connection>,
+    /// Empty until the Pusher has created the database (spec 02: it owns the
+    /// schema). Every reader goes through `conn`, so a Puller that boots first
+    /// answers 503 instead of dying.
+    conn: OnceLock<Mutex<rusqlite::Connection>>,
     storage: Storage,
     presign_ttl: Duration,
     bump_debounce: i64,
+}
+
+impl AppState {
+    fn conn(&self) -> Option<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+        Some(self.conn.get()?.lock().unwrap())
+    }
+}
+
+fn unavailable() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response()
 }
 
 #[tokio::main]
@@ -40,10 +53,30 @@ async fn main() -> Result<()> {
     let cfg: PullerConfig = garret_server::config::load(&path)?;
 
     let state = Arc::new(AppState {
-        conn: Mutex::new(db::open(&cfg.db_path, false)?),
+        conn: OnceLock::new(),
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
         bump_debounce: cfg.bump_debounce_secs,
+    });
+
+    // Opened off the request path so the listener (and /ready) comes up now.
+    tokio::spawn({
+        let state = state.clone();
+        let db_path = cfg.db_path.clone();
+        let timeout = Duration::from_secs(cfg.db_wait_timeout_secs);
+        async move {
+            match db::open_when_ready(&db_path, timeout).await {
+                Ok(conn) => {
+                    let _ = state.conn.set(Mutex::new(conn));
+                    tracing::info!("database ready: serving");
+                }
+                // Nothing this process can do but let the supervisor restart it.
+                Err(e) => {
+                    tracing::error!("{e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
     });
 
     let metrics_handle = garret_metrics::install("puller")?;
@@ -84,6 +117,15 @@ async fn main() -> Result<()> {
                 async move { body }
             }),
         )
+        .route(
+            "/ready",
+            get(|State(state): State<Arc<AppState>>| async move {
+                match state.conn().is_some() {
+                    true => (StatusCode::OK, "ready").into_response(),
+                    false => unavailable(),
+                }
+            }),
+        )
         // axum 0.8 wants whole-segment params, so the suffix is split here.
         .route("/{file}", get(narinfo_route))
         .route("/nar/{file}", get(nar_route))
@@ -102,7 +144,11 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
     let Some(hash) = file.strip_suffix(".narinfo").map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let object = { db::get_object(&state.conn.lock().unwrap(), &hash) };
+    let Some(conn) = state.conn() else {
+        return unavailable();
+    };
+    let object = db::get_object(&conn, &hash);
+    drop(conn);
     metrics::counter!(
         "garret_narinfo_requests_total",
         "outcome" => if matches!(object, Ok(Some(_))) { "hit" } else { "miss" },
@@ -115,7 +161,7 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
         let state = state.clone();
         let hash = hash.clone();
         tokio::spawn(async move {
-            let conn = state.conn.lock().unwrap();
+            let Some(conn) = state.conn() else { return };
             if let Err(e) = db::bump_last_accessed(&conn, &hash, now(), state.bump_debounce) {
                 metrics::counter!("garret_bump_failures_total").increment(1);
                 tracing::warn!("last-accessed bump for {hash} failed: {e:#}");
@@ -141,7 +187,12 @@ async fn nar_route(State(state): State<Arc<AppState>>, Path(file): Path<String>)
         return StatusCode::NOT_FOUND.into_response();
     };
     // Only redirect to blobs we have a row for — row exists ⇒ blob exists.
-    match db::exists(&state.conn.lock().unwrap(), hash) {
+    // Scoped: a std guard cannot be held across the presign await.
+    let exists = match state.conn() {
+        Some(conn) => db::exists(&conn, hash),
+        None => return unavailable(),
+    };
+    match exists {
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("nar {hash}: {e:#}");
@@ -224,7 +275,9 @@ async fn list_objects(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
-    let conn = state.conn.lock().unwrap();
+    let Some(conn) = state.conn() else {
+        return unavailable();
+    };
     browse_response(
         "objects",
         browse::list(
@@ -238,12 +291,16 @@ async fn list_objects(
 }
 
 async fn object_detail(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    let conn = state.conn.lock().unwrap();
+    let Some(conn) = state.conn() else {
+        return unavailable();
+    };
     browse_response("object", db::get_object(&conn, &hash))
 }
 
 async fn object_tree(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    let conn = state.conn.lock().unwrap();
+    let Some(conn) = state.conn() else {
+        return unavailable();
+    };
     browse_response("tree", browse::tree(&conn, &hash, 64))
 }
 
@@ -251,6 +308,8 @@ async fn object_referrers(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Response {
-    let conn = state.conn.lock().unwrap();
+    let Some(conn) = state.conn() else {
+        return unavailable();
+    };
     browse_response("referrers", browse::referrers(&conn, &hash).map(Some))
 }
