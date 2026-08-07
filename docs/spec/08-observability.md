@@ -35,10 +35,13 @@ Prefix `garret_`; service distinguished by scrape job.
 - **Pusher — GC**: usage and quota gauges; evicted objects/bytes per
   pass; pass duration; orphans found; candidates-exhausted alarm
   counter; last-successful-pass timestamp.
-- **Puller**: narinfo hit/miss counters; NAR serves and bytes served;
-  serve duration and S3 first-byte histograms; Range request counter;
-  last-accessed bump queue depth and debounce-skip counter; browse
-  requests by endpoint; browse auth failures.
+- **Puller**: narinfo hit/miss counters; NAR redirects issued, by
+  hit/miss; presign duration histogram; last-accessed bump queue depth
+  and debounce-skip counter; browse requests by endpoint; browse auth
+  failures. The Puller no longer sees NAR bytes
+  ([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md)), so
+  bytes-served, serve-duration, first-byte and Range counters are gone —
+  served-byte volume is now S4's to report, not ours.
 
 ## Logs
 

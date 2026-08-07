@@ -1,0 +1,19 @@
+[package]
+name = "garret-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "garret-admin"
+path = "src/main.rs"
+
+[dependencies]
+garret-common.workspace = true
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }

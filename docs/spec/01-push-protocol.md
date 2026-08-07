@@ -23,11 +23,19 @@ Body layout (streamed, never buffered whole):
 
 1. A 4-byte little-endian length prefix.
 2. A JSON metadata preamble of that length: `storePath`, `narHash`,
-   `narSize`, `references` (store path hashes), `deriver?`, `ca?`.
+   `narSize`, `references` (**full store paths**), `deriver?`, `ca?`.
 3. The zstd-compressed NAR stream (single frame) to EOF.
 
 The length-prefixed preamble avoids header-size limits for long reference
 lists while keeping the request a single streamed body.
+
+References are full store paths, not hashes: narinfo's `References:` line
+prints reference *names* (`<hash>-<name>`) and the signed fingerprint uses
+their full paths, so a hash alone cannot be expanded back into either —
+and references may point outside the cache, so the DB cannot resolve them.
+Negotiation (`missing-paths`) still speaks hashes; only the upload
+preamble needs the name. (Corrected at M1: the original spec said hashes
+here, which made a valid narinfo impossible to produce.)
 
 ### Compression and verification
 

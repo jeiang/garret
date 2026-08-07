@@ -23,14 +23,16 @@ full rationale and rejected alternatives.
 
 Pusher and Puller are separate processes **colocated on one NixOS host**,
 sharing a SQLite database file (WAL mode) and one S3-compatible bucket
-(Garage). The service split is about exposure and auth, not placement.
-([map: charting decisions](../../.scratch/spec/map.md))
+(MEGA S4, remote). The service split is about exposure and auth, not
+placement. ([map: charting decisions](../../.scratch/spec/map.md))
 
 ```
 build machines ── push protocol (OIDC) ──▶ Pusher ──┐
                                                      ├── SQLite (one file, WAL)
 any machine ──── substituter protocol ───▶ Puller ──┤
-                       (anonymous)                   └── Garage (S3), internal
+                       (anonymous)          │        └── MEGA S4 (S3), remote
+                                            │                    ▲
+                          NAR bytes: 302 presigned ──────────────┘
 ```
 
 ## Storage model
@@ -40,6 +42,10 @@ store path hash. **No chunking, no content dedup, no refcounting.**
 Dedup happens at path granularity via push negotiation only.
 ([ticket 05](../../.scratch/spec/issues/05-chunking-decision.md),
 [ADR-0002](../adr/0002-whole-nar-storage.md))
+
+The store is remote (MEGA S4), so the Puller redirects NAR requests to
+presigned URLs rather than proxying bytes.
+([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md))
 
 ## Stack
 
@@ -66,5 +72,5 @@ framework choice. ([ticket 01](../../.scratch/spec/issues/01-http-framework.md),
 
 Multi-cache/multi-tenancy; attic compatibility or data migration;
 container/k8s packaging; custom pull protocol; upload resume;
-post-build-hook socket ingestion; presigned-redirect downloads; OTLP
-tracing. (See the map's Out-of-scope section for rationale.)
+post-build-hook socket ingestion; OTLP tracing. (See the map's
+Out-of-scope section for rationale.)

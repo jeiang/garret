@@ -41,10 +41,11 @@ CREATE INDEX objects_last_accessed ON objects(last_accessed_at); -- LRU order
 
 CREATE TABLE object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
-  reference TEXT NOT NULL,             -- hash; may not be in the cache
+  reference TEXT NOT NULL,             -- basename `<hash>-<name>`; may not be in the cache
+  reference_hash TEXT GENERATED ALWAYS AS (substr(reference, 1, 32)) VIRTUAL,
   PRIMARY KEY (referrer, reference)
 ) WITHOUT ROWID;
-CREATE INDEX object_refs_reference ON object_refs(reference); -- reverse deps
+CREATE INDEX object_refs_reference ON object_refs(reference_hash); -- reverse deps
 
 CREATE TABLE stats (                   -- single row
   id           INTEGER PRIMARY KEY CHECK (id = 1),
@@ -58,6 +59,13 @@ Notes:
   referrer lookups via the reverse index). References may point outside
   the cache. **Self-references are excluded at insert time** (a
   self-referencing path would never be evictable under closure-safe GC).
+- `reference` holds the **basename**, not the bare hash: narinfo prints
+  reference names and the signed fingerprint needs full store paths, and
+  neither can be reconstructed from a hash — least of all for references
+  outside the cache. `reference_hash` is generated from it, so joins
+  against `objects.store_path_hash` (GC's evictability check, the
+  referrers endpoint) stay indexed with no second copy to keep in sync.
+  (Corrected at M1; see [01-push-protocol.md](01-push-protocol.md).)
 - Name search uses the indexed `name` column with LIKE; FTS5 only if
   scale ever demands it.
 - `total_bytes` is reconciled against `SUM(file_size)` at each GC pass.

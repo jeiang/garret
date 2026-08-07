@@ -10,8 +10,9 @@ chunking (any parameter set) cut rebuild-churn storage 1.6–1.9× but only
 identical-NAR dedup measured 1.009× (worthless), and chunking's costs land
 exactly where garret optimizes — hot-path CPU, protocol round-trips,
 GC complexity, and multi-object reads. Consequences: presigned redirects
-are always possible, GC is row⇒blob trivial, and push negotiation is
-path-level only. Revisit only if rebuild-churn storage becomes the binding
+are always possible — and are now the shipped read path
+([ADR-0005](0005-remote-object-store-presigned-reads.md)) — GC is
+row⇒blob trivial, and push negotiation is path-level only. Revisit only if rebuild-churn storage becomes the binding
 cost — and then with ≥1 MiB average chunks, never attic's 64 KiB.
 Evidence: `.scratch/spec/research/dedup-measurement.md` and
 `chunking-state-of-the-art.md`.

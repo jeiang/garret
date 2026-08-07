@@ -3,14 +3,14 @@
 A single-tenant Nix binary cache — attic's successor for this
 infrastructure. Split into an OIDC-protected **Pusher** (custom
 high-throughput push protocol) and a public **Puller** (standard Nix
-substituter), colocated on one host over SQLite + Garage.
+substituter), colocated on one host over SQLite + S3 (MEGA S4).
 
 Design goals: maximum push throughput, minimal round-trips, provably
 bounded memory under concurrent load, extensive Prometheus metrics.
 
 ## Status
 
-**Design complete, implementation not started.**
+**Design complete; implementation started (workspace skeleton).**
 
 - Spec: [docs/spec/00-overview.md](docs/spec/00-overview.md)
 - Decisions: [docs/adr/](docs/adr/)

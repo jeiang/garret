@@ -52,7 +52,8 @@ Module option sketch (all under `services.garret.*`):
   audience}, github.{ownerId, refPatterns}}`, `signingKeyFiles` (list —
   active + retiring), `adminSocketPath`, `gcInterval`.
 - **puller**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.*` (same),
-  `browse.oidc.{issuer, audience}`, `bumpDebounce`.
+  `presignTtl` (default 1 h), `browse.oidc.{issuer, audience}`,
+  `bumpDebounce`.
 - **watcher** (client machines): `enable`, `endpoint`,
   `credentialsFile` (client id/secret), `filters.{excludePatterns,
   upstreamKeys}`, `jobs`, `zstdLevel`, `fullSync`.
