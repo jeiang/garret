@@ -74,6 +74,7 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             }),
         },
         Request::Resign => resign(state).map(|resigned| Response::Resign { resigned }),
+        Request::Delete { hashes } => delete(state, &hashes).await,
     };
     result.unwrap_or_else(|e| Response::Error {
         message: format!("{e:#}"),
@@ -87,6 +88,47 @@ fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
         total_bytes: db::total_bytes(&conn)?,
         quota_bytes: gc.map(|gc| gc.cfg.quota_bytes),
         uploads_in_flight: state.in_flight.len(),
+    })
+}
+
+/// Removes objects outright: row first, blob second, exactly as GC does
+/// (spec 05) so a failed blob delete leaves an orphan for the sweep rather
+/// than a row pointing at nothing.
+///
+/// Deliberately unconditional -- it does not check whether anything still
+/// references the object. GC decides by reachability; this is the operator
+/// saying "remove it regardless", which is the whole reason it exists.
+async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
+    let mut deleted = 0;
+    let mut bytes_freed = 0;
+    let mut missing = Vec::new();
+    let mut keys = Vec::new();
+
+    for hash in hashes {
+        let present = {
+            let conn = state.conn.lock().unwrap();
+            db::exists(&conn, hash)?
+        };
+        if !present {
+            missing.push(hash.clone());
+            continue;
+        }
+        let freed = {
+            let mut conn = state.conn.lock().unwrap();
+            db::delete_object(&mut conn, hash)?
+        };
+        deleted += 1;
+        bytes_freed += freed;
+        keys.push(garret_server::storage::key_for(hash));
+    }
+
+    if !keys.is_empty() {
+        state.storage.delete_objects(&keys).await?;
+    }
+    Ok(Response::Delete {
+        deleted,
+        bytes_freed,
+        missing,
     })
 }
 

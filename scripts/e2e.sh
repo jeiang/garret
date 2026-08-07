@@ -354,6 +354,29 @@ if admin key generate garret-rotate-2 "$root/rotate.key" 2>/dev/null; then
 fi
 echo "  refuses to overwrite an existing key"
 
+# Delete: the operator escape hatch for an object GC would not reach. Uses the
+# leaf, whose removal is observable without disturbing the root the GC section
+# below still needs.
+leaf_hash=$(basename "$leaf" | cut -c1-32)
+curl -sf "http://127.0.0.1:18081/$leaf_hash.narinfo" >/dev/null \
+  || { echo "leaf should be present before delete"; exit 1; }
+admin delete "$leaf_hash" | tee "$root/delete.out"
+grep -q "deleted 1 object" "$root/delete.out"
+if curl -sf "http://127.0.0.1:18081/$leaf_hash.narinfo" >/dev/null 2>&1; then
+  echo "narinfo still served after delete"; exit 1
+fi
+echo "  deleted object is gone from the Puller"
+
+# A hash that was never there must be reported, not silently counted as a
+# successful delete -- otherwise a typo looks like success.
+admin delete 00000000000000000000000000000000 | tee "$root/delete-missing.out"
+grep -q "deleted 0 object" "$root/delete-missing.out"
+grep -q "not in the cache: 00000000000000000000000000000000" "$root/delete-missing.out"
+echo "  unknown hash is reported rather than swallowed"
+
+# Re-push it so the GC section still has the closure it expects.
+garret push "$path" >/dev/null
+
 say "benchmark harness"
 ./target/debug/garret-bench --endpoint "http://127.0.0.1:18080" \
   --concurrency 4 --count 12 --json "$root/bench.json" | tail -20

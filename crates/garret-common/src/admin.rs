@@ -17,6 +17,10 @@ pub enum Request {
     /// Re-sign every object with the currently configured keys — the backfill
     /// after adding a key during rotation.
     Resign,
+    /// Remove objects by store-path hash, row and blob. The operator escape
+    /// hatch for an object that must go before GC would reach it: a bad push,
+    /// or one written by a server version whose metadata is now known wrong.
+    Delete { hashes: Vec<String> },
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -36,6 +40,13 @@ pub enum Response {
     Resign {
         resigned: usize,
     },
+    Delete {
+        deleted: usize,
+        bytes_freed: i64,
+        /// Hashes that were not in the cache; deleting them is a no-op, but
+        /// silently reporting success would hide a typo.
+        missing: Vec<String>,
+    },
     Error {
         message: String,
     },
@@ -47,7 +58,14 @@ mod tests {
 
     #[test]
     fn requests_round_trip_as_one_line() {
-        for request in [Request::Status, Request::GcRun, Request::Resign] {
+        for request in [
+            Request::Status,
+            Request::GcRun,
+            Request::Resign,
+            Request::Delete {
+                hashes: vec!["a".repeat(32)],
+            },
+        ] {
             let line = serde_json::to_string(&request).unwrap();
             assert!(!line.contains('\n'), "a request must fit on one line");
             assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), request);
