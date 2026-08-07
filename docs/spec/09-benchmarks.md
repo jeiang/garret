@@ -27,14 +27,21 @@ concurrency, per-NAR latency capture.
      machine-independent);
    - p99 per-NAR time ≤ 3× the uncontended median.
 2. **Large-body streaming** — single-stream 1 MiB / 100 MiB / 2 GiB
-   pushes and pulls; the regression gate for HTTP/2 flow-control tuning.
-3. **Pull side** — concurrent cold downloads (post-restart, no page
-   cache): flat Puller memory, saturating the test link.
+   pushes; the regression gate for HTTP/2 flow-control tuning. (Pulls no
+   longer stream through us — see below.)
+3. **Pull side** — concurrent cold narinfo + redirect issuance: flat
+   Puller memory and redirect latency under load. Since the Puller
+   redirects rather than proxies
+   ([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md)), this
+   scenario measures metadata and presigning, not throughput; download
+   speed is S4's, not ours, and is not a garret pass/fail.
 
 ## Environment & regression tracking
 
-The harness provisions a throwaway local Garage + both services from the
-flake (devshell/NixOS test); also pointable at real infra for validation
-runs. Results emit JSON; a justfile target compares against a checked-in
+The harness provisions a throwaway **local Garage** + both services from
+the flake (devshell/NixOS test) — a LAN stand-in keeps memory and
+backpressure results machine-independent and costs no S4 egress. Also
+pointable at real infra (S4) for validation runs, which is the only way
+to see true WAN upload behaviour. Results emit JSON; a justfile target compares against a checked-in
 baseline. Rerun before merging performance-relevant changes. No CI
 gating in v1.
