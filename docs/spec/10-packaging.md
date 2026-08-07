@@ -58,5 +58,22 @@ Module option sketch (all under `services.garret.*`):
   `credentialsFile` (client id/secret), `filters.{excludePatterns,
   upstreamKeys}`, `jobs`, `zstdLevel`, `fullSync`.
 
+The pusher module also carries `pullerEndpoint` and a per-issuer `client_id`,
+both advertised by `/api/v1/discovery` so `garret login <pusher-url>` can write
+a whole client config (spec 06). Set `client_id` on the human issuer only.
+
 Secrets (S3 credentials, signing keys, OIDC client secrets) are file
 paths — agenix/sops-friendly, never in the nix store.
+
+## Shell completions
+
+The workspace derivation's `postInstall` runs the freshly built `garret
+completions <shell>` under `installShellFiles`, installing bash, zsh and fish
+scripts under `$out/share`. It is guarded by
+`stdenv.buildPlatform.canExecute stdenv.hostPlatform`: generating completions
+means executing the binary just built, which a `pkgsCross` build cannot do, and
+without the guard that fails with an exec-format error naming nothing useful.
+
+The per-binary `only` wrappers symlink `share/` as well as `bin/`, or
+`nix profile install .#garret` would install the binary and silently drop its
+completions.

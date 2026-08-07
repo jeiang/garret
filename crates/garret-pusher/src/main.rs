@@ -20,7 +20,7 @@ use axum::{
     http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{post, put},
+    routing::{get, post, put},
 };
 use futures::StreamExt;
 use garret_common::Preamble;
@@ -142,10 +142,55 @@ async fn main() -> Result<()> {
         tracing::warn!("no [gc] section: the cache is unbounded and will never evict");
     }
 
+    // Everything `garret login` needs to write a whole client config from one
+    // URL. Static, so it is rendered once here rather than per request.
+    //
+    // There is no `pusher_endpoint`: the client already dialled this server to
+    // ask, and behind a reverse proxy `listen` is a loopback address that would
+    // be wrong to advertise. The Puller URL is the one thing the Pusher cannot
+    // infer, which is why it is configured.
+    //
+    // Nothing here is secret — the public halves of the signing keys, and OIDC
+    // client metadata that every device-flow request already sends in the clear.
+    let discovery = {
+        let device = cfg.oidc.iter().find(|i| i.client_id.is_some());
+        if device.is_none() {
+            tracing::warn!(
+                "no issuer sets `client_id`: /api/v1/discovery omits its oidc \
+                 section and `garret login` cannot bootstrap a config"
+            );
+        }
+        if cfg.puller_endpoint.is_none() {
+            tracing::warn!(
+                "no `puller_endpoint`: /api/v1/discovery omits it and \
+                 `garret use`, `list` and `tree` stay unconfigured"
+            );
+        }
+        serde_json::to_string(&json!({
+            "puller_endpoint": cfg.puller_endpoint,
+            "public_keys": state.keys.iter().map(|k| k.public_key()).collect::<Vec<_>>(),
+            "oidc": device.map(|i| json!({
+                "issuer": i.issuer,
+                "audience": i.audience,
+                "client_id": i.client_id,
+            })),
+        }))?
+    };
+
     let app = Router::new()
         .route("/api/v1/missing-paths", post(missing_paths))
         .route("/api/v1/nar/{hash}", put(upload))
         .layer(middleware::from_fn_with_state(state.clone(), require_oidc))
+        // Registered *after* the auth layer, which wraps only the routes above
+        // it — that placement is the whole reason this route is anonymous, so
+        // do not reorder it upwards.
+        .route(
+            "/api/v1/discovery",
+            get(move || {
+                let body = discovery.clone();
+                async move { ([(header::CONTENT_TYPE, "application/json")], body) }
+            }),
+        )
         .layer(middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
 

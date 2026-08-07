@@ -4,5 +4,7 @@
 pub mod auth;
 pub mod browse;
 pub mod config;
+pub mod discovery;
+pub mod nixconf;
 pub mod push;
 pub mod watcher;

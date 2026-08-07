@@ -27,8 +27,20 @@ JWKS. There is no token-exchange service and no garret-issued token.
 
 ## Surface summary
 
-- Pusher: all endpoints require OIDC (either issuer).
+- Pusher: every endpoint requires OIDC (either issuer) **except
+  `GET /api/v1/discovery`**, which is anonymous.
 - Puller: narinfo/NAR anonymous; **browse routes require Pocket ID**.
+
+`/api/v1/discovery` returns the Puller URL, the signing keys' public halves,
+and the OIDC issuer, audience and `client_id` — everything `garret login` needs
+to write a config, and nothing that is secret: a public key is public by
+definition, and OIDC client metadata already travels in the clear in every
+device-flow request. It reveals no cache contents, no subjects and no
+credentials. It is anonymous by *placement* — registered after the
+`require_oidc` layer, which wraps only the routes above it — so there is no
+auth-bypass branch to get wrong, and the e2e asserts the anonymous 200 so a
+router reordering cannot silently re-authenticate it. See
+[ADR-0006](../adr/0006-server-served-client-discovery.md).
 
 ## Validation mechanics
 

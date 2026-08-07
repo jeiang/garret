@@ -1,30 +1,109 @@
 # Client CLI & Store Watcher
 
 Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
+[ticket 18](../../.scratch/spec/issues/18-client-ux.md),
 [ticket 12 research](../../.scratch/spec/research/store-watcher-mechanisms.md).
 
 ## Commands
 
 | Command | Behavior |
 |---|---|
-| `garret login` | Device flow against Pocket ID; stores rotating refresh token |
-| `garret push <paths…\|installable>` | Full closure via one missing-paths query; parallel workers |
+| `garret login [pusher-url] [--force]` | Writes the config from server discovery, then device flow against Pocket ID; stores rotating refresh token |
+| `garret logout` | Deletes the stored refresh token; the config stays |
+| `garret whoami` | Subject, audience, expiry, and a live probe that the Pusher accepts the token |
+| `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter |
+| `garret push <paths…\|installable> [--dry-run]` | Full closure via one missing-paths query; parallel workers |
 | `garret watch-store` | Watcher daemon (below) |
 | `garret list` | Search/filter cache contents (browse API) |
 | `garret tree <path>` | Dependency tree (browse API) |
+| `garret completions <shell>` | bash/zsh/fish completion script |
 
 Admin operations live in `garret-admin`
 (see [10-packaging.md](10-packaging.md)).
 
-Config: TOML — endpoint, workers, zstd level, filters, credentials
-reference — with env/flag overrides. Parallelism via `--jobs`.
+`login`, `logout` and `completions` run without a config — `login` is the
+only way to create one, so requiring one would be circular. Every other
+command reports the missing config by naming `garret login <pusher-url>`.
+
+## Config bootstrap
+
+`garret login <pusher-url>` fetches `GET /api/v1/discovery` from the Pusher
+(anonymous; [ADR-0006](../adr/0006-server-served-client-discovery.md)) and
+writes `endpoint`, `puller_endpoint`, `public_keys` and the whole `[oidc]`
+section, creating `~/.config/garret/` if absent. The URL argument is the
+Pusher's, which is also what lands in `endpoint`, so the one thing the human
+must know is the one thing they would have had to configure anyway.
+
+- No config and no URL is an error naming the fix.
+- A URL with no config bootstraps.
+- No URL with a config re-authenticates and leaves the config alone.
+- A URL *and* a config refuses without `--force`, printing both the current
+  contents and what would replace them. `--force` overwrites wholesale rather
+  than merging: the only fields a human hand-edits interactively are `jobs` and
+  `zstd_level`, and `[watch]` lives on daemon hosts whose config the NixOS
+  module writes at an explicit `--config` path.
+
+The written file is a hand-rendered subset with comments, not a serialization
+of the config struct — which would emit every default and the entire `[watch]`
+section into a laptop's config.
 
 ## Push behavior
 
 Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), jittered backoff on 429/5xx, idempotent retries.
-Progress output per path plus a summary. No client metrics endpoint in
-v1.
+No client metrics endpoint in v1.
+
+Progress is a single bar over **uncompressed NAR bytes** — that total is known
+exactly from the closure before a byte moves, while compressed bytes-on-wire
+have no total until the upload ends, and a bar over path count lurches because
+a closure holds 1 KB man-pages beside 400 MB toolchains. The reported rate is
+therefore NAR bytes/s, not wire bytes/s. The bar draws to stderr and hides
+itself when stderr is not a terminal, so CI needs no flag and takes the
+per-path lines as its progress indication. There is no `--no-progress`.
+
+A path reported `deduped` was uploaded in full and *then* found redundant
+server-side; the bandwidth was spent either way. A failure does not abort the
+run — every path is attempted and reported, the summary is emitted, and only
+then does the process exit non-zero.
+
+`--dry-run` negotiates, reports what would be uploaded, and stops.
+
+## Machine-readable output
+
+`--json` is global. It sends everything human to stderr, so stdout carries only
+data.
+
+- `list` and `tree` emit the browse API's JSON verbatim. The server already has
+  a schema (spec 07); mirroring it client-side would create a second one.
+- `whoami` emits one object.
+- `push` emits NDJSON, one event per line:
+
+```
+{"event":"negotiated","closure":312,"missing":47,"nar_bytes":4021374976}
+{"event":"path","path":"/nix/store/…","status":"pushed","nar_size":81920}
+{"event":"path","path":"/nix/store/…","status":"deduped","nar_size":4096}
+{"event":"path","path":"/nix/store/…","status":"failed","error":"upload rejected with 503: …"}
+{"event":"done","pushed":40,"deduped":6,"failed":1,"nar_bytes":4021374976}
+```
+
+`negotiated` gives a consumer the denominator up front and `done` makes a
+truncated stream detectable. `--dry-run --json` reuses the identical schema,
+with `status:"would-push"` and a zeroed `done`, so a consumer needs one parser.
+
+## Pointing nix at the cache
+
+`garret use` appends `extra-substituters` and `extra-trusted-public-keys` to
+the user's `~/.config/nix/nix.conf` — never `/etc/nix/nix.conf`, never via
+sudo. Idempotence is a substring match on the URL, not a nix.conf parse.
+
+It then runs `nix config show substituters` and checks the URL comes back.
+Substituters in a *user's* nix.conf are silently ignored unless that user is in
+`trusted-users`; that one subprocess turns the classic silent failure into a
+message carrying the `nix.settings` snippet to use instead. `--print` emits
+both forms and writes nothing, for the declarative case.
+
+`public_keys` is plural because the Pusher signs every object with every
+configured key, so a rotation has several live at once.
 
 ## Store watcher
 

@@ -239,6 +239,7 @@ mod tests {
         IssuerConfig {
             issuer: "https://token.actions.githubusercontent.com".into(),
             audience: "garret".into(),
+            client_id: None,
             jwks_url: None,
             github_owner_id: Some(owner.into()),
             ref_patterns: refs.iter().map(|r| (*r).to_owned()).collect(),
@@ -279,6 +280,7 @@ mod tests {
         let mut cfg = IssuerConfig {
             issuer: "https://id.example".into(),
             audience: "garret".into(),
+            client_id: None,
             jwks_url: None,
             github_owner_id: None,
             ref_patterns: vec![],

@@ -28,6 +28,7 @@ let
     db_path = cfg.dbPath;
     store_dir = cfg.storeDir;
     signing_key_files = cfg.signingKeyFiles;
+    puller_endpoint = cfg.pullerEndpoint;
     admin_socket = cfg.adminSocketPath;
     s3 = {
       inherit (cfg.s3) bucket region;
@@ -112,6 +113,17 @@ in
       '';
     };
 
+    pullerEndpoint = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = ''
+        Public URL of the Puller, advertised by `/api/v1/discovery` so
+        `garret login <pusher-url>` can write a complete client config. The one
+        thing the Pusher cannot infer about the deployment. Null means discovery
+        omits it and `garret use`, `list` and `tree` stay unconfigured.
+      '';
+    };
+
     quotaBytes = mkOption {
       type = types.nullOr types.int;
       default = null;
@@ -137,6 +149,16 @@ in
         options = {
           issuer = mkOption { type = types.str; description = "Issuer URL."; };
           audience = mkOption { type = types.str; description = "RFC 8707 audience identifying garret."; };
+          client_id = mkOption {
+            type = types.nullOr types.str;
+            default = null;
+            description = ''
+              Public client id for `garret login`'s device flow. Set it on the
+              human issuer only — never on the GitHub Actions issuer, which
+              needs no client id. Discovery advertises the first issuer that
+              sets one, so exactly one should.
+            '';
+          };
           jwks_url = mkOption { type = types.nullOr types.str; default = null; description = "Skips discovery when set."; };
           github_owner_id = mkOption { type = types.nullOr types.str; default = null; description = "GitHub: immutable owner id."; };
           ref_patterns = mkOption { type = types.listOf types.str; default = [ ]; description = "GitHub: allowed refs."; };

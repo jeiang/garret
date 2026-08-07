@@ -36,6 +36,12 @@ fn pusher_listen() -> String {
 pub struct IssuerConfig {
     pub issuer: String,
     pub audience: String,
+    /// The public client id `garret login` should use for the device flow.
+    /// Lives here rather than in a top-level `[discovery]` section so it cannot
+    /// drift from the issuer the Pusher actually validates against, and so it
+    /// self-selects: only the human device-flow issuer has one, never the
+    /// GitHub Actions issuer. Discovery advertises the first issuer that sets it.
+    pub client_id: Option<String>,
     /// Skips discovery. An `http(s)` URL, or a path to a static JWKS file —
     /// the sanctioned local-dev override.
     pub jwks_url: Option<String>,
@@ -154,6 +160,10 @@ pub struct PusherConfig {
     #[serde(default = "store_dir")]
     pub store_dir: String,
     pub signing_key_files: Vec<String>,
+    /// Advertised by `/api/v1/discovery` so `garret login` can write a whole
+    /// client config from one URL. Absent means discovery omits it and the
+    /// client keeps its existing "set `puller_endpoint`" error.
+    pub puller_endpoint: Option<String>,
     /// At least one is required; there is no auth-disable flag (spec 04).
     pub oidc: Vec<IssuerConfig>,
     #[serde(default)]

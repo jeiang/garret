@@ -106,6 +106,7 @@ metrics_listen = "127.0.0.1:19091"
 db_path = "$root/garret.db"
 signing_key_files = ["$root/signing.key"]
 admin_socket = "$root/admin.sock"
+puller_endpoint = "http://127.0.0.1:18081"
 
 [limits]
 # 5 MiB is S4's minimum part size; small here so the multipart path is
@@ -124,6 +125,7 @@ orphan_grace_secs = 0
 [[oidc]]
 issuer = "https://dev.garret.test"
 audience = "garret"
+client_id = "garret-cli"
 jwks_url = "$root/jwks.json"
 $s3_block
 EOF
@@ -131,6 +133,7 @@ EOF
 cat > "$root/client.toml" <<EOF
 endpoint = "http://127.0.0.1:18080"
 puller_endpoint = "http://127.0.0.1:18081"
+public_keys = ["$pubkey"]
 
 [oidc]
 issuer = "https://dev.garret.test"
@@ -222,9 +225,16 @@ export GARRET_TOKEN
 GARRET_TOKEN=$(cat "$root/token")
 garret() { "$bin"/garret --config "$root/client.toml" "$@"; }
 
+# --dry-run first, on a closure nothing has uploaded yet: it must report the
+# work and then not do it. If it uploaded, the real push below would report
+# `deduped` instead of `pushed` and this stage would fail.
+garret push --dry-run "$path" | tee "$root/dry.out"
+grep -q "2 path(s) in closure, 2 missing" "$root/dry.out"
+[ "$(grep -c 'would-push' "$root/dry.out")" = "2" ]
+
 garret push "$path" | tee "$root/push.out"
 grep -q "2 path(s) in closure, 2 missing" "$root/push.out"
-grep -q "done: 2 path(s) uploaded" "$root/push.out"
+grep -q "done: 2 pushed, 0 deduped, 0 failed" "$root/push.out"
 
 # Re-pushing must be a no-op: idempotency is normal operation, not an error.
 garret push "$path" | tee "$root/push2.out"
@@ -235,7 +245,7 @@ say "multipart: a body larger than several parts"
 head -c 12000000 /dev/urandom > "$root/big.bin"
 big=$(nix store add-path "$root/big.bin" --name garret-e2e-big)
 garret push "$big" | tee "$root/push-big.out"
-grep -q "done: 1 path(s) uploaded" "$root/push-big.out"
+grep -q "done: 1 pushed, 0 deduped, 0 failed" "$root/push-big.out"
 
 metric() { curl -sf "http://127.0.0.1:$1/metrics" | awk -v k="$2" '$1 == k {print $2}'; }
 parts=$(metric 19091 garret_s3_parts_total)
@@ -316,6 +326,80 @@ grep -q "garret-e2e-leaf" "$root/tree.out"
 # The leaf's referrer is the root — the reverse index, end to end.
 authed "http://127.0.0.1:18081/api/v1/objects/$leaf_hash/referrers" | grep -q "garret-e2e-root"
 garret list leaf | grep -q garret-e2e-leaf
+
+say "client UX: discovery, whoami, use, json"
+# Discovery must stay anonymous. It is registered after the auth layer, and
+# that placement is the only thing keeping it public — if someone reorders the
+# router, `garret login` silently breaks for anyone not already logged in.
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/api/v1/discovery")
+echo "  discovery without a token -> $code"
+[ "$code" = "200" ] || { echo "discovery must be anonymous, got $code"; exit 1; }
+curl -sf "http://127.0.0.1:18080/api/v1/discovery" > "$root/discovery.json"
+python3 -c "
+import json
+d = json.load(open('$root/discovery.json'))
+assert d['puller_endpoint'] == 'http://127.0.0.1:18081', d
+assert d['oidc']['client_id'] == 'garret-cli', d
+assert d['oidc']['audience'] == 'garret', d
+assert d['public_keys'] == ['$pubkey'], d
+print('  discovery:', d['public_keys'])
+"
+
+# whoami proves the token is not merely present but accepted.
+garret whoami | tee "$root/whoami.out"
+grep -q "authenticated" "$root/whoami.out"
+grep -q "http://127.0.0.1:18080" "$root/whoami.out"
+garret --json whoami | python3 -c "
+import json, sys
+w = json.load(sys.stdin)
+assert w['audience'] == 'garret', w
+assert w['puller_endpoint'] == 'http://127.0.0.1:18081', w
+"
+
+# --print must name the Puller (never the Pusher) and the real signing key.
+garret use --print | tee "$root/use.out"
+grep -q "extra-substituters = http://127.0.0.1:18081" "$root/use.out"
+grep -q "extra-trusted-public-keys = $pubkey" "$root/use.out"
+grep -q "nix.settings" "$root/use.out"
+# Writing is never exercised here: it would edit the invoking user's nix.conf.
+
+say "client UX: push --json emits a well-formed NDJSON stream"
+head -c 4096 /dev/urandom > "$root/json.bin"
+jsonpath=$(nix store add-path "$root/json.bin" --name garret-e2e-json)
+garret --json push "$jsonpath" > "$root/push.ndjson"
+python3 -c "
+import json
+events = [json.loads(l) for l in open('$root/push.ndjson') if l.strip()]
+assert events[0]['event'] == 'negotiated', events[0]
+assert events[-1]['event'] == 'done', events[-1]
+paths = [e for e in events if e['event'] == 'path']
+# The terminating summary must agree with the per-path events, or a consumer
+# that trusts only one of the two gets a different answer.
+assert events[-1]['pushed'] == sum(p['status'] == 'pushed' for p in paths), events
+assert events[-1]['failed'] == 0, events
+assert events[0]['missing'] == len(paths), (events[0], paths)
+print('  events:', [e['event'] for e in events])
+"
+garret --json list leaf | python3 -c "
+import json, sys
+# Pass-through: the browse API's own schema, not a client re-shaping of it.
+assert 'objects' in json.load(sys.stdin)
+"
+garret --json tree "$hash" | python3 -c "
+import json, sys
+assert json.load(sys.stdin)['children'], 'tree must carry the leaf'
+"
+
+say "client UX: completions need no config, other commands say how to make one"
+# Guards the load-then-dispatch ordering: `login` and `completions` must run on
+# a machine that has no config at all, which is the state they exist to fix.
+"$bin"/garret --config "$root/absent.toml" completions fish > "$root/garret.fish"
+[ -s "$root/garret.fish" ] || { echo "completions must work without a config"; exit 1; }
+grep -q "garret" "$root/garret.fish"
+if "$bin"/garret --config "$root/absent.toml" list 2>"$root/noconfig.err"; then
+  echo "list must fail without a config"; exit 1
+fi
+grep -q "garret login" "$root/noconfig.err"
 
 say "store watcher"
 # The cursor bootstraps at MAX(id), so only paths built *after* this starts

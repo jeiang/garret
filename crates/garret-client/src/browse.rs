@@ -26,13 +26,17 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
 }
 
+/// Both queries return the server's JSON verbatim rather than a re-shaped
+/// struct. `--json` then passes it straight through — the browse API already
+/// has a schema (spec 07), and mirroring it client-side would create a second
+/// one to keep in sync. Human rendering deserializes it into the types below.
 pub async fn list(
     http: &reqwest::Client,
     puller: &str,
     token: &str,
     query: Option<&str>,
     limit: usize,
-) -> Result<Page> {
+) -> Result<serde_json::Value> {
     let mut request = http
         .get(format!("{puller}/api/v1/objects"))
         .bearer_auth(token)
@@ -55,7 +59,7 @@ pub async fn tree(
     puller: &str,
     token: &str,
     hash: &str,
-) -> Result<TreeNode> {
+) -> Result<serde_json::Value> {
     http.get(format!("{puller}/api/v1/objects/{hash}/tree"))
         .bearer_auth(token)
         .send()

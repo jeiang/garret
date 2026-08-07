@@ -17,6 +17,12 @@ pub struct Config {
     pub max_retries: u32,
     /// Puller base URL — `list` and `tree` query the browse API, not the Pusher.
     pub puller_endpoint: Option<String>,
+    /// The cache's signing keys, public halves, as `garret use` writes them into
+    /// `trusted-public-keys`. Plural because the Pusher signs every object with
+    /// every configured key, so a rotation has more than one live at once.
+    /// Written by `garret login` from the server's discovery document.
+    #[serde(default)]
+    pub public_keys: Vec<String>,
     #[serde(default)]
     pub watch: Watch,
 }
@@ -94,12 +100,17 @@ fn max_retries() -> u32 {
     5
 }
 
-pub fn path() -> Result<std::path::PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
+/// `$XDG_CONFIG_HOME`, or `~/.config`. Shared by the client config, the stored
+/// token and the nix.conf `garret use` writes.
+pub fn config_home() -> Result<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .context("neither XDG_CONFIG_HOME nor HOME is set")?;
-    Ok(base.join("garret").join("config.toml"))
+        .context("neither XDG_CONFIG_HOME nor HOME is set")
+}
+
+pub fn path() -> Result<std::path::PathBuf> {
+    Ok(config_home()?.join("garret").join("config.toml"))
 }
 
 pub fn load(explicit: Option<&str>) -> Result<Config> {
@@ -107,6 +118,14 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         Some(p) => std::path::PathBuf::from(p),
         None => path()?,
     };
+    // `login` is the only way to create a config, so a missing one has exactly
+    // one fix and this says it rather than reporting a bare ENOENT.
+    if !path.exists() {
+        anyhow::bail!(
+            "no config at {} — run `garret login <pusher-url>` to create one",
+            path.display()
+        );
+    }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading client config {}", path.display()))?;
     let mut cfg: Config = toml::from_str(&text).context("parsing client config")?;
@@ -114,4 +133,125 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         cfg.endpoint = endpoint;
     }
     Ok(cfg)
+}
+
+/// TOML-quotes a string. Base64 signing keys carry `+/=` and issuer URLs carry
+/// `:/`, none of which need escaping — but borrowing toml's own quoting is
+/// free and removes the question entirely.
+fn q(value: &str) -> String {
+    toml::Value::from(value).to_string()
+}
+
+/// Renders the config `login` writes: the discovered subset, commented.
+///
+/// Deliberately not `#[derive(Serialize)]`. Serializing `Config` would emit
+/// every default and the entire `[watch]` section — nix-db paths, cursor paths,
+/// poll intervals, all daemon-only — into a laptop's config, with no comments
+/// to say which of them matter. The point is to write a subset, so the subset
+/// is written by hand. `renders_a_parseable_config` guards the drift.
+pub fn render(endpoint: &str, discovery: &crate::discovery::Discovery) -> Result<String> {
+    let oidc = discovery.oidc.as_ref().context(
+        "the server's discovery document has no oidc section: no issuer sets a \
+         `client_id`, so the device flow has nothing to identify itself as",
+    )?;
+    let client_id = oidc.client_id.as_deref().context(
+        "the server advertised an issuer with no `client_id`, which `garret login` requires",
+    )?;
+
+    let mut out = String::new();
+    out.push_str("# Written by `garret login`. Re-run with --force to regenerate.\n");
+    out.push_str(&format!("endpoint = {}\n", q(endpoint)));
+    match &discovery.puller_endpoint {
+        Some(puller) => out.push_str(&format!("puller_endpoint = {}\n", q(puller))),
+        // Named rather than omitted: `use`, `list` and `tree` all fail without
+        // it, and a commented key is a better clue than an absent one.
+        None => out.push_str(
+            "# puller_endpoint — the server advertised none; `use`/`list`/`tree` need it\n",
+        ),
+    }
+    if discovery.public_keys.is_empty() {
+        out.push_str("# public_keys — the server advertised none; `garret use` needs them\n");
+    } else {
+        let keys: Vec<String> = discovery.public_keys.iter().map(|k| q(k)).collect();
+        out.push_str(&format!("public_keys = [{}]\n", keys.join(", ")));
+    }
+    out.push_str(&format!(
+        "\n[oidc]\nissuer = {}\nclient_id = {}\naudience = {}\n",
+        q(&oidc.issuer),
+        q(client_id),
+        q(&oidc.audience),
+    ));
+    out.push_str("\n# Optional: jobs = 8, zstd_level = 3, max_retries = 5\n");
+    Ok(out)
+}
+
+/// Writes the config, creating `~/.config/garret/` if it is not there — the
+/// whole point being that a fresh machine needs no manual setup.
+pub fn write(path: &std::path::Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::{Discovery, Oidc};
+
+    fn discovery() -> Discovery {
+        Discovery {
+            puller_endpoint: Some("https://cache.example".into()),
+            public_keys: vec!["garret-1:AAAA+bb/cc=".into()],
+            oidc: Some(Oidc {
+                issuer: "https://id.example".into(),
+                audience: "garret".into(),
+                client_id: Some("garret-cli".into()),
+            }),
+        }
+    }
+
+    /// The template and the struct can drift; this is what stops them. It also
+    /// catches `deny_unknown_fields` violations, which are otherwise only
+    /// discovered by a user whose brand-new config refuses to load.
+    #[test]
+    fn renders_a_parseable_config() {
+        let text = render("https://push.example", &discovery()).unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.endpoint, "https://push.example");
+        assert_eq!(
+            cfg.puller_endpoint.as_deref(),
+            Some("https://cache.example")
+        );
+        assert_eq!(cfg.public_keys, ["garret-1:AAAA+bb/cc="]);
+        assert_eq!(cfg.oidc.client_id.as_deref(), Some("garret-cli"));
+        assert_eq!(cfg.oidc.audience, "garret");
+        // Defaults survive being absent from the template.
+        assert_eq!(cfg.jobs, jobs());
+    }
+
+    /// A server with no `puller_endpoint` and no keys still yields a config
+    /// that loads — the affected commands fail later, with their own messages.
+    #[test]
+    fn renders_a_parseable_config_when_the_server_advertises_little() {
+        let sparse = Discovery {
+            puller_endpoint: None,
+            public_keys: vec![],
+            ..discovery()
+        };
+        let text = render("https://push.example", &sparse).unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert!(cfg.puller_endpoint.is_none());
+        assert!(cfg.public_keys.is_empty());
+    }
+
+    #[test]
+    fn rendering_refuses_a_server_that_advertises_no_client_id() {
+        let no_oidc = Discovery {
+            oidc: None,
+            ..discovery()
+        };
+        assert!(render("https://push.example", &no_oidc).is_err());
+    }
 }
