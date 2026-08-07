@@ -1,0 +1,20 @@
+[package]
+name = "garret-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+aws-config = "1"
+aws-sdk-s3 = "1"
+base64 = "0.22"
+ed25519-dalek = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.9"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
