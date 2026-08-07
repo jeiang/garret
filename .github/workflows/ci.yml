@@ -15,12 +15,35 @@ permissions:
   contents: read
 
 jobs:
-  # ---------------------------------------------------------------- build ---
-  build:
-    name: build
+  # ----------------------------------------------------------------- lint ---
+  lint:
+    name: lint and formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = ${{ vars.GARRET_PULLER }}
+            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+
+      # clippy -D warnings, then cargo fmt --check.
+      - name: Lints and formatting
+        run: nix develop --command just check
+
+  # ---------------------------------------------------------------- build ---
+  build:
+    name: build (${{ matrix.os }})
+    strategy:
+      # A darwin-only break is still worth seeing when linux is green.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]  # macos-latest is aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -38,12 +61,31 @@ jobs:
       - name: Show what was built
         run: ls -l result/bin
 
+      # The whole closure, not just garret's own path: `nix-store --import`
+      # refuses a path whose references are not already in the store, and the
+      # importing job has no way to fetch them without building.
+      - name: Export the build closure
+        run: |
+          readlink -f result > out-path.txt
+          nix-store --export $(nix-store --query --requisites ./result) > closure.nar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # The push job wants both closures; e2e wants only the linux one.
+          name: garret-closure-${{ matrix.os }}
+          path: |
+            closure.nar
+            out-path.txt
+          # Only ever consumed by the jobs below, in this same run.
+          retention-days: 1
+          compression-level: 1
+
   # ----------------------------------------------------------------- test ---
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -52,15 +94,47 @@ jobs:
             extra-substituters = ${{ vars.GARRET_PULLER }}
             extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
 
-      # Unit tests run inside the package build (buildRustPackage's check
-      # phase), so this job owns the checks that a build cannot make:
-      # lints, formatting, and the end-to-end gate.
-      - name: Lints and formatting
-        run: nix develop --command just check
+      # buildRustPackage's check phase already runs these inside `build`, but
+      # only there: a green `build` is not a legible test report, and a broken
+      # test is a test failure, not a build failure.
+      - name: Application tests
+        run: nix develop --command just test
+
+  # ------------------------------------------------------------------ e2e ---
+  e2e:
+    name: end-to-end
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = ${{ vars.GARRET_PULLER }}
+            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+            # The imported closure is locally built and therefore unsigned;
+            # only a trusted user may add such a path to the store.
+            trusted-users = root runner
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: garret-closure-ubuntu-latest
+
+      # `nix build` after the import is a no-op that only re-creates ./result:
+      # the output path is already valid, so nothing is compiled.
+      - name: Import the build closure
+        run: |
+          nix-store --import < closure.nar
+          nix build .#garret-all
 
       - name: End-to-end gate
         # Provisions a throwaway Garage, pushes real store paths through the
         # real client, and substitutes them back with signature verification.
+        # GARRET_BIN keeps it from compiling the workspace all over again.
+        env:
+          GARRET_BIN: ${{ github.workspace }}/result/bin
         run: nix develop --command scripts/e2e.sh
 
   # ----------------------------------------------------------------- push ---
@@ -70,7 +144,7 @@ jobs:
   push:
     name: push to garret
     runs-on: ubuntu-latest
-    needs: [build, test]
+    needs: [lint, build, test, e2e]
     # Only what lands on main is cached, so pull requests never push. Manual
     # dispatch is allowed too: only collaborators can trigger it, and it is the
     # way to verify the cache without waiting for a merge.
@@ -83,7 +157,7 @@ jobs:
       # No secret is stored anywhere; the token is minted per push and expires.
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -91,10 +165,28 @@ jobs:
             experimental-features = nix-command flakes
             extra-substituters = ${{ vars.GARRET_PULLER }}
             extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+            # The imported closure is locally built and therefore unsigned;
+            # only a trusted user may add such a path to the store.
+            trusted-users = root runner
 
-      - name: Build
-        # Free once the cache is warm — that is the point of this job.
-        run: nix build .#garret-all --print-build-logs
+      - uses: actions/download-artifact@v4
+        with:
+          name: garret-closure-ubuntu-latest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: garret-closure-macos-latest
+          path: darwin
+
+      - name: Import the build closures
+        # Takes the place of a second `nix build .#garret-all`: the paths come
+        # from the build job, so a cold cache costs one compile per run, not two.
+        # A store path is a store path — a linux runner can hold and push the
+        # darwin closure it could never execute.
+        run: |
+          nix-store --import < closure.nar
+          nix-store --import < darwin/closure.nar
+          nix build .#garret-all
 
       - name: Realise the dev toolchain
         # The devshell closure is most of what a CI run needs; caching it is
@@ -115,4 +207,4 @@ jobs:
 
       - name: Push build outputs and toolchain
         # The client walks each closure itself, so dependencies come along.
-        run: ./result/bin/garret push ./result ./toolchain
+        run: ./result/bin/garret push ./result ./toolchain "$(cat darwin/out-path.txt)"
