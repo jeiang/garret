@@ -71,7 +71,12 @@ jobs:
     name: push to garret
     runs-on: ubuntu-latest
     needs: [build, test]
-    if: vars.GARRET_ENDPOINT != '' && github.event_name == 'push'
+    # Only what lands on main is cached, so pull requests never push. Manual
+    # dispatch is allowed too: only collaborators can trigger it, and it is the
+    # way to verify the cache without waiting for a merge.
+    if: >-
+      vars.GARRET_ENDPOINT != '' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     permissions:
       contents: read
       # Lets the runner mint the OIDC token garret validates by owner id.
