@@ -65,7 +65,9 @@ fn max_attempts() -> u32 {
 #[serde(deny_unknown_fields)]
 pub struct Oidc {
     pub issuer: String,
-    pub client_id: String,
+    /// Only the device flow needs one; GitHub Actions and client_credentials
+    /// callers identify themselves other ways.
+    pub client_id: Option<String>,
     /// The `aud` claim garret validates the resulting token against.
     pub audience: String,
     /// RFC 8707 resource indicator, sent only when set. Off by default

@@ -52,10 +52,15 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Login => {
+            let client_id = cfg
+                .oidc
+                .client_id
+                .as_deref()
+                .context("`oidc.client_id` is required for `garret login`")?;
             auth::device_login(
                 &http,
                 &cfg.oidc.issuer,
-                &cfg.oidc.client_id,
+                client_id,
                 cfg.oidc.resource.as_deref(),
             )
             .await?;

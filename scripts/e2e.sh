@@ -186,25 +186,15 @@ check_401 "wrong audience"  -H "Authorization: Bearer $(cat "$root/token-wrong-a
 check_401 "expired token"   -H "Authorization: Bearer $(cat "$root/token-expired")"
 
 say "building a two-path closure"
-# A real reference, not a lone path: this is what exercises closure discovery,
-# the narinfo References line, and the signature computed over it. `nix store
-# add-path` will not do — it does not scan for references.
-stamp=$(date +%s)
-path=$(nix build --impure --no-link --print-out-paths --expr "
-let
-  leaf = derivation {
-    name = \"garret-e2e-leaf\"; system = builtins.currentSystem;
-    builder = \"/bin/sh\"; args = [ \"-c\" \"echo leaf $stamp > \$out\" ];
-  };
-in derivation {
-  name = \"garret-e2e-root\"; system = builtins.currentSystem;
-  # Writes its own \$out as well as the leaf, so the root *self-references*.
-  # Most compiled store paths do, and a self-reference is covered by the
-  # signature -- a server that stores or renders it inconsistently produces a
-  # narinfo whose fingerprint nix cannot reproduce. Without this the whole
-  # suite passed while every real-world push was unverifiable.
-  builder = \"/bin/sh\"; args = [ \"-c\" \"echo \${leaf} \$out > \$out\" ];
-}")
+# See scripts/e2e-fixture.nix for why these are runCommand derivations rather
+# than a bare `derivation` with a bash builder.
+export GARRET_E2E_FLAKE="$PWD"
+export GARRET_E2E_STAMP
+GARRET_E2E_STAMP=$(date +%s)
+fixture() {
+  nix build --impure --no-link --print-out-paths -f scripts/e2e-fixture.nix "$1"
+}
+path=$(fixture closure)
 hash=$(basename "$path" | cut -c1-32)
 leaf=$(nix path-info --recursive "$path" | grep -- '-garret-e2e-leaf$')
 echo "root: $path"
@@ -316,11 +306,7 @@ say "store watcher"
 ./target/debug/garret --config "$root/client.toml" watch-store > "$root/watch.log" 2>&1 &
 watch_pid=$!
 sleep 2
-watched=$(nix build --impure --no-link --print-out-paths --expr "
-derivation {
-  name = \"garret-e2e-watched\"; system = builtins.currentSystem;
-  builder = \"/bin/sh\"; args = [ \"-c\" \"echo watched $stamp > \$out\" ];
-}")
+watched=$(fixture watched)
 watched_hash=$(basename "$watched" | cut -c1-32)
 echo "  built $watched"
 for _ in $(seq 40); do
