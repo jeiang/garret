@@ -14,11 +14,46 @@ pub struct StoredToken {
 }
 
 pub fn token_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .context("neither XDG_CONFIG_HOME nor HOME is set")?;
-    Ok(base.join("garret").join("token.json"))
+    Ok(crate::config::config_home()?
+        .join("garret")
+        .join("token.json"))
+}
+
+/// `garret logout`. Idempotent: a missing token file is the desired state, not
+/// an error. The config stays — `rm` exists, and re-logging-in is the common case.
+pub fn logout() -> Result<PathBuf> {
+    let path = token_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
+}
+
+/// The `sub`, `aud` and `exp` a token carries, for `garret whoami`.
+#[derive(Debug, Default, Deserialize)]
+pub struct Claims {
+    pub sub: Option<String>,
+    pub exp: Option<i64>,
+    /// `aud` is a string or an array of strings depending on the issuer.
+    #[serde(default)]
+    pub aud: serde_json::Value,
+}
+
+/// Reads a JWT's payload **without verifying its signature**. Verification is
+/// the server's job and needs the issuer's JWKS; the client is only reporting
+/// what it is holding, and a forged token would be rejected by the liveness
+/// probe `whoami` runs anyway. Never use this to make an access decision.
+pub fn peek_claims(token: &str) -> Result<Claims> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+    let payload = token
+        .split('.')
+        .nth(1)
+        .context("token is not a JWT: expected three dot-separated segments")?;
+    let bytes = B64URL
+        .decode(payload)
+        .context("token payload is not base64url")?;
+    serde_json::from_slice(&bytes).context("token payload is not JSON")
 }
 
 pub fn save_token(token: &StoredToken) -> Result<()> {

@@ -202,7 +202,15 @@ impl Watcher {
         if missing.is_empty() {
             return Ok(());
         }
-        pusher.push_all(missing).await?;
+        // The daemon reports per path into the journal and draws no bar. A
+        // failure must surface as an error here, because the watcher's retry
+        // and skip-list logic is what decides whether the cursor advances.
+        let summary = pusher
+            .push_all(missing, &crate::push::Report::plain())
+            .await;
+        if summary.failed > 0 {
+            bail!("{} path(s) failed to push", summary.failed);
+        }
         Ok(())
     }
 }

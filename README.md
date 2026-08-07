@@ -16,6 +16,24 @@ Push, pull, auth, GC, browse, the store watcher, packaging and the NixOS
 modules are all in. Nothing has run against MEGA S4 or a real OIDC issuer
 yet — both are untested surfaces until the first deployment.
 
+## Quickstart
+
+```
+garret login https://push.cache.example   # writes the config, then device flow
+garret use                                # points nix at the cache
+garret push ./result                      # uploads the closure
+```
+
+`login` takes the Pusher URL and fetches the rest — Puller URL, signing keys,
+OIDC issuer and client id — from the server, creating `~/.config/garret/` if
+it is not there. It is the only command that runs without a config, because it
+is the one that writes it.
+
+Also: `garret whoami`, `garret logout`, `garret push --dry-run`, `--json` on
+`push` (NDJSON), `list`, `tree` and `whoami`, and `garret completions <shell>`
+(installed automatically by the Nix package). Full reference:
+[docs/spec/06-client.md](docs/spec/06-client.md).
+
 - Spec: [docs/spec/00-overview.md](docs/spec/00-overview.md)
 - Decisions: [docs/adr/](docs/adr/)
 - Glossary: [CONTEXT.md](CONTEXT.md)

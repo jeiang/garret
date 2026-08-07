@@ -16,6 +16,18 @@
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
         # rusqlite is vendored (its `bundled` feature), so no system sqlite.
+        nativeBuildInputs = [ pkgs.installShellFiles ];
+        # Generating completions means *running* the binary we just built, which
+        # only works when the build machine can execute the host platform's
+        # binaries. Without the guard a `pkgsCross` build fails here with an
+        # exec-format error that says nothing about completions.
+        postInstall = pkgs.lib.optionalString
+          (pkgs.stdenv.buildPlatform.canExecute pkgs.stdenv.hostPlatform) ''
+          installShellCompletion --cmd garret \
+            --bash <($out/bin/garret completions bash) \
+            --zsh <($out/bin/garret completions zsh) \
+            --fish <($out/bin/garret completions fish)
+        '';
         meta.description = "A single-tenant Nix binary cache";
       };
 
@@ -23,9 +35,16 @@
       # `garret-${name}` while the binary inside it is `${name}`, so without it
       # `nix run .#garret-admin` looks for a `garret-garret-admin` that does not
       # exist and fails with "unable to execute".
+      #
+      # `share/` is linked too, not just `bin/`: the shell completions installed
+      # by postInstall live there, and a wrapper that dropped them would leave
+      # `nix profile install .#garret` with no completions at all.
       only = pkgs: name: pkgs.runCommand "garret-${name}" { meta.mainProgram = name; } ''
         mkdir -p $out/bin
         ln -s ${garret pkgs}/bin/${name} $out/bin/${name}
+        if [ -d ${garret pkgs}/share ]; then
+          ln -s ${garret pkgs}/share $out/share
+        fi
       '';
     in
     {

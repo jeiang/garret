@@ -7,10 +7,156 @@ use anyhow::{Context, Result, bail};
 use async_compression::{Level, tokio::bufread::ZstdEncoder};
 use futures::{StreamExt, stream};
 use garret_common::{Preamble, hash_of_store_path};
+use indicatif::{MultiProgress, ProgressBar, ProgressBarIter, ProgressStyle};
 use reqwest::{Body, StatusCode};
 use serde::Deserialize;
-use tokio::{io::BufReader, process::Command};
+use serde_json::json;
+use tokio::{io::AsyncRead, io::BufReader, process::Command};
 use tokio_util::io::ReaderStream;
+
+/// Where push output goes.
+///
+/// The bar draws to stderr (via the shared `MultiProgress`, which also carries
+/// tracing's writer so a log line suspends it instead of shredding it), while
+/// per-path lines and NDJSON events go to stdout. That split is what makes
+/// `garret push --json > events.ndjson` show a live bar and still write clean
+/// JSON.
+#[derive(Clone)]
+pub struct Report {
+    json: bool,
+    mp: MultiProgress,
+    bar: Option<ProgressBar>,
+}
+
+impl Report {
+    /// Announces the negotiation result and opens the bar. Called once, after
+    /// `missing`, because that is the first moment the byte total is known.
+    pub fn start(json: bool, mp: &MultiProgress, closure: usize, missing: &[PathInfo]) -> Self {
+        let nar_bytes: u64 = missing.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        let mut report = Self {
+            json,
+            mp: mp.clone(),
+            bar: None,
+        };
+        if json {
+            report.event(json!({
+                "event": "negotiated",
+                "closure": closure,
+                "missing": missing.len(),
+                "nar_bytes": nar_bytes,
+            }));
+            return report;
+        }
+        report.out(&format!(
+            "{closure} path(s) in closure, {} missing",
+            missing.len()
+        ));
+        if missing.is_empty() {
+            return report;
+        }
+        // One overall bar over *uncompressed* NAR bytes. That total is exactly
+        // known from the closure before a byte moves, whereas compressed
+        // bytes-on-wire have no total until the upload is over — and a bar over
+        // path count lurches, because a closure is 1 KB man-pages sitting next
+        // to 400 MB toolchains. The rate is therefore NAR bytes/s, not wire
+        // bytes/s, and the template says so.
+        let bar = mp.add(ProgressBar::new(nar_bytes));
+        bar.set_style(
+            ProgressStyle::with_template(
+                "{spinner} [{elapsed_precise}] [{wide_bar}] {bytes}/{total_bytes} ({bytes_per_sec} NAR, eta {eta})",
+            )
+            .expect("static template")
+            .progress_chars("=> "),
+        );
+        report.bar = Some(bar);
+        report
+    }
+
+    /// The daemon's reporter: per-path lines to the journal, no bar (the
+    /// journal is not a TTY anyway), no events.
+    pub fn plain() -> Self {
+        Self {
+            json: false,
+            mp: MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden()),
+            bar: None,
+        }
+    }
+
+    /// Writes to stdout without the bar clobbering the line.
+    fn out(&self, line: &str) {
+        self.mp.suspend(|| println!("{line}"));
+    }
+
+    fn event(&self, value: serde_json::Value) {
+        self.out(&value.to_string());
+    }
+
+    /// One path finished, one way or another. A failure is reported here and
+    /// the run continues: every path gets an event, and the non-zero exit comes
+    /// after `finish`, so a consumer always sees the totals.
+    fn path(&self, info: &PathInfo, status: &str, error: Option<&str>) {
+        if self.json {
+            let mut event = json!({
+                "event": "path",
+                "path": info.path,
+                "status": status,
+                "nar_size": info.nar_size,
+            });
+            if let Some(error) = error {
+                event["error"] = error.into();
+            }
+            self.event(event);
+        } else if let Some(error) = error {
+            self.out(&format!("  failed   {}: {error}", info.path));
+        } else {
+            self.out(&format!("  {status:<8} {}", info.path));
+        }
+    }
+
+    pub fn finish(&self, summary: &Summary) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+        if self.json {
+            self.event(json!({
+                "event": "done",
+                "pushed": summary.pushed,
+                "deduped": summary.deduped,
+                "failed": summary.failed,
+                "nar_bytes": summary.nar_bytes,
+            }));
+        } else {
+            self.out(&format!(
+                "done: {} pushed, {} deduped, {} failed",
+                summary.pushed, summary.deduped, summary.failed
+            ));
+        }
+    }
+
+    /// Counts NAR bytes as they are read, *before* compression — the units the
+    /// bar's total is denominated in.
+    ///
+    /// A retried path is re-read and so counted twice, nudging the bar past its
+    /// total on a rare failure. That is cosmetic, and correcting it would mean
+    /// threading a per-attempt counter through the body stream to decrement on
+    /// error; the bar clamps its display, so it is left alone.
+    fn wrap<R: AsyncRead + Unpin>(&self, reader: R) -> ProgressBarIter<R> {
+        match &self.bar {
+            Some(bar) => bar.clone().wrap_async_read(reader),
+            None => ProgressBar::hidden().wrap_async_read(reader),
+        }
+    }
+}
+
+/// What a push run did. `deduped` means the bytes were uploaded and *then*
+/// found redundant server-side — not that they were skipped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    pub pushed: usize,
+    pub deduped: usize,
+    pub failed: usize,
+    pub nar_bytes: u64,
+}
 
 pub struct Pusher {
     pub http: reqwest::Client,
@@ -108,20 +254,23 @@ impl Pusher {
             .collect())
     }
 
-    /// Uploads every path with at most `jobs` in flight. Returns how many were
-    /// newly created; already-present paths count as success.
-    pub async fn push_all(&self, paths: Vec<PathInfo>) -> Result<usize> {
-        let results = stream::iter(paths)
+    /// Uploads every path with at most `jobs` in flight.
+    ///
+    /// A failure does not abort the run: every path is attempted and reported,
+    /// and the caller decides the exit code from `Summary::failed`. That way a
+    /// `--json` consumer always receives the terminating `done` event.
+    pub async fn push_all(&self, paths: Vec<PathInfo>, report: &Report) -> Summary {
+        let nar_bytes: u64 = paths.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        let statuses = stream::iter(paths)
             .map(|info| async move {
-                let name = info.path.clone();
-                match self.push_one(&info).await {
+                match self.push_one(&info, report).await {
                     Ok(status) => {
-                        println!("  {status:<8} {name}");
-                        Ok(())
+                        report.path(&info, status, None);
+                        status
                     }
                     Err(e) => {
-                        eprintln!("  failed   {name}: {e:#}");
-                        Err(e)
+                        report.path(&info, "failed", Some(&format!("{e:#}")));
+                        "failed"
                     }
                 }
             })
@@ -129,17 +278,18 @@ impl Pusher {
             .collect::<Vec<_>>()
             .await;
 
-        let failed = results.iter().filter(|r| r.is_err()).count();
-        if failed > 0 {
-            bail!("{failed} path(s) failed to push");
+        Summary {
+            pushed: statuses.iter().filter(|s| **s == "pushed").count(),
+            deduped: statuses.iter().filter(|s| **s == "deduped").count(),
+            failed: statuses.iter().filter(|s| **s == "failed").count(),
+            nar_bytes,
         }
-        Ok(results.len())
     }
 
-    async fn push_one(&self, info: &PathInfo) -> Result<&'static str> {
+    async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
         let mut delay = Duration::from_millis(250);
         for attempt in 0..=self.max_retries {
-            match self.attempt(info).await {
+            match self.attempt(info, report).await {
                 Ok(status) => return Ok(status),
                 Err(e) if attempt < self.max_retries && is_retryable(&e) => {
                     // Jitter so a fleet of pushers doesn't retry in lockstep.
@@ -153,7 +303,7 @@ impl Pusher {
         unreachable!("loop returns on the final attempt")
     }
 
-    async fn attempt(&self, info: &PathInfo) -> Result<&'static str> {
+    async fn attempt(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
         let preamble = Preamble {
             store_path: info.path.clone(),
             nar_hash: info.nar_hash.clone(),
@@ -171,8 +321,12 @@ impl Pusher {
             .spawn()
             .context("running `nix nar dump-path`")?;
         let stdout = child.stdout.take().expect("stdout was piped");
-        let encoder =
-            ZstdEncoder::with_quality(BufReader::new(stdout), Level::Precise(self.zstd_level));
+        // Counted here, before the encoder, so the ticks are in the same units
+        // as the bar's total.
+        let encoder = ZstdEncoder::with_quality(
+            BufReader::new(report.wrap(stdout)),
+            Level::Precise(self.zstd_level),
+        );
 
         let framed = preamble.to_framed()?;
         let body = stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(framed)) })
@@ -207,7 +361,9 @@ impl Pusher {
         let ack: Ack = response.json().await.context("parsing upload response")?;
         Ok(match ack.status.as_str() {
             // First writer wins; a concurrent pusher finishing it is success.
-            "exists" | "in-progress" => "skipped",
+            // "deduped", not "skipped": the bytes were uploaded and only then
+            // found redundant, so the bandwidth was spent either way.
+            "exists" | "in-progress" => "deduped",
             _ => "pushed",
         })
     }
