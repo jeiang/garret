@@ -1,7 +1,10 @@
 //! Pusher: accepts NARs over the garret push protocol (spec 01-push-protocol).
-//! M2 slice — negotiation, upload, signing, OIDC. No multipart (M3), no GC (M4).
+//! M3 slice — negotiation, streamed multipart upload, signing, OIDC,
+//! backpressure and metrics. No GC yet (M4).
 
 use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -19,20 +22,24 @@ use garret_server::{
     auth::{Authenticator, Subject},
     config::PusherConfig,
     db::{self, Object},
+    inflight::InFlight,
+    metrics as garret_metrics,
     narinfo::{self, SigningKeyFile},
     nix_base32, now,
-    storage::{self, Storage},
+    storage::{self, Storage, UploadLimits},
 };
 use serde_json::json;
-use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 struct AppState {
     conn: Mutex<rusqlite::Connection>,
     storage: Storage,
     keys: Vec<SigningKeyFile>,
     store_dir: String,
-    max_body_bytes: u64,
     auth: Authenticator,
+    limits: UploadLimits,
+    uploads: Arc<Semaphore>,
+    in_flight: InFlight,
 }
 
 #[tokio::main]
@@ -42,6 +49,15 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("usage: garret-pusher <config.toml>")?;
     let cfg: PusherConfig = garret_server::config::load(&path)?;
+
+    // Before any metric call: the recorder must exist first or the value is lost.
+    let metrics_handle = garret_metrics::install("pusher")?;
+    let metrics_listen = cfg.metrics_listen.clone();
+    tokio::spawn(async move {
+        if let Err(e) = garret_metrics::serve(metrics_handle, &metrics_listen).await {
+            tracing::error!("metrics listener failed: {e:#}");
+        }
+    });
 
     let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
     // Authenticator::new refuses an empty issuer list, so this cannot start
@@ -57,14 +73,28 @@ async fn main() -> Result<()> {
         storage: Storage::new(&cfg.s3).await?,
         keys: garret_server::load_signing_keys(&cfg.signing_key_files)?,
         store_dir: cfg.store_dir,
-        max_body_bytes: cfg.max_body_bytes,
         auth,
+        limits: UploadLimits::new(
+            cfg.limits.part_size,
+            cfg.limits.max_parts_in_flight,
+            cfg.limits.max_in_flight_bytes,
+        ),
+        uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
+        in_flight: InFlight::new(),
     });
+
+    // Saturation must be visible before it hurts, so the caps are exported
+    // alongside the gauges that approach them (spec 08). The recorder is
+    // already installed above — a gauge set before it would go nowhere.
+    metrics::gauge!("garret_uploads_limit").set(cfg.limits.max_concurrent_uploads as f64);
+    metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
+    metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
 
     let app = Router::new()
         .route("/api/v1/missing-paths", post(missing_paths))
         .route("/api/v1/nar/{hash}", put(upload))
         .layer(middleware::from_fn_with_state(state.clone(), require_oidc))
+        .layer(middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -75,8 +105,23 @@ async fn main() -> Result<()> {
 
 struct Error(StatusCode, String);
 
+impl Error {
+    /// 429s carry Retry-After so clients back off on the server's terms.
+    fn retry_after(status: StatusCode, message: &str) -> Self {
+        Error(status, message.to_owned())
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        if self.0 == StatusCode::TOO_MANY_REQUESTS {
+            return (
+                self.0,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({ "error": self.1 })),
+            )
+                .into_response();
+        }
         (self.0, Json(json!({ "error": self.1 }))).into_response()
     }
 }
@@ -128,8 +173,16 @@ async fn missing_paths(
     State(state): State<Arc<AppState>>,
     Json(hashes): Json<Vec<String>>,
 ) -> Result<Json<Vec<String>>, Error> {
-    let conn = state.conn.lock().unwrap();
-    Ok(Json(db::missing(&conn, &hashes)?))
+    let missing = {
+        let conn = state.conn.lock().unwrap();
+        db::missing(&conn, &hashes)?
+    };
+    metrics::histogram!("garret_negotiation_batch_size").record(hashes.len() as f64);
+    if !hashes.is_empty() {
+        metrics::histogram!("garret_negotiation_missing_ratio")
+            .record(missing.len() as f64 / hashes.len() as f64);
+    }
+    Ok(Json(missing))
 }
 
 async fn upload(
@@ -141,41 +194,78 @@ async fn upload(
     // Idempotency: answered before the body is read, so `Expect: 100-continue`
     // clients skip the transfer entirely (spec 01).
     if db::exists(&state.conn.lock().unwrap(), &hash).map_err(Error::from)? {
+        metrics::counter!("garret_upload_skipped_total", "reason" => "exists").increment(1);
         return Ok((StatusCode::OK, Json(json!({"status": "exists"}))).into_response());
     }
 
-    // ponytail: M1 buffers the whole body — PutObject needs a length up front,
-    // and the cap keeps that honest. M3 replaces this with the spec's multipart
-    // path (64 MiB parts, permit acquired before each read) and the cap goes.
-    let mut stream = body.into_data_stream();
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| Error(StatusCode::BAD_REQUEST, e.to_string()))?;
-        if (buf.len() + chunk.len()) as u64 > state.max_body_bytes {
-            return Err(Error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                format!("body exceeds max_body_bytes ({})", state.max_body_bytes),
-            ));
+    // Shed before reading a byte: the queue belongs in the clients, and past
+    // the cap the server stays fast rather than slowly running out of memory.
+    let Ok(_slot) = state.uploads.clone().try_acquire_owned() else {
+        metrics::counter!("garret_uploads_shed_total").increment(1);
+        return Err(Error::retry_after(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many concurrent uploads",
+        ));
+    };
+    // Second pusher for the same path: first writer wins, and the loser treats
+    // it as success rather than racing to overwrite an identical blob.
+    let Some(_claim) = state.in_flight.claim(&hash) else {
+        metrics::counter!("garret_upload_skipped_total", "reason" => "in-progress").increment(1);
+        return Ok((StatusCode::OK, Json(json!({"status": "in-progress"}))).into_response());
+    };
+
+    metrics::gauge!("garret_uploads_in_flight").increment(1.0);
+    let started = std::time::Instant::now();
+    let result = store_upload(&state, &hash, &subject, body).await;
+    metrics::gauge!("garret_uploads_in_flight").decrement(1.0);
+
+    match &result {
+        Ok(size) => {
+            metrics::counter!("garret_uploads_accepted_total").increment(1);
+            metrics::histogram!("garret_upload_bytes").record(*size as f64);
+            metrics::histogram!("garret_upload_duration_seconds").record(started.elapsed());
         }
-        buf.extend_from_slice(&chunk);
+        Err(_) => metrics::counter!("garret_uploads_failed_total").increment(1),
     }
-
-    let preamble = take_preamble(&mut buf)?.ok_or_else(|| {
-        Error(
-            StatusCode::BAD_REQUEST,
-            "body ended before the preamble was complete".into(),
-        )
-    })?;
-    let compressed = buf; // take_preamble drained it off the front
-
-    let object = build_object(&hash, &preamble, &compressed, &state, &subject)?;
-    state
-        .storage
-        .put(&storage::key_for(&hash), compressed)
-        .await?;
-    db::insert_object(&mut state.conn.lock().unwrap(), &object, now())?;
-
+    result?;
     Ok((StatusCode::CREATED, Json(json!({"status": "created"}))).into_response())
+}
+
+/// Reads the preamble, then streams the rest straight to S3. Returns the
+/// stored size. The body never lands in memory whole.
+async fn store_upload(
+    state: &AppState,
+    hash: &str,
+    subject: &Subject,
+    body: Body,
+) -> Result<i64, Error> {
+    let mut stream = body.into_data_stream();
+    let mut head: Vec<u8> = Vec::new();
+    let preamble = loop {
+        if let Some(preamble) = take_preamble(&mut head)? {
+            break preamble;
+        }
+        let Some(chunk) = stream.next().await else {
+            return Err(Error(
+                StatusCode::BAD_REQUEST,
+                "body ended before the preamble was complete".into(),
+            ));
+        };
+        head.extend_from_slice(&chunk.map_err(|e| Error(StatusCode::BAD_REQUEST, e.to_string()))?);
+    };
+
+    // Whatever followed the preamble in that chunk is the start of the NAR.
+    let leftover = Bytes::from(head);
+    let nar = futures::stream::once(async move { Ok::<_, axum::Error>(leftover) }).chain(stream);
+
+    let (digest, file_size) = state
+        .storage
+        .put_streaming(&storage::key_for(hash), Box::pin(nar), &state.limits)
+        .await?;
+
+    let object = build_object(hash, &preamble, &digest, file_size, state, subject)?;
+    db::insert_object(&mut state.conn.lock().unwrap(), &object, now())?;
+    Ok(file_size)
 }
 
 /// Splits the 4-byte-LE-length-prefixed JSON preamble off the front of `buf`,
@@ -203,7 +293,8 @@ fn take_preamble(buf: &mut Vec<u8>) -> Result<Option<Preamble>, Error> {
 fn build_object(
     hash: &str,
     preamble: &Preamble,
-    compressed: &[u8],
+    digest: &[u8],
+    file_size: i64,
     state: &AppState,
     subject: &Subject,
 ) -> Result<Object, Error> {
@@ -233,8 +324,8 @@ fn build_object(
         nar_size: preamble.nar_size,
         // Server-computed over exactly the bytes stored — the only integrity
         // check in the system now that the Puller redirects (ADR-0005).
-        file_hash: format!("sha256:{}", nix_base32::encode(&Sha256::digest(compressed))),
-        file_size: compressed.len() as i64,
+        file_hash: format!("sha256:{}", nix_base32::encode(digest)),
+        file_size,
         deriver: preamble.deriver.clone().map(basename),
         ca: preamble.ca.clone(),
         references: preamble.references.iter().cloned().map(basename).collect(),

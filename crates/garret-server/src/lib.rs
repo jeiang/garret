@@ -3,6 +3,8 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod inflight;
+pub mod metrics;
 pub mod narinfo;
 pub mod nix_base32;
 pub mod storage;

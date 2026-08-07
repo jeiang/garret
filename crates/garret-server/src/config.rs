@@ -47,6 +47,55 @@ pub struct IssuerConfig {
     pub allowed_groups: Vec<String>,
 }
 
+/// Backpressure caps (spec 01-push-protocol). Server memory is bounded by
+/// these, not by how many clients show up.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Limits {
+    #[serde(default = "max_concurrent_uploads")]
+    pub max_concurrent_uploads: usize,
+    #[serde(default = "max_in_flight_bytes")]
+    pub max_in_flight_bytes: u64,
+    #[serde(default = "part_size")]
+    pub part_size: usize,
+    #[serde(default = "max_parts_in_flight")]
+    pub max_parts_in_flight: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_uploads: max_concurrent_uploads(),
+            max_in_flight_bytes: max_in_flight_bytes(),
+            part_size: part_size(),
+            max_parts_in_flight: max_parts_in_flight(),
+        }
+    }
+}
+
+fn max_concurrent_uploads() -> usize {
+    32
+}
+
+fn max_in_flight_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+fn part_size() -> usize {
+    64 * 1024 * 1024
+}
+
+fn max_parts_in_flight() -> usize {
+    4
+}
+
+fn pusher_metrics_listen() -> String {
+    "127.0.0.1:9091".into()
+}
+
+fn puller_metrics_listen() -> String {
+    "127.0.0.1:9092".into()
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PusherConfig {
     #[serde(default = "pusher_listen")]
@@ -58,13 +107,10 @@ pub struct PusherConfig {
     pub signing_key_files: Vec<String>,
     /// At least one is required; there is no auth-disable flag (spec 04).
     pub oidc: Vec<IssuerConfig>,
-    /// Bodies above this are refused until multipart lands (M3).
-    #[serde(default = "max_body")]
-    pub max_body_bytes: u64,
-}
-
-fn max_body() -> u64 {
-    100 * 1024 * 1024
+    #[serde(default)]
+    pub limits: Limits,
+    #[serde(default = "pusher_metrics_listen")]
+    pub metrics_listen: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +123,8 @@ pub struct PullerConfig {
     pub store_dir: String,
     #[serde(default = "presign_ttl")]
     pub presign_ttl_secs: u64,
+    #[serde(default = "puller_metrics_listen")]
+    pub metrics_listen: String,
 }
 
 fn puller_listen() -> String {

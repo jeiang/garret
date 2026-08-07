@@ -12,7 +12,7 @@ say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
 # A leftover Garage on 3901 answers with a different RPC secret and the failure
 # looks like a handshake bug rather than a stale process. Fail clearly instead.
-for port in 3900 3901 18080 18081; do
+for port in 3900 3901 18080 18081 19091 19092; do
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "port $port is already in use — kill the leftover process and retry" >&2
     exit 1
@@ -95,8 +95,16 @@ PY
 
 cat > "$root/pusher.toml" <<EOF
 listen = "127.0.0.1:18080"
+metrics_listen = "127.0.0.1:19091"
 db_path = "$root/garret.db"
 signing_key_files = ["$root/signing.key"]
+
+[limits]
+# 5 MiB is S4's minimum part size; small here so the multipart path is
+# actually exercised without moving 64 MiB.
+part_size = 5242880
+max_parts_in_flight = 2
+max_concurrent_uploads = 4
 
 [[oidc]]
 issuer = "https://dev.garret.test"
@@ -115,6 +123,7 @@ audience = "garret"
 EOF
 cat > "$root/puller.toml" <<EOF
 listen = "127.0.0.1:18081"
+metrics_listen = "127.0.0.1:19092"
 db_path = "$root/garret.db"
 $s3_block
 EOF
@@ -186,6 +195,42 @@ grep -q "done: 2 path(s) uploaded" "$root/push.out"
 # Re-pushing must be a no-op: idempotency is normal operation, not an error.
 garret push "$path" | tee "$root/push2.out"
 grep -q "2 path(s) in closure, 0 missing" "$root/push2.out"
+
+say "multipart: a body larger than several parts"
+# Incompressible, so zstd cannot shrink it back under the part size.
+head -c 12000000 /dev/urandom > "$root/big.bin"
+big=$(nix store add-path "$root/big.bin" --name garret-e2e-big)
+garret push "$big" | tee "$root/push-big.out"
+grep -q "done: 1 path(s) uploaded" "$root/push-big.out"
+
+metric() { curl -sf "http://127.0.0.1:$1/metrics" | awk -v k="$2" '$1 == k {print $2}'; }
+parts=$(metric 19091 garret_s3_parts_total)
+completed=$(metric 19091 garret_s3_multipart_completed_total)
+aborted=$(metric 19091 garret_s3_multipart_aborted_total)
+echo "  parts=$parts completed=$completed aborted=${aborted:-0}"
+[ "${completed:-0}" = "1" ] || { echo "expected one completed multipart"; exit 1; }
+[ "${parts:-0}" -ge 3 ] || { echo "expected 3+ parts for a 12 MB body"; exit 1; }
+[ -z "$aborted" ] || [ "$aborted" = "0" ] || { echo "multipart was aborted"; exit 1; }
+
+# The big path must come back intact — proof the parts were reassembled in order.
+nix copy --from "http://127.0.0.1:18081" --to "$root/dest-big" "$big" \
+  --option trusted-public-keys "$pubkey" --option require-sigs true \
+  --option substitute false --refresh
+cmp "$root/dest-big/$big" "$root/big.bin"
+
+say "metrics and health"
+curl -sf "http://127.0.0.1:19092/healthz" >/dev/null
+accepted=$(metric 19091 garret_uploads_accepted_total)   # 2 closure paths + 1 big
+echo "  uploads accepted: $accepted"
+[ "$accepted" = "3" ] || { echo "expected 3 accepted uploads, got $accepted"; exit 1; }
+[ "$(metric 19091 garret_uploads_limit)" = "4" ] || { echo "cap not exported"; exit 1; }
+if curl -sf "http://127.0.0.1:19091/metrics" | grep -q '^garret_narinfo_requests_total'; then
+  echo "pusher must not expose puller metrics"; exit 1
+fi
+# The public listener must never serve metrics — they are internal-only.
+code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/metrics")
+echo "  public /metrics -> $code"
+[ "$code" != "200" ] || { echo "metrics leaked onto the public listener"; exit 1; }
 
 say "narinfo"
 curl -sf "http://127.0.0.1:18081/$hash.narinfo" | tee "$root/narinfo"

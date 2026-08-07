@@ -22,12 +22,19 @@ from the DB row and vice versa. No prefix sharding.
 
 Defaults, all configurable:
 
-- Single `PutObject` below **100 MiB**.
+- Single `PutObject` when the whole body fits in one part (**64 MiB**).
 - Above: multipart with **64 MiB parts**, at most **4 parts in flight**,
   and the concurrency permit acquired **before** reading each part — the
   reader must never race ahead of S3. Worst-case buffering is 4×64 MiB
   per NAR; the protocol's global in-flight byte cap bounds the aggregate.
 - On any upload error, abort the multipart immediately so parts free.
+
+The single-`PutObject` threshold is the part size, not a separate 100 MiB
+knob as originally written (corrected at M3). `PutObject` needs the body
+length up front, so the threshold is exactly how much must be buffered
+before the shape of the upload is known — setting it above the part size
+would buffer 100 MiB per upload and break the 4×64 MiB bound this section
+promises. One knob, and the promise holds.
 
 S4 constraints the defaults must keep satisfying: parts 1..N-1 must be
 **identical in size** (uniform parts with a short final part — what we

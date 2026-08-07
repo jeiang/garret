@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+metrics = "0.24"
 garret-server.workspace = true
 anyhow = "1"
 axum = "0.8"
