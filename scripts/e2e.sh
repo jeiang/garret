@@ -95,7 +95,9 @@ def mint(name, **overrides):
 
 mint("token")
 mint("token-wrong-audience", aud="somebody-else")
-mint("token-expired", exp=int(time.time()) - 60)
+# Well past the server's 60s skew allowance: expired by exactly the leeway is
+# a coin flip on sub-second timing, not a test.
+mint("token-expired", exp=int(time.time()) - 3600)
 PY
 
 cat > "$root/pusher.toml" <<EOF
