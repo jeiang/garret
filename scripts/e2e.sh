@@ -175,12 +175,17 @@ wait_for() {
   exit 1
 }
 
-# The Pusher owns the schema, so it must exist before the Puller opens it.
+# Deliberately backwards: the Pusher owns the schema, and the Puller must wait
+# for it rather than die, serving 503 until /ready says otherwise.
+"$bin"/garret-puller "$root/puller.toml" &
 "$bin"/garret-pusher "$root/pusher.toml" &
 pusher_pid=$!
 wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
-"$bin"/garret-puller "$root/puller.toml" &
-wait_for puller "http://127.0.0.1:18081/nix-cache-info"
+for i in $(seq 100); do
+  curl -sf -o /dev/null "http://127.0.0.1:18081/ready" && break
+  [ "$i" = 100 ] && { echo "puller never became ready" >&2; exit 1; }
+  sleep 0.3
+done
 
 say "unauthenticated and bad tokens are refused"
 check_401() {

@@ -24,6 +24,7 @@ let
     store_dir = cfg.storeDir;
     presign_ttl_secs = cfg.presignTtlSeconds;
     bump_debounce_secs = cfg.bumpDebounceSeconds;
+    db_wait_timeout_secs = cfg.dbWaitTimeoutSeconds;
     s3 = {
       inherit (cfg.s3) bucket region;
       endpoint_url = cfg.s3.endpointUrl;
@@ -58,6 +59,12 @@ in
       type = types.int;
       default = 86400;
       description = "Skip a last-accessed write if the stored value is newer than this.";
+    };
+
+    dbWaitTimeoutSeconds = mkOption {
+      type = types.int;
+      default = 300;
+      description = "How long to wait for the Pusher to create the database before exiting.";
     };
 
     s3 = {

@@ -83,6 +83,40 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA).context("applying schema")
 }
 
+/// The Pusher creates the database, so a Puller started first would otherwise
+/// die on a missing file. Wait instead — including for the schema, since the
+/// file appears (WAL, journal) before the Pusher has finished migrating.
+/// Gives up after `timeout` so a typo'd `db_path` still fails loudly.
+pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result<Connection> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(250);
+    loop {
+        match open(path, false).and_then(|conn| {
+            conn.query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'objects'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .context("checking for schema")
+            .map(|found| (conn, found.is_some()))
+        }) {
+            Ok((conn, true)) => return Ok(conn),
+            Ok((_, false)) => tracing::info!("waiting for {path}: pusher has not migrated it yet"),
+            Err(e) => tracing::info!("waiting for database: {e:#}"),
+        }
+        let now = Instant::now();
+        anyhow::ensure!(
+            now < deadline,
+            "database {path} was not created within {timeout:?} — is the pusher running?"
+        );
+        tokio::time::sleep(delay.min(deadline - now)).await;
+        delay = (delay * 2).min(Duration::from_secs(15));
+    }
+}
+
 /// Inserts the object, its refs and the usage counter in one transaction —
 /// only ever called after the blob is durable (row exists ⇒ blob exists).
 pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()> {
@@ -478,5 +512,43 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(referrers, vec![a]);
+    }
+
+    #[tokio::test]
+    async fn open_when_ready_waits_for_the_pusher_to_create_the_schema() {
+        let path = std::env::temp_dir().join("garret-open-when-ready.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let path = path.to_str().unwrap().to_owned();
+
+        let waiter = tokio::spawn({
+            let path = path.clone();
+            async move { open_when_ready(&path, std::time::Duration::from_secs(30)).await }
+        });
+        // Not ready while the file is absent, nor while it exists unmigrated.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+        let created = open(&path, true).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished(), "an empty database is not ready");
+
+        migrate(&created).unwrap();
+        let conn = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("open_when_ready should return once the schema exists")
+            .unwrap()
+            .unwrap();
+        assert!(!exists(&conn, "nope").unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn open_when_ready_gives_up_on_a_database_that_never_appears() {
+        let err = open_when_ready(
+            "/nonexistent-dir/garret.sqlite",
+            std::time::Duration::from_millis(600),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("was not created"), "{err:#}");
     }
 }
