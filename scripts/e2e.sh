@@ -98,6 +98,7 @@ listen = "127.0.0.1:18080"
 metrics_listen = "127.0.0.1:19091"
 db_path = "$root/garret.db"
 signing_key_files = ["$root/signing.key"]
+admin_socket = "$root/admin.sock"
 
 [limits]
 # 5 MiB is S4's minimum part size; small here so the multipart path is
@@ -148,7 +149,8 @@ $s3_block
 EOF
 
 say "starting garret"
-cargo build --quiet -p garret-pusher -p garret-puller -p garret-client
+cargo build --quiet -p garret-pusher -p garret-puller -p garret-client \
+  -p garret-admin -p garret-bench
 
 # Bounded: a service that dies on startup should fail the run, not hang it.
 wait_for() {
@@ -326,6 +328,45 @@ if curl -sf "http://127.0.0.1:18081/$drv_hash.narinfo" >/dev/null 2>&1; then
   echo "watcher pushed a .drv, which the filter must exclude"; exit 1
 fi
 
+say "admin socket"
+admin() { ./target/debug/garret-admin --socket "$root/admin.sock" "$@"; }
+admin status | tee "$root/status.out"
+grep -q "^objects:" "$root/status.out"
+
+# Key management is offline: it must work with no Pusher involved at all.
+admin key generate garret-rotate-2 "$root/rotate.key" > "$root/keygen.out"
+generated=$(awk '/public key:/ {print $3}' "$root/keygen.out")
+shown=$(admin key show "$root/rotate.key")
+[ "$generated" = "$shown" ] || { echo "generate and show disagree: $generated vs $shown"; exit 1; }
+echo "  offline keygen agrees with key show"
+# It must refuse to clobber an existing key rather than destroying signatures.
+if admin key generate garret-rotate-2 "$root/rotate.key" 2>/dev/null; then
+  echo "key generate overwrote an existing key"; exit 1
+fi
+echo "  refuses to overwrite an existing key"
+
+say "benchmark harness"
+./target/debug/garret-bench --endpoint "http://127.0.0.1:18080" \
+  --concurrency 4 --count 12 --json "$root/bench.json" | tail -20
+python3 -c "
+import json
+r = json.load(open('$root/bench.json'))
+print('  pushed', r['pushed'], 'failed', r['failed'], 'shed-retries', r['shed_retries'])
+assert r['zero_failures'], r
+assert r['pushed'] == r['corpus_entries'], r
+assert r['uncontended_median_ms'] > 0, 'baseline must actually be measured'
+assert r['p99_slowdown'] > 0, 'slowdown must be measured even though it is not a gate'
+"
+# The same seed must produce the same corpus on any machine.
+./target/debug/garret-bench --endpoint "http://127.0.0.1:18080" \
+  --concurrency 2 --count 12 --json "$root/bench2.json" >/dev/null
+python3 -c "
+import json
+a, b = json.load(open('$root/bench.json')), json.load(open('$root/bench2.json'))
+assert a['corpus_bytes'] == b['corpus_bytes'], (a['corpus_bytes'], b['corpus_bytes'])
+print('  same seed, same corpus:', a['corpus_bytes'], 'bytes')
+"
+
 say "garbage collection"
 # Restart the Pusher under a quota the corpus already exceeds. Only one
 # process ever writes the DB, so the old one goes first.
@@ -338,6 +379,10 @@ sed 's/^quota_bytes = .*/quota_bytes = 1000/; s/^interval_secs = .*/interval_sec
 grep -q "quota_bytes = 1000" "$root/pusher-gc.toml"
 ./target/debug/garret-pusher "$root/pusher-gc.toml" &
 wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
+
+# GC on demand through the admin socket, rather than waiting on the timer.
+admin gc run | tee "$root/gcrun.out"
+grep -q "evicted" "$root/gcrun.out"
 
 before=$(metric 19091 garret_gc_usage_bytes)
 echo "  usage before: $before (quota 1000)"

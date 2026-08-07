@@ -25,7 +25,28 @@ concurrency, per-NAR latency capture.
    - Pusher RSS < **2× its configured in-flight byte cap** throughout,
      returning to baseline after (cap-relative: provable and
      machine-independent);
-   - p99 per-NAR time ≤ 3× the uncontended median.
+   - latency: **reported, not gated** — see below.
+
+**The p99 latency budget does not survive this corpus** (found at M5).
+The original rule was "p99 per-NAR time ≤ 3× the uncontended median", and
+no reading of it works:
+
+- *Absolute p99 against a median* measures the corpus's size spread, not
+  contention. This corpus is deliberately fat-tailed, so the largest NAR
+  takes far more than 3× the median NAR at **any** concurrency, including
+  none. The rule fails on an idle server.
+- *Each NAR against its own uncontended time* removes size, but then
+  measures small NARs queueing behind large ones — which bounded upload
+  concurrency guarantees by construction. A 4 KiB path behind three
+  16 MiB uploads shows a ~60× slowdown on a server behaving exactly as
+  designed.
+
+So `garret-bench` reports both (`p99_ms`, `p99_slowdown`) and gates only
+on **zero failures**, which is unambiguous. Latency is tracked by
+comparing against the checked-in baseline, where a regression shows up as
+a change; `--max-p99-slowdown` sets a budget for anyone who wants a hard
+gate. Picking a defensible fixed threshold needs numbers from real
+hardware, which is a decision for after the first production runs.
 2. **Large-body streaming** — single-stream 1 MiB / 100 MiB / 2 GiB
    pushes; the regression gate for HTTP/2 flow-control tuning. (Pulls no
    longer stream through us — see below.)

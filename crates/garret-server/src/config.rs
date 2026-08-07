@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct S3Config {
     pub bucket: String,
     pub endpoint_url: Option<String>,
@@ -31,6 +32,7 @@ fn pusher_listen() -> String {
 /// One trusted OIDC issuer. Pocket ID and GitHub Actions differ only in the
 /// authorization fields they populate (spec 04-auth).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct IssuerConfig {
     pub issuer: String,
     pub audience: String,
@@ -50,6 +52,7 @@ pub struct IssuerConfig {
 /// Backpressure caps (spec 01-push-protocol). Server memory is bounded by
 /// these, not by how many clients show up.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     #[serde(default = "max_concurrent_uploads")]
     pub max_concurrent_uploads: usize,
@@ -98,6 +101,7 @@ fn puller_metrics_listen() -> String {
 
 /// Quota and eviction policy (spec 05-gc).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct GcConfig {
     pub quota_bytes: u64,
     #[serde(default = "high_watermark")]
@@ -141,6 +145,7 @@ fn orphan_grace() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PusherConfig {
     #[serde(default = "pusher_listen")]
     pub listen: String,
@@ -155,11 +160,14 @@ pub struct PusherConfig {
     pub limits: Limits,
     /// Absent means no quota is enforced and GC never evicts.
     pub gc: Option<GcConfig>,
+    /// Root-only unix socket for garret-admin. Absent means no admin surface.
+    pub admin_socket: Option<String>,
     #[serde(default = "pusher_metrics_listen")]
     pub metrics_listen: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PullerConfig {
     #[serde(default = "puller_listen")]
     pub listen: String,
@@ -215,5 +223,35 @@ mod tests {
         assert!(949 < cfg.high());
         // And a pass always frees a margin, so passes stay infrequent.
         assert!(cfg.low() < cfg.high());
+    }
+}
+
+#[cfg(test)]
+mod strictness_tests {
+    use super::*;
+
+    /// A misplaced or mistyped key must fail loudly. Silently ignoring one is
+    /// how `admin_socket` ended up inside `[limits]` and did nothing.
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let good = r#"
+            db_path = "/tmp/x.db"
+            signing_key_files = ["/tmp/k"]
+            [s3]
+            bucket = "b"
+            [[oidc]]
+            issuer = "https://i"
+            audience = "a"
+        "#;
+        assert!(toml::from_str::<PusherConfig>(good).is_ok());
+
+        let typo = good.replace("db_path", "database_path");
+        assert!(toml::from_str::<PusherConfig>(&typo).is_err());
+
+        let misplaced = format!("{good}\n[limits]\nadmin_socket = \"/run/x.sock\"\n");
+        assert!(
+            toml::from_str::<PusherConfig>(&misplaced).is_err(),
+            "a root key inside [limits] must not be silently swallowed"
+        );
     }
 }

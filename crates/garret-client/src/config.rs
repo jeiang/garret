@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Pusher base URL.
     pub endpoint: String,
@@ -22,6 +23,7 @@ pub struct Config {
 
 /// Store watcher settings; only the daemon reads these.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Watch {
     /// `client_id:client_secret` for this machine's confidential client.
     pub credentials_file: Option<String>,
@@ -60,6 +62,7 @@ fn max_attempts() -> u32 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Oidc {
     pub issuer: String,
     pub client_id: String,

@@ -9,6 +9,7 @@ use std::{
 
 use bytes::Bytes;
 
+mod admin;
 mod gc;
 
 use anyhow::{Context, Result};
@@ -36,15 +37,15 @@ use garret_server::{
 use serde_json::json;
 use tokio::sync::Semaphore;
 
-struct AppState {
-    conn: Arc<Mutex<rusqlite::Connection>>,
-    storage: Storage,
-    keys: Vec<SigningKeyFile>,
-    store_dir: String,
-    auth: Authenticator,
-    limits: UploadLimits,
-    uploads: Arc<Semaphore>,
-    in_flight: InFlight,
+pub(crate) struct AppState {
+    pub conn: Arc<Mutex<rusqlite::Connection>>,
+    pub storage: Storage,
+    pub keys: Vec<SigningKeyFile>,
+    pub store_dir: String,
+    pub auth: Authenticator,
+    pub limits: UploadLimits,
+    pub uploads: Arc<Semaphore>,
+    pub in_flight: InFlight,
 }
 
 #[tokio::main]
@@ -95,13 +96,26 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
 
-    if let Some(gc_cfg) = cfg.gc.clone() {
-        let collector = gc::Gc {
+    let collector = cfg.gc.clone().map(|gc_cfg| {
+        Arc::new(gc::Gc {
             conn: state.conn.clone(),
             storage: state.storage.clone(),
             in_flight: state.in_flight.clone(),
-            cfg: gc_cfg.clone(),
-        };
+            cfg: gc_cfg,
+        })
+    });
+
+    if let Some(admin_socket) = cfg.admin_socket.clone() {
+        let (state, collector) = (state.clone(), collector.clone());
+        tokio::spawn(async move {
+            if let Err(e) = admin::serve(admin_socket, state, collector).await {
+                tracing::error!("admin socket failed: {e:#}");
+            }
+        });
+    }
+
+    if let Some(collector) = collector.clone() {
+        let gc_cfg = collector.cfg.clone();
         tokio::spawn(async move {
             // Startup sweep first, then a tick loop. Each tick is a counter
             // check; eviction only happens past the high watermark (spec 05).

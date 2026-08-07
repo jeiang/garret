@@ -250,6 +250,15 @@ pub fn delete_object(conn: &mut Connection, hash: &str) -> Result<i64> {
     Ok(size)
 }
 
+/// Replaces an object's stored signatures (`garret-admin resign`).
+pub fn update_sigs(conn: &mut Connection, hash: &str, sigs: &[String]) -> Result<()> {
+    conn.execute(
+        "UPDATE objects SET sigs = ?2 WHERE store_path_hash = ?1",
+        params![hash, serde_json::to_string(sigs)?],
+    )?;
+    Ok(())
+}
+
 /// Every object key, for the orphan sweep to diff the bucket against.
 pub fn all_hashes(conn: &Connection) -> Result<std::collections::HashSet<String>> {
     let mut stmt = conn.prepare("SELECT store_path_hash FROM objects")?;

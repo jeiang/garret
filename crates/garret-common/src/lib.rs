@@ -1,5 +1,7 @@
 //! Wire types shared by the client and the server.
 
+pub mod admin;
+
 use serde::{Deserialize, Serialize};
 
 /// The JSON metadata that prefixes an uploaded NAR (spec 01-push-protocol).
