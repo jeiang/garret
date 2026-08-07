@@ -62,6 +62,7 @@
             garage
             zstd
             curl
+            lsof
             openssl
             (python3.withPackages (ps: [ ps.pyjwt ps.cryptography ]))
           ];

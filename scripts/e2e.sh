@@ -186,6 +186,11 @@ check_401 "wrong audience"  -H "Authorization: Bearer $(cat "$root/token-wrong-a
 check_401 "expired token"   -H "Authorization: Bearer $(cat "$root/token-expired")"
 
 say "building a two-path closure"
+# A store-path builder rather than /bin/sh: the Linux sandbox has no /bin/sh,
+# and interpolating a store path declares it as an input automatically.
+# `.out` and head -1: bash is multi-output, and --print-out-paths lists them all.
+sh="$(nix build --no-link --print-out-paths 'nixpkgs#bash.out' | head -1)/bin/bash"
+[ -x "$sh" ] || { echo "no usable bash at $sh" >&2; exit 1; }
 # A real reference, not a lone path: this is what exercises closure discovery,
 # the narinfo References line, and the signature computed over it. `nix store
 # add-path` will not do — it does not scan for references.
@@ -194,7 +199,7 @@ path=$(nix build --impure --no-link --print-out-paths --expr "
 let
   leaf = derivation {
     name = \"garret-e2e-leaf\"; system = builtins.currentSystem;
-    builder = \"/bin/sh\"; args = [ \"-c\" \"echo leaf $stamp > \$out\" ];
+    builder = \"$sh\"; args = [ \"-c\" \"echo leaf $stamp > \$out\" ];
   };
 in derivation {
   name = \"garret-e2e-root\"; system = builtins.currentSystem;
@@ -203,7 +208,7 @@ in derivation {
   # signature -- a server that stores or renders it inconsistently produces a
   # narinfo whose fingerprint nix cannot reproduce. Without this the whole
   # suite passed while every real-world push was unverifiable.
-  builder = \"/bin/sh\"; args = [ \"-c\" \"echo \${leaf} \$out > \$out\" ];
+  builder = \"$sh\"; args = [ \"-c\" \"echo \${leaf} \$out > \$out\" ];
 }")
 hash=$(basename "$path" | cut -c1-32)
 leaf=$(nix path-info --recursive "$path" | grep -- '-garret-e2e-leaf$')
@@ -319,7 +324,7 @@ sleep 2
 watched=$(nix build --impure --no-link --print-out-paths --expr "
 derivation {
   name = \"garret-e2e-watched\"; system = builtins.currentSystem;
-  builder = \"/bin/sh\"; args = [ \"-c\" \"echo watched $stamp > \$out\" ];
+  builder = \"$sh\"; args = [ \"-c\" \"echo watched $stamp > \$out\" ];
 }")
 watched_hash=$(basename "$watched" | cut -c1-32)
 echo "  built $watched"

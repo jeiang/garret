@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same ref makes the previous run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- build ---
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          # `garret` itself is the cache once it is running: when the repository
+          # variables below are set, every job substitutes from it instead of
+          # rebuilding. Empty values are simply inert lines in nix.conf.
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = ${{ vars.GARRET_PULLER }}
+            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+
+      - name: Build all binaries
+        run: nix build .#garret-all --print-build-logs
+
+      - name: Show what was built
+        run: ls -l result/bin
+
+  # ----------------------------------------------------------------- test ---
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = ${{ vars.GARRET_PULLER }}
+            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+
+      # Unit tests run inside the package build (buildRustPackage's check
+      # phase), so this job owns the checks that a build cannot make:
+      # lints, formatting, and the end-to-end gate.
+      - name: Lints and formatting
+        run: nix develop --command just check
+
+      - name: End-to-end gate
+        # Provisions a throwaway Garage, pushes real store paths through the
+        # real client, and substitutes them back with signature verification.
+        run: nix develop --command scripts/e2e.sh
+
+  # ----------------------------------------------------------------- push ---
+  # Populates the cache with this build's outputs and the dev toolchain, so
+  # later runs substitute instead of compiling. Skipped until garret is
+  # actually running: set the GARRET_ENDPOINT repository variable to enable it.
+  push:
+    name: push to garret
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: vars.GARRET_ENDPOINT != '' && github.event_name == 'push'
+    permissions:
+      contents: read
+      # Lets the runner mint the OIDC token garret validates by owner id.
+      # No secret is stored anywhere; the token is minted per push and expires.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = ${{ vars.GARRET_PULLER }}
+            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+
+      - name: Build
+        # Free once the cache is warm — that is the point of this job.
+        run: nix build .#garret-all --print-build-logs
+
+      - name: Realise the dev toolchain
+        # The devshell closure is most of what a CI run needs; caching it is
+        # what makes later runs cheap.
+        run: nix develop --profile toolchain --command true
+
+      - name: Configure the client
+        run: |
+          mkdir -p ~/.config/garret
+          cat > ~/.config/garret/config.toml <<EOF
+          endpoint = "${{ vars.GARRET_ENDPOINT }}"
+          jobs = ${{ vars.GARRET_JOBS || 8 }}
+
+          [oidc]
+          issuer = "https://token.actions.githubusercontent.com"
+          audience = "${{ vars.GARRET_AUDIENCE || 'garret' }}"
+          EOF
+
+      - name: Push build outputs and toolchain
+        # The client walks each closure itself, so dependencies come along.
+        run: ./result/bin/garret push ./result ./toolchain
