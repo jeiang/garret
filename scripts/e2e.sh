@@ -198,7 +198,12 @@ let
   };
 in derivation {
   name = \"garret-e2e-root\"; system = builtins.currentSystem;
-  builder = \"/bin/sh\"; args = [ \"-c\" \"echo \${leaf} > \$out\" ];
+  # Writes its own \$out as well as the leaf, so the root *self-references*.
+  # Most compiled store paths do, and a self-reference is covered by the
+  # signature -- a server that stores or renders it inconsistently produces a
+  # narinfo whose fingerprint nix cannot reproduce. Without this the whole
+  # suite passed while every real-world push was unverifiable.
+  builder = \"/bin/sh\"; args = [ \"-c\" \"echo \${leaf} \$out > \$out\" ];
 }")
 hash=$(basename "$path" | cut -c1-32)
 leaf=$(nix path-info --recursive "$path" | grep -- '-garret-e2e-leaf$')
@@ -257,8 +262,12 @@ echo "  public /metrics -> $code"
 say "narinfo"
 curl -sf "http://127.0.0.1:18081/$hash.narinfo" | tee "$root/narinfo"
 grep -q "^Sig: garret-e2e-1:" "$root/narinfo"
-# The reference must appear by *name*, which a bare hash could not reconstruct.
-grep -q "^References: $(basename "$leaf")\$" "$root/narinfo"
+# References must appear by *name*, which a bare hash could not reconstruct --
+# and must list both the leaf and the root's own path. The self-reference is
+# part of what the signature covers, so rendering it is not cosmetic: omit it
+# and nix rebuilds a different fingerprint and rejects the path.
+grep -q "^References: .*$(basename "$leaf")" "$root/narinfo"
+grep -q "^References: .*$(basename "$path")" "$root/narinfo"
 
 say "NAR request redirects (ADR-0005)"
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18081/nar/$hash.nar.zst")
