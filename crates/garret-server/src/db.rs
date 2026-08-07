@@ -123,10 +123,16 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
         let mut stmt =
             tx.prepare("INSERT INTO object_refs (referrer, reference) VALUES (?1, ?2)")?;
         for r in &obj.references {
-            // Self-references would make the object permanently unevictable (spec 02).
-            if hash_of(r) != obj.store_path_hash {
-                stmt.execute(params![obj.store_path_hash, r])?;
-            }
+            // Self-references are stored, not dropped: the signature covers the
+            // full reference list the pusher was handed, so a narinfo rendered
+            // without them produces a fingerprint nix cannot match, and every
+            // self-referential path -- which is most compiled packages -- fails
+            // verification with "lacks a signature by a trusted key".
+            //
+            // The reason they were dropped (spec 02: a self-edge makes an object
+            // permanently unevictable) is handled where it belongs, in
+            // `evictable`, which ignores self-edges when deciding reachability.
+            stmt.execute(params![obj.store_path_hash, r])?;
         }
     }
     tx.execute(
@@ -213,9 +219,14 @@ pub fn reconcile_total_bytes(conn: &Connection) -> Result<i64> {
 /// object cannot make another referenced (spec 05).
 pub fn evictable(conn: &Connection, limit: usize) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(
+        // `r.referrer != o.store_path_hash` skips self-edges: an object
+        // referring to itself must not count as a referrer keeping itself
+        // alive, or nothing would ever be evictable (spec 02).
         "SELECT o.store_path_hash, o.file_size FROM objects o
          WHERE NOT EXISTS (
-             SELECT 1 FROM object_refs r WHERE r.reference_hash = o.store_path_hash
+             SELECT 1 FROM object_refs r
+             WHERE r.reference_hash = o.store_path_hash
+               AND r.referrer != o.store_path_hash
          )
          ORDER BY o.last_accessed_at ASC, o.store_path_hash ASC
          LIMIT ?1",
@@ -344,16 +355,29 @@ mod tests {
     }
 
     #[test]
-    fn drops_self_references() {
+    fn self_references_survive_the_round_trip_and_stay_evictable() {
+        // Replaces an earlier `drops_self_references`, which pinned the
+        // opposite behaviour: the signature covers the reference list as
+        // pushed, self-reference included, so dropping it on write renders a
+        // narinfo whose fingerprint nix cannot reproduce. Most compiled store
+        // paths self-reference, so that failed verification for nearly
+        // everything.
         let mut conn = db();
         let a = "a".repeat(32);
-        insert_object(&mut conn, &object(&a, &[&format!("{a}-thing")]), 100).unwrap();
+        let own = format!("{a}-thing");
+        insert_object(&mut conn, &object(&a, &[&own]), 100).unwrap();
+
+        assert_eq!(
+            get_object(&conn, &a).unwrap().unwrap().references,
+            vec![own],
+            "self-reference must round-trip: it is covered by the signature"
+        );
+
+        // ...but a self-edge must not count as a referrer keeping the object
+        // alive, or nothing would ever be evictable (spec 02).
         assert!(
-            get_object(&conn, &a)
-                .unwrap()
-                .unwrap()
-                .references
-                .is_empty()
+            evictable(&conn, 10).unwrap().iter().any(|(h, _)| h == &a),
+            "self-reference made the object unevictable"
         );
     }
 

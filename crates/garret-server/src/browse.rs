@@ -145,7 +145,7 @@ pub fn referrers(conn: &Connection, hash: &str) -> Result<Vec<Summary>> {
         "SELECT o.store_path_hash, o.name, o.store_path, o.nar_size, o.file_size, o.created_at
          FROM object_refs r
          JOIN objects o ON o.store_path_hash = r.referrer
-         WHERE r.reference_hash = ?1
+         WHERE r.reference_hash = ?1 AND r.referrer != ?1
          ORDER BY o.name",
     )?;
     Ok(stmt
