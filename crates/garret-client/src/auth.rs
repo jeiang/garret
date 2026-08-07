@@ -79,10 +79,18 @@ fn default_interval() -> u64 {
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    access_token: String,
+    /// Optional because the device-flow poll returns `authorization_pending`
+    /// with no token at all. A required field made the first poll fail to
+    /// deserialize and abort the login, so `garret login` only ever worked if
+    /// the human approved within the poll interval.
+    access_token: Option<String>,
     refresh_token: Option<String>,
     #[serde(default)]
     error: Option<String>,
+}
+
+fn missing_token() -> anyhow::Error {
+    anyhow!("token response contained no access_token")
 }
 
 /// Appends the RFC 8707 `resource` parameter only when one is configured.
@@ -152,15 +160,23 @@ pub async fn device_login(
             // Both are "keep waiting"; anything else is terminal.
             Some("authorization_pending") | Some("slow_down") => continue,
             Some(other) => bail!("device authorization failed: {other}"),
+            // No error and no token is not success -- keep polling rather than
+            // reporting a login that did not happen.
+            None if response.access_token.is_none() => continue,
             None => {
-                if let Some(refresh_token) = response.refresh_token {
+                let TokenResponse {
+                    access_token,
+                    refresh_token,
+                    ..
+                } = response;
+                if let Some(refresh_token) = refresh_token {
                     save_token(&StoredToken {
                         refresh_token,
                         issuer: issuer.to_owned(),
                         client_id: client_id.to_owned(),
                     })?;
                 }
-                return Ok(response.access_token);
+                return access_token.ok_or_else(missing_token);
             }
         }
     }
@@ -190,14 +206,19 @@ async fn refresh(
         .await?;
 
     // Rotating refresh tokens: persist the new one or the next run is locked out.
-    if let Some(refresh_token) = response.refresh_token {
+    let TokenResponse {
+        access_token,
+        refresh_token,
+        ..
+    } = response;
+    if let Some(refresh_token) = refresh_token {
         save_token(&StoredToken {
             refresh_token,
             issuer: stored.issuer.clone(),
             client_id: stored.client_id.clone(),
         })?;
     }
-    Ok(response.access_token)
+    access_token.ok_or_else(missing_token)
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,7 +276,7 @@ pub async fn client_credentials(
         .context("requesting a client_credentials token")?
         .json()
         .await?;
-    Ok(response.access_token)
+    response.access_token.ok_or_else(missing_token)
 }
 
 /// Reads `id:secret` from a mode-0600 file rather than taking it on argv,

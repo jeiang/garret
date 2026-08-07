@@ -40,6 +40,12 @@ enum Command {
     },
     /// Re-sign every object with the currently configured keys
     Resign,
+    /// Remove objects by store-path hash, row and blob
+    Delete {
+        /// Store-path hashes (the 32 characters before the first `-`)
+        #[arg(required = true)]
+        hashes: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -141,6 +147,23 @@ async fn main() -> Result<()> {
 
         Command::Resign => match request(&cli.socket, Request::Resign).await? {
             Response::Resign { resigned } => println!("re-signed {resigned} object(s)"),
+            other => print_unexpected(other),
+        },
+
+        Command::Delete { hashes } => match request(&cli.socket, Request::Delete { hashes }).await?
+        {
+            Response::Delete {
+                deleted,
+                bytes_freed,
+                missing,
+            } => {
+                println!("deleted {deleted} object(s), {bytes_freed} byte(s) freed");
+                // Reported, not swallowed: a mistyped hash would otherwise
+                // look exactly like a successful delete.
+                if !missing.is_empty() {
+                    println!("not in the cache: {}", missing.join(", "));
+                }
+            }
             other => print_unexpected(other),
         },
     }
