@@ -27,9 +27,15 @@ struct Cli {
     /// Pusher base URL
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     endpoint: String,
-    /// Bearer token (also read from GARRET_TOKEN)
+    /// Bearer token. Omit to authenticate exactly as `garret push` does,
+    /// using the client config — a human running this has a login, not a
+    /// raw token to paste.
     #[arg(long, env = "GARRET_TOKEN")]
-    token: String,
+    token: Option<String>,
+    /// Client config used when --token is absent (defaults to the same
+    /// $XDG_CONFIG_HOME/garret/config.toml the CLI reads).
+    #[arg(long)]
+    config: Option<String>,
     /// Concurrent pushers — the headline scenario is 20
     #[arg(long, default_value_t = 20)]
     concurrency: usize,
@@ -93,6 +99,18 @@ async fn main() -> Result<()> {
     );
 
     let http = reqwest::Client::new();
+    let token = match cli.token.clone() {
+        Some(token) => token,
+        None => {
+            let cfg = garret_client::config::load(cli.config.as_deref())?;
+            garret_client::auth::bearer_token(
+                &http,
+                &cfg.oidc.audience,
+                cfg.oidc.resource.as_deref(),
+            )
+            .await?
+        }
+    };
     let shed = Arc::new(AtomicU64::new(0));
 
     // Baseline first, one at a time, over the same corpus under different
@@ -102,15 +120,7 @@ async fn main() -> Result<()> {
     let mut baseline = Vec::new();
     for entry in &baseline_entries {
         let started = Instant::now();
-        push(
-            &http,
-            &cli.endpoint,
-            &cli.token,
-            entry,
-            cli.zstd_level,
-            &shed,
-        )
-        .await?;
+        push(&http, &cli.endpoint, &token, entry, cli.zstd_level, &shed).await?;
         // Floored at 1 ms: the ratio below divides by this.
         baseline.push((started.elapsed().as_millis() as u64).max(1));
     }
@@ -129,7 +139,7 @@ async fn main() -> Result<()> {
             let (http, endpoint, token, shed) = (
                 http.clone(),
                 cli.endpoint.clone(),
-                cli.token.clone(),
+                token.clone(),
                 shed.clone(),
             );
             async move {
