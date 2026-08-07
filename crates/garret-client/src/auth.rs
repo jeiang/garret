@@ -85,23 +85,35 @@ struct TokenResponse {
     error: Option<String>,
 }
 
+/// Appends the RFC 8707 `resource` parameter only when one is configured.
+/// Always sending it breaks issuers that require each resource to be
+/// registered in advance (Pocket ID answers `invalid_target`), and the
+/// parameter is not needed when the issuer already puts the client id in `aud`.
+fn with_resource<'a>(
+    mut form: Vec<(&'a str, &'a str)>,
+    resource: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    if let Some(resource) = resource {
+        form.push(("resource", resource));
+    }
+    form
+}
+
 /// Device flow: the human approves in a browser (passkey, in Pocket ID's case)
 /// while this polls. Returns the access token and stores the refresh token.
 pub async fn device_login(
     http: &reqwest::Client,
     issuer: &str,
     client_id: &str,
-    audience: &str,
+    resource: Option<&str>,
 ) -> Result<String> {
     let endpoints = discover(http, issuer).await?;
     let grant: DeviceGrant = http
         .post(&endpoints.device_authorization_endpoint)
-        // RFC 8707 resource indicator — how garret's audience is requested.
-        .form(&[
-            ("client_id", client_id),
-            ("scope", "openid offline_access"),
-            ("resource", audience),
-        ])
+        .form(&with_resource(
+            vec![("client_id", client_id), ("scope", "openid offline_access")],
+            resource,
+        ))
         .send()
         .await?
         .error_for_status()
@@ -123,12 +135,14 @@ pub async fn device_login(
         tokio::time::sleep(Duration::from_secs(grant.interval)).await;
         let response: TokenResponse = http
             .post(&endpoints.token_endpoint)
-            .form(&[
-                ("client_id", client_id),
-                ("device_code", &grant.device_code),
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("resource", audience),
-            ])
+            .form(&with_resource(
+                vec![
+                    ("client_id", client_id),
+                    ("device_code", &grant.device_code),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ],
+                resource,
+            ))
             .send()
             .await?
             .json()
@@ -152,16 +166,22 @@ pub async fn device_login(
     }
 }
 
-async fn refresh(http: &reqwest::Client, stored: &StoredToken, audience: &str) -> Result<String> {
+async fn refresh(
+    http: &reqwest::Client,
+    stored: &StoredToken,
+    resource: Option<&str>,
+) -> Result<String> {
     let endpoints = discover(http, &stored.issuer).await?;
     let response: TokenResponse = http
         .post(&endpoints.token_endpoint)
-        .form(&[
-            ("client_id", &stored.client_id as &str),
-            ("refresh_token", &stored.refresh_token),
-            ("grant_type", "refresh_token"),
-            ("resource", audience),
-        ])
+        .form(&with_resource(
+            vec![
+                ("client_id", &stored.client_id as &str),
+                ("refresh_token", &stored.refresh_token),
+                ("grant_type", "refresh_token"),
+            ],
+            resource,
+        ))
         .send()
         .await?
         .error_for_status()
@@ -216,17 +236,19 @@ pub async fn client_credentials(
     issuer: &str,
     client_id: &str,
     client_secret: &str,
-    audience: &str,
+    resource: Option<&str>,
 ) -> Result<String> {
     let endpoints = discover(http, issuer).await?;
     let response: TokenResponse = http
         .post(&endpoints.token_endpoint)
-        .form(&[
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("grant_type", "client_credentials"),
-            ("resource", audience),
-        ])
+        .form(&with_resource(
+            vec![
+                ("client_id", client_id),
+                ("client_secret", client_secret),
+                ("grant_type", "client_credentials"),
+            ],
+            resource,
+        ))
         .send()
         .await?
         .error_for_status()
@@ -249,7 +271,11 @@ pub fn read_client_credentials(path: &str) -> Result<(String, String)> {
 }
 
 /// Resolves a bearer token from whatever this environment provides.
-pub async fn bearer_token(http: &reqwest::Client, audience: &str) -> Result<String> {
+pub async fn bearer_token(
+    http: &reqwest::Client,
+    audience: &str,
+    resource: Option<&str>,
+) -> Result<String> {
     if let Ok(token) = std::env::var("GARRET_TOKEN") {
         return Ok(token);
     }
@@ -261,5 +287,5 @@ pub async fn bearer_token(http: &reqwest::Client, audience: &str) -> Result<Stri
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .ok_or_else(|| anyhow!("not logged in — run `garret login` (looked in {path:?})"))?;
-    refresh(http, &stored, audience).await
+    refresh(http, &stored, resource).await
 }

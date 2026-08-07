@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
                 &http,
                 &cfg.oidc.issuer,
                 &cfg.oidc.client_id,
-                &cfg.oidc.audience,
+                cfg.oidc.resource.as_deref(),
             )
             .await?;
             println!(
@@ -91,11 +91,14 @@ async fn main() -> Result<()> {
                         &cfg.oidc.issuer,
                         &id,
                         &secret,
-                        &cfg.oidc.audience,
+                        cfg.oidc.resource.as_deref(),
                     )
                     .await?
                 }
-                None => auth::bearer_token(&http, &cfg.oidc.audience).await?,
+                None => {
+                    auth::bearer_token(&http, &cfg.oidc.audience, cfg.oidc.resource.as_deref())
+                        .await?
+                }
             };
             let pusher = push::Pusher {
                 token,
@@ -151,7 +154,7 @@ async fn pusher(
     jobs: Option<usize>,
 ) -> Result<push::Pusher> {
     Ok(push::Pusher {
-        token: auth::bearer_token(http, &cfg.oidc.audience).await?,
+        token: auth::bearer_token(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()).await?,
         http: http.clone(),
         endpoint: cfg.endpoint.clone(),
         jobs: jobs.unwrap_or(cfg.jobs),
@@ -165,7 +168,10 @@ async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(
         .puller_endpoint
         .clone()
         .context("set `puller_endpoint` in the config: list/tree query the Puller")?;
-    Ok((puller, auth::bearer_token(http, &cfg.oidc.audience).await?))
+    Ok((
+        puller,
+        auth::bearer_token(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()).await?,
+    ))
 }
 
 /// Byte sizes for humans; the API keeps the exact number.

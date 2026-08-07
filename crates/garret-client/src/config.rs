@@ -66,8 +66,17 @@ fn max_attempts() -> u32 {
 pub struct Oidc {
     pub issuer: String,
     pub client_id: String,
-    /// RFC 8707 resource indicator identifying garret to the issuer.
+    /// The `aud` claim garret validates the resulting token against.
     pub audience: String,
+    /// RFC 8707 resource indicator, sent only when set. Off by default
+    /// because not every issuer implements RFC 8707, and those that do
+    /// generally require each resource to be registered first — Pocket ID
+    /// rejects any unregistered value with `invalid_target`, which made the
+    /// device flow unusable when this was always sent. Omitting it falls
+    /// back to the issuer's own audience behaviour, which for Pocket ID
+    /// already includes the client id in `aud`.
+    #[serde(default)]
+    pub resource: Option<String>,
 }
 
 fn jobs() -> usize {
