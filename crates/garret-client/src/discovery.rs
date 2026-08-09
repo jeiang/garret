@@ -39,13 +39,21 @@ pub async fn fetch(http: &reqwest::Client, endpoint: &str) -> Result<Discovery> 
 
     // The one failure worth naming precisely: a client newer than its server.
     // Without this it surfaces as a bare 404 and looks like a typo'd URL.
-    if response.status() == StatusCode::NOT_FOUND {
+    //
+    // 401 lands here too. Discovery is anonymous by design, so a server that
+    // demands a token on it is one whose auth layer still wraps the whole
+    // router — the shape the Pusher had before this endpoint existed. Left to
+    // the generic arm below it reads as "your credentials are wrong", which
+    // sends you off chasing an OIDC problem that isn't there.
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED {
         bail!(
-            "{url} returned 404 — this Pusher predates `garret login <url>`.\n\
+            "{url} returned {status} — this Pusher predates `garret login <url>` \
+             (discovery needs no token, so a 401 here means its auth layer \
+             covers every route).\n\
              Upgrade the server, or write the config by hand."
         );
     }
-    let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         bail!("discovery failed with {status}: {}", body.trim());
