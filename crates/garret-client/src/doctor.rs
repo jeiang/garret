@@ -415,6 +415,7 @@ mod tests {
             max_retries: 5,
             puller_endpoint: Some("https://cache.example".into()),
             public_keys: vec!["garret-1:AAAA=".into()],
+            upstream_keys: vec!["cache.nixos.org-1".into()],
             watch: Default::default(),
         }
     }
