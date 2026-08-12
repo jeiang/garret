@@ -81,3 +81,16 @@ server memory is provably bounded by configuration.
 JSON. No upload resume in v1: a failed push restarts from zero. An
 `Upload-Offset`-style header is reserved so resume can be added without a
 version break.
+
+**Connection drops mid-upload are retryable too.** The early replies
+above (`exists`, `in-progress`, `429`) are all sent before the body is
+read, and the server then closes the connection with request bytes still
+unread — over HTTP/1.1 that close becomes a TCP RST. A client that is
+not waiting on `100-continue` and is still writing the body races the
+RST: usually it reads the reply first, but sometimes the write fails
+(broken pipe / connection reset) and the reply is lost. Clients must
+treat a connection-level error during an upload as retryable with the
+same bounded backoff as a `429` — negotiation makes every push
+idempotent, so the retry either lands the NAR or cheaply learns
+`exists`. (Found at M5: the e2e bench flaked on exactly this race when
+re-pushing an already-present corpus.)

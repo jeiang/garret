@@ -15,8 +15,13 @@ any machine; no real store contents in the repo.
 
 `garret-bench` authenticates exactly as the client does (its config and
 OIDC flow) and speaks the real protocol — preamble framing, zstd, 429
-backoff — with controlled concurrency and per-NAR latency capture. One subcommand per scenario
-(`push`, `stream`, `pull`) plus `all`, writing a single JSON report.
+backoff — with controlled concurrency and per-NAR latency capture.
+Connection drops mid-body are retried on the same schedule as a 429 and
+reported separately as `dropped_retries`: they are usually the server's
+early `exists`/`429` reply closing the socket before the body finished
+(spec 01), not a network fault, and neither retry counts as a failure.
+One subcommand per scenario (`push`, `stream`, `pull`) plus `all`,
+writing a single JSON report.
 
 Every report carries a `meta` block: os, arch, cpu count, binary
 version, seed, and a `label` (default `os-arch`, `--label` /

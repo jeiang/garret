@@ -155,6 +155,10 @@ struct PushResults {
     pushed: u64,
     failed: u64,
     shed_retries: u64,
+    /// Uploads retried because the connection died mid-body — usually the
+    /// server's early `exists`/429 reply closing the socket before the body
+    /// was written out, not a real network fault.
+    dropped_retries: u64,
     wall_seconds: f64,
     /// Aggregate throughput in uncompressed NAR MiB/s — the number a user
     /// experiences — and its on-the-wire counterpart.
@@ -317,6 +321,7 @@ async fn run_push(
     );
 
     let shed = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
     let wire = Arc::new(AtomicU64::new(0));
 
     // Baseline first, one at a time, over the same corpus under different
@@ -333,6 +338,7 @@ async fn run_push(
             entry,
             args.zstd_level,
             &shed,
+            &dropped,
             &wire,
         )
         .await?;
@@ -352,17 +358,22 @@ async fn run_push(
 
     let latencies: Vec<(usize, Option<Duration>)> = stream::iter(entries.into_iter().enumerate())
         .map(|(index, entry)| {
-            let (http, endpoint, token, shed, wire) = (
+            let (http, endpoint, token, shed, dropped, wire) = (
                 http.clone(),
                 cli.endpoint.clone(),
                 token.to_owned(),
                 shed.clone(),
+                dropped.clone(),
                 wire.clone(),
             );
             let zstd_level = args.zstd_level;
             async move {
                 let started = Instant::now();
-                match push(&http, &endpoint, &token, &entry, zstd_level, &shed, &wire).await {
+                match push(
+                    &http, &endpoint, &token, &entry, zstd_level, &shed, &dropped, &wire,
+                )
+                .await
+                {
                     Ok(()) => (index, Some(started.elapsed())),
                     Err(e) => {
                         eprintln!("push {} failed: {e:#}", entry.name);
@@ -406,6 +417,7 @@ async fn run_push(
         pushed: ok.len() as u64,
         failed,
         shed_retries: shed.load(Ordering::Relaxed),
+        dropped_retries: dropped.load(Ordering::Relaxed),
         wall_seconds: wall.as_secs_f64(),
         nar_mib_per_sec: corpus_bytes as f64 / mib / wall.as_secs_f64(),
         wire_mib_per_sec: wire_bytes as f64 / mib / wall.as_secs_f64(),
@@ -582,6 +594,7 @@ async fn push(
     entry: &corpus::Entry,
     level: i32,
     shed: &AtomicU64,
+    dropped: &AtomicU64,
     wire: &AtomicU64,
 ) -> Result<()> {
     let mut body = preamble_for(entry).to_framed()?;
@@ -590,13 +603,27 @@ async fn push(
 
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
-        let response = http
+        let response = match http
             .put(format!("{endpoint}/api/v1/nar/{}", entry.hash))
             .bearer_auth(token)
             .body(body.clone())
             .send()
             .await
-            .context("sending the upload")?;
+        {
+            Ok(response) => response,
+            // The server answers `exists` and 429 sheds before reading the
+            // body, then closes the connection (spec 01) — a client still
+            // writing sometimes gets the RST before the response and sees a
+            // broken pipe instead. Idempotent by negotiation, so retried on
+            // the same schedule as an explicit shed.
+            Err(e) if garret_client::push::connection_dropped(&e) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
+                delay *= 2;
+                continue;
+            }
+            Err(e) => return Err(e).context("sending the upload"),
+        };
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             shed.fetch_add(1, Ordering::Relaxed);
@@ -613,7 +640,7 @@ async fn push(
         }
         return Ok(());
     }
-    bail!("still shedding after 6 attempts")
+    bail!("still shed or dropped after 6 attempts")
 }
 
 /// One PUT with a lazily generated body. No zstd: the server never
@@ -634,13 +661,23 @@ async fn push_streaming(
             chunks.map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c))),
         ));
 
-        let response = http
+        let response = match http
             .put(format!("{endpoint}/api/v1/nar/{}", entry.hash))
             .bearer_auth(token)
             .body(body)
             .send()
             .await
-            .context("sending the upload")?;
+        {
+            Ok(response) => response,
+            // Same early-reply race as push(); the rebuilt-per-attempt body
+            // makes the retry cheap and idempotent.
+            Err(e) if garret_client::push::connection_dropped(&e) => {
+                tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
+                delay *= 2;
+                continue;
+            }
+            Err(e) => return Err(e).context("sending the upload"),
+        };
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
@@ -656,5 +693,5 @@ async fn push_streaming(
         }
         return Ok(());
     }
-    bail!("still shedding after 6 attempts")
+    bail!("still shed or dropped after 6 attempts")
 }
