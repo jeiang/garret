@@ -108,6 +108,56 @@ the Mac is an **aarch64-only** gap (`asm` feature required there). Ticket
 20 updated accordingly: production x86 hardware is already fast; the flag
 matters for aarch64 dev machines and any future ARM deployment.
 
+## 1-CPU noise investigation and methodology change (2026-08-12, later)
+
+Re-running the matrix on latest main produced bimodal 1-CPU push numbers
+(~275 vs ~36 vs once 4 MiB/s) that survived a quiet box (load <0.25).
+Chased and pinned down:
+
+- **Not disk**: reproduced with the whole bench root on tmpfs
+  (`TMPDIR=/dev/shm`); bees CPU-time and NVMe deltas flat during runs.
+- **Not TCP**: zero `ListenOverflows`/`ListenDrops`/`TCPSynRetrans`/
+  `RetransSegs` deltas across slow runs.
+- **Not client retries**: `shed_retries` and `dropped_retries` both 0.
+- **Mechanism (confirmed via the new `max_ms` field)**: exactly one push
+  per slow run was held open for the whole stall (`max_ms` ≈
+  `wall_seconds`: 8.6 s of an 8.9 s wall, 141.9 s of 142 s — the 142.0 s
+  figure recurred in three independent runs, so some deterministic
+  timeout is involved), while every percentile stayed normal — with 200
+  entries, p99 is only the ~2nd-worst sample, which is why the old
+  results hid it. Garage logs show nothing; the held PUT sat in
+  `store_upload` waiting on Garage (the aws-sdk default config has no
+  operation timeout, so a stalled part upload waits indefinitely).
+
+Verdict, refined after re-running with Garage unpinned: a **Garage
+artifact under concurrent multipart load**, not (only) starvation. With
+the limits on the garret services alone (`GARRET_WRAP`, spec 09) and
+Garage free on 7 idle cores, ~half of 1-CPU runs still caught a stall
+(`max_ms` 1.9 s / 8.6 s), and one run wedged **permanently**: Garage
+stopped reading its S3 socket mid-part-upload (7.7 MB stuck in Recv-Q
+for over an hour, all processes idle) — nothing in the chain times out
+(the bench client's reqwest and the pusher's aws-sdk both default to no
+operation timeout), so the run hung until killed. Pinning Garage made
+the stall worse (it always self-resolved ≤142 s, but hit more runs);
+unpinning made garret's own numbers honest.
+
+Outcome:
+
+- Methodology (spec 09): limits wrap `garret-pusher`/`garret-puller`
+  only. Garage (upstream S3 stand-in) and the bench client (remote
+  pushers stand-in) run free; builds too. 1-CPU push went 275 → ~890
+  MiB/s — the old number was mostly the stand-ins' CPU bill.
+- `garret-bench` now reports `max_ms`; re-run protocol: a run with
+  `max_ms` out of line with `p99_ms` caught the stand-in stall — re-run
+  it rather than checking it in (benchmarks/README.md documents this).
+- Deferred: Garage under its own separate constraints (fully-local
+  setup benchmark), and a production gap worth a ticket — the pusher's
+  S3 calls have **no operation timeout**, so a stalled upstream holds an
+  upload slot and its in-flight bytes indefinitely (observed live here).
+
+Final numbers (garret-only limits) are in benchmarks/README.md; the
+whole-stack table above is kept for history but is not comparable.
+
 ## Deferred bench extensions (recorded, not built)
 
 - **Stepped-concurrency pull sweep** (c = 20/100/300, keep-alive on and
