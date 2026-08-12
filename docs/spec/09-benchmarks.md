@@ -15,7 +15,11 @@ any machine; no real store contents in the repo.
 
 `garret-bench` reuses the client's push library — real protocol path
 (negotiation, preamble framing, zstd, 429 backoff), controlled
-concurrency, per-NAR latency capture.
+concurrency, per-NAR latency capture. Connection drops mid-body are
+retried on the same schedule as a 429 and reported separately as
+`dropped_retries`: they are usually the server's early `exists`/`429`
+reply closing the socket before the body finished (spec 01), not a
+network fault, and neither retry counts as a failure.
 
 ## Scenarios and pass/fail
 

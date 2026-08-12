@@ -414,7 +414,38 @@ fn is_retryable(error: &anyhow::Error) -> bool {
         || text.contains(" 50")
         || error
             .downcast_ref::<reqwest::Error>()
-            .is_some_and(|e| e.is_timeout() || e.is_connect())
+            .is_some_and(|e| e.is_timeout() || e.is_connect() || connection_dropped(e))
+}
+
+/// The server answers `exists`, `in-progress` and 429 sheds *before* reading
+/// the body (spec 01), and hyper then closes the connection with request bytes
+/// still unread — which the kernel turns into an RST. A client mid-way through
+/// writing the body races that RST: sometimes it reads the response first,
+/// sometimes the write dies with a broken pipe and the response is lost. That
+/// loss is indistinguishable from a network drop, and both are safe to retry:
+/// negotiation makes every push idempotent.
+pub fn connection_dropped(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cause = Some(error);
+    while let Some(e) = cause {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+            );
+        }
+        // hyper's IncompleteMessage carries no io::Error: a reused idle
+        // connection the server closed under us, equally retryable.
+        if e.to_string()
+            .contains("connection closed before message completed")
+        {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
 }
 
 /// Jitter without a rand dependency: nanosecond noise, capped at the delay.
@@ -460,6 +491,39 @@ mod tests {
         assert!(is_retryable(&anyhow::anyhow!("upload rejected with 503")));
         assert!(!is_retryable(&anyhow::anyhow!("upload rejected with 400")));
         assert!(!is_retryable(&anyhow::anyhow!("upload rejected with 401")));
+    }
+
+    /// Stand-in for reqwest's wrapping: the io::Error sits at the bottom of a
+    /// source chain, not at the top.
+    #[derive(Debug)]
+    struct Wrapped(std::io::Error);
+
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "error writing a body to connection")
+        }
+    }
+
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    #[test]
+    fn a_dropped_connection_is_recognised_through_the_source_chain() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(connection_dropped(&Wrapped(std::io::Error::from(kind))));
+        }
+        assert!(!connection_dropped(&Wrapped(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        ))));
+        // No io::Error anywhere in the chain: not a drop.
+        assert!(!connection_dropped(&std::fmt::Error));
     }
 
     #[test]

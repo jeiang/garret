@@ -470,7 +470,8 @@ say "benchmark harness"
 python3 -c "
 import json
 r = json.load(open('$root/bench.json'))
-print('  pushed', r['pushed'], 'failed', r['failed'], 'shed-retries', r['shed_retries'])
+print('  pushed', r['pushed'], 'failed', r['failed'],
+      'shed-retries', r['shed_retries'], 'dropped-retries', r['dropped_retries'])
 assert r['zero_failures'], r
 assert r['pushed'] == r['corpus_entries'], r
 assert r['uncontended_median_ms'] > 0, 'baseline must actually be measured'
