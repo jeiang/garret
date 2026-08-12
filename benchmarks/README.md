@@ -20,7 +20,7 @@ labels, so each environment keeps its own file.
 | Label | Environment | Push NAR MiB/s | Push median/p99/max ms | Stream 1M/100M/2G MiB/s | Pull req/s | narinfo p50/p99 ms | Peak pusher RSS | Zero failures |
 |---|---|---|---|---|---|---|---|---|
 | `macos-aarch64` | MacBook Pro (dev baseline) | 712 | 45 / 217 / 276 | 91 / 240 / 377 | 27.0k | 0.60 / 1.92 | 147 MiB | yes |
-| `nixos-x86_64` | artemis, no limits | 803 | 33 / 243 / 269 | 107 / 292 / 366 | 22.5k | 0.70 / 3.63 | 411 MiB | yes |
+| `nixos-x86_64` | artemis, no limits | 938 | 32 / 198 / 262 | 111 / 287 / 385 | 27.2k | 0.60 / 1.93 | 407 MiB | yes |
 | `nixos-x86_64-896m` | artemis, 896 MiB memory cap | 935 | 31 / 211 / 257 | 106 / 298 / 407 | 28.2k | 0.62 / 1.81 | 366 MiB | yes |
 | `nixos-x86_64-1cpu` | artemis, pinned to 1 CPU | 892 | 31 / 226 / 308 | 117 / 278 / 457 | 11.8k | 1.66 / 3.59 | 162 MiB | yes |
 | `nixos-x86_64-1cpu-896m` | artemis, 1 CPU + 896 MiB | 886 | 31 / 287 / 441 | 111 / 281 / 456 | 12.3k | 1.64 / 2.67 | 160 MiB | yes |

@@ -144,6 +144,14 @@ impl Storage {
         }
         // S4 and Garage both accept path-style; it avoids DNS games for dotted buckets.
         builder = builder.force_path_style(cfg.path_style);
+        // Overall deadline per call, not per attempt: a timed-out attempt
+        // would be retried, and re-uploading a part is forbidden on S4
+        // (spec 03) — fail once and let the caller abort the multipart.
+        builder = builder.timeout_config(
+            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                .operation_timeout(std::time::Duration::from_secs(cfg.operation_timeout_secs))
+                .build(),
+        );
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: cfg.bucket.clone(),

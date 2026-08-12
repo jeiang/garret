@@ -28,6 +28,13 @@ Defaults, all configurable:
   reader must never race ahead of S3. Worst-case buffering is 4×64 MiB
   per NAR; the protocol's global in-flight byte cap bounds the aggregate.
 - On any upload error, abort the multipart immediately so parts free.
+- Every S3 call carries an **overall operation deadline** —
+  `[s3] operation_timeout_secs`, default **60** — covering connect,
+  transfer, and any SDK-internal retries (ticket 27). Overall rather
+  than per-attempt on purpose: a timed-out attempt would be retried,
+  and part re-upload is forbidden below. A stalled upstream therefore
+  costs one timeout and a loud failed push instead of holding an upload
+  permit and its in-flight bytes forever.
 
 The single-`PutObject` threshold is the part size, not a separate 100 MiB
 knob as originally written (corrected at M3). `PutObject` needs the body
