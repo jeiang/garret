@@ -8,10 +8,15 @@ license.workspace = true
 name = "garret-bench"
 path = "src/main.rs"
 
+[[bench]]
+name = "hotpath"
+harness = false
+
 [dependencies]
 garret-client.workspace = true
 garret-common.workspace = true
 anyhow = "1"
+bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -19,3 +24,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 zstd = "0.13"
+
+[dev-dependencies]
+criterion = "0.5"
+# No "asm" feature: this bench mirrors what garret-server compiles today.
+# Ticket 20 (sha256-hardware-acceleration) records the measured 5.2x delta.
+sha2 = "0.10"

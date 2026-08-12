@@ -44,6 +44,8 @@ just build      # cargo build --workspace
 just test       # unit tests
 just check      # clippy (-D warnings) + rustfmt
 just e2e        # end-to-end gate against a throwaway Garage
+just bench-local # self-provisioned benchmark: all spec-09 scenarios + RSS check
+just microbench  # in-process criterion benches (zstd, sha256, framing)
 ```
 
 CI runs the same gates plus a push to the cache itself:
