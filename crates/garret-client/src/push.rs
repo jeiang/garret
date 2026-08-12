@@ -31,7 +31,18 @@ pub struct Report {
 impl Report {
     /// Announces the negotiation result and opens the bar. Called once, after
     /// `missing`, because that is the first moment the byte total is known.
-    pub fn start(json: bool, mp: &MultiProgress, closure: usize, missing: &[PathInfo]) -> Self {
+    ///
+    /// `upstream` is the paths the upstream filter dropped *before* the
+    /// Negotiation. They are reported here, each with status `upstream`, so
+    /// `closure` minus `upstream` is what was negotiated and the counts stay
+    /// honest.
+    pub fn start(
+        json: bool,
+        mp: &MultiProgress,
+        closure: usize,
+        upstream: &[PathInfo],
+        missing: &[PathInfo],
+    ) -> Self {
         let nar_bytes: u64 = missing.iter().map(|p| p.nar_size.max(0) as u64).sum();
         let mut report = Self {
             json,
@@ -42,15 +53,23 @@ impl Report {
             report.event(json!({
                 "event": "negotiated",
                 "closure": closure,
+                "upstream": upstream.len(),
                 "missing": missing.len(),
                 "nar_bytes": nar_bytes,
             }));
+            for info in upstream {
+                report.path(info, "upstream", None);
+            }
             return report;
         }
-        report.out(&format!(
-            "{closure} path(s) in closure, {} missing",
-            missing.len()
+        report.out(&Self::negotiated_line(
+            closure,
+            upstream.len(),
+            missing.len(),
         ));
+        for info in upstream {
+            report.path(info, "upstream", None);
+        }
         if missing.is_empty() {
             return report;
         }
@@ -70,6 +89,16 @@ impl Report {
         );
         report.bar = Some(bar);
         report
+    }
+
+    /// The human Negotiation summary, shared with `--dry-run`. The upstream
+    /// count appears only when the filter dropped something — the common case
+    /// has nothing to say.
+    pub fn negotiated_line(closure: usize, upstream: usize, missing: usize) -> String {
+        match upstream {
+            0 => format!("{closure} path(s) in closure, {missing} missing"),
+            u => format!("{closure} path(s) in closure, {u} served upstream, {missing} missing"),
+        }
     }
 
     /// The daemon's reporter: per-path lines to the journal, no bar (the
@@ -205,6 +234,32 @@ pub struct PathInfo {
     pub deriver: Option<String>,
     /// Content-address string for fixed-output and CA paths.
     pub ca: Option<String>,
+    /// Signatures, `key-name:base64` each — what the upstream filter reads.
+    #[serde(default)]
+    pub signatures: Vec<String>,
+}
+
+/// True when any signature's key name (the part before `:`) is one of the
+/// configured upstream keys. Exact name equality, not substring: a key merely
+/// *containing* `cache.nixos.org-1` must not match.
+pub fn signed_upstream(signatures: &[String], upstream_keys: &[String]) -> bool {
+    signatures.iter().any(|sig| {
+        let key = sig.split(':').next().unwrap_or_default();
+        upstream_keys.iter().any(|u| u == key)
+    })
+}
+
+/// Splits a closure into (ours, upstream). A path signed by an upstream key is
+/// already served elsewhere: pushing it would spend bandwidth and Quota on
+/// bytes Eviction would happily reclaim but the cache never needed to hold. It
+/// never enters the Negotiation, so the batch shrinks for free (spec 06).
+pub fn partition_upstream(
+    closure: Vec<PathInfo>,
+    upstream_keys: &[String],
+) -> (Vec<PathInfo>, Vec<PathInfo>) {
+    closure
+        .into_iter()
+        .partition(|p| !signed_upstream(&p.signatures, upstream_keys))
 }
 
 /// Whole closure of the given installables, roots included.
@@ -481,6 +536,67 @@ mod tests {
         let infos = parse_path_info(json).unwrap();
         assert_eq!(infos[0].nar_hash, "sha256:h");
         assert!(infos[0].deriver.is_none());
+        // Absent signatures (older nix, unsigned paths) parse as empty.
+        assert!(infos[0].signatures.is_empty());
+    }
+
+    #[test]
+    fn parses_signatures_when_nix_reports_them() {
+        let json = br#"[{"path":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x",
+            "narHash":"sha256:h","narSize":12,"references":[],
+            "signatures":["cache.nixos.org-1:sig","garret-1:sig"]}]"#;
+        let infos = parse_path_info(json).unwrap();
+        assert_eq!(
+            infos[0].signatures,
+            ["cache.nixos.org-1:sig", "garret-1:sig"]
+        );
+    }
+
+    fn info(path: &str, signatures: &[&str]) -> PathInfo {
+        PathInfo {
+            path: path.into(),
+            nar_hash: "sha256:h".into(),
+            nar_size: 1,
+            references: vec![],
+            deriver: None,
+            ca: None,
+            signatures: signatures.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn upstream_signed_paths_are_partitioned_out() {
+        let keys = vec!["cache.nixos.org-1".to_owned()];
+        let closure = vec![
+            info("/nix/store/aaa-ours", &["garret-1:sig"]),
+            info("/nix/store/bbb-toolchain", &["cache.nixos.org-1:sig"]),
+            info("/nix/store/ccc-unsigned", &[]),
+            // A key whose name merely contains an upstream key must not match.
+            info("/nix/store/ddd-lookalike", &["not-cache.nixos.org-1x:sig"]),
+        ];
+        let (ours, upstream) = partition_upstream(closure, &keys);
+        assert_eq!(
+            ours.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(),
+            [
+                "/nix/store/aaa-ours",
+                "/nix/store/ccc-unsigned",
+                "/nix/store/ddd-lookalike"
+            ]
+        );
+        assert_eq!(upstream.len(), 1);
+        assert_eq!(upstream[0].path, "/nix/store/bbb-toolchain");
+    }
+
+    #[test]
+    fn the_negotiated_line_mentions_upstream_only_when_nonzero() {
+        assert_eq!(
+            Report::negotiated_line(2, 0, 2),
+            "2 path(s) in closure, 2 missing"
+        );
+        assert_eq!(
+            Report::negotiated_line(5, 3, 1),
+            "5 path(s) in closure, 3 served upstream, 1 missing"
+        );
     }
 
     #[test]

@@ -217,6 +217,9 @@ python3 -c "
 import json
 events = [json.loads(l) for l in open('$root/push.ndjson') if l.strip()]
 assert events[0]['event'] == 'negotiated', events[0]
+# A locally-added path carries no upstream signature, so the upstream filter
+# must drop nothing — and the field must be present for consumers.
+assert events[0]['upstream'] == 0, events[0]
 assert events[-1]['event'] == 'done', events[-1]
 paths = [e for e in events if e['event'] == 'path']
 # The terminating summary must agree with the per-path events, or a consumer
