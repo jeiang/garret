@@ -403,15 +403,23 @@ mod tests {
 
     /// Same failure mode, different cause: the wedged reader holds the lock,
     /// and the next read queues behind it. Its budget must trip too.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_read_queued_behind_a_wedged_lock_holder_trips_its_budget() {
         let conn = conn();
-        let wedged = db_read(conn.clone(), Duration::from_millis(25), |_| {
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let wedged = db_read(conn.clone(), Duration::from_millis(25), move |_| {
+            // Signal that the lock is held so the queued read provably starts
+            // second; otherwise it could win the lock and succeed.
+            holding_tx.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(500));
             Ok(())
         });
-        let queued = db_read(conn, Duration::from_millis(25), |_| Ok(()));
-        let (wedged, queued) = tokio::join!(wedged, queued);
+        let wedged = tokio::spawn(wedged);
+        holding_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wedged read should acquire the lock");
+        let queued = db_read(conn, Duration::from_millis(25), |_| Ok(())).await;
+        let wedged = wedged.await.unwrap();
         assert!(wedged.is_none());
         assert!(queued.is_none(), "queued read should degrade, not wait");
     }
