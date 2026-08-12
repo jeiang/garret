@@ -31,10 +31,11 @@ baseline can never silently masquerade as the cgroup-limited sandbox's.
 A limited environment encodes its caps in the label
 (e.g. `linux-x86_64-2cpu-2g`), and applies them via `GARRET_WRAP` — a
 command prefix (`taskset -c 0`, a systemd-run scope, …) that
-`bench-local` puts on the garret services and the bench client but
-**not** on Garage or the builds: in real usage the S3-compatible service
-is upstream of the sandbox, so the limits measure garret, not the
-stand-in. (Benchmarking a fully local setup with Garage under its own
+`bench-local` puts on the two garret services and nothing else. Garage
+and the bench client are both stand-ins for things outside the sandbox
+(the upstream S3-compatible service and the machines pushing to the
+cache), and the builds are setup — so the limits measure garret, not
+the harness. (Benchmarking a fully local setup with Garage under its own
 constraints is recorded as a possible future scenario, not built.)
 
 ## Scenarios and pass/fail

@@ -46,7 +46,9 @@ rss_log="$root/rss.log"
 say "running all scenarios"
 GARRET_TOKEN=$(cat "$root/token")
 export GARRET_TOKEN
-${GARRET_WRAP:-} "$bin"/garret-bench all \
+# The bench client stays outside GARRET_WRAP: it stands in for the remote
+# machines pushing to the cache, which don't share the sandbox's limits.
+"$bin"/garret-bench all \
   --endpoint "$pusher_url" \
   --puller-endpoint "$puller_url" \
   --json "$out" \
