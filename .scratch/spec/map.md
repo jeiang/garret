@@ -170,9 +170,11 @@ measured. Findings and proposals:
 - Research: [similar-projects-survey](research/similar-projects-survey.md),
   [benchmark-baseline-2026-08](research/benchmark-baseline-2026-08.md)
 - Tickets: [19 daemon push](issues/19-daemon-push.md) (reopens the
-  post-build-hook out-of-scope item above with cachix/MNC evidence),
+  post-build-hook out-of-scope item above with cachix/MNC evidence; still
+  open — no `daemon`/`enqueue` subcommand exists),
   [20 sha256 acceleration](issues/20-sha256-hardware-acceleration.md)
-  (measured 5.2x),
+  (implemented same-day as filed, commit 319bf70; status line was stale
+  until 2026-08-12),
   [21 upstream filter](issues/21-upstream-filter.md) (implemented
   same-day as filed; status line was stale until 2026-08-12),
   [22 closure pinning](issues/22-closure-pinning.md),

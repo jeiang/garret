@@ -1,6 +1,6 @@
 # 20 — Hardware-accelerated SHA-256 in the Pusher
 
-Status: proposed, measured (2026-08 review). Evidence:
+Status: implemented (2026-08; commit 319bf70). Evidence:
 [baseline](../research/benchmark-baseline-2026-08.md).
 
 ## Problem
