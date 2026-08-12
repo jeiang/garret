@@ -1,7 +1,9 @@
 # 21 — Skip pushing paths an upstream cache already serves
 
-Status: proposed (2026-08 review). Evidence:
-[survey](../research/similar-projects-survey.md).
+Status: implemented (2026-08; spec 06). Evidence:
+[survey](../research/similar-projects-survey.md); shipped same-day as
+`feat(client): skip pushing paths an upstream cache already serves
+(ticket 21)`.
 
 ## Problem
 

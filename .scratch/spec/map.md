@@ -172,7 +172,9 @@ measured. Findings and proposals:
 - Tickets: [19 daemon push](issues/19-daemon-push.md) (reopens the
   post-build-hook out-of-scope item above with cachix/MNC evidence),
   [20 sha256 acceleration](issues/20-sha256-hardware-acceleration.md)
-  (measured 5.2x), [21 upstream filter](issues/21-upstream-filter.md),
+  (measured 5.2x),
+  [21 upstream filter](issues/21-upstream-filter.md) (implemented
+  same-day as filed; status line was stale until 2026-08-12),
   [22 closure pinning](issues/22-closure-pinning.md),
   [23 fsck](issues/23-fsck.md), [24 doctor](issues/24-doctor.md),
   [25 pull-path budgets](issues/25-pull-path-budgets.md) (implemented;
