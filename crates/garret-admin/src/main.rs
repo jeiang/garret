@@ -10,6 +10,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use garret_common::admin::{Request, Response};
+use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -45,6 +46,21 @@ enum Command {
         /// Store-path hashes (the 32 characters before the first `-`)
         #[arg(required = true)]
         hashes: Vec<String>,
+    },
+    /// Audit row ⇔ blob consistency (spec 02/03); dry-run by default
+    Fsck {
+        /// Delete dangling rows and size-mismatched rows
+        #[arg(long)]
+        repair: bool,
+        /// Compare DB `file_size` against the S3 object's actual size
+        #[arg(long)]
+        verify_sizes: bool,
+        /// Reject new pushes and wait for uploads to drain before repairing
+        #[arg(long, requires = "repair")]
+        quiesce: bool,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -166,8 +182,110 @@ async fn main() -> Result<()> {
             }
             other => print_unexpected(other),
         },
+
+        Command::Fsck {
+            repair,
+            verify_sizes,
+            quiesce,
+            json,
+        } => match request(
+            &cli.socket,
+            Request::Fsck {
+                repair,
+                verify_sizes,
+                quiesce,
+            },
+        )
+        .await?
+        {
+            Response::Fsck {
+                dangling,
+                size_mismatches,
+                orphans,
+                repaired,
+                quiesced,
+                quiesce_drained,
+            } => {
+                // Orphans alone stay informational: the orphan sweep already
+                // owns them on its own schedule.
+                let ok = dangling.is_empty()
+                    && size_mismatches.is_empty()
+                    && !(quiesced && !quiesce_drained);
+
+                if json {
+                    println!(
+                        "{}",
+                        json!({
+                            "ok": ok,
+                            "dangling": dangling,
+                            "size_mismatches": size_mismatches,
+                            "orphans": orphans,
+                            "repaired": repaired,
+                            "quiesce_drained": quiesced.then_some(quiesce_drained),
+                        })
+                    );
+                } else {
+                    print_fsck_report(&dangling, &size_mismatches, &orphans, repair, repaired);
+                    if quiesced && !quiesce_drained {
+                        println!(
+                            "quiesce timed out waiting for uploads to drain — no repair was performed"
+                        );
+                    }
+                }
+
+                if !ok {
+                    std::process::exit(1);
+                }
+            }
+            other => print_unexpected(other),
+        },
     }
     Ok(())
+}
+
+fn print_fsck_report(
+    dangling: &[garret_common::admin::FsckRow],
+    size_mismatches: &[garret_common::admin::FsckSizeMismatch],
+    orphans: &[String],
+    repair: bool,
+    repaired: usize,
+) {
+    if dangling.is_empty() {
+        println!("dangling rows: none");
+    } else {
+        println!("dangling rows ({}):", dangling.len());
+        for row in dangling {
+            println!("  {} {}", row.store_path_hash, row.name);
+        }
+    }
+
+    if size_mismatches.is_empty() {
+        println!("size mismatches: none");
+    } else {
+        println!("size mismatches ({}):", size_mismatches.len());
+        for row in size_mismatches {
+            println!(
+                "  {} {} (db {} bytes, s3 {} bytes)",
+                row.store_path_hash, row.name, row.db_size, row.s3_size
+            );
+        }
+    }
+
+    if orphans.is_empty() {
+        println!("orphan blobs: none");
+    } else {
+        println!(
+            "orphan blobs ({}), informational only — handled by the orphan sweep:",
+            orphans.len()
+        );
+        for key in orphans {
+            println!("  {key}");
+        }
+    }
+
+    if repair {
+        println!("repaired {repaired} row(s)");
+    }
 }
 
 #[derive(Subcommand)]

@@ -3,13 +3,14 @@
 //! backpressure and metrics. No GC yet (M4).
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::Duration,
 };
 
 use bytes::Bytes;
 
 mod admin;
+mod fsck;
 mod gc;
 
 use anyhow::{Context, Result};
@@ -46,6 +47,10 @@ pub(crate) struct AppState {
     pub limits: UploadLimits,
     pub uploads: Arc<Semaphore>,
     pub in_flight: InFlight,
+    /// Set for the duration of `fsck --repair --quiesce`'s drain wait and
+    /// repair: while true, new pushes are rejected rather than admitted
+    /// (spec 05-gc).
+    pub quiescing: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -87,6 +92,7 @@ async fn main() -> Result<()> {
         ),
         uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
         in_flight: InFlight::new(),
+        quiescing: Arc::new(AtomicBool::new(false)),
     });
 
     // Saturation must be visible before it hurts, so the caps are exported
@@ -200,6 +206,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct Error(StatusCode, String);
 
 impl Error {
@@ -288,6 +295,16 @@ async fn upload(
     axum::Extension(subject): axum::Extension<Subject>,
     body: Body,
 ) -> Result<Response, Error> {
+    // Checked before anything else: `fsck --repair --quiesce` needs new
+    // pushes rejected outright while it drains and repairs (spec 05-gc).
+    if state.quiescing.load(std::sync::atomic::Ordering::SeqCst) {
+        metrics::counter!("garret_upload_skipped_total", "reason" => "quiescing").increment(1);
+        return Err(Error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cache is quiescing for fsck --repair --quiesce".into(),
+        ));
+    }
+
     // Idempotency: answered before the body is read, so `Expect: 100-continue`
     // clients skip the transfer entirely (spec 01).
     if db::exists(&state.conn.lock().unwrap(), &hash).map_err(Error::from)? {
@@ -436,4 +453,117 @@ fn build_object(
 
 fn basename(path: String) -> String {
     path.rsplit('/').next().unwrap_or(&path).to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use garret_server::config::{IssuerConfig, S3Config};
+
+    use super::*;
+
+    /// A `Storage` pointed at an address nothing listens on. `Storage::new`
+    /// only builds a client (no network call), so this is fast and never
+    /// touches a real S3 endpoint — safe as long as the test never actually
+    /// calls a storage method.
+    async fn unreachable_storage() -> Storage {
+        Storage::new(&S3Config {
+            bucket: "test".into(),
+            endpoint_url: Some("http://127.0.0.1:1".into()),
+            region: Some("us-east-1".into()),
+            path_style: true,
+            access_key_id: Some("x".into()),
+            secret_access_key: Some("x".into()),
+            operation_timeout_secs: 1,
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn test_state(conn: rusqlite::Connection) -> Arc<AppState> {
+        Arc::new(AppState {
+            conn: Arc::new(Mutex::new(conn)),
+            storage: unreachable_storage().await,
+            keys: vec![],
+            store_dir: "/nix/store".into(),
+            auth: Authenticator::new(vec![IssuerConfig {
+                issuer: "https://issuer.example".into(),
+                audience: "aud".into(),
+                client_id: None,
+                jwks_url: None,
+                github_owner_id: None,
+                ref_patterns: vec![],
+                allowed_groups: vec![],
+            }])
+            .unwrap(),
+            limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024),
+            uploads: Arc::new(Semaphore::new(1)),
+            in_flight: InFlight::new(),
+            quiescing: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn open_db() -> rusqlite::Connection {
+        let conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        conn
+    }
+
+    /// The quiescing check sits before the idempotency check, the upload
+    /// semaphore and the in-flight claim — this exercises it in isolation,
+    /// with no upload machinery reached.
+    #[tokio::test]
+    async fn quiescing_rejects_a_push_before_anything_else() {
+        let state = test_state(open_db()).await;
+        state
+            .quiescing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = upload(
+            State(state),
+            Path("a".repeat(32)),
+            axum::Extension(Subject("test#user".into())),
+            Body::empty(),
+        )
+        .await
+        .expect_err("quiescing must reject the push");
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// With the flag clear, the handler proceeds past the quiescing check
+    /// into its normal idempotency short-circuit.
+    #[tokio::test]
+    async fn a_non_quiescing_push_reaches_the_idempotency_check() {
+        let mut conn = open_db();
+        let hash = "a".repeat(32);
+        db::insert_object(
+            &mut conn,
+            &Object {
+                store_path_hash: hash.clone(),
+                store_path: format!("/nix/store/{hash}-thing"),
+                name: "thing".into(),
+                nar_hash: "sha256:x".into(),
+                nar_size: 1,
+                file_hash: "sha256:y".into(),
+                file_size: 1,
+                deriver: None,
+                ca: None,
+                references: vec![],
+                sigs: vec![],
+                pushed_by: None,
+            },
+            0,
+        )
+        .unwrap();
+        let state = test_state(conn).await;
+
+        let response = upload(
+            State(state),
+            Path(hash),
+            axum::Extension(Subject("test#user".into())),
+            Body::empty(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

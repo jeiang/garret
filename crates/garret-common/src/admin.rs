@@ -25,6 +25,19 @@ pub enum Request {
         /// 32-character store-path hashes of the objects to remove.
         hashes: Vec<String>,
     },
+    /// Audit row ⇔ blob consistency (spec 02/03), and optionally repair it.
+    Fsck {
+        /// Delete dangling rows and size-mismatched rows. Dry-run (report
+        /// only) is the default.
+        repair: bool,
+        /// Compare `file_size` against the S3 object's size for hashes with
+        /// both a row and a blob; mismatches are a third finding category.
+        verify_sizes: bool,
+        /// Reject new pushes and wait for in-flight uploads to drain before
+        /// repairing, for the degraded case where the live in-flight signal
+        /// alone isn't trusted. Only meaningful with `repair: true`.
+        quiesce: bool,
+    },
 }
 
 /// The Pusher's reply to a [`Request`]; variants mirror the request commands,
@@ -69,11 +82,54 @@ pub enum Response {
         /// silently reporting success would hide a typo.
         missing: Vec<String>,
     },
+    /// Reply to [`Request::Fsck`].
+    Fsck {
+        /// Rows with no matching blob, past the in-flight and age guards.
+        dangling: Vec<FsckRow>,
+        /// Rows whose blob exists but disagrees on size (`--verify-sizes`
+        /// only) — a third category, not double-reported as dangling.
+        size_mismatches: Vec<FsckSizeMismatch>,
+        /// Blob keys with no matching row, past the same guards. Informational
+        /// only: the existing orphan sweep owns deleting these, on its own
+        /// schedule.
+        orphans: Vec<String>,
+        /// Rows actually deleted this run (dangling + size-mismatch
+        /// combined). Zero unless `repair: true`.
+        repaired: usize,
+        /// Whether quiesce mode was engaged at all, mirroring the request.
+        quiesced: bool,
+        /// True if in-flight uploads reached zero within the timeout. False
+        /// means the drain timed out and no repair happened, even if
+        /// `repair` was requested.
+        quiesce_drained: bool,
+    },
     /// The command failed; `message` is operator-facing text.
     Error {
         /// Human-readable description of what went wrong.
         message: String,
     },
+}
+
+/// A dangling row: a store path with no matching blob (spec 02).
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct FsckRow {
+    /// 32-character store-path hash.
+    pub store_path_hash: String,
+    /// Basename after the hash, for a human-readable report.
+    pub name: String,
+}
+
+/// A row whose blob exists but whose size disagrees with `file_size`.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct FsckSizeMismatch {
+    /// 32-character store-path hash.
+    pub store_path_hash: String,
+    /// Basename after the hash, for a human-readable report.
+    pub name: String,
+    /// `file_size` as recorded in the database.
+    pub db_size: i64,
+    /// The S3 object's actual size.
+    pub s3_size: i64,
 }
 
 #[cfg(test)]
@@ -89,6 +145,11 @@ mod tests {
             Request::Delete {
                 hashes: vec!["a".repeat(32)],
             },
+            Request::Fsck {
+                repair: true,
+                verify_sizes: true,
+                quiesce: true,
+            },
         ] {
             let line = serde_json::to_string(&request).unwrap();
             assert!(!line.contains('\n'), "a request must fit on one line");
@@ -98,6 +159,15 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::GcRun).unwrap(),
             r#"{"command":"gc-run"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::Fsck {
+                repair: false,
+                verify_sizes: false,
+                quiesce: false,
+            })
+            .unwrap(),
+            r#"{"command":"fsck","repair":false,"verify_sizes":false,"quiesce":false}"#
         );
     }
 
