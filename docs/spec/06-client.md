@@ -15,6 +15,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter |
 | `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers |
 | `garret watch-store` | Watcher daemon (below) |
+| `garret enqueue [paths…] [--socket]` | Wake a running `watch-store` to poll now; paths default to `$OUT_PATHS`, for use as nix's `post-build-hook`. Exits 0 unconditionally |
 | `garret list` | Search/filter cache contents (browse API) |
 | `garret tree <path>` | Dependency tree (browse API) |
 | `garret completions <shell>` | bash/zsh/fish completion script |
@@ -22,9 +23,11 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 Admin operations live in `garret-admin`
 (see [10-packaging.md](10-packaging.md)).
 
-`login`, `logout` and `completions` run without a config — `login` is the
-only way to create one, so requiring one would be circular. Every other
-command reports the missing config by naming `garret login <pusher-url>`.
+`login`, `logout`, `completions` and `enqueue` run without a config — `login`
+is the only way to create one, so requiring one would be circular, and
+`enqueue` runs inside the post-build-hook as whatever user nix chooses, so it
+depends only on its socket-path default. Every other command reports the
+missing config by naming `garret login <pusher-url>`.
 
 ## Config bootstrap
 
@@ -165,9 +168,19 @@ configured key, so a rotation has several live at once.
   `/nix/var/nix/db/db.sqlite` (AUTOINCREMENT — monotonic, never reused;
   schema checked at startup). Complete by construction: catch-up after
   downtime, initial scan, and offline backlog are all "the cursor is
-  old". inotify on `*.lock` removals (race-free: Nix unlinks the lock
-  only after `registerValidPath`) serves as a latency wakeup triggering
-  an immediate poll.
+  old".
+- **Wake socket** ([ADR-0008](../adr/0008-wake-socket-not-daemon-push.md)):
+  a unix *datagram* socket at `[watch] socket_path` (default
+  `/run/garret/watch.sock`). Any datagram means "poll the cursor now";
+  bursts coalesce into one early poll. `garret enqueue`, registered as
+  nix's `post-build-hook` (which passes paths via `$OUT_PATHS`, not
+  argv), is the sender — so pushes start the moment a build finishes
+  instead of up to `poll_interval_secs` later. The socket carries no
+  authority (the cursor decides what pushes), so it is mode `0666` and
+  a bind failure only warns: the watcher keeps polling, and `enqueue`
+  exits 0 even when nothing listens — a hook must never block or fail
+  a build. The cursor is the durability story; the socket is latency
+  only.
 - **Privilege**: root systemd service managed by the NixOS module. No
   unprivileged mode in v1.
 - **Scope**: pushes bare paths as they become valid — dependencies
@@ -185,3 +198,16 @@ configured key, so a rotation has several live at once.
   before push are skipped silently.
 - **Bootstrap**: cursor starts at `MAX(id)` (only new paths push);
   `--full-sync` opts into walking history from id 0.
+
+### Hook setup
+
+`post-build-hook` takes a bare program, no arguments, so it cannot name
+`garret enqueue` directly. The NixOS module wires a wrapper automatically
+whenever the watcher is enabled. Elsewhere, write one by hand:
+
+```sh
+#!/bin/sh
+exec garret enqueue
+```
+
+and set `post-build-hook = /path/to/that-script` in `nix.conf`.

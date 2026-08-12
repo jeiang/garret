@@ -298,6 +298,34 @@ if curl -sf "$puller_url/$drv_hash.narinfo" >/dev/null 2>&1; then
   echo "watcher pushed a .drv, which the filter must exclude"; exit 1
 fi
 
+say "wake socket: enqueue pushes without waiting for the poll"
+# A 300s poll interval means the only way the path can appear within the 10s
+# budget below is the wake datagram — the poll cannot take credit.
+sed 's/poll_interval_secs = 1/poll_interval_secs = 300/' "$root/client.toml" \
+  > "$root/client-wake.toml"
+echo "socket_path = \"$root/watch.sock\"" >> "$root/client-wake.toml"
+"$bin"/garret --config "$root/client-wake.toml" watch-store > "$root/wake.log" 2>&1 &
+wake_pid=$!
+sleep 2
+[ -S "$root/watch.sock" ] || {
+  echo "watcher never bound the wake socket"; sed -n '1,40p' "$root/wake.log"; exit 1; }
+woken=$(fixture woken)
+woken_hash=$(basename "$woken" | cut -c1-32)
+echo "  built $woken"
+"$bin"/garret enqueue --socket "$root/watch.sock" "$woken"
+for _ in $(seq 20); do
+  curl -sf "$puller_url/$woken_hash.narinfo" >/dev/null 2>&1 && break
+  sleep 0.5
+done
+kill $wake_pid 2>/dev/null || true
+curl -sf "$puller_url/$woken_hash.narinfo" >/dev/null || {
+  echo "enqueue never woke the watcher"; sed -n '1,40p' "$root/wake.log"; exit 1; }
+echo "  enqueue woke the watcher; pushed well inside the poll interval"
+# The hook contract: exit 0 even when nothing is listening.
+"$bin"/garret enqueue --socket "$root/no-such.sock" "$woken" 2>/dev/null || {
+  echo "enqueue must exit 0 when the socket is dead"; exit 1; }
+echo "  enqueue exits 0 against a dead socket"
+
 say "admin socket"
 admin() { "$bin"/garret-admin --socket "$root/admin.sock" "$@"; }
 admin status | tee "$root/status.out"
@@ -412,7 +440,7 @@ echo "  evicted objects: ${evicted:-0}"
 # may reference an object GC removed. Which objects go is GC's business; broken
 # closures are not.
 authed "$puller_url/api/v1/objects?limit=500" > "$root/after-gc.json"
-pushed="$hash $leaf_hash $watched_hash"
+pushed="$hash $leaf_hash $watched_hash $woken_hash"
 GARRET_PUSHED="$pushed" python3 -c "
 import json, os, urllib.request
 token = os.environ['GARRET_TOKEN']

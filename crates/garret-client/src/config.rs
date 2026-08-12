@@ -68,6 +68,11 @@ pub struct Watch {
     /// watcher moves on.
     #[serde(default = "max_attempts")]
     pub max_attempts: u32,
+    /// Where the wake socket listens; `garret enqueue` (the post-build-hook
+    /// stub) pokes it so a fresh build is polled for immediately instead of
+    /// after `poll_interval_secs`.
+    #[serde(default = "socket_path")]
+    pub socket_path: String,
 }
 
 fn nix_db() -> String {
@@ -88,6 +93,14 @@ fn upstream_keys() -> Vec<String> {
 
 fn max_attempts() -> u32 {
     5
+}
+
+/// The default wake-socket path, shared with `garret enqueue`'s `--socket`
+/// default so both ends agree with zero configuration.
+pub const DEFAULT_SOCKET_PATH: &str = "/run/garret/watch.sock";
+
+fn socket_path() -> String {
+    DEFAULT_SOCKET_PATH.into()
 }
 
 /// Which issuer to get tokens from, and what to ask it for (spec 04-auth).

@@ -1,6 +1,9 @@
 # 19 — Post-build-hook daemon push (reopens a v1 non-goal)
 
-Status: proposed (2026-08 review). Evidence:
+Status: implemented in a reduced shape (2026-08). No separate daemon: the
+wake socket lives on `watch-store` itself and `garret enqueue` is the hook
+stub — see [ADR-0008](../../../docs/adr/0008-wake-socket-not-daemon-push.md)
+for why the two-process design below was rejected. Evidence:
 [survey](../research/similar-projects-survey.md).
 
 ## Problem
