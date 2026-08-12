@@ -65,6 +65,26 @@ Consequence: the S4 endpoint and bucket name are publicly visible in
 redirect URLs. Cache contents are already public; credentials are not
 exposed (presigning is signature-only).
 
+### Bounded budgets: degrade to a miss
+
+A substituter's contract is bounded latency and harmless failure: nix
+tolerates a miss natively (build locally, try the next substituter) but a
+hang stalls builds fleet-wide. Both pull-path calls therefore carry
+budgets — the narinfo/NAR database read (`db_read_budget_ms`) and the
+presign call (`presign_budget_ms`), each defaulting to 250 ms; measured
+p99s are ~1.6 ms and ~2.4 ms, so a trip means something is genuinely
+wrong. The database read is synchronous rusqlite under a Mutex, so it
+runs on the blocking pool — a wedged read (or one queued behind a wedged
+lock holder) trips its budget instead of stalling the request.
+
+On timeout or error the Puller answers **404** — a miss, which clients
+handle — and increments `garret_degraded_total{reason}`
+(spec [08-observability](08-observability.md)). The not-yet-created
+database still answers **503** (`/ready` models that state); degradation
+covers a database or object store that is present but wedged. The browse
+API is outside this contract and keeps its 500s.
+(Ticket 25; prior art: sccache's timed-out-lookup → local-compile miss.)
+
 ## Cleanup
 
 No reliance on S3 lifecycle rules. GC owns cleanup — see

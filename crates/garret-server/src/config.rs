@@ -234,10 +234,27 @@ pub struct PullerConfig {
     /// giving up. Until then the Puller serves 503s and `/ready` says so.
     #[serde(default = "db_wait_timeout")]
     pub db_wait_timeout_secs: u64,
+    /// Budget for a pull-path database read before the request degrades to a
+    /// miss (ticket 25). Measured p99 is ~1.6 ms, so a trip means something
+    /// is genuinely wrong. Default 250.
+    #[serde(default = "db_read_budget")]
+    pub db_read_budget_ms: u64,
+    /// Budget for presigning a NAR redirect before the request degrades to a
+    /// miss (ticket 25). Measured p99 is ~2.4 ms. Default 250.
+    #[serde(default = "presign_budget")]
+    pub presign_budget_ms: u64,
 }
 
 fn db_wait_timeout() -> u64 {
     300
+}
+
+fn db_read_budget() -> u64 {
+    250
+}
+
+fn presign_budget() -> u64 {
+    250
 }
 
 fn bump_debounce() -> i64 {

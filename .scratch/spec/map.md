@@ -175,6 +175,9 @@ measured. Findings and proposals:
   (measured 5.2x), [21 upstream filter](issues/21-upstream-filter.md),
   [22 closure pinning](issues/22-closure-pinning.md),
   [23 fsck](issues/23-fsck.md), [24 doctor](issues/24-doctor.md),
-  [25 pull-path budgets](issues/25-pull-path-budgets.md)
+  [25 pull-path budgets](issues/25-pull-path-budgets.md) (implemented;
+  its measured tail cost spawned
+  [26 read-connection pool](issues/26-puller-read-connection-pool.md),
+  a later investigation)
 - Non-goals otherwise revalidated: chunking/dedup, custom pull protocol,
   upload resume, OTLP, multi-tenancy, containers.

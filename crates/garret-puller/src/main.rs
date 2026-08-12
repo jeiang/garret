@@ -27,21 +27,61 @@ use serde::Deserialize;
 struct AppState {
     /// Empty until the Pusher has created the database (spec 02: it owns the
     /// schema). Every reader goes through `conn`, so a Puller that boots first
-    /// answers 503 instead of dying.
-    conn: OnceLock<Mutex<rusqlite::Connection>>,
+    /// answers 503 instead of dying. Arc'd so pull-path reads can move onto
+    /// the blocking pool under a budget (ticket 25).
+    conn: OnceLock<Arc<Mutex<rusqlite::Connection>>>,
     storage: Storage,
     presign_ttl: Duration,
     bump_debounce: i64,
+    db_read_budget: Duration,
+    presign_budget: Duration,
 }
 
 impl AppState {
     fn conn(&self) -> Option<std::sync::MutexGuard<'_, rusqlite::Connection>> {
         Some(self.conn.get()?.lock().unwrap())
     }
+
+    fn conn_handle(&self) -> Option<Arc<Mutex<rusqlite::Connection>>> {
+        self.conn.get().cloned()
+    }
 }
 
 fn unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response()
+}
+
+/// Degrade to a miss (ticket 25). A substituter's contract is bounded latency
+/// and harmless failure: nix handles a 404 natively (try the next
+/// substituter, build locally), while a hang stalls builds fleet-wide and a
+/// 500 is noise it isn't built for. Counted by reason so degradation is
+/// observable, never silent.
+fn degraded_miss(reason: &'static str) -> Response {
+    metrics::counter!("garret_degraded_total", "reason" => reason).increment(1);
+    StatusCode::NOT_FOUND.into_response()
+}
+
+/// A pull-path database read under the configured budget. The read is sync
+/// rusqlite under a Mutex, so it runs on the blocking pool — a wedged read
+/// (or one queued behind a wedged lock holder) then trips the timeout instead
+/// of stalling the request; the orphaned read keeps its blocking thread until
+/// it returns, but the client has its answer. `None` means the budget tripped.
+async fn db_read<T, F>(
+    conn: Arc<Mutex<rusqlite::Connection>>,
+    budget: Duration,
+    read: F,
+) -> Option<anyhow::Result<T>>
+where
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = tokio::task::spawn_blocking(move || read(&conn.lock().unwrap()));
+    match tokio::time::timeout(budget, task).await {
+        Ok(joined) => {
+            Some(joined.unwrap_or_else(|e| Err(anyhow::anyhow!("db read task failed: {e}"))))
+        }
+        Err(_elapsed) => None,
+    }
 }
 
 #[tokio::main]
@@ -57,6 +97,8 @@ async fn main() -> Result<()> {
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
         bump_debounce: cfg.bump_debounce_secs,
+        db_read_budget: Duration::from_millis(cfg.db_read_budget_ms),
+        presign_budget: Duration::from_millis(cfg.presign_budget_ms),
     });
 
     // Opened off the request path so the listener (and /ready) comes up now.
@@ -67,7 +109,7 @@ async fn main() -> Result<()> {
         async move {
             match db::open_when_ready(&db_path, timeout).await {
                 Ok(conn) => {
-                    let _ = state.conn.set(Mutex::new(conn));
+                    let _ = state.conn.set(Arc::new(Mutex::new(conn)));
                     tracing::info!("database ready: serving");
                 }
                 // Nothing this process can do but let the supervisor restart it.
@@ -144,16 +186,25 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
     let Some(hash) = file.strip_suffix(".narinfo").map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(conn) = state.conn() else {
+    let Some(conn) = state.conn_handle() else {
         return unavailable();
     };
-    let object = db::get_object(&conn, &hash);
-    drop(conn);
+    let object = {
+        let hash = hash.clone();
+        db_read(conn, state.db_read_budget, move |conn| {
+            db::get_object(conn, &hash)
+        })
+        .await
+    };
+    // A degraded request is served as a miss, so it counts as one here too.
     metrics::counter!(
         "garret_narinfo_requests_total",
-        "outcome" => if matches!(object, Ok(Some(_))) { "hit" } else { "miss" },
+        "outcome" => if matches!(object, Some(Ok(Some(_)))) { "hit" } else { "miss" },
     )
     .increment(1);
+    let Some(object) = object else {
+        return degraded_miss("db_timeout");
+    };
 
     // Fire-and-forget: LRU only needs day granularity, so a bump must never
     // sit on the request path or hold up a substituter (spec 02-database).
@@ -177,7 +228,7 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("narinfo {hash}: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            degraded_miss("db_error")
         }
     }
 }
@@ -187,34 +238,44 @@ async fn nar_route(State(state): State<Arc<AppState>>, Path(file): Path<String>)
         return StatusCode::NOT_FOUND.into_response();
     };
     // Only redirect to blobs we have a row for — row exists ⇒ blob exists.
-    // Scoped: a std guard cannot be held across the presign await.
-    let exists = match state.conn() {
-        Some(conn) => db::exists(&conn, hash),
-        None => return unavailable(),
+    let Some(conn) = state.conn_handle() else {
+        return unavailable();
+    };
+    let exists = {
+        let hash = hash.to_owned();
+        db_read(conn, state.db_read_budget, move |conn| {
+            db::exists(conn, &hash)
+        })
+        .await
     };
     match exists {
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
+        None => return degraded_miss("db_timeout"),
+        Some(Ok(false)) => return StatusCode::NOT_FOUND.into_response(),
+        Some(Err(e)) => {
             tracing::error!("nar {hash}: {e:#}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return degraded_miss("db_error");
         }
-        Ok(true) => {}
+        Some(Ok(true)) => {}
     }
     let started = std::time::Instant::now();
-    match state
-        .storage
-        .presigned_get(&storage::key_for(hash), state.presign_ttl)
-        .await
+    match tokio::time::timeout(
+        state.presign_budget,
+        state
+            .storage
+            .presigned_get(&storage::key_for(hash), state.presign_ttl),
+    )
+    .await
     {
-        Ok(url) => {
+        Ok(Ok(url)) => {
             metrics::counter!("garret_nar_redirects_total").increment(1);
             metrics::histogram!("garret_presign_duration_seconds").record(started.elapsed());
             Redirect::temporary(&url).into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!("presigning {hash}: {e:#}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            degraded_miss("presign_error")
         }
+        Err(_elapsed) => degraded_miss("presign_timeout"),
     }
 }
 
@@ -312,4 +373,55 @@ async fn object_referrers(
         return unavailable();
     };
     browse_response("referrers", browse::referrers(&conn, &hash).map(Some))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn() -> Arc<Mutex<rusqlite::Connection>> {
+        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()))
+    }
+
+    #[tokio::test]
+    async fn a_read_within_budget_returns_its_result() {
+        let got = db_read(conn(), Duration::from_secs(5), |_| Ok(42)).await;
+        assert_eq!(got.unwrap().unwrap(), 42);
+    }
+
+    /// The read is sync under the connection Mutex; the budget must still
+    /// trip while it is wedged (ticket 25) — hence the blocking pool.
+    #[tokio::test]
+    async fn a_wedged_read_trips_the_budget_instead_of_hanging() {
+        let got = db_read(conn(), Duration::from_millis(25), |_| {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        })
+        .await;
+        assert!(got.is_none(), "the budget should have tripped");
+    }
+
+    /// Same failure mode, different cause: the wedged reader holds the lock,
+    /// and the next read queues behind it. Its budget must trip too.
+    #[tokio::test]
+    async fn a_read_queued_behind_a_wedged_lock_holder_trips_its_budget() {
+        let conn = conn();
+        let wedged = db_read(conn.clone(), Duration::from_millis(25), |_| {
+            std::thread::sleep(Duration::from_millis(500));
+            Ok(())
+        });
+        let queued = db_read(conn, Duration::from_millis(25), |_| Ok(()));
+        let (wedged, queued) = tokio::join!(wedged, queued);
+        assert!(wedged.is_none());
+        assert!(queued.is_none(), "queued read should degrade, not wait");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_read_surfaces_as_an_error_not_a_crash() {
+        let got = db_read(conn(), Duration::from_secs(5), |_| -> anyhow::Result<()> {
+            panic!("boom")
+        })
+        .await;
+        assert!(got.unwrap().is_err());
+    }
 }

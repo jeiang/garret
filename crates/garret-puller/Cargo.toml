@@ -11,6 +11,6 @@ garret-server.workspace = true
 anyhow = "1"
 axum = { version = "0.8", features = ["query"] }
 rusqlite = "0.37"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
