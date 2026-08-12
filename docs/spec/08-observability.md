@@ -35,6 +35,10 @@ Prefix `garret_`; service distinguished by scrape job.
 - **Pusher — GC**: usage and quota gauges; evicted objects/bytes per
   pass; pass duration; orphans found; candidates-exhausted alarm
   counter; last-successful-pass timestamp.
+- **Pusher — fsck**: `garret_fsck_runs_total` counter; `garret_fsck_findings`
+  gauge by `kind` (`dangling`, `orphan`, `size_mismatch`), set to the
+  latest run's count per kind; `garret_fsck_rows_repaired_total` counter
+  by `reason` (`dangling`, `size_mismatch`).
 - **Puller**: narinfo hit/miss counters; NAR redirects issued, by
   hit/miss; presign duration histogram; `garret_degraded_total` by
   `reason` (`db_timeout`, `db_error`, `presign_timeout`,
