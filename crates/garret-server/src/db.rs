@@ -335,6 +335,19 @@ pub fn all_hashes(conn: &Connection) -> Result<std::collections::HashSet<String>
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// One row per object: hash, name, creation time and blob size — exactly
+/// what `garret-admin fsck` needs to classify rows, without an N+1 fetch
+/// through [`get_object`] per hash.
+pub fn all_objects_brief(conn: &Connection) -> Result<Vec<(String, String, i64, i64)>> {
+    let mut stmt =
+        conn.prepare("SELECT store_path_hash, name, created_at, file_size FROM objects")?;
+    Ok(stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 /// Debounced last-accessed bump (spec 02): day granularity is enough for LRU,
 /// so a row touched in the last `stale_after` seconds is left alone.
 pub fn bump_last_accessed(conn: &Connection, hash: &str, now: i64, stale_after: i64) -> Result<()> {
@@ -520,6 +533,24 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn brief_listing_carries_what_fsck_needs() {
+        let mut conn = db();
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 200).unwrap();
+
+        let mut rows = all_objects_brief(&conn).unwrap();
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            rows,
+            vec![
+                (a, "thing".to_string(), 100, 5),
+                (b, "thing".to_string(), 200, 5),
+            ]
+        );
     }
 
     #[test]

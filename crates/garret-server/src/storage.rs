@@ -71,6 +71,14 @@ pub fn key_for(store_path_hash: &str) -> String {
     format!("nar/{store_path_hash}.nar.zst")
 }
 
+/// The store-path hash a blob key encodes — the inverse of [`key_for`].
+/// `None` for anything outside the flat `nar/<hash>.nar.zst` layout.
+pub fn hash_for(key: &str) -> Option<&str> {
+    key.strip_prefix("nar/")
+        .and_then(|k| k.strip_suffix(".nar.zst"))
+        .filter(|h| !h.is_empty())
+}
+
 /// Pulls exactly `part_size` bytes (fewer only at end of stream), keeping any
 /// overshoot in `carry` for the next part.
 async fn read_part<S, E>(
@@ -359,9 +367,9 @@ impl Storage {
             .build())
     }
 
-    /// Every blob under `nar/`, with its age. Paginated — the bucket outgrows
-    /// one response long before the cache is interesting.
-    pub async fn list_blobs(&self) -> Result<Vec<(String, Duration)>> {
+    /// Every blob under `nar/`, with its age and size. Paginated — the
+    /// bucket outgrows one response long before the cache is interesting.
+    pub async fn list_blobs(&self) -> Result<Vec<(String, Duration, i64)>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -382,7 +390,7 @@ impl Storage {
                     .and_then(|t| SystemTime::try_from(*t).ok())
                     .and_then(|t| SystemTime::now().duration_since(t).ok())
                     .unwrap_or(Duration::ZERO);
-                out.push((key.to_owned(), age));
+                out.push((key.to_owned(), age, object.size().unwrap_or(0)));
             }
 
             token = page.next_continuation_token().map(str::to_owned);
@@ -435,10 +443,7 @@ impl Storage {
             let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
                 continue;
             };
-            let hash = key
-                .strip_prefix("nar/")
-                .and_then(|k| k.strip_suffix(".nar.zst"))
-                .unwrap_or_default();
+            let hash = hash_for(key).unwrap_or_default();
             if in_flight.contains(hash) {
                 continue;
             }
@@ -484,6 +489,10 @@ mod tests {
     #[test]
     fn key_layout_is_flat_and_derivable() {
         assert_eq!(key_for("abc"), "nar/abc.nar.zst");
+        assert_eq!(hash_for("nar/abc.nar.zst"), Some("abc"));
+        assert_eq!(hash_for("nar/.nar.zst"), None, "empty hash is not a match");
+        assert_eq!(hash_for("other/abc.nar.zst"), None);
+        assert_eq!(hash_for("nar/abc.zst"), None);
     }
 
     /// Feeds `chunks` through `read_part` and returns the part sizes produced.
