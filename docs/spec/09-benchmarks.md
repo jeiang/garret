@@ -59,8 +59,10 @@ no reading of it works:
   16 MiB uploads shows a ~60× slowdown on a server behaving exactly as
   designed.
 
-So `garret-bench` reports both (`p99_ms`, `p99_slowdown`) and gates only
-on **zero failures**, which is unambiguous. Latency is tracked by
+So `garret-bench` reports both (`p99_ms`, `p99_slowdown`) — plus `max_ms`,
+because with 200 entries p99 is only the ~2nd-worst sample and a single
+hung request can crater `wall_seconds` while every percentile stays
+normal — and gates only on **zero failures**, which is unambiguous. Latency is tracked by
 comparing against the checked-in baseline, where a regression shows up as
 a change; `--max-p99-slowdown` sets a budget for anyone who wants a hard
 gate. Picking a defensible fixed threshold needs numbers from real
