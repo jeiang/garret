@@ -8,108 +8,20 @@ set -euo pipefail
 root=$(cd "$(mktemp -d)" && pwd -P)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$root"' EXIT
 
-say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
-
 # GARRET_BIN points at a directory of already-built binaries (CI passes the nix
 # build's result/bin), so the run does not compile the workspace a second time.
 # Unset means the usual local flow: build the workspace in debug below.
 bin=${GARRET_BIN:-./target/debug}
 
-# A leftover Garage on 3901 answers with a different RPC secret and the failure
-# looks like a handshake bug rather than a stale process. Fail clearly instead.
-for port in 3900 3901 18080 18081 19091 19092; do
-  if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "port $port is already in use — kill the leftover process and retry" >&2
-    exit 1
-  fi
-done
+source "$(dirname "$0")/provision.sh"
 
-say "starting garage"
-mkdir -p "$root"/garage/{meta,data}
-cat > "$root/garage.toml" <<EOF
-metadata_dir = "$root/garage/meta"
-data_dir = "$root/garage/data"
-db_engine = "sqlite"
-replication_factor = 1
-rpc_bind_addr = "127.0.0.1:3901"
-rpc_public_addr = "127.0.0.1:3901"
-rpc_secret = "$(openssl rand -hex 32)"
+require_free_ports 3900 3901 18080 18081 19091 19092
+start_garage 1G
+make_signing_key
+mint_dev_tokens
 
-[s3_api]
-s3_region = "garage"
-api_bind_addr = "127.0.0.1:3900"
-EOF
-garage -c "$root/garage.toml" server &
-until garage -c "$root/garage.toml" status >/dev/null 2>&1; do sleep 0.3; done
-
-node=$(garage -c "$root/garage.toml" node id -q | cut -d@ -f1)
-garage -c "$root/garage.toml" layout assign -z dc1 -c 1G "$node" >/dev/null
-garage -c "$root/garage.toml" layout apply --version 1 >/dev/null
-garage -c "$root/garage.toml" bucket create garret >/dev/null
-keyinfo=$(garage -c "$root/garage.toml" key create garret-key)
-key_id=$(grep -o 'GK[0-9a-f]*' <<<"$keyinfo" | head -1)
-key_secret=$(awk '/Secret key:/ {print $3}' <<<"$keyinfo")
-garage -c "$root/garage.toml" bucket allow --read --write garret --key garret-key >/dev/null
-
-say "generating signing key"
-nix key generate-secret --key-name garret-e2e-1 > "$root/signing.key"
-pubkey=$(nix key convert-secret-to-public < "$root/signing.key")
-echo "public key: $pubkey"
-
-s3_block="
-[s3]
-bucket = \"garret\"
-endpoint_url = \"http://127.0.0.1:3900\"
-region = \"garage\"
-path_style = true
-access_key_id = \"$key_id\"
-secret_access_key = \"$key_secret\"
-"
-say "minting dev-issuer keys and a token"
-# The dev issuer is a static JWKS on disk (spec 04-auth) — the sanctioned local
-# override. There is no auth-disable flag to reach for instead.
-GARRET_E2E_ROOT="$root" python3 - <<'PY'
-import json, os, time
-import jwt
-from cryptography.hazmat.primitives.asymmetric import rsa
-
-root = os.environ["GARRET_E2E_ROOT"]
-key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key()))
-jwk.update({"kid": "dev-1", "use": "sig", "alg": "RS256"})
-with open(f"{root}/jwks.json", "w") as f:
-    json.dump({"keys": [jwk]}, f)
-
-def mint(name, **overrides):
-    claims = {
-        "iss": "https://dev.garret.test",
-        "aud": "garret",
-        "sub": "dev-user",
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 3600,
-    }
-    claims.update(overrides)
-    token = jwt.encode(claims, key, algorithm="RS256", headers={"kid": "dev-1"})
-    with open(f"{root}/{name}", "w") as f:
-        f.write(token)
-
-mint("token")
-mint("token-wrong-audience", aud="somebody-else")
-# Well past the server's 60s skew allowance: expired by exactly the leeway is
-# a coin flip on sub-second timing, not a test.
-mint("token-expired", exp=int(time.time()) - 3600)
-PY
-
-cat > "$root/pusher.toml" <<EOF
-listen = "127.0.0.1:18080"
-metrics_listen = "127.0.0.1:19091"
-db_path = "$root/garret.db"
-signing_key_files = ["$root/signing.key"]
-admin_socket = "$root/admin.sock"
-puller_endpoint = "http://127.0.0.1:18081"
-
-[limits]
-# 5 MiB is S4's minimum part size; small here so the multipart path is
+write_configs '[limits]
+# 5 MiB is the S4 minimum part size; small here so the multipart path is
 # actually exercised without moving 64 MiB.
 part_size = 5242880
 max_parts_in_flight = 2
@@ -120,75 +32,9 @@ max_concurrent_uploads = 4
 # The GC stage below restarts the Pusher with a deliberately tiny quota.
 quota_bytes = 10737418240
 interval_secs = 1
-orphan_grace_secs = 0
-
-[[oidc]]
-issuer = "https://dev.garret.test"
-audience = "garret"
-client_id = "garret-cli"
-jwks_url = "$root/jwks.json"
-$s3_block
-EOF
-
-cat > "$root/client.toml" <<EOF
-endpoint = "http://127.0.0.1:18080"
-puller_endpoint = "http://127.0.0.1:18081"
-public_keys = ["$pubkey"]
-
-[oidc]
-issuer = "https://dev.garret.test"
-client_id = "garret-cli"
-audience = "garret"
-
-[watch]
-nix_db = "/nix/var/nix/db/db.sqlite"
-cursor_path = "$root/watcher-cursor"
-poll_interval_secs = 1
-EOF
-cat > "$root/puller.toml" <<EOF
-listen = "127.0.0.1:18081"
-metrics_listen = "127.0.0.1:19092"
-db_path = "$root/garret.db"
-bump_debounce_secs = 0
-
-[browse_oidc]
-issuer = "https://dev.garret.test"
-audience = "garret"
-jwks_url = "$root/jwks.json"
-$s3_block
-EOF
-
-say "starting garret"
-if [ -z "${GARRET_BIN:-}" ]; then
-  cargo build --quiet -p garret-pusher -p garret-puller -p garret-client \
-    -p garret-admin -p garret-bench
-fi
-for exe in garret garret-pusher garret-puller garret-admin garret-bench; do
-  [ -x "$bin/$exe" ] || { echo "missing $bin/$exe" >&2; exit 1; }
-done
-
-# Bounded: a service that dies on startup should fail the run, not hang it.
-wait_for() {
-  local what=$1 url=$2 i
-  for i in $(seq 100); do
-    curl -s -o /dev/null "$url" && return 0
-    sleep 0.3
-  done
-  echo "$what never came up ($url)" >&2
-  exit 1
-}
-
-# Deliberately backwards: the Pusher owns the schema, and the Puller must wait
-# for it rather than die, serving 503 until /ready says otherwise.
-"$bin"/garret-puller "$root/puller.toml" &
-"$bin"/garret-pusher "$root/pusher.toml" &
-pusher_pid=$!
-wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
-for i in $(seq 100); do
-  curl -sf -o /dev/null "http://127.0.0.1:18081/ready" && break
-  [ "$i" = 100 ] && { echo "puller never became ready" >&2; exit 1; }
-  sleep 0.3
-done
+orphan_grace_secs = 0'
+build_binaries debug garret garret-pusher garret-puller garret-admin garret-bench
+start_services
 
 say "unauthenticated and bad tokens are refused"
 check_401() {
@@ -465,24 +311,45 @@ echo "  unknown hash is reported rather than swallowed"
 garret push "$path" >/dev/null
 
 say "benchmark harness"
-"$bin"/garret-bench --endpoint "http://127.0.0.1:18080" \
+# All three scenarios, wired end to end: push seeds the corpus (count 12),
+# stream exercises the single-stream path, pull reads the corpus back.
+"$bin"/garret-bench push --endpoint "http://127.0.0.1:18080" \
   --concurrency 4 --count 12 --json "$root/bench.json" | tail -20
 python3 -c "
 import json
-r = json.load(open('$root/bench.json'))
+r = json.load(open('$root/bench.json'))['push']
 print('  pushed', r['pushed'], 'failed', r['failed'],
       'shed-retries', r['shed_retries'], 'dropped-retries', r['dropped_retries'])
 assert r['zero_failures'], r
 assert r['pushed'] == r['corpus_entries'], r
 assert r['uncontended_median_ms'] > 0, 'baseline must actually be measured'
 assert r['p99_slowdown'] > 0, 'slowdown must be measured even though it is not a gate'
+assert r['nar_mib_per_sec'] > 0 and r['wire_bytes'] > 0, r
+"
+"$bin"/garret-bench stream --endpoint "http://127.0.0.1:18080" \
+  --reps 1 --no-giant --json "$root/bench-stream.json" | tail -5
+python3 -c "
+import json
+runs = json.load(open('$root/bench-stream.json'))['stream']
+assert all(r['failed'] == 0 for r in runs), runs
+assert [r['size_bytes'] for r in runs] == [2**20, 100 * 2**20], runs
+print('  stream MiB/s:', [round(r['mib_per_sec'], 1) for r in runs])
+"
+"$bin"/garret-bench pull --puller-endpoint "http://127.0.0.1:18081" \
+  --count 12 --passes 1 --json "$root/bench-pull.json" | tail -5
+python3 -c "
+import json
+r = json.load(open('$root/bench-pull.json'))['pull']
+assert r['zero_failures'], r
+assert r['requests'] == 24, r
+print('  pull narinfo p50:', r['narinfo_p50_ms'], 'ms, redirect p50:', r['redirect_p50_ms'], 'ms')
 "
 # The same seed must produce the same corpus on any machine.
-"$bin"/garret-bench --endpoint "http://127.0.0.1:18080" \
+"$bin"/garret-bench push --endpoint "http://127.0.0.1:18080" \
   --concurrency 2 --count 12 --json "$root/bench2.json" >/dev/null
 python3 -c "
 import json
-a, b = json.load(open('$root/bench.json')), json.load(open('$root/bench2.json'))
+a, b = (json.load(open(f))['push'] for f in ('$root/bench.json', '$root/bench2.json'))
 assert a['corpus_bytes'] == b['corpus_bytes'], (a['corpus_bytes'], b['corpus_bytes'])
 print('  same seed, same corpus:', a['corpus_bytes'], 'bytes')
 "

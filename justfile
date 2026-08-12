@@ -16,6 +16,23 @@ check:
 e2e:
 	nix develop --command scripts/e2e.sh
 
-# Load-test a running Pusher and record results for comparison
-bench endpoint="http://127.0.0.1:8080":
-	cargo run --release -p garret-bench -- --endpoint {{endpoint}} --json bench-results.json
+# Load-test a running deployment (all scenarios) and record results
+bench pusher="http://127.0.0.1:8080" puller="http://127.0.0.1:8081":
+	cargo run --release -p garret-bench -- all --endpoint {{pusher}} --puller-endpoint {{puller}} --json bench-results.json
+
+# Self-provisioned benchmark: throwaway Garage + services, all scenarios,
+# pusher RSS sampled against the spec's 2x in-flight-cap budget
+bench-local:
+	nix develop --command scripts/bench-local.sh
+
+# Diff the latest results against the checked-in baseline
+bench-compare baseline="benchmarks/baseline.json" current="bench-results.json":
+	python3 scripts/bench-diff.py {{baseline}} {{current}}
+
+# Promote the latest results to the checked-in baseline
+bench-baseline:
+	cp bench-results.json benchmarks/baseline.json
+
+# In-process micro-benchmarks: zstd, sha256, preamble framing
+microbench:
+	cargo bench -p garret-bench

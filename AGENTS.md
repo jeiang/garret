@@ -11,6 +11,9 @@ the `garret` CLI, over SQLite + S3. Rust workspace under `crates/`.
   crates) and rustfmt
 - `just e2e` — end-to-end gate against a throwaway Garage (runs inside
   `nix develop`)
+- `just bench-local` — self-provisioned benchmark run (all spec-09
+  scenarios + RSS check); `just bench-compare` diffs against
+  `benchmarks/baseline.json`; `just microbench` for the criterion benches
 
 ## Rules
 

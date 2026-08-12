@@ -64,6 +64,48 @@ impl Entry {
     }
 }
 
+impl Entry {
+    /// The body as a lazy chunk iterator, for entries too large to hold in
+    /// memory (the streaming scenario's 2 GiB blob). Always incompressible
+    /// random bytes: the server never decompresses — it streams whatever
+    /// follows the preamble to S3 — so wire bytes are what the scenario
+    /// measures, and compressible filler would only measure the client's CPU.
+    pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = Vec<u8>> + use<> {
+        let mut rng = Rng::new(u64::from_str_radix(&self.hash[..16], 32).unwrap_or(1));
+        let mut remaining = self.size;
+        std::iter::from_fn(move || {
+            if remaining == 0 {
+                return None;
+            }
+            let len = chunk_size.min(remaining);
+            remaining -= len;
+            let mut out = vec![0u8; len];
+            for word in out.chunks_mut(8) {
+                let bytes = rng.next_u64().to_le_bytes();
+                word.copy_from_slice(&bytes[..word.len()]);
+            }
+            Some(out)
+        })
+    }
+}
+
+/// One entry for the large-body streaming scenario. `salt` keeps reruns
+/// against a long-lived server from colliding with their own past uploads
+/// (an `exists` ack skips the body and fakes an instant push); sizes stay
+/// fixed, so runs remain comparable.
+pub fn stream_entry(seed: u64, size: usize, rep: usize, salt: u64) -> Entry {
+    let mut rng = Rng::new(seed ^ salt ^ ((size as u64) << 8) ^ rep as u64);
+    let hash: String = (0..32)
+        .map(|_| NIX_BASE32[rng.below(32) as usize] as char)
+        .collect();
+    Entry {
+        hash,
+        name: format!("bench-stream-{size}-{rep}"),
+        size,
+        compressibility: 0,
+    }
+}
+
 const NIX_BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
 /// `count` entries plus, when `with_giant` is set, one multi-GB blob — the fat
@@ -194,6 +236,27 @@ mod tests {
                 "baseline must not collide with the load run"
             );
         }
+    }
+
+    #[test]
+    fn chunks_agree_with_the_requested_size_and_are_deterministic() {
+        let entry = stream_entry(9, 1_000_000, 0, 42);
+        let total: usize = entry.chunks(64 * 1024).map(|c| c.len()).sum();
+        assert_eq!(total, 1_000_000);
+        let first: Vec<u8> = entry.chunks(64 * 1024).next().unwrap();
+        assert_eq!(first, entry.chunks(64 * 1024).next().unwrap());
+        // Random filler must not quietly compress away, or the streaming
+        // scenario measures zstd instead of the wire.
+        assert!(zstd::encode_all(first.as_slice(), 3).unwrap().len() > first.len() / 2);
+    }
+
+    #[test]
+    fn stream_entries_differ_by_rep_and_salt_but_not_by_run() {
+        let a = stream_entry(1, 4096, 0, 7);
+        assert_eq!(a, stream_entry(1, 4096, 0, 7));
+        assert_ne!(a.hash, stream_entry(1, 4096, 1, 7).hash);
+        assert_ne!(a.hash, stream_entry(1, 4096, 0, 8).hash);
+        assert_eq!(a.size, 4096);
     }
 
     #[test]

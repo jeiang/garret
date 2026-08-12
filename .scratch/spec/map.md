@@ -158,3 +158,23 @@ were decided in ticket 17. One item graduated out of this effort:)
 - post-build-hook socket ingestion (cachix-daemon pattern) — ruled out of
   v1 by the client CLI ticket; the NixOS fleet's cursor watcher covers all
   ingestion. Revisit only if non-NixOS machines join the fleet.
+
+## Post-v1 review (2026-08)
+
+A codebase review after M5: features surveyed across attic, harmonia,
+nix-serve-ng, ncps, cachix, FlakeHub/magic-nix-cache, tvix/snix,
+bazel-remote and sccache; the spec-09 bench harness completed (all three
+scenarios, micro-benches, baseline tracking) and a first baseline
+measured. Findings and proposals:
+
+- Research: [similar-projects-survey](research/similar-projects-survey.md),
+  [benchmark-baseline-2026-08](research/benchmark-baseline-2026-08.md)
+- Tickets: [19 daemon push](issues/19-daemon-push.md) (reopens the
+  post-build-hook out-of-scope item above with cachix/MNC evidence),
+  [20 sha256 acceleration](issues/20-sha256-hardware-acceleration.md)
+  (measured 5.2x), [21 upstream filter](issues/21-upstream-filter.md),
+  [22 closure pinning](issues/22-closure-pinning.md),
+  [23 fsck](issues/23-fsck.md), [24 doctor](issues/24-doctor.md),
+  [25 pull-path budgets](issues/25-pull-path-budgets.md)
+- Non-goals otherwise revalidated: chunking/dedup, custom pull protocol,
+  upload resume, OTLP, multi-tenancy, containers.

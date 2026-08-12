@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "arch": "x86_64",
+    "cpus": 8,
+    "label": "nixos-x86_64-896m",
+    "os": "linux",
+    "seed": 20250806,
+    "timestamp_unix": 1786516882,
+    "version": "0.1.0"
+  },
+  "pull": {
+    "concurrency": 20,
+    "failed": 0,
+    "narinfo_p50_ms": 0.633,
+    "narinfo_p99_ms": 1.655,
+    "passes": 3,
+    "redirect_p50_ms": 0.697,
+    "redirect_p99_ms": 1.793,
+    "requests": 1200,
+    "requests_per_sec": 26596.26458123583,
+    "wall_seconds": 0.045119118,
+    "zero_failures": true
+  },
+  "push": {
+    "concurrency": 20,
+    "corpus_bytes": 668784240,
+    "corpus_entries": 200,
+    "dropped_retries": 0,
+    "failed": 0,
+    "median_ms": 29,
+    "nar_mib_per_sec": 960.3901911897075,
+    "p99_ms": 182,
+    "p99_slowdown": 86.0,
+    "pushed": 200,
+    "shed_retries": 0,
+    "uncontended_median_ms": 1,
+    "wall_seconds": 0.664107525,
+    "wire_bytes": 155055514,
+    "wire_mib_per_sec": 222.6634328815499,
+    "zero_failures": true
+  },
+  "stream": [
+    {
+      "failed": 0,
+      "median_seconds": 0.00949415,
+      "mib_per_sec": 105.3280177793694,
+      "reps": 3,
+      "size_bytes": 1048576
+    },
+    {
+      "failed": 0,
+      "median_seconds": 0.33847925,
+      "mib_per_sec": 295.4390852615042,
+      "reps": 3,
+      "size_bytes": 104857600
+    },
+    {
+      "failed": 0,
+      "median_seconds": 8.656841751,
+      "mib_per_sec": 236.57588516775465,
+      "reps": 1,
+      "size_bytes": 2147483648
+    }
+  ],
+  "pusher_rss": {
+    "peak_kib": 363480,
+    "final_kib": 299500
+  }
+}
