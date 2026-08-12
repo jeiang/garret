@@ -65,6 +65,49 @@ absolute p99 on a fat-tailed corpus.
    `GARRET_BENCH_ARGS="--concurrency 40" just bench-local` variants — the
    knobs exist; no code needed.
 
+## NixOS x86_64 runs, unlimited and resource-limited (2026-08-12)
+
+Machine: `artemis`, NixOS x86_64, 8 cores, 96 GB RAM (shared box — one
+anomalous 1-cpu run was discarded after a clean re-run reproduced the
+combined-limit numbers instead; interference, not signal). Limits applied
+to the **whole stack** (Garage + Pusher + Puller + bench client) via
+`taskset -c 0` for the CPU pin and a systemd user scope with
+`MemoryMax=896M MemorySwapMax=0` for the memory cap. Result files:
+`benchmarks/bench-nixos-*.json`; labels encode the caps.
+
+| Config | Push (NAR MiB/s) | Stream 1M/100M/2G (MiB/s) | Pull (req/s) | narinfo p99 | Peak RSS |
+|---|---|---|---|---|---|
+| unlimited | **974** | 111 / 298 / **472** | 27.5k | 1.4 ms | 411 MiB |
+| 896 MiB | 960 | 105 / 295 / 237 | 26.6k | 1.7 ms | 354 MiB |
+| 1 cpu | 279 | 84 / 98 / 95 | 6.9k | 6.3 ms | 136 MiB |
+| 1 cpu + 896 MiB | 279 | 89 / 97 / 46 | 6.3k | 6.4 ms | 148 MiB |
+
+**Zero failures and the RSS criterion held in every configuration** — the
+backpressure design does what spec 01 promises even on one core under a
+hard 896 MiB ceiling.
+
+Findings:
+
+1. **Push throughput is CPU-bound, not memory-bound**: 974 → 279 MiB/s
+   when pinned to one core, while the 896 MiB cap alone costs ~1%. The
+   sandbox's binding constraint is its CPU allocation.
+2. **The memory cap taxes exactly one thing: large single-stream writes**
+   (472 → 237 MiB/s unlimited-cpu, 95 → 46 MiB/s at 1 cpu) — page-cache
+   / writeback pressure on Garage, not garret. Small and medium bodies
+   are unaffected.
+3. **The Puller degrades gracefully with CPU**: 27.5k → 6.9k req/s and
+   p99 stays under 7 ms even with every component sharing one core.
+4. Peak RSS *fell* with tighter limits (411 → 136 MiB) — the kernel
+   reclaiming harder, plus slower ingest naturally holding fewer parts in
+   flight.
+
+Micro-benches on artemis (x86_64, default features): zstd level 3 mixed
+1.47 GiB/s; **SHA-256 2.21 GiB/s with stock `sha2 = "0.10"`** — sha2
+runtime-detects SHA-NI on x86_64, so the 315 MiB/s fallback measured on
+the Mac is an **aarch64-only** gap (`asm` feature required there). Ticket
+20 updated accordingly: production x86 hardware is already fast; the flag
+matters for aarch64 dev machines and any future ARM deployment.
+
 ## Deferred bench extensions (recorded, not built)
 
 - **Stepped-concurrency pull sweep** (c = 20/100/300, keep-alive on and

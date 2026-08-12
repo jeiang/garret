@@ -21,9 +21,11 @@ mint_dev_tokens
 
 # The caps the RSS criterion is measured against (spec 09 scenario 1: peak
 # RSS < 2x max_in_flight_bytes). Modest on purpose: with the 2 GiB default
-# cap the check could never fail on a corpus this size. No [gc]: eviction
-# mid-benchmark would measure the sweep, not the push path.
-in_flight_cap=268435456 # 256 MiB
+# cap the check could never fail on a corpus this size. Overridable so a
+# memory-limited sandbox can size the Pusher to its box, exactly as a real
+# deployment would. No [gc]: eviction mid-benchmark would measure the
+# sweep, not the push path.
+in_flight_cap=${GARRET_IN_FLIGHT_CAP:-268435456} # 256 MiB
 write_configs "[limits]
 part_size = 16777216
 max_parts_in_flight = 4

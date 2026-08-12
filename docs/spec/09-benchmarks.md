@@ -99,7 +99,10 @@ underperforms the load scenarios.
 
 `just bench-local` provisions a throwaway **local Garage** + both
 services from the flake (release builds), runs all three scenarios, and
-samples Pusher RSS for the scenario-1 memory criterion — a LAN stand-in
+samples Pusher RSS for the scenario-1 memory criterion
+(`GARRET_IN_FLIGHT_CAP` overrides the 256 MiB in-flight cap the criterion
+is measured against, so a memory-limited sandbox can size the Pusher to
+its box) — a LAN stand-in
 keeps memory and backpressure results machine-independent and costs no
 S4 egress. Also pointable at real infra (S4) via `just bench`, which is
 the only way to see true WAN upload behaviour. Load scenarios assume a
