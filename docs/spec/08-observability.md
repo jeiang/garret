@@ -36,9 +36,14 @@ Prefix `garret_`; service distinguished by scrape job.
   pass; pass duration; orphans found; candidates-exhausted alarm
   counter; last-successful-pass timestamp.
 - **Puller**: narinfo hit/miss counters; NAR redirects issued, by
-  hit/miss; presign duration histogram; last-accessed bump queue depth
-  and debounce-skip counter; browse requests by endpoint; browse auth
-  failures. The Puller no longer sees NAR bytes
+  hit/miss; presign duration histogram; `garret_degraded_total` by
+  `reason` (`db_timeout`, `db_error`, `presign_timeout`,
+  `presign_error`) — pull-path requests degraded to a 404 miss when a
+  budget tripped or a read failed (spec
+  [03-storage](03-storage.md#bounded-budgets-degrade-to-a-miss); a
+  degraded narinfo request also counts as a miss); last-accessed bump
+  queue depth and debounce-skip counter; browse requests by endpoint;
+  browse auth failures. The Puller no longer sees NAR bytes
   ([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md)), so
   bytes-served, serve-duration, first-byte and Range counters are gone —
   served-byte volume is now S4's to report, not ours.
