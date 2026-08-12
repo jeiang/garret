@@ -15,7 +15,7 @@ bin=${GARRET_BIN:-./target/debug}
 
 source "$(dirname "$0")/provision.sh"
 
-require_free_ports 3900 3901 18080 18081 19091 19092
+require_free_ports "$s3_port" "$garage_rpc_port" "$pusher_port" "$puller_port" "$pusher_metrics_port" "$puller_metrics_port"
 start_garage 1G
 make_signing_key
 mint_dev_tokens
@@ -42,7 +42,7 @@ check_401() {
   shift
   code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
     -H 'Content-Type: application/json' -d '[]' "$@" \
-    "http://127.0.0.1:18080/api/v1/missing-paths")
+    "$pusher_url/api/v1/missing-paths")
   echo "  $what -> $code"
   [ "$code" = "401" ] || { echo "expected 401 for $what, got $code"; exit 1; }
 }
@@ -94,36 +94,36 @@ garret push "$big" | tee "$root/push-big.out"
 grep -q "done: 1 pushed, 0 deduped, 0 failed" "$root/push-big.out"
 
 metric() { curl -sf "http://127.0.0.1:$1/metrics" | awk -v k="$2" '$1 == k {print $2}'; }
-parts=$(metric 19091 garret_s3_parts_total)
-completed=$(metric 19091 garret_s3_multipart_completed_total)
-aborted=$(metric 19091 garret_s3_multipart_aborted_total)
+parts=$(metric "$pusher_metrics_port" garret_s3_parts_total)
+completed=$(metric "$pusher_metrics_port" garret_s3_multipart_completed_total)
+aborted=$(metric "$pusher_metrics_port" garret_s3_multipart_aborted_total)
 echo "  parts=$parts completed=$completed aborted=${aborted:-0}"
 [ "${completed:-0}" = "1" ] || { echo "expected one completed multipart"; exit 1; }
 [ "${parts:-0}" -ge 3 ] || { echo "expected 3+ parts for a 12 MB body"; exit 1; }
 [ -z "$aborted" ] || [ "$aborted" = "0" ] || { echo "multipart was aborted"; exit 1; }
 
 # The big path must come back intact — proof the parts were reassembled in order.
-nix copy --from "http://127.0.0.1:18081" --to "$root/dest-big" "$big" \
+nix copy --from "$puller_url" --to "$root/dest-big" "$big" \
   --option trusted-public-keys "$pubkey" --option require-sigs true \
   --option substitute false --refresh
 cmp "$root/dest-big/$big" "$root/big.bin"
 
 say "metrics and health"
-curl -sf "http://127.0.0.1:19092/healthz" >/dev/null
-accepted=$(metric 19091 garret_uploads_accepted_total)   # 2 closure paths + 1 big
+curl -sf "http://127.0.0.1:$puller_metrics_port/healthz" >/dev/null
+accepted=$(metric "$pusher_metrics_port" garret_uploads_accepted_total)   # 2 closure paths + 1 big
 echo "  uploads accepted: $accepted"
 [ "$accepted" = "3" ] || { echo "expected 3 accepted uploads, got $accepted"; exit 1; }
-[ "$(metric 19091 garret_uploads_limit)" = "4" ] || { echo "cap not exported"; exit 1; }
-if curl -sf "http://127.0.0.1:19091/metrics" | grep -q '^garret_narinfo_requests_total'; then
+[ "$(metric "$pusher_metrics_port" garret_uploads_limit)" = "4" ] || { echo "cap not exported"; exit 1; }
+if curl -sf "http://127.0.0.1:$pusher_metrics_port/metrics" | grep -q '^garret_narinfo_requests_total'; then
   echo "pusher must not expose puller metrics"; exit 1
 fi
 # The public listener must never serve metrics — they are internal-only.
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/metrics")
+code=$(curl -s -o /dev/null -w '%{http_code}' "$pusher_url/metrics")
 echo "  public /metrics -> $code"
 [ "$code" != "200" ] || { echo "metrics leaked onto the public listener"; exit 1; }
 
 say "narinfo"
-curl -sf "http://127.0.0.1:18081/$hash.narinfo" | tee "$root/narinfo"
+curl -sf "$puller_url/$hash.narinfo" | tee "$root/narinfo"
 grep -q "^Sig: garret-e2e-1:" "$root/narinfo"
 # References must appear by *name*, which a bare hash could not reconstruct --
 # and must list both the leaf and the root's own path. The self-reference is
@@ -133,14 +133,14 @@ grep -q "^References: .*$(basename "$leaf")" "$root/narinfo"
 grep -q "^References: .*$(basename "$path")" "$root/narinfo"
 
 say "NAR request redirects (ADR-0005)"
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18081/nar/$hash.nar.zst")
-location=$(curl -s -o /dev/null -w '%{redirect_url}' "http://127.0.0.1:18081/nar/$hash.nar.zst")
+code=$(curl -s -o /dev/null -w '%{http_code}' "$puller_url/nar/$hash.nar.zst")
+location=$(curl -s -o /dev/null -w '%{redirect_url}' "$puller_url/nar/$hash.nar.zst")
 echo "$code -> ${location%%\?*}?<presigned>"
 [ "$code" = "307" ] || { echo "expected a redirect, got $code"; exit 1; }
 
 say "nix copy out of the puller (signature-checked)"
 dest="$root/dest"
-nix copy --from "http://127.0.0.1:18081" --to "$dest" "$path" \
+nix copy --from "$puller_url" --to "$dest" "$path" \
   --option trusted-public-keys "$pubkey" \
   --option require-sigs true \
   --option substitute false --refresh
@@ -150,12 +150,12 @@ diff <(cat "$dest/$leaf") <(cat "$leaf")
 
 say "browse API"
 # Anonymous pull must keep working while browse demands a token (spec 04).
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18081/api/v1/objects")
+code=$(curl -s -o /dev/null -w '%{http_code}' "$puller_url/api/v1/objects")
 echo "  browse without a token -> $code"
 [ "$code" = "401" ] || { echo "browse must require OIDC, got $code"; exit 1; }
 
 authed() { curl -sf -H "Authorization: Bearer $GARRET_TOKEN" "$@"; }
-authed "http://127.0.0.1:18081/api/v1/objects?limit=50" > "$root/objects.json"
+authed "$puller_url/api/v1/objects?limit=50" > "$root/objects.json"
 python3 -c "
 import json, sys
 page = json.load(open('$root/objects.json'))
@@ -163,28 +163,28 @@ names = sorted(o['name'] for o in page['objects'])
 print('  objects:', names)
 assert 'garret-e2e-root' in names and 'garret-e2e-leaf' in names, names
 "
-authed "http://127.0.0.1:18081/api/v1/objects?q=leaf" | grep -q garret-e2e-leaf
-authed "http://127.0.0.1:18081/api/v1/objects/$hash" | grep -q '"pushed_by"'
+authed "$puller_url/api/v1/objects?q=leaf" | grep -q garret-e2e-leaf
+authed "$puller_url/api/v1/objects/$hash" | grep -q '"pushed_by"'
 
 leaf_hash=$(basename "$leaf" | cut -c1-32)
 garret tree "$hash" | tee "$root/tree.out"
 grep -q "garret-e2e-leaf" "$root/tree.out"
 # The leaf's referrer is the root — the reverse index, end to end.
-authed "http://127.0.0.1:18081/api/v1/objects/$leaf_hash/referrers" | grep -q "garret-e2e-root"
+authed "$puller_url/api/v1/objects/$leaf_hash/referrers" | grep -q "garret-e2e-root"
 garret list leaf | grep -q garret-e2e-leaf
 
 say "client UX: discovery, whoami, use, json"
 # Discovery must stay anonymous. It is registered after the auth layer, and
 # that placement is the only thing keeping it public — if someone reorders the
 # router, `garret login` silently breaks for anyone not already logged in.
-code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:18080/api/v1/discovery")
+code=$(curl -s -o /dev/null -w '%{http_code}' "$pusher_url/api/v1/discovery")
 echo "  discovery without a token -> $code"
 [ "$code" = "200" ] || { echo "discovery must be anonymous, got $code"; exit 1; }
-curl -sf "http://127.0.0.1:18080/api/v1/discovery" > "$root/discovery.json"
+curl -sf "$pusher_url/api/v1/discovery" > "$root/discovery.json"
 python3 -c "
 import json
 d = json.load(open('$root/discovery.json'))
-assert d['puller_endpoint'] == 'http://127.0.0.1:18081', d
+assert d['puller_endpoint'] == '$puller_url', d
 assert d['oidc']['client_id'] == 'garret-cli', d
 assert d['oidc']['audience'] == 'garret', d
 assert d['public_keys'] == ['$pubkey'], d
@@ -194,20 +194,45 @@ print('  discovery:', d['public_keys'])
 # whoami proves the token is not merely present but accepted.
 garret whoami | tee "$root/whoami.out"
 grep -q "authenticated" "$root/whoami.out"
-grep -q "http://127.0.0.1:18080" "$root/whoami.out"
+grep -q "$pusher_url" "$root/whoami.out"
 garret --json whoami | python3 -c "
 import json, sys
 w = json.load(sys.stdin)
 assert w['audience'] == 'garret', w
-assert w['puller_endpoint'] == 'http://127.0.0.1:18081', w
+assert w['puller_endpoint'] == '$puller_url', w
 "
 
 # --print must name the Puller (never the Pusher) and the real signing key.
 garret use --print | tee "$root/use.out"
-grep -q "extra-substituters = http://127.0.0.1:18081" "$root/use.out"
+grep -q "extra-substituters = $puller_url" "$root/use.out"
 grep -q "extra-trusted-public-keys = $pubkey" "$root/use.out"
 grep -q "nix.settings" "$root/use.out"
 # Writing is never exercised here: it would edit the invoking user's nix.conf.
+
+say "client UX: doctor walks the layers and names the broken one"
+# All six layers healthy, and the root path is cached, so everything passes.
+garret doctor "$path" | tee "$root/doctor.out"
+[ "$(grep -c '^pass' "$root/doctor.out")" = "6" ] \
+  || { echo "expected all six doctor checks to pass"; exit 1; }
+grep -q "^pass path .*cached" "$root/doctor.out"
+garret --json doctor "$path" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['ok'], d
+names = [c['name'] for c in d['checks']]
+assert names == ['discovery', 'config', 'keys', 'auth', 'pull', 'path'], names
+assert all(c['status'] == 'pass' for c in d['checks']), d
+"
+# An uncached path must become a *named* failure and a non-zero exit — the
+# exit code is the scriptable answer to \"is this cached\".
+if garret doctor /nix/store/00000000000000000000000000000000-absent \
+    > "$root/doctor-absent.out" 2>/dev/null; then
+  echo "doctor must exit non-zero for an uncached path"; exit 1
+fi
+grep -q "^fail path .*not cached" "$root/doctor-absent.out"
+# The other layers still pass: the failure names the path, not the pipeline.
+[ "$(grep -c '^pass' "$root/doctor-absent.out")" = "5" ] \
+  || { echo "an uncached path must not fail the other layers"; exit 1; }
 
 say "client UX: push --json emits a well-formed NDJSON stream"
 head -c 4096 /dev/urandom > "$root/json.bin"
@@ -260,16 +285,16 @@ watched=$(fixture watched)
 watched_hash=$(basename "$watched" | cut -c1-32)
 echo "  built $watched"
 for _ in $(seq 40); do
-  curl -sf "http://127.0.0.1:18081/$watched_hash.narinfo" >/dev/null 2>&1 && break
+  curl -sf "$puller_url/$watched_hash.narinfo" >/dev/null 2>&1 && break
   sleep 0.5
 done
 kill $watch_pid 2>/dev/null || true
-curl -sf "http://127.0.0.1:18081/$watched_hash.narinfo" >/dev/null || {
+curl -sf "$puller_url/$watched_hash.narinfo" >/dev/null || {
   echo "watcher never pushed the new path"; sed -n '1,40p' "$root/watch.log"; exit 1; }
 echo "  watcher pushed it without being asked"
 # .drv paths must never be pushed.
 drv_hash=$(basename "$(nix path-info --derivation "$watched" 2>/dev/null || echo x-x)" | cut -c1-32)
-if curl -sf "http://127.0.0.1:18081/$drv_hash.narinfo" >/dev/null 2>&1; then
+if curl -sf "$puller_url/$drv_hash.narinfo" >/dev/null 2>&1; then
   echo "watcher pushed a .drv, which the filter must exclude"; exit 1
 fi
 
@@ -294,11 +319,11 @@ echo "  refuses to overwrite an existing key"
 # leaf, whose removal is observable without disturbing the root the GC section
 # below still needs.
 leaf_hash=$(basename "$leaf" | cut -c1-32)
-curl -sf "http://127.0.0.1:18081/$leaf_hash.narinfo" >/dev/null \
+curl -sf "$puller_url/$leaf_hash.narinfo" >/dev/null \
   || { echo "leaf should be present before delete"; exit 1; }
 admin delete "$leaf_hash" | tee "$root/delete.out"
 grep -q "deleted 1 object" "$root/delete.out"
-if curl -sf "http://127.0.0.1:18081/$leaf_hash.narinfo" >/dev/null 2>&1; then
+if curl -sf "$puller_url/$leaf_hash.narinfo" >/dev/null 2>&1; then
   echo "narinfo still served after delete"; exit 1
 fi
 echo "  deleted object is gone from the Puller"
@@ -316,7 +341,7 @@ garret push "$path" >/dev/null
 say "benchmark harness"
 # All three scenarios, wired end to end: push seeds the corpus (count 12),
 # stream exercises the single-stream path, pull reads the corpus back.
-"$bin"/garret-bench push --endpoint "http://127.0.0.1:18080" \
+"$bin"/garret-bench push --endpoint "$pusher_url" \
   --concurrency 4 --count 12 --json "$root/bench.json" | tail -20
 python3 -c "
 import json
@@ -329,7 +354,7 @@ assert r['uncontended_median_ms'] > 0, 'baseline must actually be measured'
 assert r['p99_slowdown'] > 0, 'slowdown must be measured even though it is not a gate'
 assert r['nar_mib_per_sec'] > 0 and r['wire_bytes'] > 0, r
 "
-"$bin"/garret-bench stream --endpoint "http://127.0.0.1:18080" \
+"$bin"/garret-bench stream --endpoint "$pusher_url" \
   --reps 1 --no-giant --json "$root/bench-stream.json" | tail -5
 python3 -c "
 import json
@@ -338,7 +363,7 @@ assert all(r['failed'] == 0 for r in runs), runs
 assert [r['size_bytes'] for r in runs] == [2**20, 100 * 2**20], runs
 print('  stream MiB/s:', [round(r['mib_per_sec'], 1) for r in runs])
 "
-"$bin"/garret-bench pull --puller-endpoint "http://127.0.0.1:18081" \
+"$bin"/garret-bench pull --puller-endpoint "$puller_url" \
   --count 12 --passes 1 --json "$root/bench-pull.json" | tail -5
 python3 -c "
 import json
@@ -348,7 +373,7 @@ assert r['requests'] == 24, r
 print('  pull narinfo p50:', r['narinfo_p50_ms'], 'ms, redirect p50:', r['redirect_p50_ms'], 'ms')
 "
 # The same seed must produce the same corpus on any machine.
-"$bin"/garret-bench push --endpoint "http://127.0.0.1:18080" \
+"$bin"/garret-bench push --endpoint "$pusher_url" \
   --concurrency 2 --count 12 --json "$root/bench2.json" >/dev/null
 python3 -c "
 import json
@@ -368,16 +393,16 @@ sed 's/^quota_bytes = .*/quota_bytes = 1000/; s/^interval_secs = .*/interval_sec
   "$root/pusher.toml" > "$root/pusher-gc.toml"
 grep -q "quota_bytes = 1000" "$root/pusher-gc.toml"
 "$bin"/garret-pusher "$root/pusher-gc.toml" &
-wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
+wait_for pusher "$pusher_url/api/v1/missing-paths"
 
 # GC on demand through the admin socket, rather than waiting on the timer.
 admin gc run | tee "$root/gcrun.out"
 grep -q "evicted" "$root/gcrun.out"
 
-before=$(metric 19091 garret_gc_usage_bytes)
+before=$(metric "$pusher_metrics_port" garret_gc_usage_bytes)
 echo "  usage before: $before (quota 1000)"
 for _ in $(seq 30); do
-  evicted=$(metric 19091 garret_gc_evicted_objects_total)
+  evicted=$(metric "$pusher_metrics_port" garret_gc_evicted_objects_total)
   [ "${evicted:-0}" != "0" ] && break
   sleep 1
 done
@@ -386,7 +411,7 @@ echo "  evicted objects: ${evicted:-0}"
 # The invariant, checked over whatever actually survived: no surviving object
 # may reference an object GC removed. Which objects go is GC's business; broken
 # closures are not.
-authed "http://127.0.0.1:18081/api/v1/objects?limit=500" > "$root/after-gc.json"
+authed "$puller_url/api/v1/objects?limit=500" > "$root/after-gc.json"
 pushed="$hash $leaf_hash $watched_hash"
 GARRET_PUSHED="$pushed" python3 -c "
 import json, os, urllib.request
@@ -397,7 +422,7 @@ print('  survivors:', len(survivors), 'of', len(pushed) + 1, 'pushed')
 assert survivors, 'GC evicted everything, including unreferenced roots it should have stopped at'
 for h in survivors:
     req = urllib.request.Request(
-        f'http://127.0.0.1:18081/api/v1/objects/{h}',
+        f'$puller_url/api/v1/objects/{h}',
         headers={'Authorization': f'Bearer {token}'})
     obj = json.load(urllib.request.urlopen(req))
     for ref in obj['references']:

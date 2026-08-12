@@ -25,6 +25,8 @@ let
     presign_ttl_secs = cfg.presignTtlSeconds;
     bump_debounce_secs = cfg.bumpDebounceSeconds;
     db_wait_timeout_secs = cfg.dbWaitTimeoutSeconds;
+    db_read_budget_ms = cfg.dbReadBudgetMs;
+    presign_budget_ms = cfg.presignBudgetMs;
     s3 = {
       inherit (cfg.s3) bucket region;
       endpoint_url = cfg.s3.endpointUrl;
@@ -65,6 +67,18 @@ in
       type = types.int;
       default = 300;
       description = "How long to wait for the Pusher to create the database before exiting.";
+    };
+
+    dbReadBudgetMs = mkOption {
+      type = types.int;
+      default = 250;
+      description = "Pull-path database read budget before the request degrades to a 404 miss.";
+    };
+
+    presignBudgetMs = mkOption {
+      type = types.int;
+      default = 250;
+      description = "Presign budget before a NAR request degrades to a 404 miss.";
     };
 
     s3 = {

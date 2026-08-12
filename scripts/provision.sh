@@ -10,8 +10,34 @@
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
-# A leftover Garage on 3901 answers with a different RPC secret and the failure
-# looks like a handshake bug rather than a stale process. Fail clearly instead.
+# Parallel runs (git worktrees, agents sharing a machine) must not collide on
+# ports: each run gets a random free block of six consecutive ports unless the
+# caller pins GARRET_E2E_PORT_BASE.
+pick_port_base() {
+  local base p
+  while :; do
+    base=$(( (RANDOM % 40000) + 20000 ))
+    for p in $(seq "$base" $((base + 5))); do
+      lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && continue 2
+    done
+    echo "$base"
+    return
+  done
+}
+
+port_base=${GARRET_E2E_PORT_BASE:-$(pick_port_base)}
+s3_port=$port_base
+garage_rpc_port=$((port_base + 1))
+pusher_port=$((port_base + 2))
+puller_port=$((port_base + 3))
+pusher_metrics_port=$((port_base + 4))
+puller_metrics_port=$((port_base + 5))
+pusher_url="http://127.0.0.1:$pusher_port"
+puller_url="http://127.0.0.1:$puller_port"
+
+# A leftover Garage on the RPC port answers with a different RPC secret and the
+# failure looks like a handshake bug rather than a stale process. Fail clearly
+# instead. (With random ports this mostly guards a pinned GARRET_E2E_PORT_BASE.)
 require_free_ports() {
   local port
   for port in "$@"; do
@@ -35,13 +61,13 @@ metadata_dir = "$root/garage/meta"
 data_dir = "$root/garage/data"
 db_engine = "sqlite"
 replication_factor = 1
-rpc_bind_addr = "127.0.0.1:3901"
-rpc_public_addr = "127.0.0.1:3901"
+rpc_bind_addr = "127.0.0.1:$garage_rpc_port"
+rpc_public_addr = "127.0.0.1:$garage_rpc_port"
 rpc_secret = "$(openssl rand -hex 32)"
 
 [s3_api]
 s3_region = "garage"
-api_bind_addr = "127.0.0.1:3900"
+api_bind_addr = "127.0.0.1:$s3_port"
 EOF
   garage -c "$root/garage.toml" server &
   until garage -c "$root/garage.toml" status >/dev/null 2>&1; do sleep 0.3; done
@@ -59,7 +85,7 @@ EOF
   s3_block="
 [s3]
 bucket = \"garret\"
-endpoint_url = \"http://127.0.0.1:3900\"
+endpoint_url = \"http://127.0.0.1:$s3_port\"
 region = \"garage\"
 path_style = true
 access_key_id = \"$key_id\"
@@ -118,12 +144,12 @@ PY
 write_configs() {
   local pusher_extras=$1
   cat > "$root/pusher.toml" <<EOF
-listen = "127.0.0.1:18080"
-metrics_listen = "127.0.0.1:19091"
+listen = "127.0.0.1:$pusher_port"
+metrics_listen = "127.0.0.1:$pusher_metrics_port"
 db_path = "$root/garret.db"
 signing_key_files = ["$root/signing.key"]
 admin_socket = "$root/admin.sock"
-puller_endpoint = "http://127.0.0.1:18081"
+puller_endpoint = "$puller_url"
 
 $pusher_extras
 
@@ -136,8 +162,8 @@ $s3_block
 EOF
 
   cat > "$root/client.toml" <<EOF
-endpoint = "http://127.0.0.1:18080"
-puller_endpoint = "http://127.0.0.1:18081"
+endpoint = "$pusher_url"
+puller_endpoint = "$puller_url"
 public_keys = ["$pubkey"]
 
 [oidc]
@@ -152,8 +178,8 @@ poll_interval_secs = 1
 EOF
 
   cat > "$root/puller.toml" <<EOF
-listen = "127.0.0.1:18081"
-metrics_listen = "127.0.0.1:19092"
+listen = "127.0.0.1:$puller_port"
+metrics_listen = "127.0.0.1:$puller_metrics_port"
 db_path = "$root/garret.db"
 bump_debounce_secs = 0
 
@@ -209,10 +235,10 @@ start_services() {
   "$bin"/garret-puller "$root/puller.toml" &
   "$bin"/garret-pusher "$root/pusher.toml" &
   pusher_pid=$!
-  wait_for pusher "http://127.0.0.1:18080/api/v1/missing-paths"
+  wait_for pusher "$pusher_url/api/v1/missing-paths"
   local i
   for i in $(seq 100); do
-    curl -sf -o /dev/null "http://127.0.0.1:18081/ready" && break
+    curl -sf -o /dev/null "$puller_url/ready" && break
     [ "$i" = 100 ] && { echo "puller never became ready" >&2; exit 1; }
     sleep 0.3
   done

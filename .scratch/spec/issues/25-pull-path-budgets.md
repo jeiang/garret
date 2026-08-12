@@ -1,6 +1,9 @@
 # 25 — Bounded budgets + degrade-to-miss on the pull path
 
-Status: proposed (2026-08 review). Evidence:
+Status: implemented (2026-08; ADR-0007, spec 03/08). Measured tail cost
+of the blocking-pool hop is recorded in
+[26 — read-connection pool](26-puller-read-connection-pool.md), the
+later investigation it spawned. Evidence:
 [survey](../research/similar-projects-survey.md),
 [baseline](../research/benchmark-baseline-2026-08.md).
 

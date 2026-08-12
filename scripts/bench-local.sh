@@ -13,7 +13,7 @@ out=${GARRET_BENCH_JSON:-bench-results.json}
 
 source "$(dirname "$0")/provision.sh"
 
-require_free_ports 3900 3901 18080 18081 19091 19092
+require_free_ports "$s3_port" "$garage_rpc_port" "$pusher_port" "$puller_port" "$pusher_metrics_port" "$puller_metrics_port"
 # Room for the corpus (~750 MiB), its serial baseline, and the 2 GiB blob.
 start_garage 20G
 make_signing_key
@@ -47,8 +47,8 @@ say "running all scenarios"
 GARRET_TOKEN=$(cat "$root/token")
 export GARRET_TOKEN
 "$bin"/garret-bench all \
-  --endpoint "http://127.0.0.1:18080" \
-  --puller-endpoint "http://127.0.0.1:18081" \
+  --endpoint "$pusher_url" \
+  --puller-endpoint "$puller_url" \
   --json "$out" \
   ${GARRET_BENCH_ARGS:-}
 

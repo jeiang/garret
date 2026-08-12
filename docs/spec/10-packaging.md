@@ -53,7 +53,8 @@ Module option sketch (all under `services.garret.*`):
   active + retiring), `adminSocketPath`, `gcInterval`.
 - **puller**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.*` (same),
   `presignTtl` (default 1 h), `browse.oidc.{issuer, audience}`,
-  `bumpDebounce`.
+  `bumpDebounce`, `dbReadBudgetMs` / `presignBudgetMs` (pull-path
+  degrade-to-miss budgets, spec 03; default 250 ms).
 - **watcher** (client machines): `enable`, `endpoint`,
   `credentialsFile` (client id/secret), `filters.{excludePatterns,
   upstreamKeys}`, `jobs`, `zstdLevel`, `fullSync`.
