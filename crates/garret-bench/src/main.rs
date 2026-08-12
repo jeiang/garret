@@ -167,6 +167,11 @@ struct PushResults {
     /// Per-NAR latencies under load; the rule is about the tail, not the mean.
     median_ms: u64,
     p99_ms: u64,
+    /// The single slowest push. With 200 entries p99 is only the ~2nd-worst
+    /// sample, so one hung request (e.g. a SYN caught in retransmit backoff)
+    /// can crater wall_seconds while every percentile stays normal — this
+    /// field is what catches that.
+    max_ms: u64,
     uncontended_median_ms: u64,
     /// p99 of each NAR's loaded time divided by its *own* uncontended time.
     ///
@@ -421,6 +426,7 @@ async fn run_push(
         wire_mib_per_sec: wire_bytes as f64 / mib / wall.as_secs_f64(),
         median_ms: percentile(&ok, 50.0),
         p99_ms: percentile(&ok, 99.0),
+        max_ms: ok.last().copied().unwrap_or(0),
         uncontended_median_ms: uncontended_median,
         p99_slowdown,
         // A 429 the client retried is normal operation, not a failure. This

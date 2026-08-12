@@ -229,13 +229,21 @@ wait_for() {
 
 # Leaves the Pusher's PID in $pusher_pid (the e2e GC stage restarts it, and
 # the bench RSS sampler watches it).
+#
+# GARRET_WRAP is a command prefix (e.g. "taskset -c 0" or a systemd-run
+# scope) applied to the garret services and the bench client — but not to
+# Garage or the builds: in real usage the S3 service is upstream of the
+# sandbox, so resource-limited benchmarks constrain garret alone.
 start_services() {
   # Deliberately backwards: the Pusher owns the schema, and the Puller must
   # wait for it rather than die, serving 503 until /ready says otherwise.
-  "$bin"/garret-puller "$root/puller.toml" &
-  "$bin"/garret-pusher "$root/pusher.toml" &
+  ${GARRET_WRAP:-} "$bin"/garret-puller "$root/puller.toml" &
+  ${GARRET_WRAP:-} "$bin"/garret-pusher "$root/pusher.toml" &
   pusher_pid=$!
   wait_for pusher "$pusher_url/api/v1/missing-paths"
+  # A wrapper like systemd-run forks, making $! the wrapper's PID; resolve
+  # the PID the RSS sampler and GC restart actually need.
+  [ -n "${GARRET_WRAP:-}" ] && pusher_pid=$(pgrep -nf "garret-pusher $root/pusher.toml")
   local i
   for i in $(seq 100); do
     curl -sf -o /dev/null "$puller_url/ready" && break

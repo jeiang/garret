@@ -29,7 +29,14 @@ version, seed, and a `label` (default `os-arch`, `--label` /
 the diff tool refuses to compare runs across labels, so a laptop
 baseline can never silently masquerade as the cgroup-limited sandbox's.
 A limited environment encodes its caps in the label
-(e.g. `linux-x86_64-2cpu-2g`).
+(e.g. `linux-x86_64-2cpu-2g`), and applies them via `GARRET_WRAP` — a
+command prefix (`taskset -c 0`, a systemd-run scope, …) that
+`bench-local` puts on the two garret services and nothing else. Garage
+and the bench client are both stand-ins for things outside the sandbox
+(the upstream S3-compatible service and the machines pushing to the
+cache), and the builds are setup — so the limits measure garret, not
+the harness. (Benchmarking a fully local setup with Garage under its own
+constraints is recorded as a possible future scenario, not built.)
 
 ## Scenarios and pass/fail
 
@@ -59,8 +66,10 @@ no reading of it works:
   16 MiB uploads shows a ~60× slowdown on a server behaving exactly as
   designed.
 
-So `garret-bench` reports both (`p99_ms`, `p99_slowdown`) and gates only
-on **zero failures**, which is unambiguous. Latency is tracked by
+So `garret-bench` reports both (`p99_ms`, `p99_slowdown`) — plus `max_ms`,
+because with 200 entries p99 is only the ~2nd-worst sample and a single
+hung request can crater `wall_seconds` while every percentile stays
+normal — and gates only on **zero failures**, which is unambiguous. Latency is tracked by
 comparing against the checked-in baseline, where a regression shows up as
 a change; `--max-p99-slowdown` sets a budget for anyone who wants a hard
 gate. Picking a defensible fixed threshold needs numbers from real

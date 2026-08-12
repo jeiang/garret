@@ -23,10 +23,20 @@ pub struct S3Config {
     pub access_key_id: Option<String>,
     /// See [`S3Config::access_key_id`] — set both or neither.
     pub secret_access_key: Option<String>,
+    /// Overall deadline for one S3 call, SDK retries included (ticket 27).
+    /// Without it a stalled upstream holds an upload permit and its
+    /// in-flight bytes forever. Default 60; raise on slow uplinks or with
+    /// larger parts.
+    #[serde(default = "s3_operation_timeout")]
+    pub operation_timeout_secs: u64,
 }
 
 fn yes() -> bool {
     true
+}
+
+fn s3_operation_timeout() -> u64 {
+    60
 }
 
 fn store_dir() -> String {

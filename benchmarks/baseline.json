@@ -5,64 +5,66 @@
     "label": "macos-aarch64",
     "os": "macos",
     "seed": 20250806,
-    "timestamp_unix": 1786508628,
+    "timestamp_unix": 1786545099,
     "version": "0.1.0"
   },
   "pull": {
     "concurrency": 20,
     "failed": 0,
-    "narinfo_p50_ms": 0.607,
-    "narinfo_p99_ms": 1.607,
+    "narinfo_p50_ms": 0.602,
+    "narinfo_p99_ms": 1.924,
     "passes": 3,
-    "redirect_p50_ms": 0.653,
-    "redirect_p99_ms": 2.354,
+    "redirect_p50_ms": 0.694,
+    "redirect_p99_ms": 2.389,
     "requests": 1200,
-    "requests_per_sec": 28842.57209789765,
-    "wall_seconds": 0.041605166,
+    "requests_per_sec": 26953.34544362118,
+    "wall_seconds": 0.044521375,
     "zero_failures": true
   },
   "push": {
     "concurrency": 20,
     "corpus_bytes": 668784240,
     "corpus_entries": 200,
+    "dropped_retries": 0,
     "failed": 0,
-    "median_ms": 47,
-    "nar_mib_per_sec": 641.3216858214292,
-    "p99_ms": 296,
-    "p99_slowdown": 112.0,
+    "max_ms": 276,
+    "median_ms": 45,
+    "nar_mib_per_sec": 712.0593425267672,
+    "p99_ms": 217,
+    "p99_slowdown": 118.0,
     "pushed": 200,
     "shed_retries": 0,
-    "uncontended_median_ms": 2,
-    "wall_seconds": 0.994512375,
+    "uncontended_median_ms": 1,
+    "wall_seconds": 0.895715167,
     "wire_bytes": 155055514,
-    "wire_mib_per_sec": 148.68840754140413,
+    "wire_mib_per_sec": 165.08870985654497,
     "zero_failures": true
   },
   "stream": [
     {
       "failed": 0,
-      "median_seconds": 0.014267417,
-      "mib_per_sec": 70.08977168046606,
+      "median_seconds": 0.011018583,
+      "mib_per_sec": 90.75577140908227,
       "reps": 3,
       "size_bytes": 1048576
     },
     {
       "failed": 0,
-      "median_seconds": 0.689437916,
-      "mib_per_sec": 145.04569255515096,
+      "median_seconds": 0.417118459,
+      "mib_per_sec": 239.74004948076393,
       "reps": 3,
       "size_bytes": 104857600
     },
     {
       "failed": 0,
-      "median_seconds": 10.250224208,
-      "mib_per_sec": 199.8005076222231,
+      "median_seconds": 5.433303125,
+      "mib_per_sec": 376.9346110244861,
       "reps": 1,
       "size_bytes": 2147483648
     }
   ],
   "pusher_rss": {
-    "peak_kib": 149232,
-    "final_kib": 149232
+    "peak_kib": 150352,
+    "final_kib": 150336
   }
 }
