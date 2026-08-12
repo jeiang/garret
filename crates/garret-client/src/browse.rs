@@ -87,6 +87,32 @@ pub async fn tree(
         .context("parsing the dependency tree")
 }
 
+/// One pin in a `garret pins` listing (ticket 22).
+#[derive(Debug, Deserialize)]
+pub struct Pin {
+    /// Operator-chosen pin name.
+    pub name: String,
+    /// Store path hash of the pinned root.
+    pub store_path_hash: String,
+    /// The store path's name part is not sent separately; render from the path.
+    pub store_path: String,
+    /// Unix time the pin stops protecting; `None` = permanent.
+    pub expires_at: Option<i64>,
+}
+
+/// Fetches the pin listing, verbatim — see [`list`] for why.
+pub async fn pins(http: &reqwest::Client, puller: &str, token: &str) -> Result<serde_json::Value> {
+    http.get(format!("{puller}/api/v1/pins"))
+        .bearer_auth(token)
+        .send()
+        .await?
+        .error_for_status()
+        .context("listing pins")?
+        .json()
+        .await
+        .context("parsing the pin list")
+}
+
 /// Renders the tree as indented lines, marking what the cache does not hold
 /// and where a repeat was truncated.
 pub fn render(node: &TreeNode, depth: usize, out: &mut String) {

@@ -1,6 +1,6 @@
 # 22 — Closure pinning: GC-exempt roots
 
-Status: proposed (2026-08 review). Evidence:
+Status: implemented (2026-08). Evidence:
 [survey](../research/similar-projects-survey.md).
 
 ## Problem

@@ -17,6 +17,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret watch-store` | Watcher daemon (below) |
 | `garret list` | Search/filter cache contents (browse API) |
 | `garret tree <path>` | Dependency tree (browse API) |
+| `garret pins` | List GC-exempt pins (browse API; set with `garret-admin pin`) |
 | `garret completions <shell>` | bash/zsh/fish completion script |
 
 Admin operations live in `garret-admin`

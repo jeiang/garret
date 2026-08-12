@@ -50,6 +50,14 @@ CREATE TABLE object_refs (
 ) WITHOUT ROWID;
 CREATE INDEX object_refs_reference ON object_refs(reference_hash); -- reverse deps
 
+CREATE TABLE pins (                  -- GC-exempt roots (ticket 22, spec 05)
+  name             TEXT PRIMARY KEY,   -- operator-chosen
+  store_path_hash  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
+  expires_at       INTEGER,            -- NULL = permanent
+  created_at       INTEGER NOT NULL
+);
+CREATE INDEX pins_hash ON pins(store_path_hash);
+
 CREATE TABLE stats (                   -- single row
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   total_bytes  INTEGER NOT NULL       -- maintained in insert/delete txs

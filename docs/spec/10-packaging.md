@@ -38,6 +38,8 @@ Pusher runs).
 | `gc run` | socket — trigger a GC pass |
 | `status` | socket — object count, usage vs quota, in-flight uploads |
 | `fsck [--repair] [--verify-sizes] [--quiesce] [--json]` | socket — audit row⇔blob consistency, optionally repair |
+| `pin <name> <hash> [--expires <duration>]` | socket — GC-exempt root, closure-protecting (spec 05) |
+| `unpin <name>` | socket — remove a pin; unknown name is an error |
 
 ## NixOS modules & flake outputs
 

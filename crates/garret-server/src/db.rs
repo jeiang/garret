@@ -66,6 +66,14 @@ CREATE TABLE IF NOT EXISTS object_refs (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS object_refs_reference ON object_refs(reference_hash);
 
+CREATE TABLE IF NOT EXISTS pins (
+  name             TEXT PRIMARY KEY,
+  store_path_hash  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
+  expires_at       INTEGER,          -- NULL = permanent
+  created_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pins_hash ON pins(store_path_hash);
+
 CREATE TABLE IF NOT EXISTS stats (
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   total_bytes  INTEGER NOT NULL
@@ -274,7 +282,13 @@ pub fn reconcile_total_bytes(conn: &Connection) -> Result<i64> {
 /// Objects no surviving object in the cache references, least-recently-accessed
 /// first. Everything returned is evictable *together*: removing one unreferenced
 /// object cannot make another referenced (spec 05).
-pub fn evictable(conn: &Connection, limit: usize) -> Result<Vec<(String, i64)>> {
+///
+/// Live pins are excluded. Only the pinned root needs excluding: eviction is
+/// root-first, so while the pinned row survives, its `object_refs` keep every
+/// closure member referenced and therefore out of this query — the whole
+/// closure is protected without any walk. An expired pin simply stops
+/// matching; no sweep runs (ticket 22).
+pub fn evictable(conn: &Connection, limit: usize, now: i64) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(
         // `r.referrer != o.store_path_hash` skips self-edges: an object
         // referring to itself must not count as a referrer keeping itself
@@ -285,12 +299,49 @@ pub fn evictable(conn: &Connection, limit: usize) -> Result<Vec<(String, i64)>> 
              WHERE r.reference_hash = o.store_path_hash
                AND r.referrer != o.store_path_hash
          )
+         AND NOT EXISTS (
+             SELECT 1 FROM pins p
+             WHERE p.store_path_hash = o.store_path_hash
+               AND (p.expires_at IS NULL OR p.expires_at > ?2)
+         )
          ORDER BY o.last_accessed_at ASC, o.store_path_hash ASC
          LIMIT ?1",
     )?;
     Ok(stmt
-        .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map(params![limit, now], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Creates or replaces a pin (idempotent, ncps semantics). Pinning a hash not
+/// in the cache is a hard error, not a no-op (ticket 22).
+pub fn pin(
+    conn: &Connection,
+    name: &str,
+    hash: &str,
+    expires_at: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM objects WHERE store_path_hash = ?1",
+            params![hash],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    anyhow::ensure!(exists, "{hash} is not in the cache — nothing to pin");
+    conn.execute(
+        "INSERT OR REPLACE INTO pins (name, store_path_hash, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![name, hash, expires_at, now],
+    )?;
+    Ok(())
+}
+
+/// Removes a pin; `false` means no pin had that name (reported, not swallowed,
+/// so a typo does not look like a successful unpin).
+pub fn unpin(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn.execute("DELETE FROM pins WHERE name = ?1", params![name])? > 0)
 }
 
 /// Removes the row and its refs, and debits the usage counter, in one
@@ -446,7 +497,10 @@ mod tests {
         // ...but a self-edge must not count as a referrer keeping the object
         // alive, or nothing would ever be evictable (spec 02).
         assert!(
-            evictable(&conn, 10).unwrap().iter().any(|(h, _)| h == &a),
+            evictable(&conn, 10, 1000)
+                .unwrap()
+                .iter()
+                .any(|(h, _)| h == &a),
             "self-reference made the object unevictable"
         );
     }
@@ -472,7 +526,7 @@ mod tests {
         insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
         insert_object(&mut conn, &object(&c, &[]), 200).unwrap();
 
-        let candidates = evictable(&conn, 10).unwrap();
+        let candidates = evictable(&conn, 10, 1000).unwrap();
         let hashes: Vec<&str> = candidates.iter().map(|(h, _)| h.as_str()).collect();
         // b is referenced, so it must not appear at any price.
         assert!(
@@ -485,12 +539,65 @@ mod tests {
         // Evicting the root frees its dependency for the next pass — this is
         // what makes root-first eviction reclaim whole closures.
         delete_object(&mut conn, &a).unwrap();
-        let after: Vec<String> = evictable(&conn, 10)
+        let after: Vec<String> = evictable(&conn, 10, 1000)
             .unwrap()
             .into_iter()
             .map(|(h, _)| h)
             .collect();
         assert!(after.contains(&b));
+    }
+
+    #[test]
+    fn a_live_pin_protects_its_whole_closure_and_an_expired_one_does_not() {
+        let mut conn = db();
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        // a → b: pinning a must keep b too, via root-first eviction.
+        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 100).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+
+        pin(&conn, "release", &a, None, 500).unwrap();
+        assert!(
+            evictable(&conn, 10, 1000).unwrap().is_empty(),
+            "pinned closure appeared as an eviction candidate"
+        );
+
+        // Idempotent re-pin with an expiry; once past it, protection lapses
+        // with no sweep — the pin simply stops matching.
+        pin(&conn, "release", &a, Some(900), 500).unwrap();
+        assert!(evictable(&conn, 10, 800).unwrap().is_empty());
+        let after: Vec<String> = evictable(&conn, 10, 1000)
+            .unwrap()
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(after, vec![a.clone()], "expired pin still protecting");
+
+        assert!(unpin(&conn, "release").unwrap());
+        assert!(
+            !unpin(&conn, "release").unwrap(),
+            "double unpin reported ok"
+        );
+    }
+
+    #[test]
+    fn pinning_an_unknown_hash_is_a_hard_error() {
+        let conn = db();
+        assert!(pin(&conn, "nope", &"f".repeat(32), None, 100).is_err());
+    }
+
+    #[test]
+    fn deleting_a_pinned_object_drops_the_pin() {
+        // `garret-admin delete` is the explicit operator override; the pin
+        // must not linger pointing at nothing (FK cascade).
+        let mut conn = db();
+        let a = "a".repeat(32);
+        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        pin(&conn, "release", &a, None, 100).unwrap();
+        delete_object(&mut conn, &a).unwrap();
+        let pins: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pins, 0);
     }
 
     #[test]

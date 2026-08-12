@@ -70,7 +70,7 @@ impl Gc {
         while usage > low {
             let candidates = {
                 let conn = self.conn.lock().unwrap();
-                db::evictable(&conn, BATCH)?
+                db::evictable(&conn, BATCH, now())?
             };
             if candidates.is_empty() {
                 result.candidates_exhausted = true;

@@ -140,6 +140,7 @@ async fn main() -> Result<()> {
                 .route("/api/v1/objects/{hash}", get(object_detail))
                 .route("/api/v1/objects/{hash}/tree", get(object_tree))
                 .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
+                .route("/api/v1/pins", get(list_pins))
                 .layer(axum::middleware::from_fn_with_state(
                     auth,
                     require_browse_oidc,
@@ -373,6 +374,13 @@ async fn object_referrers(
         return unavailable();
     };
     browse_response("referrers", browse::referrers(&conn, &hash).map(Some))
+}
+
+async fn list_pins(State(state): State<Arc<AppState>>) -> Response {
+    let Some(conn) = state.conn() else {
+        return unavailable();
+    };
+    browse_response("pins", browse::pins(&conn).map(Some))
 }
 
 #[cfg(test)]

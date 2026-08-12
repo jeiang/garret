@@ -383,6 +383,19 @@ print('  same seed, same corpus:', a['corpus_bytes'], 'bytes')
 "
 
 say "garbage collection"
+# Pin the small closure's root before the quota squeeze: it and its leaf must
+# ride out eviction while the 12 MB path goes (ticket 22). Set through the
+# still-running Pusher — the restarted one starts evicting on its first tick.
+admin pin release "$hash" | grep -q "pinned release"
+garret pins | tee "$root/pins.out"
+grep -q "release" "$root/pins.out"
+grep -q "permanent" "$root/pins.out"
+# Pinning garbage must fail loudly, not no-op.
+if admin pin typo 00000000000000000000000000000000 2>/dev/null; then
+  echo "pinning an unknown hash should be an error"; exit 1
+fi
+echo "  pin set, listed, and unknown hashes refused"
+
 # Restart the Pusher under a quota the corpus already exceeds. Only one
 # process ever writes the DB, so the old one goes first.
 kill $pusher_pid 2>/dev/null || true
@@ -432,5 +445,16 @@ for h in survivors:
                 f'closure broken: {obj[\"name\"]} survives but its reference {ref} was evicted')
 print('  every surviving object still has its full closure')
 "
+# The pinned closure specifically must have survived the squeeze.
+curl -sf "$puller_url/$hash.narinfo" >/dev/null \
+  || { echo "pinned root was evicted"; exit 1; }
+curl -sf "$puller_url/$leaf_hash.narinfo" >/dev/null \
+  || { echo "pinned root's dependency was evicted"; exit 1; }
+echo "  pinned closure survived GC"
+admin unpin release | grep -q "unpinned"
+if admin unpin release 2>/dev/null; then
+  echo "unpinning a missing name should be an error"; exit 1
+fi
+echo "  unpin removes the pin and a second unpin fails loudly"
 
 say "PASS — authenticated push via the client, signed, redirected, and substituted back verified"
