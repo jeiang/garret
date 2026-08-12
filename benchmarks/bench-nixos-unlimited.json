@@ -5,20 +5,20 @@
     "label": "nixos-x86_64",
     "os": "linux",
     "seed": 20250806,
-    "timestamp_unix": 1786516687,
+    "timestamp_unix": 1786540343,
     "version": "0.1.0"
   },
   "pull": {
     "concurrency": 20,
     "failed": 0,
-    "narinfo_p50_ms": 0.655,
-    "narinfo_p99_ms": 1.416,
+    "narinfo_p50_ms": 0.584,
+    "narinfo_p99_ms": 1.707,
     "passes": 3,
-    "redirect_p50_ms": 0.706,
-    "redirect_p99_ms": 1.541,
+    "redirect_p50_ms": 0.653,
+    "redirect_p99_ms": 1.804,
     "requests": 1200,
-    "requests_per_sec": 27473.8778941355,
-    "wall_seconds": 0.043677853,
+    "requests_per_sec": 28272.626624318353,
+    "wall_seconds": 0.042443881,
     "zero_failures": true
   },
   "push": {
@@ -27,43 +27,43 @@
     "corpus_entries": 200,
     "dropped_retries": 0,
     "failed": 0,
-    "median_ms": 30,
-    "nar_mib_per_sec": 973.824403387754,
-    "p99_ms": 198,
-    "p99_slowdown": 89.0,
+    "median_ms": 33,
+    "nar_mib_per_sec": 930.7626068101583,
+    "p99_ms": 191,
+    "p99_slowdown": 85.0,
     "pushed": 200,
     "shed_retries": 0,
     "uncontended_median_ms": 1,
-    "wall_seconds": 0.654945954,
+    "wall_seconds": 0.685247074,
     "wire_bytes": 155055514,
-    "wire_mib_per_sec": 225.77811255395545,
+    "wire_mib_per_sec": 215.7943710080982,
     "zero_failures": true
   },
   "stream": [
     {
       "failed": 0,
-      "median_seconds": 0.008981772,
-      "mib_per_sec": 111.33660484813018,
+      "median_seconds": 0.009195976,
+      "mib_per_sec": 108.74321551078428,
       "reps": 3,
       "size_bytes": 1048576
     },
     {
       "failed": 0,
-      "median_seconds": 0.33516231,
-      "mib_per_sec": 298.36290363316806,
+      "median_seconds": 0.343097589,
+      "mib_per_sec": 291.4622638167242,
       "reps": 3,
       "size_bytes": 104857600
     },
     {
       "failed": 0,
-      "median_seconds": 4.342251816,
-      "mib_per_sec": 471.6446873149284,
+      "median_seconds": 4.532984473,
+      "mib_per_sec": 451.7994738783214,
       "reps": 1,
       "size_bytes": 2147483648
     }
   ],
   "pusher_rss": {
-    "peak_kib": 420976,
-    "final_kib": 342376
+    "peak_kib": 360700,
+    "final_kib": 311544
   }
 }
