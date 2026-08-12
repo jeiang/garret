@@ -1,6 +1,7 @@
 # 24 — `garret doctor`: one-command client/deployment diagnosis
 
-Status: proposed (2026-08 review). Evidence:
+Status: resolved (implemented 2026-08; spec in
+[06-client.md](../../../docs/spec/06-client.md)). Evidence:
 [survey](../research/similar-projects-survey.md).
 
 ## Problem

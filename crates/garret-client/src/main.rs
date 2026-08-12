@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use garret_client::{auth, browse, config, discovery, nixconf, push, watcher};
+use garret_client::{auth, browse, config, discovery, doctor, nixconf, push, watcher};
 use indicatif::MultiProgress;
 use serde_json::json;
 
@@ -35,6 +35,11 @@ enum Command {
     Logout,
     /// Show who this machine is logged in as, and whether the server agrees
     Whoami,
+    /// Diagnose the client→cache pipeline layer by layer
+    Doctor {
+        /// Store path (or bare 32-character hash) to ask "is this cached?"
+        path: Option<String>,
+    },
     /// Point the local Nix at the cache as a substituter
     Use {
         /// Print the configuration instead of writing it
@@ -115,6 +120,47 @@ async fn main() -> Result<()> {
         }
 
         Command::Whoami => whoami(&cfg.unwrap(), &http, cli.json).await?,
+
+        Command::Doctor { path } => {
+            // A diagnostic that hangs is a diagnostic that failed: every probe
+            // gets a hard timeout, unlike the push path where a slow server is
+            // the client's problem to wait out.
+            let timed = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?;
+            let checks = doctor::run(&cfg.unwrap(), &timed, path.as_deref()).await;
+            let failed = checks
+                .iter()
+                .filter(|c| c.status == doctor::Status::Fail)
+                .count();
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({
+                        "ok": failed == 0,
+                        "checks": checks.iter().map(|c| json!({
+                            "name": c.name,
+                            "status": c.status.as_str(),
+                            "detail": c.detail,
+                        })).collect::<Vec<_>>(),
+                    })
+                );
+            } else {
+                for check in &checks {
+                    println!(
+                        "{:<4} {:<9} {}",
+                        check.status.as_str(),
+                        check.name,
+                        check.detail
+                    );
+                }
+            }
+            // Reported first, then the exit code carries the failure — the
+            // same order push uses, so a --json consumer always gets the data.
+            if failed > 0 {
+                anyhow::bail!("{failed} of {} check(s) failed", checks.len());
+            }
+        }
 
         Command::Use { print } => use_cache(&cfg.unwrap(), print)?,
 

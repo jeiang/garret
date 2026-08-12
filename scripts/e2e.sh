@@ -209,6 +209,31 @@ grep -q "extra-trusted-public-keys = $pubkey" "$root/use.out"
 grep -q "nix.settings" "$root/use.out"
 # Writing is never exercised here: it would edit the invoking user's nix.conf.
 
+say "client UX: doctor walks the layers and names the broken one"
+# All six layers healthy, and the root path is cached, so everything passes.
+garret doctor "$path" | tee "$root/doctor.out"
+[ "$(grep -c '^pass' "$root/doctor.out")" = "6" ] \
+  || { echo "expected all six doctor checks to pass"; exit 1; }
+grep -q "^pass path .*cached" "$root/doctor.out"
+garret --json doctor "$path" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['ok'], d
+names = [c['name'] for c in d['checks']]
+assert names == ['discovery', 'config', 'keys', 'auth', 'pull', 'path'], names
+assert all(c['status'] == 'pass' for c in d['checks']), d
+"
+# An uncached path must become a *named* failure and a non-zero exit — the
+# exit code is the scriptable answer to \"is this cached\".
+if garret doctor /nix/store/00000000000000000000000000000000-absent \
+    > "$root/doctor-absent.out" 2>/dev/null; then
+  echo "doctor must exit non-zero for an uncached path"; exit 1
+fi
+grep -q "^fail path .*not cached" "$root/doctor-absent.out"
+# The other layers still pass: the failure names the path, not the pipeline.
+[ "$(grep -c '^pass' "$root/doctor-absent.out")" = "5" ] \
+  || { echo "an uncached path must not fail the other layers"; exit 1; }
+
 say "client UX: push --json emits a well-formed NDJSON stream"
 head -c 4096 /dev/urandom > "$root/json.bin"
 jsonpath=$(nix store add-path "$root/json.bin" --name garret-e2e-json)

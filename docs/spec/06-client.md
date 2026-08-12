@@ -11,6 +11,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret login [pusher-url] [--force]` | Writes the config from server discovery, then device flow against Pocket ID; stores rotating refresh token |
 | `garret logout` | Deletes the stored refresh token; the config stays |
 | `garret whoami` | Subject, audience, expiry, and a live probe that the Pusher accepts the token |
+| `garret doctor [path]` | Layer-by-layer diagnosis (below); with a path, a Negotiation round answers "is this cached" |
 | `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter |
 | `garret push <paths…\|installable> [--dry-run]` | Full closure via one missing-paths query; parallel workers |
 | `garret watch-store` | Watcher daemon (below) |
@@ -47,6 +48,40 @@ The written file is a hand-rendered subset with comments, not a serialization
 of the config struct — which would emit every default and the entire `[watch]`
 section into a laptop's config.
 
+## Doctor
+
+Sources: [ticket 24](../../.scratch/spec/issues/24-doctor.md). Prior art:
+`cachix doctor`, and sccache's startup check that names the failing backend
+instead of 500ing later.
+
+When a push or substitution misbehaves, every diagnosis step is one curl —
+but only if you remember them all. `garret doctor [path]` runs them in layer
+order, each printing one `pass`/`fail` line naming the layer, and exits
+non-zero if any check failed:
+
+| Check | What it probes |
+|---|---|
+| `discovery` | `GET /api/v1/discovery` on the Pusher — the server is reachable at all |
+| `config` | The local config against the discovery document — drift in `puller_endpoint` or `[oidc]` since `garret login` wrote it. Fields the server does not advertise are sparse, not drifted |
+| `keys` | Configured `public_keys` against discovery's — a configured key the server no longer signs with fails; *extra* server keys pass with a re-login nudge (rotation in progress) |
+| `auth` | Token acquisition plus the empty-Negotiation liveness probe `whoami` uses — the token is not merely present but accepted |
+| `pull` | The Puller's `/nix-cache-info`, then one narinfo probe. Hit and miss both pass: the question is whether the substituter protocol is served, not whether a given path is cached |
+| `path` | Only with a path argument: one Negotiation round for its hash. Not cached is a `fail`, so the exit code carries the answer for scripts |
+
+A check whose prerequisite failed reports `skip` rather than guessing:
+no discovery document leaves `config` and `keys` nothing to compare
+against, and without an accepted token `path` cannot be asked. Every probe
+runs under a hard timeout — a diagnostic that hangs is a diagnostic that
+failed.
+
+Under `--json`, `doctor` emits one object (the checks are the data; the
+failure summary goes to stderr):
+
+```json
+{"ok":false,"checks":[{"name":"discovery","status":"pass","detail":"…"},
+                      {"name":"path","status":"fail","detail":"not cached — …"}]}
+```
+
 ## Push behavior
 
 Per the protocol: worker pool of concurrent PUTs, client-side zstd
@@ -75,7 +110,7 @@ data.
 
 - `list` and `tree` emit the browse API's JSON verbatim. The server already has
   a schema (spec 07); mirroring it client-side would create a second one.
-- `whoami` emits one object.
+- `whoami` and `doctor` each emit one object.
 - `push` emits NDJSON, one event per line:
 
 ```
