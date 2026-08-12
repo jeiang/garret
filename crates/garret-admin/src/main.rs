@@ -47,6 +47,18 @@ enum Command {
         #[arg(required = true)]
         hashes: Vec<String>,
     },
+    /// Pin an object's closure as a GC-exempt root (spec 05)
+    Pin {
+        /// Pin name (re-pinning a name replaces it)
+        name: String,
+        /// Store-path hash of the root (the 32 characters before the first `-`)
+        hash: String,
+        /// Protect only this long (e.g. `36h`, `30d`); permanent by default
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Remove a pin by name
+    Unpin { name: String },
     /// Audit row ⇔ blob consistency (spec 02/03); dry-run by default
     Fsck {
         /// Delete dangling rows and size-mismatched rows
@@ -183,6 +195,48 @@ async fn main() -> Result<()> {
             other => print_unexpected(other),
         },
 
+        Command::Pin {
+            name,
+            hash,
+            expires,
+        } => {
+            let expires_at = expires
+                .as_deref()
+                .map(|d| {
+                    parse_duration(d).map(|secs| {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64
+                            + secs
+                    })
+                })
+                .transpose()?;
+            match request(
+                &cli.socket,
+                Request::Pin {
+                    name: name.clone(),
+                    hash,
+                    expires_at,
+                },
+            )
+            .await?
+            {
+                Response::Pin => println!("pinned {name}"),
+                other => print_unexpected(other),
+            }
+        }
+
+        Command::Unpin { name } => match request(&cli.socket, Request::Unpin { name }).await? {
+            Response::Unpin { removed: true } => println!("unpinned"),
+            // Reported, not swallowed: a mistyped name would otherwise look
+            // exactly like a successful unpin.
+            Response::Unpin { removed: false } => {
+                bail!("no pin has that name");
+            }
+            other => print_unexpected(other),
+        },
+
         Command::Fsck {
             repair,
             verify_sizes,
@@ -315,6 +369,9 @@ fn print_unexpected(response: Response) {
         Response::Error { message } => eprintln!("error: {message}"),
         other => eprintln!("unexpected response: {other:?}"),
     }
+    // A failed command must fail the process: scripts branch on the exit
+    // code, and a printed error with status 0 reads as success.
+    std::process::exit(1);
 }
 
 #[cfg(unix)]
@@ -336,5 +393,40 @@ fn human(bytes: i64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// `<number><s|m|h|d>` → seconds. ponytail: four suffixes cover release
+/// retention; reach for a duration crate only if operators ask for more.
+fn parse_duration(text: &str) -> Result<i64> {
+    let (digits, suffix) = text.split_at(text.len().saturating_sub(1));
+    let scale = match suffix {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => bail!("bad duration {text:?} — use e.g. 90s, 30m, 36h, 30d"),
+    };
+    let n: i64 = digits
+        .parse()
+        .ok()
+        .filter(|n| *n > 0)
+        .with_context(|| format!("bad duration {text:?} — use e.g. 90s, 30m, 36h, 30d"))?;
+    Ok(n * scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_duration;
+
+    #[test]
+    fn durations_parse_or_fail_loudly() {
+        assert_eq!(parse_duration("90s").unwrap(), 90);
+        assert_eq!(parse_duration("30m").unwrap(), 1800);
+        assert_eq!(parse_duration("36h").unwrap(), 129600);
+        assert_eq!(parse_duration("30d").unwrap(), 2_592_000);
+        for bad in ["", "d", "30", "-1d", "0h", "1w"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 }

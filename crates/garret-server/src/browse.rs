@@ -175,6 +175,43 @@ pub fn referrers(conn: &Connection, hash: &str) -> Result<Vec<Summary>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// One GC-exempt root (ticket 22), as `GET /api/v1/pins` reports it.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Pin {
+    /// Operator-chosen pin name.
+    pub name: String,
+    /// Store path hash of the pinned root.
+    pub store_path_hash: String,
+    /// Full store path of the pinned root.
+    pub store_path: String,
+    /// Unix time the pin stops protecting; `None` = permanent.
+    pub expires_at: Option<i64>,
+    /// Unix time the pin was created.
+    pub created_at: i64,
+}
+
+/// All pins, expired ones included — the listing is for auditing what the
+/// operator set up, and hiding an expired pin would hide the answer to
+/// "why did my release get evicted?".
+pub fn pins(conn: &Connection) -> Result<Vec<Pin>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.name, p.store_path_hash, o.store_path, p.expires_at, p.created_at
+         FROM pins p JOIN objects o ON o.store_path_hash = p.store_path_hash
+         ORDER BY p.name",
+    )?;
+    Ok(stmt
+        .query_map([], |row| {
+            Ok(Pin {
+                name: row.get(0)?,
+                store_path_hash: row.get(1)?,
+                store_path: row.get(2)?,
+                expires_at: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
 fn name_of(conn: &Connection, hash: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
@@ -255,6 +292,25 @@ mod tests {
                 .unwrap()
                 .objects
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn pin_listing_joins_the_store_path_and_keeps_expired_pins_visible() {
+        let mut conn = db();
+        db::insert_object(&mut conn, &object(&h('a'), "hello-1.0", &[]), 100).unwrap();
+        db::pin(&conn, "release", &h('a'), Some(50), 10).unwrap();
+
+        let got = pins(&conn).unwrap();
+        assert_eq!(
+            got,
+            vec![Pin {
+                name: "release".into(),
+                store_path_hash: h('a'),
+                store_path: format!("/nix/store/{}-hello-1.0", h('a')),
+                expires_at: Some(50),
+                created_at: 10,
+            }]
         );
     }
 

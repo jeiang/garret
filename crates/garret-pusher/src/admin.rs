@@ -75,6 +75,18 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
         },
         Request::Resign => resign(state).map(|resigned| Response::Resign { resigned }),
         Request::Delete { hashes } => delete(state, &hashes).await,
+        Request::Pin {
+            name,
+            hash,
+            expires_at,
+        } => {
+            let conn = state.conn.lock().unwrap();
+            db::pin(&conn, &name, &hash, expires_at, garret_server::now()).map(|()| Response::Pin)
+        }
+        Request::Unpin { name } => {
+            let conn = state.conn.lock().unwrap();
+            db::unpin(&conn, &name).map(|removed| Response::Unpin { removed })
+        }
         Request::Fsck {
             repair,
             verify_sizes,

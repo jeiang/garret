@@ -25,6 +25,23 @@ pub enum Request {
         /// 32-character store-path hashes of the objects to remove.
         hashes: Vec<String>,
     },
+    /// Pin an object as a GC-exempt root (ticket 22): its whole closure is
+    /// protected from eviction while the pin is live. Idempotent — pinning an
+    /// existing name replaces it.
+    Pin {
+        /// Operator-chosen pin name.
+        name: String,
+        /// 32-character store-path hash of the root to protect. Must already
+        /// be in the cache; pinning an unknown hash is a hard error.
+        hash: String,
+        /// Unix time the pin stops protecting; `None` = permanent.
+        expires_at: Option<i64>,
+    },
+    /// Remove a pin by name.
+    Unpin {
+        /// The pin's name.
+        name: String,
+    },
     /// Audit row ⇔ blob consistency (spec 02/03), and optionally repair it.
     Fsck {
         /// Delete dangling rows and size-mismatched rows. Dry-run (report
@@ -81,6 +98,14 @@ pub enum Response {
         /// Hashes that were not in the cache; deleting them is a no-op, but
         /// silently reporting success would hide a typo.
         missing: Vec<String>,
+    },
+    /// Reply to [`Request::Pin`].
+    Pin,
+    /// Reply to [`Request::Unpin`].
+    Unpin {
+        /// False when no pin had that name — reported, not swallowed, so a
+        /// typo does not look like a successful unpin.
+        removed: bool,
     },
     /// Reply to [`Request::Fsck`].
     Fsck {
@@ -149,6 +174,14 @@ mod tests {
                 repair: true,
                 verify_sizes: true,
                 quiesce: true,
+            },
+            Request::Pin {
+                name: "release".into(),
+                hash: "b".repeat(32),
+                expires_at: Some(1234),
+            },
+            Request::Unpin {
+                name: "release".into(),
             },
         ] {
             let line = serde_json::to_string(&request).unwrap();

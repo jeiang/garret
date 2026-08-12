@@ -73,6 +73,8 @@ enum Command {
     },
     /// Print an object's dependency tree
     Tree { hash: String },
+    /// List GC-exempt pins (set with `garret-admin pin`)
+    Pins,
     /// Emit a shell completion script
     Completions { shell: clap_complete::Shell },
 }
@@ -284,6 +286,40 @@ async fn main() -> Result<()> {
             let mut out = String::new();
             browse::render(&tree, 0, &mut out);
             print!("{out}");
+        }
+
+        Command::Pins => {
+            let cfg = cfg.unwrap();
+            let (puller, token) = browse_target(&cfg, &http).await?;
+            let raw = browse::pins(&http, &puller, &token).await?;
+            if cli.json {
+                println!("{raw}");
+                return Ok(());
+            }
+            let pins: Vec<browse::Pin> =
+                serde_json::from_value(raw).context("parsing the pin list")?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            for pin in &pins {
+                let expiry = match pin.expires_at {
+                    None => "permanent".to_owned(),
+                    Some(t) if t <= now => "expired".to_owned(),
+                    // Unix seconds, not a formatted date: no date dependency
+                    // for one column, and --json is the machine surface.
+                    Some(t) => format!("expires at {t}"),
+                };
+                println!(
+                    "{:<20} {}  {} ({expiry})",
+                    pin.name,
+                    &pin.store_path_hash[..8.min(pin.store_path_hash.len())],
+                    pin.store_path,
+                );
+            }
+            if pins.is_empty() {
+                eprintln!("no pins");
+            }
         }
     }
     Ok(())
