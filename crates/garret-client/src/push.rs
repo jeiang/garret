@@ -113,6 +113,8 @@ impl Report {
         }
     }
 
+    /// Clears the bar and emits the totals — the `done` event under `--json`,
+    /// which is what makes a truncated NDJSON stream detectable.
     pub fn finish(&self, summary: &Summary) {
         if let Some(bar) = &self.bar {
             bar.finish_and_clear();
@@ -152,18 +154,34 @@ impl Report {
 /// found redundant server-side — not that they were skipped.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Summary {
+    /// Paths whose upload created a new Object.
     pub pushed: usize,
+    /// Paths another writer beat us to (`exists` or `in-progress` acks).
     pub deduped: usize,
+    /// Paths that failed even after retries; a non-zero count is what turns
+    /// into a non-zero exit code.
     pub failed: usize,
+    /// Total uncompressed NAR bytes across the attempted paths.
     pub nar_bytes: u64,
 }
 
+/// A configured connection to the Pusher: everything [`missing`] and
+/// [`push_all`] need, assembled once per run.
+///
+/// [`missing`]: Pusher::missing
+/// [`push_all`]: Pusher::push_all
 pub struct Pusher {
+    /// Shared HTTP client, reused across the negotiation and every PUT.
     pub http: reqwest::Client,
+    /// Pusher base URL.
     pub endpoint: String,
+    /// Bearer token sent with every request.
     pub token: String,
+    /// Maximum concurrent uploads.
     pub jobs: usize,
+    /// zstd level for compressing NARs on the way out.
     pub zstd_level: i32,
+    /// Retries per path on 429/5xx, with exponential jittered backoff.
     pub max_retries: u32,
 }
 
@@ -171,14 +189,21 @@ pub struct Pusher {
 /// beats re-implementing its database: the client already requires nix.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PathInfo {
+    /// Full store path.
     pub path: String,
+    /// Hash of the uncompressed NAR, `sha256:` prefixed.
     #[serde(rename = "narHash")]
     pub nar_hash: String,
+    /// Uncompressed NAR size in bytes.
     #[serde(rename = "narSize")]
     pub nar_size: i64,
+    /// Direct references as full store paths — the preamble needs names, not
+    /// hashes, or the server cannot produce a valid narinfo (spec 01).
     #[serde(default)]
     pub references: Vec<String>,
+    /// Deriver store path, when nix knows it.
     pub deriver: Option<String>,
+    /// Content-address string for fixed-output and CA paths.
     pub ca: Option<String>,
 }
 

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+/// The user's nix.conf: `$XDG_CONFIG_HOME/nix/nix.conf`.
 pub fn path() -> Result<PathBuf> {
     Ok(crate::config::config_home()?.join("nix").join("nix.conf"))
 }
@@ -33,8 +34,11 @@ pub fn nixos_snippet(puller: &str, public_keys: &[String]) -> String {
     )
 }
 
+/// What [`apply`] did to the nix.conf at the carried path.
 pub enum Outcome {
+    /// The substituter lines were appended.
     Added(PathBuf),
+    /// The URL was already named there; nothing was written.
     AlreadyPresent(PathBuf),
 }
 

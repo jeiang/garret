@@ -1,5 +1,7 @@
 //! Wire types shared by the client and the server.
 
+#![warn(missing_docs)]
+
 pub mod admin;
 
 use serde::{Deserialize, Serialize};
@@ -7,13 +9,18 @@ use serde::{Deserialize, Serialize};
 /// The JSON metadata that prefixes an uploaded NAR (spec 01-push-protocol).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preamble {
+    /// Full `/nix/store/<hash>-<name>` path of the object being pushed.
     pub store_path: String,
+    /// `sha256:` hash of the uncompressed NAR, as `nix path-info` reports it.
     pub nar_hash: String,
+    /// Uncompressed NAR size in bytes.
     pub nar_size: i64,
     /// Full store paths — narinfo prints reference names and the signed
     /// fingerprint uses full paths, neither recoverable from a hash.
     pub references: Vec<String>,
+    /// Store path of the deriving `.drv`, when the local store knows it.
     pub deriver: Option<String>,
+    /// Content-address string for CA paths, passed through to the narinfo.
     pub ca: Option<String>,
 }
 

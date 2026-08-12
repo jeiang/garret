@@ -13,14 +13,21 @@ use rusqlite::{Connection, OpenFlags, params};
 
 use crate::push::{PathInfo, Pusher};
 
+/// The daemon's assembled settings; [`run`](Watcher::run) is its whole life.
 pub struct Watcher {
+    /// Path to the Nix database (normally `/nix/var/nix/db/db.sqlite`).
     pub nix_db: String,
+    /// Where the Watcher Cursor persists across restarts.
     pub cursor_path: PathBuf,
+    /// How long to sleep when a poll finds nothing new.
     pub poll_interval: Duration,
+    /// What not to push.
     pub filters: Filters,
+    /// Failures per path before it lands on the skip-list.
     pub max_attempts: u32,
 }
 
+/// Why a newly-valid path might not be worth pushing (spec 06).
 #[derive(Debug, Default, Clone)]
 pub struct Filters {
     /// Signed by one of these upstreams already — someone else serves it.
@@ -32,8 +39,11 @@ pub struct Filters {
 /// One newly-valid store path, as the Nix database describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidPath {
+    /// `ValidPaths.id` — AUTOINCREMENT, so also the cursor value.
     pub id: i64,
+    /// Full store path.
     pub path: String,
+    /// Its signatures, `key-name:base64` each, for the upstream filter.
     pub sigs: Vec<String>,
 }
 
@@ -102,6 +112,8 @@ pub fn paths_after(conn: &Connection, cursor: i64, limit: usize) -> Result<Vec<V
         .collect::<rusqlite::Result<_>>()?)
 }
 
+/// The newest `ValidPaths.id`, or 0 in an empty store — where a fresh cursor
+/// bootstraps so only paths validated from now on push.
 pub fn max_id(conn: &Connection) -> Result<i64> {
     Ok(
         conn.query_row("SELECT COALESCE(MAX(id), 0) FROM ValidPaths", [], |r| {
@@ -110,10 +122,13 @@ pub fn max_id(conn: &Connection) -> Result<i64> {
     )
 }
 
+/// Reads the persisted cursor; `None` (missing or unparseable file) means
+/// first run and triggers the bootstrap in [`Watcher::run`].
 pub fn read_cursor(path: &std::path::Path) -> Option<i64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Persists the cursor, creating its directory on first write.
 pub fn write_cursor(path: &std::path::Path, cursor: i64) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

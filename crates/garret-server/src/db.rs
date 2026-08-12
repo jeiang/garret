@@ -3,20 +3,34 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
+/// One cached store path: the unit of content in the cache, keyed by its
+/// store path hash. A row exists if and only if its blob does (spec 02).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Object {
+    /// 32-char nix-base32 store path hash — the object key, and the blob key
+    /// via [`crate::storage::key_for`].
     pub store_path_hash: String,
+    /// Full store path, e.g. `/nix/store/<hash>-<name>`.
     pub store_path: String,
+    /// Basename after the hash (`hello-1.0`); indexed for browse search.
     pub name: String,
+    /// Hash of the uncompressed NAR, `sha256:<nix-base32>` — client-claimed.
     pub nar_hash: String,
+    /// Size of the uncompressed NAR in bytes.
     pub nar_size: i64,
+    /// Hash of the stored zstd blob, computed server-side during upload.
     pub file_hash: String,
+    /// Size of the stored zstd blob in bytes; what quota accounting counts.
     pub file_size: i64,
+    /// Deriving `.drv` store path, when the client reported one.
     pub deriver: Option<String>,
+    /// Content-address string for CA paths; input-addressed paths have none.
     pub ca: Option<String>,
     /// Reference basenames (`<hash>-<name>`), as narinfo prints them.
     pub references: Vec<String>,
+    /// Ed25519 signatures (`<key-name>:<base64>`), computed on write.
     pub sigs: Vec<String>,
+    /// OIDC subject that pushed this object, kept for audit.
     pub pushed_by: Option<String>,
 }
 
@@ -59,6 +73,8 @@ CREATE TABLE IF NOT EXISTS stats (
 INSERT OR IGNORE INTO stats (id, total_bytes) VALUES (1, 0);
 "#;
 
+/// Opens the database with WAL and the pragmas both services rely on.
+///
 /// `create` belongs to the Pusher alone — it owns the schema. The Puller opens
 /// read-write (it does debounced last-accessed bumps, spec 02) but must never
 /// conjure a database: an empty one at a typo'd path would serve silent 404s.
@@ -79,6 +95,8 @@ pub fn open(path: &str, create: bool) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Applies the schema (idempotent `IF NOT EXISTS`). Pusher-only, like every
+/// other write.
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA).context("applying schema")
 }
@@ -177,6 +195,7 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
     Ok(())
 }
 
+/// Fetches an object with its references sorted, ready for narinfo rendering.
 pub fn get_object(conn: &Connection, hash: &str) -> Result<Option<Object>> {
     let mut obj = conn
         .query_row(
@@ -215,6 +234,8 @@ pub fn get_object(conn: &Connection, hash: &str) -> Result<Option<Object>> {
     Ok(obj)
 }
 
+/// Whether the cache holds this store path hash — and, by the row ⇒ blob
+/// invariant, its blob.
 pub fn exists(conn: &Connection, hash: &str) -> Result<bool> {
     Ok(conn
         .query_row(
@@ -226,6 +247,8 @@ pub fn exists(conn: &Connection, hash: &str) -> Result<bool> {
         .is_some())
 }
 
+/// Current cache usage from the maintained `stats` counter — a cheap read,
+/// which is what lets every GC tick check quota without summing rows.
 pub fn total_bytes(conn: &Connection) -> Result<i64> {
     Ok(
         conn.query_row("SELECT total_bytes FROM stats WHERE id = 1", [], |r| {

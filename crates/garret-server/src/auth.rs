@@ -45,16 +45,19 @@ struct KeyCache {
     fetched_at: Option<Instant>,
 }
 
+/// Validates bearer tokens against a fixed set of trusted issuers, caching
+/// each issuer's JWKS in memory and refetching on key rotation.
 pub struct Authenticator {
     issuers: Vec<Issuer>,
     http: reqwest::Client,
 }
 
-/// The authenticated caller; stored as `pushed_by` for audit.
+/// The authenticated caller as `<issuer>#<sub>`; stored as `pushed_by` for audit.
 #[derive(Debug, Clone)]
 pub struct Subject(pub String);
 
 impl Authenticator {
+    /// Fails on an empty issuer list: garret has no auth-disable mode (spec 04).
     pub fn new(issuers: Vec<IssuerConfig>) -> Result<Self> {
         if issuers.is_empty() {
             bail!("no OIDC issuers configured — garret has no auth-disable mode (spec 04)");

@@ -7,7 +7,9 @@ use ed25519_dalek::{Signer, SigningKey};
 
 use crate::db::Object;
 
+/// A named ed25519 signing key, in nix's secret-key format.
 pub struct SigningKeyFile {
+    /// The key name signatures are prefixed with (`cache.example.org-1`).
     pub name: String,
     key: SigningKey,
 }
@@ -30,6 +32,7 @@ impl SigningKeyFile {
         })
     }
 
+    /// The public half as `<name>:<base64>` — what goes in `trusted-public-keys`.
     pub fn public_key(&self) -> String {
         format!(
             "{}:{}",

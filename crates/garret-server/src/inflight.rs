@@ -7,6 +7,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// The shared set of store path hashes with an upload in progress. Clones
+/// share the set.
 #[derive(Default, Clone)]
 pub struct InFlight(Arc<Mutex<HashSet<String>>>);
 
@@ -18,6 +20,7 @@ pub struct Claim {
 }
 
 impl InFlight {
+    /// An empty set.
     pub fn new() -> Self {
         Self::default()
     }
@@ -31,14 +34,18 @@ impl InFlight {
         })
     }
 
+    /// Whether an upload of this path is live — the GC orphan sweep's check
+    /// before aborting a multipart.
     pub fn contains(&self, hash: &str) -> bool {
         self.0.lock().unwrap().contains(hash)
     }
 
+    /// How many uploads are in progress; exported as a gauge.
     pub fn len(&self) -> usize {
         self.0.lock().unwrap().len()
     }
 
+    /// True when no upload is in progress.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

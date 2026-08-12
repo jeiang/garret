@@ -4,25 +4,40 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// One Object in a `garret list` page, as the browse API summarizes it.
 #[derive(Debug, Deserialize)]
 pub struct Summary {
+    /// The store path hash — the Object's key in the cache.
     pub hash: String,
+    /// The store path's name part (everything after `<hash>-`).
     pub name: String,
+    /// Uncompressed NAR size in bytes.
     pub nar_size: i64,
+    /// Size of the stored Blob — the compressed NAR — in bytes.
     pub file_size: i64,
 }
 
+/// One page of `garret list` results.
 #[derive(Debug, Deserialize)]
 pub struct Page {
+    /// The Objects on this page.
     pub objects: Vec<Summary>,
+    /// Opaque cursor for the next page; `None` on the last one.
     pub next_cursor: Option<String>,
 }
 
+/// One node of a `garret tree` dependency tree.
 #[derive(Debug, Deserialize)]
 pub struct TreeNode {
+    /// The store path's name part.
     pub name: String,
+    /// The cache does not hold this dependency (referenced but never pushed,
+    /// or evicted).
     pub missing: bool,
+    /// The server pruned this subtree because the node already appeared
+    /// elsewhere in the tree; [`render`] marks it `(…)`.
     pub truncated: bool,
+    /// Direct dependencies; empty when missing or truncated.
     pub children: Vec<TreeNode>,
 }
 
@@ -54,6 +69,7 @@ pub async fn list(
         .context("parsing the object list")
 }
 
+/// Fetches an Object's dependency tree, verbatim — see [`list`] for why.
 pub async fn tree(
     http: &reqwest::Client,
     puller: &str,

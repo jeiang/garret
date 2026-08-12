@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
+/// The discovery document: what the server tells any anonymous caller about
+/// itself, and everything `render` needs to write a config.
 #[derive(Debug, Deserialize)]
 pub struct Discovery {
     /// Absent when the Pusher has no `puller_endpoint` configured.
@@ -22,13 +24,24 @@ pub struct Discovery {
     pub oidc: Option<Oidc>,
 }
 
+/// The advertised OIDC settings, destined for the config's `[oidc]` section.
 #[derive(Debug, Deserialize)]
 pub struct Oidc {
+    /// Issuer base URL.
     pub issuer: String,
+    /// The `aud` claim the Pusher validates tokens against.
     pub audience: String,
+    /// The device flow's public client id; `None` when no issuer sets one,
+    /// which makes `garret login` impossible against this server.
     pub client_id: Option<String>,
 }
 
+/// Fetches `GET /api/v1/discovery` from the Pusher, anonymously.
+///
+/// Distinguishes one failure precisely: a 404 *or* 401 means a server that
+/// predates the discovery endpoint (discovery needs no token, so a 401 can
+/// only be an auth layer wrapping every route), and says so rather than
+/// letting it read as a typo'd URL or bad credentials.
 pub async fn fetch(http: &reqwest::Client, endpoint: &str) -> Result<Discovery> {
     let url = format!("{}/api/v1/discovery", endpoint.trim_end_matches('/'));
     let response = http

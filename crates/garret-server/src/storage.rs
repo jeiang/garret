@@ -20,6 +20,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::S3Config;
 
+/// An S3 client bound to the cache's bucket. Cheap to clone — the inner
+/// client is already shared.
 #[derive(Clone)]
 pub struct Storage {
     client: Client,
@@ -29,7 +31,9 @@ pub struct Storage {
 /// Bounds every upload's memory: `part_size` bytes per in-flight part, with
 /// the total across all concurrent uploads capped by a shared semaphore.
 pub struct UploadLimits {
+    /// Bytes per part; also the single-`PutObject` threshold (spec 03).
     pub part_size: usize,
+    /// Concurrent part uploads per NAR.
     pub max_parts_in_flight: usize,
     /// One permit per part-sized buffer, shared process-wide.
     pub part_slots: Arc<Semaphore>,
@@ -47,6 +51,7 @@ impl UploadLimits {
         }
     }
 
+    /// How many part-sized buffers may exist at once, process-wide.
     pub fn total_slots(&self) -> usize {
         self.part_slots.available_permits()
     }
@@ -60,6 +65,8 @@ impl UploadLimits {
     }
 }
 
+/// The blob key for an object: flat `nar/<hash>.nar.zst`, derivable from the
+/// DB row and vice versa (spec 03).
 pub fn key_for(store_path_hash: &str) -> String {
     format!("nar/{store_path_hash}.nar.zst")
 }
@@ -114,6 +121,8 @@ async fn collect(
 }
 
 impl Storage {
+    /// Builds a client from config: explicit credentials when set, otherwise
+    /// the AWS default chain (env vars via EnvironmentFile in production).
     pub async fn new(cfg: &S3Config) -> Result<Self> {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest()).region(
             aws_sdk_s3::config::Region::new(
@@ -141,6 +150,8 @@ impl Storage {
         })
     }
 
+    /// Single-request `PutObject` for bodies already in memory (at most one
+    /// part; larger uploads go through [`Storage::put_streaming`]).
     pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<()> {
         let bytes = body.len() as u64;
         self.client

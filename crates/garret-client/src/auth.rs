@@ -6,13 +6,21 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+/// What `garret login` persists: enough to mint fresh access tokens without
+/// re-running the device flow. Never the access token itself — that is
+/// short-lived by design and re-minted per run.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredToken {
+    /// The rotating refresh token. Each refresh may replace it, and the
+    /// replacement must be persisted or the next run is locked out.
     pub refresh_token: String,
+    /// Issuer URL the token came from; refresh goes back to the same one.
     pub issuer: String,
+    /// The public client id the device flow authenticated as.
     pub client_id: String,
 }
 
+/// `$XDG_CONFIG_HOME/garret/token.json` — where the refresh token lives.
 pub fn token_path() -> Result<PathBuf> {
     Ok(crate::config::config_home()?
         .join("garret")
@@ -33,7 +41,9 @@ pub fn logout() -> Result<PathBuf> {
 /// The `sub`, `aud` and `exp` a token carries, for `garret whoami`.
 #[derive(Debug, Default, Deserialize)]
 pub struct Claims {
+    /// Subject — who the issuer says this token belongs to.
     pub sub: Option<String>,
+    /// Expiry as a Unix timestamp; `None` if the issuer omitted it.
     pub exp: Option<i64>,
     /// `aud` is a string or an array of strings depending on the issuer.
     #[serde(default)]
@@ -56,6 +66,7 @@ pub fn peek_claims(token: &str) -> Result<Claims> {
     serde_json::from_slice(&bytes).context("token payload is not JSON")
 }
 
+/// Writes the token file mode 0600, creating `~/.config/garret/` if needed.
 pub fn save_token(token: &StoredToken) -> Result<()> {
     let path = token_path()?;
     std::fs::create_dir_all(path.parent().unwrap())?;
@@ -77,12 +88,16 @@ fn restrict(_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The two OIDC endpoints the client uses, out of everything discovery offers.
 #[derive(Debug, Deserialize)]
 pub struct Endpoints {
+    /// Where the device flow asks for a user code (RFC 8628).
     pub device_authorization_endpoint: String,
+    /// Where every grant type is exchanged for tokens.
     pub token_endpoint: String,
 }
 
+/// Fetches the issuer's `/.well-known/openid-configuration`.
 pub async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints> {
     let url = format!(
         "{}/.well-known/openid-configuration",
@@ -326,7 +341,9 @@ pub fn read_client_credentials(path: &str) -> Result<(String, String)> {
     Ok((id.to_owned(), secret.to_owned()))
 }
 
-/// Resolves a bearer token from whatever this environment provides.
+/// Resolves a bearer token from whatever this environment provides, in order:
+/// `GARRET_TOKEN`, a GitHub Actions runner, then the stored refresh token
+/// (failing with "run `garret login`" when none of the three applies).
 pub async fn bearer_token(
     http: &reqwest::Client,
     audience: &str,

@@ -3,16 +3,23 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// The whole client config, `~/.config/garret/config.toml` as written by
+/// `garret login`. Unknown keys are rejected so a typo'd option fails loudly
+/// instead of silently meaning its default.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Pusher base URL.
     pub endpoint: String,
+    /// How to get a token — every command that talks to a server needs one.
     pub oidc: Oidc,
+    /// Concurrent uploads. Network-bound, so the default is not a core count.
     #[serde(default = "jobs")]
     pub jobs: usize,
+    /// zstd level for NAR compression (client-side, per the push protocol).
     #[serde(default = "zstd_level")]
     pub zstd_level: i32,
+    /// Upload attempts per path beyond the first, for 429/5xx failures only.
     #[serde(default = "max_retries")]
     pub max_retries: u32,
     /// Puller base URL — `list` and `tree` query the browse API, not the Pusher.
@@ -23,6 +30,7 @@ pub struct Config {
     /// Written by `garret login` from the server's discovery document.
     #[serde(default)]
     pub public_keys: Vec<String>,
+    /// Store watcher settings; defaulted so laptop configs never mention them.
     #[serde(default)]
     pub watch: Watch,
 }
@@ -33,16 +41,24 @@ pub struct Config {
 pub struct Watch {
     /// `client_id:client_secret` for this machine's confidential client.
     pub credentials_file: Option<String>,
+    /// The Nix database the watcher polls for newly validated paths.
     #[serde(default = "nix_db")]
     pub nix_db: String,
+    /// Where the Watcher Cursor persists across restarts.
     #[serde(default = "cursor_path")]
     pub cursor_path: String,
+    /// Seconds between database polls when the backlog is empty.
     #[serde(default = "poll_interval")]
     pub poll_interval_secs: u64,
+    /// Key names whose signatures mean "someone else already serves this
+    /// path" — such paths are not pushed. Defaults to cache.nixos.org's.
     #[serde(default = "upstream_keys")]
     pub upstream_keys: Vec<String>,
+    /// Substring patterns; a matching store path is never pushed.
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
+    /// Failed pushes per path before it lands on the skip-list and the
+    /// watcher moves on.
     #[serde(default = "max_attempts")]
     pub max_attempts: u32,
 }
@@ -67,9 +83,11 @@ fn max_attempts() -> u32 {
     5
 }
 
+/// Which issuer to get tokens from, and what to ask it for (spec 04-auth).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Oidc {
+    /// Issuer base URL; OIDC discovery hangs off it.
     pub issuer: String,
     /// Only the device flow needs one; GitHub Actions and client_credentials
     /// callers identify themselves other ways.
@@ -109,10 +127,14 @@ pub fn config_home() -> Result<std::path::PathBuf> {
         .context("neither XDG_CONFIG_HOME nor HOME is set")
 }
 
+/// The default config location: `$XDG_CONFIG_HOME/garret/config.toml`.
 pub fn path() -> Result<std::path::PathBuf> {
     Ok(config_home()?.join("garret").join("config.toml"))
 }
 
+/// Loads the config from `explicit` (the `--config` flag) or the default
+/// path, then applies the `GARRET_ENDPOINT` override. A missing file is an
+/// error that names `garret login` as the fix.
 pub fn load(explicit: Option<&str>) -> Result<Config> {
     let path = match explicit {
         Some(p) => std::path::PathBuf::from(p),
