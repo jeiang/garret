@@ -29,7 +29,13 @@ version, seed, and a `label` (default `os-arch`, `--label` /
 the diff tool refuses to compare runs across labels, so a laptop
 baseline can never silently masquerade as the cgroup-limited sandbox's.
 A limited environment encodes its caps in the label
-(e.g. `linux-x86_64-2cpu-2g`).
+(e.g. `linux-x86_64-2cpu-2g`), and applies them via `GARRET_WRAP` — a
+command prefix (`taskset -c 0`, a systemd-run scope, …) that
+`bench-local` puts on the garret services and the bench client but
+**not** on Garage or the builds: in real usage the S3-compatible service
+is upstream of the sandbox, so the limits measure garret, not the
+stand-in. (Benchmarking a fully local setup with Garage under its own
+constraints is recorded as a possible future scenario, not built.)
 
 ## Scenarios and pass/fail
 

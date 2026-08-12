@@ -46,7 +46,7 @@ rss_log="$root/rss.log"
 say "running all scenarios"
 GARRET_TOKEN=$(cat "$root/token")
 export GARRET_TOKEN
-"$bin"/garret-bench all \
+${GARRET_WRAP:-} "$bin"/garret-bench all \
   --endpoint "$pusher_url" \
   --puller-endpoint "$puller_url" \
   --json "$out" \
