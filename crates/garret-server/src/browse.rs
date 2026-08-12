@@ -5,31 +5,44 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
+/// One object in a listing: the fields the browse UI shows, nothing heavier.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct Summary {
+    /// Store path hash — the object key.
     pub hash: String,
+    /// Basename after the hash (`hello-1.0`).
     pub name: String,
+    /// Full store path.
     pub store_path: String,
+    /// Uncompressed NAR size in bytes.
     pub nar_size: i64,
+    /// Stored (compressed) blob size in bytes.
     pub file_size: i64,
+    /// Unix time the object was pushed.
     pub created_at: i64,
 }
 
+/// One page of listing results.
 #[derive(Debug, Serialize)]
 pub struct Page {
+    /// The page's objects, newest first.
     pub objects: Vec<Summary>,
     /// Opaque; pass back as `cursor` for the next page. Absent means the end.
     pub next_cursor: Option<String>,
 }
 
+/// One node of a dependency tree.
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct TreeNode {
+    /// Store path hash of this reference.
     pub hash: String,
+    /// Reference basename for children; the object's `name` at the root.
     pub name: String,
     /// Absent from the cache: shown, but marked (spec 07).
     pub missing: bool,
     /// Already expanded elsewhere in this tree; children are omitted.
     pub truncated: bool,
+    /// This node's references, empty when missing or truncated.
     pub children: Vec<TreeNode>,
 }
 

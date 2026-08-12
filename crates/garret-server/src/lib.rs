@@ -1,4 +1,5 @@
 //! Shared server internals: config, DB, S3 storage, narinfo/signing.
+#![warn(missing_docs)]
 
 pub mod auth;
 pub mod browse;
@@ -12,6 +13,7 @@ pub mod storage;
 
 use anyhow::Result;
 
+/// Current unix time in seconds, as stored in `created_at`/`last_accessed_at`.
 pub fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -19,6 +21,9 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Reads and parses every configured signing key file, failing on the first
+/// unreadable or malformed one — a partial key set would sign with fewer keys
+/// than the rotation plan expects.
 pub fn load_signing_keys(paths: &[String]) -> Result<Vec<narinfo::SigningKeyFile>> {
     paths
         .iter()

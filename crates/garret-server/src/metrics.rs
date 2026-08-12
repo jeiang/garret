@@ -24,6 +24,8 @@ fn latency_buckets() -> Vec<f64> {
     ]
 }
 
+/// Installs the global Prometheus recorder with the spec's bucket bounds and
+/// sets `garret_build_info`. Call once, before any metric is touched.
 pub fn install(service: &str) -> Result<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(Matcher::Suffix("_bytes".into()), &byte_buckets())?

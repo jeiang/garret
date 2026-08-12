@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A command sent by `garret-admin` to the Pusher's admin socket.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "kebab-case")]
 pub enum Request {
@@ -20,34 +21,57 @@ pub enum Request {
     /// Remove objects by store-path hash, row and blob. The operator escape
     /// hatch for an object that must go before GC would reach it: a bad push,
     /// or one written by a server version whose metadata is now known wrong.
-    Delete { hashes: Vec<String> },
+    Delete {
+        /// 32-character store-path hashes of the objects to remove.
+        hashes: Vec<String>,
+    },
 }
 
+/// The Pusher's reply to a [`Request`]; variants mirror the request commands,
+/// plus [`Response::Error`] for any failure.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Response {
+    /// Reply to [`Request::Status`].
     Status {
+        /// Number of objects in the cache.
         objects: i64,
+        /// Total compressed bytes stored, the figure quota is judged against.
         total_bytes: i64,
+        /// Configured quota in bytes; `None` means unlimited.
         quota_bytes: Option<u64>,
+        /// Uploads currently being received.
         uploads_in_flight: usize,
     },
+    /// Reply to [`Request::GcRun`].
     Gc {
+        /// Objects evicted by this pass.
         evicted: usize,
+        /// Compressed bytes reclaimed.
         bytes_freed: i64,
+        /// True when the pass stopped because no evictable object remained
+        /// while usage was still above the low watermark — everything left
+        /// is referenced.
         candidates_exhausted: bool,
     },
+    /// Reply to [`Request::Resign`].
     Resign {
+        /// Objects whose narinfo signatures were rewritten.
         resigned: usize,
     },
+    /// Reply to [`Request::Delete`].
     Delete {
+        /// Objects actually removed.
         deleted: usize,
+        /// Compressed bytes reclaimed.
         bytes_freed: i64,
         /// Hashes that were not in the cache; deleting them is a no-op, but
         /// silently reporting success would hide a typo.
         missing: Vec<String>,
     },
+    /// The command failed; `message` is operator-facing text.
     Error {
+        /// Human-readable description of what went wrong.
         message: String,
     },
 }
