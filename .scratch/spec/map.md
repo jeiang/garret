@@ -178,6 +178,11 @@ measured. Findings and proposals:
   [25 pull-path budgets](issues/25-pull-path-budgets.md) (implemented;
   its measured tail cost spawned
   [26 read-connection pool](issues/26-puller-read-connection-pool.md),
-  a later investigation)
+  a later investigation),
+  [27 S3 operation timeout](issues/27-s3-operation-timeout.md)
+  (implemented; found live during the bench investigation),
+  [28 pull concurrency sweep](issues/28-pull-concurrency-sweep.md)
+  (the harness only ever measures c=20; ticket 26's own revisit
+  condition needs the curve, not one point)
 - Non-goals otherwise revalidated: chunking/dedup, custom pull protocol,
   upload resume, OTLP, multi-tenancy, containers.
