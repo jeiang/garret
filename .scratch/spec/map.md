@@ -170,14 +170,23 @@ measured. Findings and proposals:
 - Research: [similar-projects-survey](research/similar-projects-survey.md),
   [benchmark-baseline-2026-08](research/benchmark-baseline-2026-08.md)
 - Tickets: [19 daemon push](issues/19-daemon-push.md) (reopens the
-  post-build-hook out-of-scope item above with cachix/MNC evidence),
+  post-build-hook out-of-scope item above with cachix/MNC evidence; still
+  open — no `daemon`/`enqueue` subcommand exists),
   [20 sha256 acceleration](issues/20-sha256-hardware-acceleration.md)
-  (measured 5.2x), [21 upstream filter](issues/21-upstream-filter.md),
+  (implemented same-day as filed, commit 319bf70; status line was stale
+  until 2026-08-12),
+  [21 upstream filter](issues/21-upstream-filter.md) (implemented
+  same-day as filed; status line was stale until 2026-08-12),
   [22 closure pinning](issues/22-closure-pinning.md),
   [23 fsck](issues/23-fsck.md), [24 doctor](issues/24-doctor.md),
   [25 pull-path budgets](issues/25-pull-path-budgets.md) (implemented;
   its measured tail cost spawned
   [26 read-connection pool](issues/26-puller-read-connection-pool.md),
-  a later investigation)
+  a later investigation),
+  [27 S3 operation timeout](issues/27-s3-operation-timeout.md)
+  (implemented; found live during the bench investigation),
+  [28 pull concurrency sweep](issues/28-pull-concurrency-sweep.md)
+  (the harness only ever measures c=20; ticket 26's own revisit
+  condition needs the curve, not one point)
 - Non-goals otherwise revalidated: chunking/dedup, custom pull protocol,
   upload resume, OTLP, multi-tenancy, containers.
