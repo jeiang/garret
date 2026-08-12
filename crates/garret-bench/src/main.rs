@@ -208,6 +208,14 @@ struct PullResults {
     zero_failures: bool,
 }
 
+/// Push-scenario tallies shared across concurrent workers.
+#[derive(Default)]
+struct Counters {
+    shed: AtomicU64,
+    dropped: AtomicU64,
+    wire: AtomicU64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -320,9 +328,7 @@ async fn run_push(
         cli.seed
     );
 
-    let shed = Arc::new(AtomicU64::new(0));
-    let dropped = Arc::new(AtomicU64::new(0));
-    let wire = Arc::new(AtomicU64::new(0));
+    let counters = Arc::new(Counters::default());
 
     // Baseline first, one at a time, over the same corpus under different
     // keys: same sizes and compressibility, so the medians are comparable and
@@ -337,9 +343,7 @@ async fn run_push(
             token,
             entry,
             args.zstd_level,
-            &shed,
-            &dropped,
-            &wire,
+            &counters,
         )
         .await?;
         // Floored at 1 ms: the ratio below divides by this.
@@ -353,27 +357,21 @@ async fn run_push(
         baseline.len()
     );
 
-    wire.store(0, Ordering::Relaxed);
+    counters.wire.store(0, Ordering::Relaxed);
     let started = Instant::now();
 
     let latencies: Vec<(usize, Option<Duration>)> = stream::iter(entries.into_iter().enumerate())
         .map(|(index, entry)| {
-            let (http, endpoint, token, shed, dropped, wire) = (
+            let (http, endpoint, token, counters) = (
                 http.clone(),
                 cli.endpoint.clone(),
                 token.to_owned(),
-                shed.clone(),
-                dropped.clone(),
-                wire.clone(),
+                counters.clone(),
             );
             let zstd_level = args.zstd_level;
             async move {
                 let started = Instant::now();
-                match push(
-                    &http, &endpoint, &token, &entry, zstd_level, &shed, &dropped, &wire,
-                )
-                .await
-                {
+                match push(&http, &endpoint, &token, &entry, zstd_level, &counters).await {
                     Ok(()) => (index, Some(started.elapsed())),
                     Err(e) => {
                         eprintln!("push {} failed: {e:#}", entry.name);
@@ -387,7 +385,7 @@ async fn run_push(
         .await;
 
     let wall = started.elapsed();
-    let wire_bytes = wire.load(Ordering::Relaxed);
+    let wire_bytes = counters.wire.load(Ordering::Relaxed);
     let mut ok: Vec<u64> = latencies
         .iter()
         .filter_map(|(_, l)| l.map(|d| d.as_millis() as u64))
@@ -416,8 +414,8 @@ async fn run_push(
         wire_bytes,
         pushed: ok.len() as u64,
         failed,
-        shed_retries: shed.load(Ordering::Relaxed),
-        dropped_retries: dropped.load(Ordering::Relaxed),
+        shed_retries: counters.shed.load(Ordering::Relaxed),
+        dropped_retries: counters.dropped.load(Ordering::Relaxed),
         wall_seconds: wall.as_secs_f64(),
         nar_mib_per_sec: corpus_bytes as f64 / mib / wall.as_secs_f64(),
         wire_mib_per_sec: wire_bytes as f64 / mib / wall.as_secs_f64(),
@@ -593,13 +591,13 @@ async fn push(
     token: &str,
     entry: &corpus::Entry,
     level: i32,
-    shed: &AtomicU64,
-    dropped: &AtomicU64,
-    wire: &AtomicU64,
+    counters: &Counters,
 ) -> Result<()> {
     let mut body = preamble_for(entry).to_framed()?;
     body.extend(zstd::encode_all(entry.body().as_slice(), level).context("compressing")?);
-    wire.fetch_add(body.len() as u64, Ordering::Relaxed);
+    counters
+        .wire
+        .fetch_add(body.len() as u64, Ordering::Relaxed);
 
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
@@ -617,7 +615,7 @@ async fn push(
             // broken pipe instead. Idempotent by negotiation, so retried on
             // the same schedule as an explicit shed.
             Err(e) if garret_client::push::connection_dropped(&e) => {
-                dropped.fetch_add(1, Ordering::Relaxed);
+                counters.dropped.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
                 delay *= 2;
                 continue;
@@ -626,7 +624,7 @@ async fn push(
         };
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            shed.fetch_add(1, Ordering::Relaxed);
+            counters.shed.fetch_add(1, Ordering::Relaxed);
             tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
             delay *= 2;
             continue;
