@@ -67,6 +67,10 @@ struct Results {
     pushed: u64,
     failed: u64,
     shed_retries: u64,
+    /// Uploads retried because the connection died mid-body — usually the
+    /// server's early `exists`/429 reply closing the socket before the body
+    /// was written out, not a real network fault.
+    dropped_retries: u64,
     wall_seconds: f64,
     /// Per-NAR latencies under load; the rule is about the tail, not the mean.
     median_ms: u64,
@@ -112,6 +116,7 @@ async fn main() -> Result<()> {
         }
     };
     let shed = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
 
     // Baseline first, one at a time, over the same corpus under different
     // keys: same sizes and compressibility, so the medians are comparable and
@@ -120,7 +125,16 @@ async fn main() -> Result<()> {
     let mut baseline = Vec::new();
     for entry in &baseline_entries {
         let started = Instant::now();
-        push(&http, &cli.endpoint, &token, entry, cli.zstd_level, &shed).await?;
+        push(
+            &http,
+            &cli.endpoint,
+            &token,
+            entry,
+            cli.zstd_level,
+            &shed,
+            &dropped,
+        )
+        .await?;
         // Floored at 1 ms: the ratio below divides by this.
         baseline.push((started.elapsed().as_millis() as u64).max(1));
     }
@@ -136,15 +150,26 @@ async fn main() -> Result<()> {
 
     let latencies: Vec<(usize, Option<Duration>)> = stream::iter(entries.into_iter().enumerate())
         .map(|(index, entry)| {
-            let (http, endpoint, token, shed) = (
+            let (http, endpoint, token, shed, dropped) = (
                 http.clone(),
                 cli.endpoint.clone(),
                 token.clone(),
                 shed.clone(),
+                dropped.clone(),
             );
             async move {
                 let started = Instant::now();
-                match push(&http, &endpoint, &token, &entry, cli.zstd_level, &shed).await {
+                match push(
+                    &http,
+                    &endpoint,
+                    &token,
+                    &entry,
+                    cli.zstd_level,
+                    &shed,
+                    &dropped,
+                )
+                .await
+                {
                     Ok(()) => (index, Some(started.elapsed())),
                     Err(e) => {
                         eprintln!("push {} failed: {e:#}", entry.name);
@@ -187,6 +212,7 @@ async fn main() -> Result<()> {
         pushed: ok.len() as u64,
         failed,
         shed_retries: shed.load(Ordering::Relaxed),
+        dropped_retries: dropped.load(Ordering::Relaxed),
         wall_seconds: wall.as_secs_f64(),
         median_ms: median,
         p99_ms: p99,
@@ -233,6 +259,7 @@ async fn push(
     entry: &corpus::Entry,
     level: i32,
     shed: &AtomicU64,
+    dropped: &AtomicU64,
 ) -> Result<()> {
     let preamble = Preamble {
         store_path: entry.store_path(),
@@ -250,13 +277,27 @@ async fn push(
 
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
-        let response = http
+        let response = match http
             .put(format!("{endpoint}/api/v1/nar/{}", entry.hash))
             .bearer_auth(token)
             .body(body.clone())
             .send()
             .await
-            .context("sending the upload")?;
+        {
+            Ok(response) => response,
+            // The server answers `exists` and 429 sheds before reading the
+            // body, then closes the connection (spec 01) — a client still
+            // writing sometimes gets the RST before the response and sees a
+            // broken pipe instead. Idempotent by negotiation, so retried on
+            // the same schedule as an explicit shed.
+            Err(e) if garret_client::push::connection_dropped(&e) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
+                delay *= 2;
+                continue;
+            }
+            Err(e) => return Err(e).context("sending the upload"),
+        };
 
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             shed.fetch_add(1, Ordering::Relaxed);
@@ -273,5 +314,5 @@ async fn push(
         }
         return Ok(());
     }
-    bail!("still shedding after 6 attempts")
+    bail!("still shed or dropped after 6 attempts")
 }
