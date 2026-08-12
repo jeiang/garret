@@ -1,7 +1,8 @@
 # 23 — `garret-admin fsck`: DB↔S3 consistency audit and repair
 
-Status: proposed (2026-08 review). Evidence:
-[survey](../research/similar-projects-survey.md).
+Status: implemented (2026-08; spec docs updated).
+
+Evidence: [survey](../research/similar-projects-survey.md).
 
 ## Problem
 

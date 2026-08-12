@@ -16,7 +16,10 @@ SQLite, one file, WAL mode, shared by both services on the same host.
   memory; the object row is inserted only after the S3 blob completes.
 
 **Invariant: row exists ⇒ blob exists.** Crashes leave no dangling DB
-state; orphaned blobs/multiparts are swept by GC.
+state; orphaned blobs/multiparts are swept by GC. `garret-admin fsck`
+(spec [05-gc](05-gc.md#garret-admin-fsck)) audits this invariant against
+the actual bucket contents and can repair drift the sweep never sees —
+a manually deleted S3 object, an interrupted restore, bucket corruption.
 
 ## Schema
 

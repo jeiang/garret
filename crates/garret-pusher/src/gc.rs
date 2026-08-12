@@ -124,20 +124,8 @@ impl Gc {
             let conn = self.conn.lock().unwrap();
             db::all_hashes(&conn)?
         };
-
-        let mut orphans = Vec::new();
-        for (key, age) in self.storage.list_blobs().await? {
-            let hash = key
-                .strip_prefix("nar/")
-                .and_then(|k| k.strip_suffix(".nar.zst"))
-                .unwrap_or_default();
-            if hash.is_empty() || known.contains(hash) || self.in_flight.contains(hash) {
-                continue;
-            }
-            if age >= grace {
-                orphans.push(key);
-            }
-        }
+        let blobs = self.storage.list_blobs().await?;
+        let orphans = orphan_keys(&blobs, &known, &self.in_flight, grace);
 
         let aborted = self
             .storage
@@ -156,5 +144,63 @@ impl Gc {
             );
         }
         Ok(count)
+    }
+}
+
+/// Blob keys with no DB row, past both guards: an upload in the in-flight
+/// set, or younger than `grace` — a row lands only after its blob
+/// completes, so a rowless blob might just be mid-push. Shared with
+/// `garret-admin fsck`'s read-only mirror-image check.
+pub(crate) fn orphan_keys(
+    blobs: &[(String, Duration, i64)],
+    known: &std::collections::HashSet<String>,
+    in_flight: &InFlight,
+    grace: Duration,
+) -> Vec<String> {
+    blobs
+        .iter()
+        .filter_map(|(key, age, _size)| {
+            let hash = storage::hash_for(key)?;
+            if known.contains(hash) || in_flight.contains(hash) || *age < grace {
+                return None;
+            }
+            Some(key.clone())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphan_keys_excludes_known_in_flight_and_young_blobs() {
+        let grace = Duration::from_secs(86400);
+        let blobs = vec![
+            (
+                "nar/known.nar.zst".to_string(),
+                Duration::from_secs(90000),
+                1,
+            ),
+            (
+                "nar/uploading.nar.zst".to_string(),
+                Duration::from_secs(90000),
+                1,
+            ),
+            ("nar/young.nar.zst".to_string(), Duration::from_secs(10), 1),
+            (
+                "nar/stale.nar.zst".to_string(),
+                Duration::from_secs(90000),
+                1,
+            ),
+        ];
+        let known: std::collections::HashSet<String> = ["known".to_string()].into();
+        let in_flight = InFlight::new();
+        let _claim = in_flight.claim("uploading").unwrap();
+
+        assert_eq!(
+            orphan_keys(&blobs, &known, &in_flight, grace),
+            vec!["nar/stale.nar.zst".to_string()],
+        );
     }
 }

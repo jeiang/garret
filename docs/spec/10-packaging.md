@@ -37,6 +37,7 @@ Pusher runs).
 | `resign` | socket — backfill signatures after adding a key |
 | `gc run` | socket — trigger a GC pass |
 | `status` | socket — object count, usage vs quota, in-flight uploads |
+| `fsck [--repair] [--verify-sizes] [--quiesce] [--json]` | socket — audit row⇔blob consistency, optionally repair |
 
 ## NixOS modules & flake outputs
 

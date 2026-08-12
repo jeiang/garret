@@ -12,7 +12,7 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
-use crate::{AppState, gc::Gc};
+use crate::{AppState, fsck, gc::Gc};
 
 pub async fn serve(path: String, state: Arc<AppState>, gc: Option<Arc<Gc>>) -> Result<()> {
     // A socket left behind by a crashed process would block the bind.
@@ -75,6 +75,19 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
         },
         Request::Resign => resign(state).map(|resigned| Response::Resign { resigned }),
         Request::Delete { hashes } => delete(state, &hashes).await,
+        Request::Fsck {
+            repair,
+            verify_sizes,
+            quiesce,
+        } => match (quiesce && !repair, gc) {
+            (true, _) => Ok(Response::Error {
+                message: "--quiesce requires --repair".into(),
+            }),
+            (false, Some(gc)) => fsck::run(state, gc, repair, verify_sizes, quiesce).await,
+            (false, None) => Ok(Response::Error {
+                message: "no [gc] section is configured".into(),
+            }),
+        },
     };
     result.unwrap_or_else(|e| Response::Error {
         message: format!("{e:#}"),

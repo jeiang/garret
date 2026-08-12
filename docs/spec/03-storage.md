@@ -96,4 +96,6 @@ API is outside this contract and keeps its 500s.
 
 No reliance on S3 lifecycle rules. GC owns cleanup — see
 [05-gc.md](05-gc.md): startup + weekly sweeps abort stale multiparts and
-delete row-less blobs older than 24 h.
+delete row-less blobs older than 24 h. `garret-admin fsck`
+(spec [05-gc](05-gc.md#garret-admin-fsck)) audits and optionally repairs
+row⇔blob drift on demand, without waiting for the sweep's schedule.
