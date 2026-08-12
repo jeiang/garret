@@ -71,7 +71,7 @@ in
       upstreamKeys = mkOption {
         type = types.listOf types.str;
         default = [ "cache.nixos.org-1" ];
-        description = "Paths already signed by these keys are served elsewhere; skip them.";
+        description = "Paths already signed by these keys are served elsewhere; skip them. Written as the `[watch]` override of the client-wide `upstream_keys`.";
       };
       excludePatterns = mkOption {
         type = types.listOf types.str;

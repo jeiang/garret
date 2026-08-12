@@ -55,6 +55,9 @@ enum Command {
         /// Negotiate and report what would be uploaded, then stop
         #[arg(long)]
         dry_run: bool,
+        /// Push paths even when a configured upstream cache already signs them
+        #[arg(long)]
+        no_upstream_filter: bool,
     },
     /// Watch the local nix store and push newly-built paths
     WatchStore {
@@ -168,6 +171,7 @@ async fn main() -> Result<()> {
             paths,
             jobs,
             dry_run,
+            no_upstream_filter,
         } => {
             if paths.is_empty() {
                 anyhow::bail!("nothing to push");
@@ -175,13 +179,20 @@ async fn main() -> Result<()> {
             let cfg = cfg.unwrap();
             let pusher = pusher(&cfg, &http, jobs).await?;
             let closure = push::closure(&paths).await?;
-            let missing = pusher.missing(&closure).await?;
+            let closure_len = closure.len();
+            // Paths an upstream cache already signs never enter the
+            // Negotiation; they are reported as `upstream` instead.
+            let (own, upstream) = match no_upstream_filter {
+                true => (closure, Vec::new()),
+                false => push::partition_upstream(closure, &cfg.upstream_keys),
+            };
+            let missing = pusher.missing(&own).await?;
 
             if dry_run {
-                return dry_run_report(cli.json, closure.len(), &missing);
+                return dry_run_report(cli.json, closure_len, &upstream, &missing);
             }
 
-            let report = push::Report::start(cli.json, &progress, closure.len(), &missing);
+            let report = push::Report::start(cli.json, &progress, closure_len, &upstream, &missing);
             let summary = pusher.push_all(missing, &report).await;
             report.finish(&summary);
             // Reported first, so a --json consumer always sees `done`, then the
@@ -224,7 +235,12 @@ async fn main() -> Result<()> {
                 cursor_path: cfg.watch.cursor_path.clone().into(),
                 poll_interval: Duration::from_secs(cfg.watch.poll_interval_secs),
                 filters: watcher::Filters {
-                    upstream_keys: cfg.watch.upstream_keys.clone(),
+                    // `[watch]` may override the client-wide upstream list.
+                    upstream_keys: cfg
+                        .watch
+                        .upstream_keys
+                        .clone()
+                        .unwrap_or_else(|| cfg.upstream_keys.clone()),
                     exclude_patterns: cfg.watch.exclude_patterns.clone(),
                 },
                 max_attempts: cfg.watch.max_attempts,
@@ -438,14 +454,26 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
 }
 
 /// `--dry-run` reuses the push schema exactly — same events, same field names —
-/// so a consumer needs one parser rather than two.
-fn dry_run_report(as_json: bool, closure: usize, missing: &[push::PathInfo]) -> Result<()> {
+/// so a consumer needs one parser rather than two. Upstream-filtered paths keep
+/// their real `upstream` status: the filter runs identically either way.
+fn dry_run_report(
+    as_json: bool,
+    closure: usize,
+    upstream: &[push::PathInfo],
+    missing: &[push::PathInfo],
+) -> Result<()> {
     let nar_bytes: u64 = missing.iter().map(|p| p.nar_size.max(0) as u64).sum();
     if as_json {
         println!(
             "{}",
-            json!({"event":"negotiated","closure":closure,"missing":missing.len(),"nar_bytes":nar_bytes})
+            json!({"event":"negotiated","closure":closure,"upstream":upstream.len(),"missing":missing.len(),"nar_bytes":nar_bytes})
         );
+        for info in upstream {
+            println!(
+                "{}",
+                json!({"event":"path","path":info.path,"status":"upstream","nar_size":info.nar_size})
+            );
+        }
         for info in missing {
             println!(
                 "{}",
@@ -458,7 +486,13 @@ fn dry_run_report(as_json: bool, closure: usize, missing: &[push::PathInfo]) -> 
         );
         return Ok(());
     }
-    println!("{closure} path(s) in closure, {} missing", missing.len());
+    println!(
+        "{}",
+        push::Report::negotiated_line(closure, upstream.len(), missing.len())
+    );
+    for info in upstream {
+        println!("  upstream   {}", info.path);
+    }
     for info in missing {
         println!("  would-push {}", info.path);
     }

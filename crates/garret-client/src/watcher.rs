@@ -58,11 +58,7 @@ impl Filters {
         if self.exclude_patterns.iter().any(|p| path.path.contains(p)) {
             return Some("excluded");
         }
-        let signed_upstream = path.sigs.iter().any(|sig| {
-            let key = sig.split(':').next().unwrap_or_default();
-            self.upstream_keys.iter().any(|u| u == key)
-        });
-        if signed_upstream {
+        if crate::push::signed_upstream(&path.sigs, &self.upstream_keys) {
             return Some("upstream");
         }
         None

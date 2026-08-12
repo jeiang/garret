@@ -30,6 +30,13 @@ pub struct Config {
     /// Written by `garret login` from the server's discovery document.
     #[serde(default)]
     pub public_keys: Vec<String>,
+    /// Key names whose signatures mean "an upstream cache already serves this
+    /// path" — `push` drops such paths from the closure before the
+    /// Negotiation, and the watcher skips them (unless `[watch]` overrides the
+    /// list). Defaults to cache.nixos.org's key; `--no-upstream-filter`
+    /// bypasses the filter for one push.
+    #[serde(default = "upstream_keys")]
+    pub upstream_keys: Vec<String>,
     /// Store watcher settings; defaulted so laptop configs never mention them.
     #[serde(default)]
     pub watch: Watch,
@@ -50,10 +57,10 @@ pub struct Watch {
     /// Seconds between database polls when the backlog is empty.
     #[serde(default = "poll_interval")]
     pub poll_interval_secs: u64,
-    /// Key names whose signatures mean "someone else already serves this
-    /// path" — such paths are not pushed. Defaults to cache.nixos.org's.
-    #[serde(default = "upstream_keys")]
-    pub upstream_keys: Vec<String>,
+    /// Per-daemon override of the top-level `upstream_keys`; unset means the
+    /// watcher shares the client-wide list.
+    #[serde(default)]
+    pub upstream_keys: Option<Vec<String>>,
     /// Substring patterns; a matching store path is never pushed.
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
@@ -203,7 +210,10 @@ pub fn render(endpoint: &str, discovery: &crate::discovery::Discovery) -> Result
         q(client_id),
         q(&oidc.audience),
     ));
-    out.push_str("\n# Optional: jobs = 8, zstd_level = 3, max_retries = 5\n");
+    out.push_str(
+        "\n# Optional: jobs = 8, zstd_level = 3, max_retries = 5,\n\
+         # upstream_keys = [\"cache.nixos.org-1\"] (paths these keys sign are not pushed)\n",
+    );
     Ok(out)
 }
 
@@ -251,6 +261,9 @@ mod tests {
         assert_eq!(cfg.oidc.audience, "garret");
         // Defaults survive being absent from the template.
         assert_eq!(cfg.jobs, jobs());
+        assert_eq!(cfg.upstream_keys, ["cache.nixos.org-1"]);
+        // Unset in [watch] means "share the top-level list".
+        assert!(cfg.watch.upstream_keys.is_none());
     }
 
     /// A server with no `puller_endpoint` and no keys still yields a config

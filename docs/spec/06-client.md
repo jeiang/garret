@@ -13,7 +13,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret whoami` | Subject, audience, expiry, and a live probe that the Pusher accepts the token |
 | `garret doctor [path]` | Layer-by-layer diagnosis (below); with a path, a Negotiation round answers "is this cached" |
 | `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter |
-| `garret push <paths…\|installable> [--dry-run]` | Full closure via one missing-paths query; parallel workers |
+| `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers |
 | `garret watch-store` | Watcher daemon (below) |
 | `garret list` | Search/filter cache contents (browse API) |
 | `garret tree <path>` | Dependency tree (browse API) |
@@ -88,6 +88,20 @@ Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), jittered backoff on 429/5xx, idempotent retries.
 No client metrics endpoint in v1.
 
+**Upstream filter** (ticket 21; prior art: attic's
+`--upstream-cache-key-name`, cachix's configurable upstreams). During closure
+assembly, paths whose `nix path-info` signatures carry a configured upstream
+key name are dropped before the Negotiation: an upstream cache already serves
+them signed, so pushing them would spend bandwidth and Quota on bytes Eviction
+would reclaim but the cache never needed to hold. The filter is a pure
+signature-name comparison — no network probes, no server change; the
+Negotiation batch just shrinks. Key names come from the top-level
+`upstream_keys` config (default `["cache.nixos.org-1"]`); `--no-upstream-filter`
+bypasses the filter for one push. Filtered paths are reported with status
+`upstream` — distinct from `deduped`, whose bandwidth was actually spent — and
+the `negotiated` counts stay honest: `closure` minus `upstream` is what was
+negotiated.
+
 Progress is a single bar over **uncompressed NAR bytes** — that total is known
 exactly from the closure before a byte moves, while compressed bytes-on-wire
 have no total until the upload ends, and a bar over path count lurches because
@@ -114,7 +128,8 @@ data.
 - `push` emits NDJSON, one event per line:
 
 ```
-{"event":"negotiated","closure":312,"missing":47,"nar_bytes":4021374976}
+{"event":"negotiated","closure":312,"upstream":118,"missing":47,"nar_bytes":4021374976}
+{"event":"path","path":"/nix/store/…","status":"upstream","nar_size":123456}
 {"event":"path","path":"/nix/store/…","status":"pushed","nar_size":81920}
 {"event":"path","path":"/nix/store/…","status":"deduped","nar_size":4096}
 {"event":"path","path":"/nix/store/…","status":"failed","error":"upload rejected with 503: …"}
@@ -122,8 +137,12 @@ data.
 ```
 
 `negotiated` gives a consumer the denominator up front and `done` makes a
-truncated stream detectable. `--dry-run --json` reuses the identical schema,
-with `status:"would-push"` and a zeroed `done`, so a consumer needs one parser.
+truncated stream detectable. `upstream`-filtered paths are reported first, then
+uploads as they finish. `--dry-run --json` reuses the identical schema, with
+`status:"would-push"` for what would upload (upstream paths keep their real
+`upstream` status — the filter runs identically either way) and a zeroed
+`done`, so a consumer needs one parser. The human summary line mentions the
+upstream count only when it is non-zero.
 
 ## Pointing nix at the cache
 
@@ -155,8 +174,11 @@ configured key, so a rotation has several live at once.
   register before roots, so closures self-assemble. The server never
   requires closed closures.
 - **Filtering**: skip `.drv` paths and paths already signed by configured
-  upstream keys (default `cache.nixos.org`, read from the DB's sigs).
-  Keep `-source` and fixed-output paths. Configurable exclude patterns.
+  upstream keys — the same key list as push's upstream filter (top-level
+  `upstream_keys`, default `cache.nixos.org-1`; `[watch] upstream_keys`
+  overrides it per daemon), read from the DB's sigs rather than
+  `nix path-info`. Keep `-source` and fixed-output paths. Configurable
+  exclude patterns.
 - **Failure handling**: capped retries with backoff (default 5), then
   local skip-list + loud log + metrics-visible counter; the cursor always
   advances — one poison path never wedges the pipeline. Paths nix-GC'd
