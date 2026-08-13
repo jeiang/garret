@@ -113,13 +113,19 @@ struct PullArgs {
     /// Puller base URL
     #[arg(long, default_value = "http://127.0.0.1:8081")]
     puller_endpoint: String,
-    /// Concurrent pull clients
-    #[arg(long, default_value_t = 20)]
-    pull_concurrency: usize,
+    /// Concurrent pull clients. A comma list (e.g. 20,100,300) sweeps each
+    /// step back to back over the same corpus, reporting one result per step.
+    #[arg(long, value_delimiter = ',', default_value = "20")]
+    pull_concurrency: Vec<usize>,
     /// Passes over the corpus (each entry gets a narinfo GET and a NAR
     /// redirect GET per pass)
     #[arg(long, default_value_t = 3)]
     passes: usize,
+    /// Disable HTTP connection reuse, so every request pays a fresh TCP
+    /// handshake — the bazel-remote #280 regression this sweep looks for was
+    /// sensitive to exactly this.
+    #[arg(long)]
+    no_pull_keepalive: bool,
 }
 
 /// Where the numbers came from. `label` is the comparison key: the diff
@@ -142,7 +148,7 @@ struct Output {
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<Vec<StreamResult>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pull: Option<PullResults>,
+    pull: Option<Vec<PullResults>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +207,7 @@ struct StreamResult {
 #[derive(Debug, Serialize)]
 struct PullResults {
     concurrency: usize,
+    keepalive: bool,
     passes: usize,
     requests: u64,
     failed: u64,
@@ -275,11 +282,17 @@ async fn main() -> Result<()> {
         output.pull = Some(run_pull(&cli, args).await?);
     }
 
+    // A single-step pull serializes as the same flat object as always, so the
+    // checked-in baseline keeps its keys; only a sweep emits an array.
+    let pull_json = match output.pull.as_deref() {
+        Some([one]) => serde_json::to_value(one)?,
+        other => serde_json::to_value(other)?,
+    };
     let report = serde_json::json!({
         "meta": meta,
         "push": output.push,
         "stream": output.stream,
-        "pull": output.pull,
+        "pull": pull_json,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(path) = &cli.json {
@@ -306,10 +319,11 @@ async fn main() -> Result<()> {
     {
         bail!("FAIL: streaming push(es) failed");
     }
-    if let Some(pull) = &output.pull
-        && !pull.zero_failures
-    {
-        bail!("FAIL: {} pull request(s) failed", pull.failed);
+    if let Some(pull) = &output.pull {
+        let failed: u64 = pull.iter().map(|p| p.failed).sum();
+        if failed > 0 {
+            bail!("FAIL: {failed} pull request(s) failed");
+        }
     }
     // Not checked here: RSS under 2x the configured in-flight byte cap. The
     // harness cannot see the server's memory; `just bench-local` samples it
@@ -487,13 +501,32 @@ async fn run_stream(
 
 /// Spec scenario 3: concurrent narinfo GETs plus NAR requests up to the
 /// redirect (never following it — download speed is S3's, not garret's).
-async fn run_pull(cli: &Cli, args: &PullArgs) -> Result<PullResults> {
-    // A separate client: redirects must be returned, not followed.
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+async fn run_pull(cli: &Cli, args: &PullArgs) -> Result<Vec<PullResults>> {
+    // A separate client: redirects must be returned, not followed. With
+    // keep-alive off, an empty idle pool forces a fresh connection per
+    // request (the harness speaks HTTP/1.1 here, so there is no multiplexing
+    // to reuse instead).
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    if args.no_pull_keepalive {
+        builder = builder.pool_max_idle_per_host(0);
+    }
+    let http = builder.build()?;
     let entries = corpus::generate(cli.seed, cli.count, false);
 
+    let mut results = Vec::new();
+    for &concurrency in &args.pull_concurrency {
+        results.push(pull_step(args, &http, &entries, concurrency).await?);
+    }
+    Ok(results)
+}
+
+/// One concurrency step over the whole corpus.
+async fn pull_step(
+    args: &PullArgs,
+    http: &reqwest::Client,
+    entries: &[corpus::Entry],
+    concurrency: usize,
+) -> Result<PullResults> {
     let requests: Vec<(String, bool)> = (0..args.passes)
         .flat_map(|_| {
             entries.iter().flat_map(|e| {
@@ -536,7 +569,7 @@ async fn run_pull(cli: &Cli, args: &PullArgs) -> Result<PullResults> {
                 )
             }
         })
-        .buffer_unordered(args.pull_concurrency)
+        .buffer_unordered(concurrency)
         .collect()
         .await;
     let wall = started.elapsed();
@@ -554,8 +587,9 @@ async fn run_pull(cli: &Cli, args: &PullArgs) -> Result<PullResults> {
     let failed = total - (narinfo.len() + redirect.len()) as u64;
     let ms = |micros: u64| micros as f64 / 1000.0;
 
-    Ok(PullResults {
-        concurrency: args.pull_concurrency,
+    let result = PullResults {
+        concurrency,
+        keepalive: !args.no_pull_keepalive,
         passes: args.passes,
         requests: total,
         failed,
@@ -566,7 +600,16 @@ async fn run_pull(cli: &Cli, args: &PullArgs) -> Result<PullResults> {
         redirect_p50_ms: ms(percentile(&redirect, 50.0)),
         redirect_p99_ms: ms(percentile(&redirect, 99.0)),
         zero_failures: failed == 0,
-    })
+    };
+    println!(
+        "pull c={concurrency} keepalive={}: narinfo p50/p99 {:.2}/{:.2} ms, redirect p50/p99 {:.2}/{:.2} ms, {failed} failed",
+        result.keepalive,
+        result.narinfo_p50_ms,
+        result.narinfo_p99_ms,
+        result.redirect_p50_ms,
+        result.redirect_p99_ms,
+    );
+    Ok(result)
 }
 
 fn percentile(sorted: &[u64], p: f64) -> u64 {
