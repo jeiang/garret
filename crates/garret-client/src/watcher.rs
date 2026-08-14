@@ -10,6 +10,7 @@ use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, params};
+use tokio::net::UnixDatagram;
 
 use crate::push::{PathInfo, Pusher};
 
@@ -25,6 +26,9 @@ pub struct Watcher {
     pub filters: Filters,
     /// Failures per path before it lands on the skip-list.
     pub max_attempts: u32,
+    /// Where the wake socket listens; `garret enqueue` pokes it to collapse
+    /// push latency from `poll_interval` to "right after the build".
+    pub socket_path: PathBuf,
 }
 
 /// Why a newly-valid path might not be worth pushing (spec 06).
@@ -132,6 +136,47 @@ pub fn write_cursor(path: &std::path::Path, cursor: i64) -> Result<()> {
     std::fs::write(path, cursor.to_string()).with_context(|| format!("writing cursor {path:?}"))
 }
 
+/// Binds the wake socket `garret enqueue` datagrams land on. A stale file from
+/// an unclean shutdown is unlinked first, so the only warning-worthy failure
+/// left is a real one (usually: the directory is not writable by this user).
+pub fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket directory {parent:?}"))?;
+    }
+    if path.exists() {
+        std::fs::remove_file(path).with_context(|| format!("unlinking stale socket {path:?}"))?;
+    }
+    let socket =
+        UnixDatagram::bind(path).with_context(|| format!("binding wake socket {path:?}"))?;
+    // ponytail: 0666 on purpose — the socket carries no authority. A datagram
+    // only makes the watcher poll its own cursor early, which the poll timer
+    // does anyway, and single-user installs run the hook as the building user.
+    // Tighten this the day a real command protocol lands here.
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o666))
+        .with_context(|| format!("setting permissions on {path:?}"))?;
+    Ok(socket)
+}
+
+/// Sleeps until `interval` elapses or a wake datagram arrives, whichever comes
+/// first. Bursts coalesce: whatever queued is drained before returning, so a
+/// hook firing fifty times costs one early poll.
+pub async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
+    let Some(socket) = socket else {
+        return tokio::time::sleep(interval).await;
+    };
+    let mut buf = [0u8; 4096];
+    tokio::select! {
+        _ = tokio::time::sleep(interval) => {}
+        received = socket.recv(&mut buf) => {
+            if let Ok(n) = received {
+                tracing::debug!(payload = %String::from_utf8_lossy(&buf[..n]), "woken by enqueue");
+            }
+            while socket.try_recv(&mut buf).is_ok() {}
+        }
+    }
+}
+
 impl Watcher {
     /// Runs until killed. The cursor always advances: one poison path must
     /// never wedge the pipeline, so repeated failures land on a skip-list and
@@ -147,13 +192,28 @@ impl Watcher {
         };
         tracing::info!(cursor, full_sync, "store watcher starting");
 
+        // The socket is an optimization, never a reason the backstop won't
+        // run: without it every path is still pushed, just up to poll_interval
+        // later.
+        let wake = match bind_wake_socket(&self.socket_path) {
+            Ok(socket) => Some(socket),
+            Err(e) => {
+                tracing::warn!(
+                    socket = ?self.socket_path,
+                    "wake socket unavailable; `garret enqueue` will be a no-op \
+                     and pushes trail builds by up to the poll interval: {e:#}"
+                );
+                None
+            }
+        };
+
         let mut skipped: HashSet<String> = HashSet::new();
         let mut attempts: std::collections::HashMap<String, u32> = Default::default();
 
         loop {
             let batch = paths_after(&conn, cursor, 500)?;
             if batch.is_empty() {
-                tokio::time::sleep(self.poll_interval).await;
+                wait_for_wake(wake.as_ref(), self.poll_interval).await;
                 continue;
             }
 
@@ -282,6 +342,38 @@ mod tests {
             )),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_wake_datagram_cuts_the_sleep_short() {
+        let dir = std::env::temp_dir().join(format!("garret-wake-{}", std::process::id()));
+        let sock_path = dir.join("watch.sock");
+        let socket = bind_wake_socket(&sock_path).unwrap();
+
+        // Silence: the full interval elapses.
+        let start = std::time::Instant::now();
+        wait_for_wake(Some(&socket), Duration::from_millis(50)).await;
+        assert!(start.elapsed() >= Duration::from_millis(50));
+
+        // A burst of wakes: returns long before the interval, drained to empty.
+        let sender = UnixDatagram::unbound().unwrap();
+        sender
+            .send_to(b"/nix/store/aaa-x", &sock_path)
+            .await
+            .unwrap();
+        sender
+            .send_to(b"/nix/store/bbb-y", &sock_path)
+            .await
+            .unwrap();
+        let start = std::time::Instant::now();
+        wait_for_wake(Some(&socket), Duration::from_secs(30)).await;
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let mut buf = [0u8; 16];
+        assert!(socket.try_recv(&mut buf).is_err(), "burst must be drained");
+
+        // Rebinding over the live socket file is the stale-socket dance.
+        bind_wake_socket(&sock_path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -65,6 +65,15 @@ enum Command {
         #[arg(long)]
         full_sync: bool,
     },
+    /// Wake a running watch-store so it polls now (the post-build-hook stub).
+    /// Exits 0 unconditionally: a hook must never block or fail the build.
+    Enqueue {
+        /// Store paths; omitted means $OUT_PATHS, as nix passes to the hook
+        paths: Vec<String>,
+        /// The watch-store wake socket
+        #[arg(long, default_value = garret_client::config::DEFAULT_SOCKET_PATH)]
+        socket: String,
+    },
     /// Search the cache contents
     List {
         query: Option<String>,
@@ -81,12 +90,17 @@ enum Command {
 
 impl Command {
     /// `login` must run before a config exists — that is the whole point of it —
-    /// and `completions`/`logout` have nothing to read one for. Everything else
-    /// still requires a config, and says so.
+    /// and `completions`/`logout` have nothing to read one for. `enqueue` runs
+    /// inside the post-build-hook as whatever user nix says, so it must not
+    /// depend on a readable config either — the socket default is its contract.
+    /// Everything else still requires a config, and says so.
     fn needs_config(&self) -> bool {
         !matches!(
             self,
-            Command::Login { .. } | Command::Logout | Command::Completions { .. }
+            Command::Login { .. }
+                | Command::Logout
+                | Command::Completions { .. }
+                | Command::Enqueue { .. }
         )
     }
 }
@@ -246,9 +260,12 @@ async fn main() -> Result<()> {
                     exclude_patterns: cfg.watch.exclude_patterns.clone(),
                 },
                 max_attempts: cfg.watch.max_attempts,
+                socket_path: cfg.watch.socket_path.clone().into(),
             };
             watcher.run(&pusher, full_sync).await?;
         }
+
+        Command::Enqueue { paths, socket } => enqueue(paths, &socket).await,
 
         Command::List { query, limit } => {
             let cfg = cfg.unwrap();
@@ -323,6 +340,42 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// CLI paths, or nix's `$OUT_PATHS` (space-separated) when there are none —
+/// `post-build-hook` runs its program with no arguments.
+fn enqueue_paths(args: Vec<String>, out_paths: Option<&str>) -> Vec<String> {
+    if !args.is_empty() {
+        return args;
+    }
+    out_paths
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `garret enqueue` — one datagram per invocation, then exit 0 no matter what.
+/// The wake socket is only an optimization: on any failure the watcher's next
+/// poll still pushes the paths, so a loud stderr line is the whole story.
+async fn enqueue(args: Vec<String>, socket: &str) {
+    let paths = enqueue_paths(args, std::env::var("OUT_PATHS").ok().as_deref());
+    if paths.is_empty() {
+        eprintln!("garret enqueue: no paths given and $OUT_PATHS is empty; nothing to do");
+        return;
+    }
+    let payload = paths.join(" ");
+    let send = async {
+        tokio::net::UnixDatagram::unbound()?
+            .send_to(payload.as_bytes(), socket)
+            .await
+    };
+    if let Err(e) = send.await {
+        eprintln!(
+            "garret enqueue: could not wake watch-store at {socket}: {e}; \
+             the paths will be picked up on its next poll"
+        );
+    }
 }
 
 /// `garret login` — the only command that can create a config, which is why it
@@ -595,5 +648,22 @@ fn human(bytes: i64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enqueue_prefers_argv_and_falls_back_to_out_paths() {
+        let argv = vec!["/nix/store/aaa-x".to_owned()];
+        assert_eq!(enqueue_paths(argv.clone(), Some("/nix/store/bbb-y")), argv);
+        assert_eq!(
+            enqueue_paths(vec![], Some(" /nix/store/aaa-x  /nix/store/bbb-y ")),
+            ["/nix/store/aaa-x", "/nix/store/bbb-y"]
+        );
+        assert!(enqueue_paths(vec![], None).is_empty());
+        assert!(enqueue_paths(vec![], Some("  ")).is_empty());
     }
 }

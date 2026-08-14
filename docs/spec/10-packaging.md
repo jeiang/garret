@@ -60,7 +60,10 @@ Module option sketch (all under `services.garret.*`):
   degrade-to-miss budgets, spec 03; default 250 ms).
 - **watcher** (client machines): `enable`, `endpoint`,
   `credentialsFile` (client id/secret), `filters.{excludePatterns,
-  upstreamKeys}`, `jobs`, `zstdLevel`, `fullSync`.
+  upstreamKeys}`, `jobs`, `zstdLevel`, `fullSync`, `socketPath` (wake
+  socket, spec 06). Enabling the watcher also sets
+  `nix.settings.post-build-hook` to a wrapper running `garret enqueue`,
+  so builds wake the watcher the moment they finish.
 
 The pusher module also carries `pullerEndpoint` and a per-issuer `client_id`,
 both advertised by `/api/v1/discovery` so `garret login <pusher-url>` can write

@@ -28,4 +28,7 @@ in
 
   # A path the watcher should notice and push without being asked.
   watched = pkgs.runCommand "garret-e2e-watched" { } "echo watched ${stamp} > $out";
+
+  # A path pushed via `garret enqueue` waking the watcher, not via its poll.
+  woken = pkgs.runCommand "garret-e2e-woken" { } "echo woken ${stamp} > $out";
 }

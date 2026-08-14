@@ -21,10 +21,18 @@ let
       poll_interval_secs = cfg.pollIntervalSeconds;
       upstream_keys = cfg.filters.upstreamKeys;
       exclude_patterns = cfg.filters.excludePatterns;
+      socket_path = cfg.socketPath;
     };
   };
 
   configFile = (pkgs.formats.toml { }).generate "garret-watcher.toml" settings;
+
+  # `post-build-hook` runs a bare program with no arguments (paths arrive in
+  # $OUT_PATHS), hence the wrapper. `enqueue` exits 0 unconditionally, so this
+  # hook can never block or fail a build.
+  enqueueHook = pkgs.writeShellScript "garret-enqueue" ''
+    exec ${cfg.package}/bin/garret enqueue --socket ${cfg.socketPath}
+  '';
 in
 {
   options.services.garret.watcher = {
@@ -58,6 +66,15 @@ in
     jobs = mkOption { type = types.int; default = 8; description = "Concurrent uploads."; };
     zstdLevel = mkOption { type = types.int; default = 3; description = "Client-side zstd level."; };
 
+    socketPath = mkOption {
+      type = types.str;
+      default = "/run/garret/watch.sock";
+      description = ''
+        Wake socket the post-build-hook pokes so a fresh build is pushed
+        immediately instead of on the next poll.
+      '';
+    };
+
     fullSync = mkOption {
       type = types.bool;
       default = false;
@@ -82,6 +99,10 @@ in
   };
 
   config = mkIf cfg.enable {
+    # Builds wake the watcher the moment they finish; the watcher's DB poll
+    # remains the durability backstop when the socket or watcher is down.
+    nix.settings.post-build-hook = enqueueHook;
+
     systemd.services.garret-watcher = {
       description = "garret store watcher";
       wantedBy = [ "multi-user.target" ];
@@ -97,6 +118,8 @@ in
         Restart = "always";
         RestartSec = 10;
         StateDirectory = "garret";
+        # /run/garret, where the wake socket lives.
+        RuntimeDirectory = "garret";
         # Root: reading the nix database and the credentials file both need it,
         # and there is no unprivileged mode in v1 (spec 06-client).
         User = "root";
