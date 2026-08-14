@@ -186,7 +186,8 @@ measured. Findings and proposals:
   [27 S3 operation timeout](issues/27-s3-operation-timeout.md)
   (implemented; found live during the bench investigation),
   [28 pull concurrency sweep](issues/28-pull-concurrency-sweep.md)
-  (the harness only ever measures c=20; ticket 26's own revisit
-  condition needs the curve, not one point)
+  (implemented: `just bench-pull-sweep` measures the c=20/100/300
+  curve, keep-alive on and off, that ticket 26's revisit condition
+  needs)
 - Non-goals otherwise revalidated: chunking/dedup, custom pull protocol,
   upload resume, OTLP, multi-tenancy, containers.

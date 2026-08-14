@@ -25,6 +25,11 @@ bench pusher="http://127.0.0.1:8080" puller="http://127.0.0.1:8081":
 bench-local:
 	nix develop --command scripts/bench-local.sh
 
+# Stepped-concurrency pull sweep (ticket 28): c=20/100/300, keep-alive on
+# and off, reported-only — the curve that would reopen ticket 26
+bench-pull-sweep:
+	nix develop --command scripts/bench-pull-sweep.sh
+
 # Diff the latest results against the checked-in baseline
 bench-compare baseline="benchmarks/baseline.json" current="bench-results.json":
 	python3 scripts/bench-diff.py {{baseline}} {{current}}

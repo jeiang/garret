@@ -1,6 +1,8 @@
 # 28 — Stepped-concurrency pull sweep in `garret-bench`
 
-Status: proposed (2026-08, follow-up to the refreshed baseline). Evidence:
+Status: implemented (2026-08-12; `--pull-concurrency` comma list +
+`--no-pull-keepalive` in `garret-bench pull`, `just bench-pull-sweep`
+recipe, spec 09 updated). Evidence:
 [baseline](../research/benchmark-baseline-2026-08.md) ("Deferred bench
 extensions"), [ticket 26](26-puller-read-connection-pool.md).
 

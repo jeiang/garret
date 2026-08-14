@@ -94,6 +94,17 @@ hardware, which is a decision for after the first production runs.
    (narinfo 200s, NAR redirects). Requires the corpus pushed first —
    `all` sequences that automatically.
 
+   `--pull-concurrency` takes a comma list (e.g. `20,100,300`): each
+   step runs back to back over the same corpus and is reported
+   separately, so the output is a latency curve rather than one point.
+   `--no-pull-keepalive` disables HTTP connection reuse for the run.
+   `just bench-pull-sweep` provisions locally and runs the
+   c=20/100/300 sweep with keep-alive on and off. Sweep results stay
+   reported-only — zero failures is still the only PASS rule, and the
+   250 ms pull budget remains the sole hard latency number; a curve
+   approaching it is the evidence that would reopen the Puller
+   read-connection-pool question.
+
 ## Micro-benchmarks
 
 `just microbench` (criterion, in `crates/garret-bench/benches/`) probes
