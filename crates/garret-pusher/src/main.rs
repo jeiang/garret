@@ -492,6 +492,7 @@ mod tests {
                 jwks_url: None,
                 github_owner_id: None,
                 ref_patterns: vec![],
+                ref_protected: None,
                 allowed_groups: vec![],
             }])
             .unwrap(),

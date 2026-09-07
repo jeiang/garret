@@ -27,6 +27,9 @@ struct Claims {
     sub: String,
     #[serde(default)]
     groups: Vec<String>,
+    /// GitHub Actions: whether the triggering ref is protected.
+    #[serde(default)]
+    ref_protected: Option<String>,
     /// GitHub Actions: the immutable owner id (names are renameable, spec 04).
     #[serde(default)]
     repository_owner_id: Option<String>,
@@ -200,7 +203,7 @@ fn base64_url(s: &str) -> Result<Vec<u8>> {
 
 /// Authorization, which lives at the issuer wherever possible (ADR-0003):
 /// Pocket ID grants by audience alone unless groups are configured; GitHub
-/// grants by immutable owner id.
+/// grants by immutable owner id and optional ref constraints.
 fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
     if let Some(expected) = &cfg.github_owner_id {
         let owner = claims
@@ -215,6 +218,16 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
             if !cfg.ref_patterns.iter().any(|p| ref_matches(p, git_ref)) {
                 bail!("ref {git_ref} is not authorized");
             }
+        }
+    }
+    if let Some(expected) = cfg.ref_protected {
+        let actual = claims
+            .ref_protected
+            .as_deref()
+            .ok_or_else(|| anyhow!("token has no ref_protected"))?;
+        let expected = if expected { "true" } else { "false" };
+        if actual != expected {
+            bail!("ref protection status is not authorized");
         }
     }
     if !cfg.allowed_groups.is_empty()
@@ -246,6 +259,7 @@ mod tests {
             jwks_url: None,
             github_owner_id: Some(owner.into()),
             ref_patterns: refs.iter().map(|r| (*r).to_owned()).collect(),
+            ref_protected: None,
             allowed_groups: vec![],
         }
     }
@@ -255,6 +269,7 @@ mod tests {
             iss: "https://token.actions.githubusercontent.com".into(),
             sub: "repo:me/thing:ref:refs/heads/main".into(),
             groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+            ref_protected: None,
             repository_owner_id: owner.map(str::to_owned),
             git_ref: git_ref.map(str::to_owned),
         }
@@ -279,6 +294,28 @@ mod tests {
     }
 
     #[test]
+    fn ref_protected_gates_when_configured() {
+        let mut cfg = github("1234", &["refs/heads/main"]);
+        cfg.ref_protected = Some(true);
+
+        let mut protected_main = claims(Some("1234"), Some("refs/heads/main"), &[]);
+        protected_main.ref_protected = Some("true".into());
+        assert!(authorize(&cfg, &protected_main).is_ok());
+
+        let mut unprotected_main = claims(Some("1234"), Some("refs/heads/main"), &[]);
+        unprotected_main.ref_protected = Some("false".into());
+        assert!(authorize(&cfg, &unprotected_main).is_err());
+
+        // An absent claim must fail closed when protection is required.
+        assert!(authorize(&cfg, &claims(Some("1234"), Some("refs/heads/main"), &[])).is_err());
+
+        // The inverse setting remains useful for explicitly unprotected refs.
+        cfg.ref_protected = Some(false);
+        assert!(authorize(&cfg, &unprotected_main).is_ok());
+        assert!(authorize(&cfg, &protected_main).is_err());
+    }
+
+    #[test]
     fn pocket_id_grants_on_audience_alone_unless_groups_are_set() {
         let mut cfg = IssuerConfig {
             issuer: "https://id.example".into(),
@@ -287,6 +324,7 @@ mod tests {
             jwks_url: None,
             github_owner_id: None,
             ref_patterns: vec![],
+            ref_protected: None,
             allowed_groups: vec![],
         };
         assert!(authorize(&cfg, &claims(None, None, &[])).is_ok());

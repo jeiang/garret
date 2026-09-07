@@ -70,6 +70,10 @@ pub struct IssuerConfig {
     /// GitHub only, optional: `refs/heads/main`, `refs/tags/*`, …
     #[serde(default)]
     pub ref_patterns: Vec<String>,
+    /// GitHub only, optional: require a protected (`true`) or unprotected
+    /// (`false`) triggering ref.
+    #[serde(default)]
+    pub ref_protected: Option<bool>,
     /// Defense-in-depth, default off — group membership lives in Pocket ID.
     #[serde(default)]
     pub allowed_groups: Vec<String>,

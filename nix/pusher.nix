@@ -10,7 +10,7 @@ let
   #
   # `pkgs.formats.toml` has no representation for null, and every nullable
   # option here (`s3.region`, `s3.endpointUrl`, and each issuer's
-  # `github_owner_id`/`jwks_url`) reaches this attrset as `null` when unset --
+  # `github_owner_id`/`jwks_url`/`ref_protected`) reaches this attrset as `null` when unset --
   # which fails the build with "unsupported unit type" rather than being
   # omitted. Serde already defaults every one of these on the Rust side, so
   # dropping the key is exactly right: a Pocket ID issuer, for instance, has no
@@ -162,6 +162,7 @@ in
           jwks_url = mkOption { type = types.nullOr types.str; default = null; description = "Skips discovery when set."; };
           github_owner_id = mkOption { type = types.nullOr types.str; default = null; description = "GitHub: immutable owner id."; };
           ref_patterns = mkOption { type = types.listOf types.str; default = [ ]; description = "GitHub: allowed refs."; };
+          ref_protected = mkOption { type = types.nullOr types.bool; default = null; description = "GitHub: require protected or unprotected refs."; };
           allowed_groups = mkOption { type = types.listOf types.str; default = [ ]; description = "Optional group allowlist."; };
         };
       });
