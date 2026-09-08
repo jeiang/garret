@@ -19,11 +19,14 @@ JWKS. There is no token-exchange service and no garret-issued token.
 
 - **Pocket ID issuer**: valid JWT + garret's RFC 8707 audience. Access
   control lives in Pocket ID (restrict the garret client to the right
-  user group). Optional `allowed-groups` config exists as
+  user group there). Optional `allowed-groups` config exists as
   defense-in-depth, default off.
-- **GitHub issuer**: match the immutable `owner_id` claim (owner-wide —
-  new repos work without config changes; never match renameable names).
-  Optional ref constraints (e.g. default-branch only).
+- **GitHub issuer**: match the immutable `repository_owner_id` claim
+  (owner-wide — new repos work without config changes; never match
+  renameable names). Optional `ref_patterns` constraints limit the triggering
+  ref. An optional `ref_protected` boolean requires the token claim to be
+  present and equal; setting it to `true` alongside
+  `ref_patterns = ["refs/heads/main"]` restricts pushes to protected main.
 
 ## Surface summary
 
