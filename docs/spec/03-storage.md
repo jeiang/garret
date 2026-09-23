@@ -29,7 +29,14 @@ Defaults, all configurable:
   and the concurrency permit acquired **before** reading each part — the
   reader must never race ahead of S3. Worst-case buffering is 4×64 MiB
   per NAR; the protocol's global in-flight byte cap bounds the aggregate.
-- On any upload error, abort the multipart immediately so parts free.
+- Each part uploads on its own task while the next is read, so client
+  ingress and S3 egress overlap and a finished part frees its permit
+  whether or not its reader is waiting. A permit is held only by a part
+  being read or uploaded, never by a waiter, so uploads sharing the global
+  cap cannot wedge each other; a cap of fewer part slots than parts in
+  flight just serializes the parts.
+- On any upload error, stop the parts still uploading, then abort the
+  multipart immediately so parts free.
 - On SIGTERM/SIGINT the Pusher stops accepting connections and lets
   in-flight uploads finish for up to **60 s**, then aborts every
   multipart still open (it is the bucket's only writer), listing again

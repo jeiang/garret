@@ -103,12 +103,12 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
 
     let collector = cfg.gc.clone().map(|gc_cfg| {
-        Arc::new(gc::Gc {
-            conn: state.conn.clone(),
-            storage: state.storage.clone(),
-            in_flight: state.in_flight.clone(),
-            cfg: gc_cfg,
-        })
+        Arc::new(gc::Gc::new(
+            state.conn.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            gc_cfg,
+        ))
     });
 
     if let Some(admin_socket) = cfg.admin_socket.clone() {
@@ -298,10 +298,17 @@ impl IntoResponse for Error {
     }
 }
 
+/// An unexpected failure's chain names S3 keys, SQLite errors and file
+/// paths: operator detail, not caller detail. The chain is logged under a
+/// fresh id and the caller gets only the id to quote back.
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
-        tracing::error!("{e:#}");
-        Error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+        let id = format!("{:016x}", fastrand::u64(..));
+        tracing::error!(error_id = %id, "{e:#}");
+        Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("internal error (id {id})"),
+        )
     }
 }
 
@@ -608,6 +615,9 @@ mod tests {
                 github_owner_id: None,
                 ref_patterns: vec![],
                 ref_protected: None,
+                repository_ids: vec![],
+                event_names: vec![],
+                job_workflow_refs: vec![],
                 allowed_groups: vec![],
             }])
             .unwrap(),
@@ -804,5 +814,65 @@ mod tests {
             .expect_err(case);
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{case}: {}", err.1);
         }
+    }
+
+    /// A 500's body must not echo the error chain, yet must carry an id the
+    /// operator can find in the log next to that chain.
+    #[tokio::test]
+    async fn an_internal_error_hides_its_chain_behind_a_logged_id() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish();
+        let err = tracing::subscriber::with_default(subscriber, || {
+            Error::from(
+                anyhow::anyhow!("sqlite: disk I/O error at /var/lib/garret/db")
+                    .context("inserting object"),
+            )
+        });
+
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"].as_str().unwrap();
+        let id = message
+            .strip_prefix("internal error (id ")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("unexpected body: {message}"));
+        assert!(!id.is_empty());
+        for secret in ["sqlite", "/var/lib/garret", "inserting object"] {
+            assert!(
+                !message.contains(secret),
+                "body leaks {secret:?}: {message}"
+            );
+        }
+
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains(&format!("error_id={id}")))
+            .unwrap_or_else(|| panic!("id {id} not logged: {log}"));
+        assert!(
+            line.contains("inserting object: sqlite: disk I/O error at /var/lib/garret/db"),
+            "{line}"
+        );
     }
 }

@@ -41,11 +41,23 @@ enum Command {
     },
     /// Re-sign every object with the currently configured keys
     Resign,
-    /// Remove objects by store-path hash, row and blob
+    /// Remove objects by store-path hash, row and blob; or, with
+    /// `--pushed-by`, everything one subject pushed (dry-run unless `--apply`)
     Delete {
         /// Store-path hashes (the 32 characters before the first `-`)
-        #[arg(required = true)]
+        #[arg(required_unless_present = "pushed_by", conflicts_with = "pushed_by")]
         hashes: Vec<String>,
+        /// Select every object this subject pushed (`<issuer>#<sub>`, as the
+        /// browse API's `pushed_by` shows it) instead of naming hashes
+        #[arg(long)]
+        pushed_by: Option<String>,
+        /// Only objects first pushed at or after this: a UTC date
+        /// (`2026-06-01`) or an age (`36h`)
+        #[arg(long, requires = "pushed_by", conflicts_with = "hashes")]
+        since: Option<String>,
+        /// Delete; without this, `--pushed-by` only lists what would go
+        #[arg(long, requires = "pushed_by", conflicts_with = "hashes")]
+        apply: bool,
     },
     /// Pin an object's closure as a GC-exempt root (spec 05)
     Pin {
@@ -84,6 +96,13 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Write a consistent copy of the database without stopping either
+    /// service. The Pusher writes it, so the path must be writable by the
+    /// Pusher; an existing file is never overwritten.
+    Backup {
+        /// Destination file (created with mode 0600)
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -104,18 +123,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Key(KeyCommand::Generate { name, out }) => {
-            if out.exists() {
-                bail!(
-                    "{} already exists — refusing to overwrite a signing key",
-                    out.display()
-                );
-            }
             let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
             // Nix's format: name:base64(seed ++ public), the whole 64 bytes.
             let mut material = key.to_bytes().to_vec();
             material.extend_from_slice(&key.verifying_key().to_bytes());
-            std::fs::write(&out, format!("{name}:{}\n", B64.encode(&material)))?;
-            restrict(&out)?;
+            write_secret(&out, &format!("{name}:{}\n", B64.encode(&material)))?;
             println!("wrote {}", out.display());
             println!(
                 "public key: {name}:{}",
@@ -188,22 +200,57 @@ async fn main() -> Result<()> {
             other => print_unexpected(other),
         },
 
-        Command::Delete { hashes } => match request(&cli.socket, Request::Delete { hashes }).await?
-        {
-            Response::Delete {
-                deleted,
-                bytes_freed,
-                missing,
-            } => {
-                println!("deleted {deleted} object(s), {bytes_freed} byte(s) freed");
-                // Reported, not swallowed: a mistyped hash would otherwise
-                // look exactly like a successful delete.
-                if !missing.is_empty() {
-                    println!("not in the cache: {}", missing.join(", "));
+        Command::Delete {
+            pushed_by: Some(subject),
+            since,
+            apply,
+            ..
+        } => {
+            let since = since
+                .map(|since| parse_cutoff(&since, unix_now()))
+                .transpose()?;
+            let dry_run = !apply;
+            match request(
+                &cli.socket,
+                Request::DeletePushedBy {
+                    subject,
+                    since,
+                    dry_run,
+                },
+            )
+            .await?
+            {
+                Response::DeletePushedBy {
+                    objects,
+                    bytes_freed,
+                } => {
+                    let verb = if dry_run { "would delete" } else { "deleted" };
+                    for basename in &objects {
+                        println!("{verb} {basename}");
+                    }
+                    println!("{verb} {} object(s), {}", objects.len(), human(bytes_freed));
                 }
+                other => print_unexpected(other),
             }
-            other => print_unexpected(other),
-        },
+        }
+
+        Command::Delete { hashes, .. } => {
+            match request(&cli.socket, Request::Delete { hashes }).await? {
+                Response::Delete {
+                    deleted,
+                    bytes_freed,
+                    missing,
+                } => {
+                    println!("deleted {deleted} object(s), {bytes_freed} byte(s) freed");
+                    // Reported, not swallowed: a mistyped hash would otherwise
+                    // look exactly like a successful delete.
+                    if !missing.is_empty() {
+                        println!("not in the cache: {}", missing.join(", "));
+                    }
+                }
+                other => print_unexpected(other),
+            }
+        }
 
         Command::Pin {
             name,
@@ -313,6 +360,19 @@ async fn main() -> Result<()> {
                 other => print_unexpected(other),
             }
         }
+
+        Command::Backup { path } => {
+            // The Pusher resolves the path, from its own working directory.
+            let path = std::path::absolute(&path)?;
+            let path = path
+                .to_str()
+                .context("backup path is not UTF-8")?
+                .to_owned();
+            match request(&cli.socket, Request::Backup { path: path.clone() }).await? {
+                Response::Backup { bytes } => println!("wrote {path} ({})", human(bytes as i64)),
+                other => print_unexpected(other),
+            }
+        }
     }
     Ok(())
 }
@@ -394,10 +454,27 @@ fn print_unexpected(response: Response) {
     std::process::exit(1);
 }
 
-#[cfg(unix)]
-fn restrict(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+/// Creates `path` holding `contents`, mode 0600 from the moment it exists:
+/// writing first and chmod-ing after leaves a window in which anyone can open
+/// the key and keep the descriptor. `create_new` (O_EXCL) also refuses
+/// whatever is already there -- a key, or a symlink planted to redirect the
+/// write.
+fn write_secret(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
+                "{} already exists — refusing to overwrite a signing key",
+                path.display()
+            ),
+            _ => anyhow::Error::new(e).context(format!("creating {}", path.display())),
+        })?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -468,7 +545,7 @@ fn parse_cutoff(text: &str, now: i64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cutoff, parse_duration};
+    use super::{parse_cutoff, parse_duration, write_secret};
 
     #[test]
     fn durations_parse_or_fail_loudly() {
@@ -493,5 +570,42 @@ mod tests {
         for bad in ["2026-13-01", "2026-06", "2026-06-00", "yesterday", "-1d"] {
             assert!(parse_cutoff(bad, 0).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("garret-admin-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn secrets_are_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode");
+        let key = dir.join("key");
+        write_secret(&key, "k:secret\n").unwrap();
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "k:secret\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Existing keys and planted symlinks are both refused: following a
+    /// dangling symlink would write the key wherever it points.
+    #[test]
+    fn secrets_never_replace_or_follow_what_is_there() {
+        let dir = scratch("exists");
+        let key = dir.join("key");
+        std::fs::write(&key, "old").unwrap();
+        assert!(write_secret(&key, "new").is_err());
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "old");
+
+        let link = dir.join("link");
+        let target = dir.join("elsewhere");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_secret(&link, "new").is_err());
+        assert!(!target.exists(), "the write followed the symlink");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
