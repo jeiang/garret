@@ -57,8 +57,16 @@ usage crosses it and deletes nothing while usage stays below it.
 ## Eviction
 
 Removing an object (and its blob) to reclaim quota. Only objects no
-surviving object references may be evicted, least-recently-accessed first
-— so every closure the cache still serves remains complete.
+surviving object references, no live pin holds, and no push used within
+the push grace may be evicted, least-recently-accessed first — so every
+closure the cache still serves, or a push is still relying on, remains
+complete.
+
+## Push Grace
+
+The day after a push or Negotiation last used an object, during which
+neither eviction nor prune removes it: the client was told the object is
+present and uploads its referrers against that answer.
 
 ## Prune
 
