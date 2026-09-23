@@ -366,6 +366,38 @@ echo "  unknown hash is reported rather than swallowed"
 # Re-push it so the GC section still has the closure it expects.
 garret push "$path" >/dev/null
 
+# Prune by push age. Everything here is minutes old, so backdate `pushed_at`
+# directly. A re-push must count as a push: its Negotiation refreshes the
+# closure, and a prune then deletes nothing.
+root_hash=$(basename "$path" | cut -c1-32)
+backdate() {
+  sqlite3 -cmd ".timeout 5000" "$root/garret.db" \
+    "UPDATE objects SET pushed_at = 0 WHERE store_path_hash IN ($1)"
+}
+backdate "'$root_hash', '$leaf_hash'"
+garret push "$path" >/dev/null
+admin prune --before 2d --apply | tee "$root/prune-fresh.out"
+grep -q "deleted 0 object" "$root/prune-fresh.out"
+echo "  a re-pushed closure counts as recent"
+# An old root goes; its dependency, pushed recently, stays.
+backdate "'$root_hash'"
+admin prune --before 2d | tee "$root/prune-dry.out"
+grep -q "would delete 1 object" "$root/prune-dry.out"
+curl -sf "$puller_url/$root_hash.narinfo" >/dev/null \
+  || { echo "a dry run deleted the root"; exit 1; }
+admin prune --before 2d --apply | tee "$root/prune.out"
+grep -q "deleted $root_hash-" "$root/prune.out"
+if curl -sf "$puller_url/$root_hash.narinfo" >/dev/null 2>&1; then
+  echo "narinfo still served after prune"; exit 1
+fi
+curl -sf "$puller_url/$leaf_hash.narinfo" >/dev/null \
+  || { echo "prune deleted a recently pushed dependency"; exit 1; }
+if admin prune --before 1h 2>/dev/null; then
+  echo "a cutoff inside the push window should be refused"; exit 1
+fi
+echo "  old root pruned, recent dependency kept, too-recent cutoff refused"
+garret push "$path" >/dev/null
+
 say "benchmark harness"
 # All three scenarios, wired end to end: push seeds the corpus (count 12),
 # stream exercises the single-stream path, pull reads the corpus back.

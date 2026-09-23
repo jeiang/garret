@@ -1,7 +1,7 @@
 //! SQLite access. Schema per spec 02-database; the Pusher owns all writes.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 /// One cached store path: the unit of content in the cache, keyed by its
 /// store path hash. A row exists if and only if its blob does (spec 02).
@@ -53,7 +53,8 @@ CREATE TABLE IF NOT EXISTS objects (
   sigs              TEXT NOT NULL,
   pushed_by         TEXT,
   created_at        INTEGER NOT NULL,
-  last_accessed_at  INTEGER NOT NULL
+  last_accessed_at  INTEGER NOT NULL,
+  pushed_at         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS objects_name          ON objects(name);
 CREATE INDEX IF NOT EXISTS objects_last_accessed ON objects(last_accessed_at);
@@ -103,10 +104,37 @@ pub fn open(path: &str, create: bool) -> Result<Connection> {
     Ok(conn)
 }
 
+/// How stale `pushed_at` must be before Negotiation rewrites it: a closure
+/// pushed from several CI jobs in one run costs one write per path, not one
+/// per job.
+pub const PUSHED_AT_DEBOUNCE: i64 = 3600;
+
+/// The newest cutoff [`prune`] accepts. A client that negotiated a path is
+/// told it need not upload it, and relies on it until its push finishes; the
+/// debounced `pushed_at` of such a path is at most [`PUSHED_AT_DEBOUNCE`]
+/// behind the Negotiation, so any cutoff older than this leaves a push up to
+/// 23 hours long room to finish against a complete closure.
+pub const PRUNE_MIN_AGE: i64 = 86400;
+
 /// Applies the schema (idempotent `IF NOT EXISTS`). Pusher-only, like every
 /// other write.
 pub fn migrate(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA).context("applying schema")
+    conn.execute_batch(SCHEMA).context("applying schema")?;
+    // Databases created before `pushed_at` existed: the best record of when
+    // those objects were last pushed is when they were first stored.
+    if conn
+        .prepare("SELECT pushed_at FROM objects LIMIT 0")
+        .is_err()
+    {
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE objects ADD COLUMN pushed_at INTEGER NOT NULL DEFAULT 0;
+             UPDATE objects SET pushed_at = created_at;
+             COMMIT;",
+        )
+        .context("adding objects.pushed_at")?;
+    }
+    Ok(())
 }
 
 /// The Pusher creates the database, so a Puller started first would otherwise
@@ -158,8 +186,9 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
         .unwrap_or(0);
     tx.execute(
         "INSERT OR REPLACE INTO objects (store_path_hash, store_path, name, nar_hash, nar_size,
-             file_hash, file_size, deriver, ca, sigs, pushed_by, created_at, last_accessed_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
+             file_hash, file_size, deriver, ca, sigs, pushed_by, created_at, last_accessed_at,
+             pushed_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?12)",
         params![
             obj.store_path_hash,
             obj.store_path,
@@ -410,13 +439,149 @@ pub fn bump_last_accessed(conn: &Connection, hash: &str, now: i64, stale_after: 
     Ok(())
 }
 
-/// Negotiation: the subset of `hashes` the cache does not hold.
-pub fn missing(conn: &Connection, hashes: &[String]) -> Result<Vec<String>> {
-    hashes
+/// Negotiation: the subset of `hashes` the cache does not hold. Every hash it
+/// does hold has its `pushed_at` refreshed (debounced): the client will now
+/// rely on that path instead of uploading it, so to [`prune`] it counts as
+/// pushed now.
+///
+/// Reads first and takes the write lock only when a bump is due, so the
+/// usual, debounced Negotiation stays read-only; the IMMEDIATE transaction
+/// makes `busy_timeout` apply, where a deferred read-to-write upgrade would
+/// fail at once under contention. [`prune`] cannot interleave: both run on
+/// the Pusher's one writer connection, behind its mutex.
+pub fn missing(conn: &mut Connection, hashes: &[String], now: i64) -> Result<Vec<String>> {
+    let mut missing = Vec::new();
+    let mut stale = Vec::new();
+    {
+        let mut pushed_at =
+            conn.prepare_cached("SELECT pushed_at FROM objects WHERE store_path_hash = ?1")?;
+        for hash in hashes {
+            match pushed_at
+                .query_row(params![hash], |r| r.get::<_, i64>(0))
+                .optional()?
+            {
+                None => missing.push(hash.clone()),
+                Some(at) if at < now - PUSHED_AT_DEBOUNCE => stale.push(hash),
+                Some(_) => {}
+            }
+        }
+    }
+    if !stale.is_empty() {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut touch =
+                tx.prepare("UPDATE objects SET pushed_at = ?2 WHERE store_path_hash = ?1")?;
+            for hash in stale {
+                touch.execute(params![hash, now])?;
+            }
+        }
+        tx.commit()?;
+    }
+    Ok(missing)
+}
+
+/// One object [`prune`] removed (or would remove): hash, name, blob size.
+pub type Pruned = (String, String, i64);
+
+/// Rows [`prune`] deletes per write transaction, like GC's batches: the
+/// Puller's last-accessed writes interleave between them instead of waiting
+/// out one long transaction.
+const PRUNE_BATCH: usize = 500;
+
+/// Removes every object last pushed before `before` that no surviving
+/// closure needs: mark from the roots that stay — objects pushed at or after
+/// the cutoff and live pins — through their references, then delete what the
+/// mark did not reach. Store paths form a DAG (self-edges aside), so this is
+/// exactly the set that repeated root-first deletion of old objects would
+/// reach. Anything unmarked is older than the cutoff by construction.
+///
+/// The mark is a plain read, so a dry run takes no write lock. Everything it
+/// reads is written only by the Pusher, and the caller holds the Pusher's
+/// connection for the whole call, so no Negotiation can refresh a doomed
+/// path between mark and delete. Deletes run in short batches, referrers
+/// before their references, so the cache is closed after every commit. The
+/// caller deletes the blobs afterwards: row first, blob second (spec 05).
+pub fn prune(conn: &mut Connection, before: i64, now: i64, dry_run: bool) -> Result<Vec<Pruned>> {
+    anyhow::ensure!(
+        before <= now - PRUNE_MIN_AGE,
+        "the cutoff must be at least {} hours ago, so a push in progress keeps its closure",
+        PRUNE_MIN_AGE / 3600
+    );
+    let doomed: Vec<Pruned> = conn
+        .prepare(
+            "WITH RECURSIVE keep(hash) AS (
+                 SELECT store_path_hash FROM objects WHERE pushed_at >= ?1
+                 UNION
+                 SELECT store_path_hash FROM pins WHERE expires_at IS NULL OR expires_at > ?2
+                 UNION
+                 SELECT r.reference_hash FROM object_refs r JOIN keep ON r.referrer = keep.hash
+             )
+             SELECT store_path_hash, name, file_size FROM objects
+             WHERE store_path_hash NOT IN (SELECT hash FROM keep)
+             ORDER BY name, store_path_hash",
+        )?
+        .query_map(params![before, now], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    if dry_run {
+        return Ok(doomed);
+    }
+    for batch in referrers_first(conn, &doomed)?.chunks(PRUNE_BATCH) {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut delete = tx.prepare("DELETE FROM objects WHERE store_path_hash = ?1")?;
+            for &i in batch {
+                delete.execute(params![doomed[i].0])?;
+            }
+        }
+        let freed: i64 = batch.iter().map(|&i| doomed[i].2).sum();
+        tx.execute(
+            "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
+            params![freed],
+        )?;
+        tx.commit()?;
+    }
+    Ok(doomed)
+}
+
+/// Indexes into `doomed`, every referrer before the objects it references
+/// (Kahn's algorithm over the edges inside the set; self-edges ignored).
+fn referrers_first(conn: &Connection, doomed: &[Pruned]) -> Result<Vec<usize>> {
+    let index: std::collections::HashMap<&str, usize> = doomed
         .iter()
-        .filter(|h| !matches!(exists(conn, h), Ok(true)))
-        .map(|h| Ok(h.clone()))
-        .collect()
+        .enumerate()
+        .map(|(i, (hash, _, _))| (hash.as_str(), i))
+        .collect();
+    let mut references = vec![Vec::new(); doomed.len()];
+    let mut referrers = vec![0usize; doomed.len()];
+    let mut stmt = conn.prepare("SELECT reference_hash FROM object_refs WHERE referrer = ?1")?;
+    for (i, (hash, _, _)) in doomed.iter().enumerate() {
+        for reference in stmt.query_map(params![hash], |row| row.get::<_, String>(0))? {
+            if let Some(&j) = index.get(reference?.as_str())
+                && j != i
+            {
+                references[i].push(j);
+                referrers[j] += 1;
+            }
+        }
+    }
+    let mut ready: Vec<usize> = (0..doomed.len()).filter(|&i| referrers[i] == 0).collect();
+    let mut order = Vec::with_capacity(doomed.len());
+    while let Some(i) = ready.pop() {
+        order.push(i);
+        for &j in &references[i] {
+            referrers[j] -= 1;
+            if referrers[j] == 0 {
+                ready.push(j);
+            }
+        }
+    }
+    anyhow::ensure!(
+        order.len() == doomed.len(),
+        "reference cycle among objects to prune; nothing deleted"
+    );
+    Ok(order)
 }
 
 #[cfg(test)]
@@ -470,7 +635,7 @@ mod tests {
         assert_eq!(got.sigs, vec!["k:sig".to_string()]);
         assert!(exists(&conn, &a).unwrap());
         assert_eq!(
-            missing(&conn, &[a.clone(), "nope".into()]).unwrap(),
+            missing(&mut conn, &[a.clone(), "nope".into()], 100).unwrap(),
             vec!["nope"]
         );
     }
@@ -616,6 +781,99 @@ mod tests {
             .unwrap();
         assert_eq!(reconcile_total_bytes(&conn).unwrap(), 5);
         assert_eq!(total_bytes(&conn).unwrap(), 5);
+    }
+
+    #[test]
+    fn prune_removes_old_closures_but_keeps_what_survivors_need() {
+        const DAY: i64 = 86400;
+        let mut conn = db();
+        let [a, b, s, n, p, q, c] =
+            ['a', 'b', 's', 'n', 'p', 'q', 'c'].map(|x| x.to_string().repeat(32));
+        let dep = |h: &str| format!("{h}-dep");
+        // Old root a (self-referencing) → b (exclusive) and s (shared with
+        // the new root n). Old root p is pinned, keeping q. Old c is
+        // re-negotiated today, which is a push as far as prune is concerned.
+        insert_object(&mut conn, &object(&a, &[&dep(&a), &dep(&b), &dep(&s)]), 100).unwrap();
+        for h in [&b, &s, &q, &c] {
+            insert_object(&mut conn, &object(h, &[]), 100).unwrap();
+        }
+        insert_object(&mut conn, &object(&p, &[&dep(&q)]), 100).unwrap();
+        insert_object(&mut conn, &object(&n, &[&dep(&s)]), 10 * DAY).unwrap();
+        pin(&conn, "release", &p, None, 100).unwrap();
+        let now = 10 * DAY + 1;
+        missing(&mut conn, std::slice::from_ref(&c), now).unwrap();
+
+        assert!(
+            prune(&mut conn, now - 1, now, true).is_err(),
+            "a cutoff inside the in-progress-push window was accepted"
+        );
+
+        let expected = vec![
+            (a.clone(), "thing".into(), 5),
+            (b.clone(), "thing".into(), 5),
+        ];
+        assert_eq!(prune(&mut conn, 5 * DAY, now, true).unwrap(), expected);
+        assert_eq!(
+            total_bytes(&conn).unwrap(),
+            35,
+            "a dry run deleted something"
+        );
+
+        assert_eq!(prune(&mut conn, 5 * DAY, now, false).unwrap(), expected);
+        for h in [&a, &b] {
+            assert!(!exists(&conn, h).unwrap(), "{h} survived the prune");
+        }
+        for h in [&s, &n, &p, &q, &c] {
+            assert!(exists(&conn, h).unwrap(), "{h} was pruned");
+        }
+        assert_eq!(total_bytes(&conn).unwrap(), 25);
+    }
+
+    #[test]
+    fn prune_deletes_referrers_before_their_references() {
+        // Batched deletes leave the cache closed after each commit only if no
+        // batch removes a dependency while its referrer survives.
+        let mut conn = db();
+        let [a, b, c, d] = ['a', 'b', 'c', 'd'].map(|x| x.to_string().repeat(32));
+        let dep = |h: &str| format!("{h}-dep");
+        // c ← b ← a, c ← d, and b refers to itself.
+        insert_object(&mut conn, &object(&c, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&b, &[&dep(&b), &dep(&c)]), 100).unwrap();
+        insert_object(&mut conn, &object(&a, &[&dep(&b)]), 100).unwrap();
+        insert_object(&mut conn, &object(&d, &[&dep(&c)]), 100).unwrap();
+        let doomed: Vec<Pruned> = [&c, &b, &a, &d]
+            .map(|h| (h.clone(), "thing".into(), 5))
+            .into();
+        let order: Vec<&str> = referrers_first(&conn, &doomed)
+            .unwrap()
+            .into_iter()
+            .map(|i| doomed[i].0.as_str())
+            .collect();
+        let at = |h: &str| order.iter().position(|x| *x == h).unwrap();
+        assert_eq!(order.len(), 4);
+        assert!(
+            at(&a) < at(&b) && at(&b) < at(&c) && at(&d) < at(&c),
+            "{order:?}"
+        );
+    }
+
+    #[test]
+    fn migrate_seeds_pushed_at_from_created_at() {
+        let conn = db();
+        conn.execute_batch("ALTER TABLE objects DROP COLUMN pushed_at")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO objects (store_path_hash, store_path, name, nar_hash, nar_size,
+                 file_hash, file_size, sigs, created_at, last_accessed_at)
+             VALUES ('a', '/nix/store/a-x', 'x', 'h', 1, 'f', 1, '[]', 42, 42)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let pushed: i64 = conn
+            .query_row("SELECT pushed_at FROM objects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pushed, 42);
     }
 
     #[test]
