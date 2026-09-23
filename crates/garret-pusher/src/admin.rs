@@ -1,6 +1,8 @@
-//! The Pusher's admin socket (spec 10-packaging). Root-only by file mode:
-//! anything reaching this socket is already privileged, so there is no
-//! separate auth layer to keep in sync.
+//! The Pusher's admin socket (spec 10-packaging). Owner-only by file mode
+//! (0600, the Pusher's own user): only root and the Pusher's uid can connect,
+//! and both already hold everything the socket grants, so there is no
+//! separate auth layer to keep in sync. That is why no other process may run
+//! as that uid — the Puller has a user of its own.
 
 use std::sync::Arc;
 

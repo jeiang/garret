@@ -26,7 +26,8 @@ resource accounting, and restarts stay independent.
 ## Admin CLI (`garret-admin`)
 
 Key operations are offline file operations; everything touching the DB
-goes through the Pusher's **admin API on a root-only unix socket**
+goes through the Pusher's **admin API on an owner-only unix socket** (0600,
+the Pusher's user: root and the Pusher can connect, the Puller cannot)
 (single-writer discipline — garret-admin never opens the DB while the
 Pusher runs).
 
@@ -45,7 +46,8 @@ Pusher runs).
 
 Flake outputs: `packages.{garret,garret-pusher,garret-puller,garret-admin,garret-bench}`,
 `nixosModules.{pusher,puller,watcher}`, `devShells.default`, `checks`
-(unit + NixOS integration test that pushes and pulls a closure).
+(`build`; on Linux also `module`, a NixOS VM test that boots the pusher and
+puller modules on one host and checks the service-user boundary below).
 
 Module option sketch (all under `services.garret.*`):
 
@@ -71,6 +73,36 @@ a whole client config (spec 06). Set `client_id` on the human issuer only.
 
 Secrets (S3 credentials, signing keys, OIDC client secrets) are file
 paths — agenix/sops-friendly, never in the nix store.
+
+### Service users and file modes
+
+The Pusher and the Puller run as different users
+([ADR-0009](../adr/0009-puller-runs-as-its-own-user.md)), so a compromise
+of the public-facing Puller reaches neither the signing keys, the admin
+socket, nor bucket write:
+
+| | Pusher | Puller |
+|---|---|---|
+| User / group | `garret` / `garret` | `garret-puller` / `garret` |
+| Database directory, `garret:garret` 0750 | owner | enter only: cannot create or replace files |
+| `garret.db`, `-wal`, `-shm`, 0660 | read/write | read/write: last-accessed bumps, and WAL readers write `-shm` |
+| Signing keys, `garret`-only (0400) | read | none |
+| Admin socket, `garret` 0600 | serves | cannot connect |
+| S3 credentials | its key (bucket write) | its own key; GetObject suffices |
+
+SQLite gives `-wal` and `-shm` the database file's mode but creates the
+database itself 0644, so the pusher unit's `ExecStartPre` (as `garret`)
+creates it 0660 before SQLite first opens it, and re-applies 0660 to all
+three files on every start. The Puller can still write rows: its bumps need
+the write lock, and SQLite has no finer permission.
+
+Upgrading from modules without the split: with the default `dbPath`,
+nothing to do — the first Pusher start makes the directory 0750 and the
+database files 0660. A custom `dbPath` directory must already be owned by
+`garret:garret` and not group-writable. A signing key readable by group
+`garret` (say `root:garret` 0440) must become `garret`-owned 0400, or the
+Puller can read it. Pointing `services.garret.puller.s3.credentialsFile` at
+a GetObject-only key is optional, and takes bucket write away from the Puller.
 
 ## Shell completions
 
