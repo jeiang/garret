@@ -99,6 +99,10 @@ pub fn open(path: &str, create: bool) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, flags)
         .with_context(|| format!("opening database {path}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // SQLite's auto-checkpoint (every 1000 pages, on commit) keeps the WAL
+    // short, but never shrinks the file: without a limit, one large
+    // transaction would leave the WAL at its size until the next restart.
+    conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;

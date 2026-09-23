@@ -34,7 +34,12 @@ Prefix `garret_`; service distinguished by scrape job.
   failures.
 - **Pusher — GC**: usage and quota gauges; evicted objects/bytes per
   pass; pass duration; orphans found; candidates-exhausted alarm
-  counter; last-successful-pass timestamp.
+  counter; `garret_gc_failures_total` by `phase` (`pass`, `sweep`), for
+  passes and orphan sweeps that errored, whoever triggered them;
+  `garret_gc_last_success_timestamp`, set by every successful pass and
+  every successful tick — including a quota check that finds nothing to
+  evict — so it goes stale only when GC stops running, never merely
+  because usage is low.
 - **Pusher — fsck**: `garret_fsck_runs_total` counter; `garret_fsck_findings`
   gauge by `kind` (`dangling`, `orphan`, `size_mismatch`), set to the
   latest run's count per kind; `garret_fsck_rows_repaired_total` counter
