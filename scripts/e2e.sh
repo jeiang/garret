@@ -337,6 +337,9 @@ generated=$(awk '/public key:/ {print $3}' "$root/keygen.out")
 shown=$(admin key show "$root/rotate.key")
 [ "$generated" = "$shown" ] || { echo "generate and show disagree: $generated vs $shown"; exit 1; }
 echo "  offline keygen agrees with key show"
+[ "$(stat -c %a "$root/rotate.key" 2>/dev/null || stat -f %Lp "$root/rotate.key")" = 600 ] \
+  || { echo "signing key is not mode 0600"; exit 1; }
+echo "  signing key is created mode 0600"
 # It must refuse to clobber an existing key rather than destroying signatures.
 if admin key generate garret-rotate-2 "$root/rotate.key" 2>/dev/null; then
   echo "key generate overwrote an existing key"; exit 1

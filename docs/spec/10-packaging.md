@@ -32,7 +32,7 @@ Pusher runs).
 
 | Command | Path |
 |---|---|
-| `key generate` | offline — writes nix-format keypair file |
+| `key generate` | offline — writes nix-format keypair file, created mode 0600; never overwrites |
 | `key show` | offline — prints public key for nix.conf |
 | `resign` | socket — backfill signatures after adding a key |
 | `gc run` | socket — trigger a GC pass |
