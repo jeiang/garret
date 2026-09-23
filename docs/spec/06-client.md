@@ -100,6 +100,16 @@ body completes, the server never stores a truncated NAR under the claimed
 narHash, and the path is reported failed with nix's stderr. The failure is not
 retried — the causes are local and mostly permanent.
 
+**Tokens** are asked for per request, never held for the whole run: a push
+or the watcher can outlive any one token (GitHub's live five minutes, Pocket
+ID's an hour). A token is re-minted once it is within 60 s of the lifetime
+its own `exp − iat` declares — for a five-minute GitHub runner token, spec
+04's "re-mint once it is >4 min old" — and concurrent requests share one
+mint, which rotating refresh tokens require. A 401 on the Negotiation or an
+upload renews the token once and retries straight away, for what aging
+cannot see (revocation, a token that declares no lifetime); a second 401 is a
+real refusal. `GARRET_TOKEN` is used as given and never renewed.
+
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure
 assembly, paths whose `nix path-info` signatures carry a configured upstream
