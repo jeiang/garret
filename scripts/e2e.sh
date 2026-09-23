@@ -132,6 +132,22 @@ grep -q "^Sig: garret-e2e-1:" "$root/narinfo"
 grep -q "^References: .*$(basename "$leaf")" "$root/narinfo"
 grep -q "^References: .*$(basename "$path")" "$root/narinfo"
 
+say "last-accessed bumps land off the request path"
+# bump_debounce_secs = 0 here, so a hit a second after the last write is
+# stale. The bump is queued, not written by the request: it must land from the
+# Puller's flush, on its own connection, within a couple of flush intervals.
+accessed() { sqlite3 "$root/garret.db" "SELECT last_accessed_at FROM objects WHERE store_path_hash = '$1'"; }
+before=$(accessed "$hash")
+sleep 1
+curl -sf "$puller_url/$hash.narinfo" >/dev/null
+for _ in $(seq 30); do
+  [ "$(accessed "$hash")" -gt "$before" ] && break
+  sleep 0.5
+done
+after=$(accessed "$hash")
+echo "  last_accessed_at $before -> $after"
+[ "$after" -gt "$before" ] || { echo "the bump was never flushed"; exit 1; }
+
 say "NAR request redirects (ADR-0005)"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$puller_url/nar/$hash.nar.zst")
 location=$(curl -s -o /dev/null -w '%{redirect_url}' "$puller_url/nar/$hash.nar.zst")

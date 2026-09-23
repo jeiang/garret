@@ -205,14 +205,24 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
 
 /// Fetches an object with its references sorted, ready for narinfo rendering.
 pub fn get_object(conn: &Connection, hash: &str) -> Result<Option<Object>> {
+    Ok(get_object_and_last_accessed(conn, hash)?.map(|(obj, _)| obj))
+}
+
+/// [`get_object`] plus the row's `last_accessed_at`, read by the same query,
+/// so the Puller decides whether a hit needs a bump without a second lookup
+/// and without a write (spec 02).
+pub fn get_object_and_last_accessed(
+    conn: &Connection,
+    hash: &str,
+) -> Result<Option<(Object, i64)>> {
     let mut obj = conn
         .query_row(
             "SELECT store_path, name, nar_hash, nar_size, file_hash, file_size, deriver, ca,
-                    sigs, pushed_by
+                    sigs, pushed_by, last_accessed_at
              FROM objects WHERE store_path_hash = ?1",
             params![hash],
             |row| {
-                Ok(Object {
+                let obj = Object {
                     store_path_hash: hash.to_owned(),
                     store_path: row.get(0)?,
                     name: row.get(1)?,
@@ -226,12 +236,13 @@ pub fn get_object(conn: &Connection, hash: &str) -> Result<Option<Object>> {
                     sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
                         .unwrap_or_default(),
                     pushed_by: row.get(9)?,
-                })
+                };
+                Ok((obj, row.get(10)?))
             },
         )
         .optional()?;
 
-    if let Some(obj) = obj.as_mut() {
+    if let Some((obj, _)) = obj.as_mut() {
         // Sorted: narinfo References order is part of what the signature covers.
         let mut stmt = conn
             .prepare("SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference")?;
@@ -399,14 +410,28 @@ pub fn all_objects_brief(conn: &Connection) -> Result<Vec<(String, String, i64, 
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// Debounced last-accessed bump (spec 02): day granularity is enough for LRU,
-/// so a row touched in the last `stale_after` seconds is left alone.
-pub fn bump_last_accessed(conn: &Connection, hash: &str, now: i64, stale_after: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE objects SET last_accessed_at = ?2
-         WHERE store_path_hash = ?1 AND last_accessed_at < ?2 - ?3",
-        params![hash, now, stale_after],
-    )?;
+/// Debounced last-accessed bumps (spec 02), one IMMEDIATE transaction per
+/// batch: the write lock is taken up front, so a busy database fails within
+/// the connection's busy timeout instead of partway through. Day granularity
+/// is enough for LRU, so a row touched in the last `stale_after` seconds is
+/// left alone.
+pub fn bump_last_accessed<S: AsRef<str>>(
+    conn: &mut Connection,
+    hashes: impl IntoIterator<Item = S>,
+    now: i64,
+    stale_after: i64,
+) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE objects SET last_accessed_at = ?2
+             WHERE store_path_hash = ?1 AND last_accessed_at < ?2 - ?3",
+        )?;
+        for hash in hashes {
+            stmt.execute(params![hash.as_ref(), now, stale_after])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -621,16 +646,22 @@ mod tests {
     #[test]
     fn last_accessed_bumps_are_debounced() {
         let mut conn = db();
-        let a = "a".repeat(32);
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
         insert_object(&mut conn, &object(&a, &[]), 1000).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 1000).unwrap();
 
-        // Within the debounce window: no write at all.
-        bump_last_accessed(&conn, &a, 1001, 86400).unwrap();
+        // Within the debounce window: the row stays put.
+        bump_last_accessed(&mut conn, [&a], 1001, 86400).unwrap();
         assert_eq!(last_accessed(&conn, &a), 1000);
 
-        // Past it: the row moves.
-        bump_last_accessed(&conn, &a, 1000 + 86401, 86400).unwrap();
+        // Past it: every row in the batch moves, as the pull path reads it.
+        bump_last_accessed(&mut conn, [&a, &b], 1000 + 86401, 86400).unwrap();
         assert_eq!(last_accessed(&conn, &a), 1000 + 86401);
+        assert_eq!(last_accessed(&conn, &b), 1000 + 86401);
+        assert_eq!(
+            get_object_and_last_accessed(&conn, &a).unwrap().unwrap().1,
+            1000 + 86401
+        );
     }
 
     fn last_accessed(conn: &Connection, hash: &str) -> i64 {

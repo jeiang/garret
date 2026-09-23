@@ -1,9 +1,9 @@
 //! Puller: the public Nix substituter. Serves narinfo (it holds the
 //! signatures) and redirects NAR requests to presigned S3 URLs (ADR-0005).
-//! M1 slice — no browse API (M4), no last-accessed bumps (M4).
 
 use std::{
-    sync::{Arc, Mutex, OnceLock},
+    collections::HashSet,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
 
@@ -33,6 +33,7 @@ struct AppState {
     storage: Storage,
     presign_ttl: Duration,
     bump_debounce: i64,
+    bumps: Bumps,
     db_read_budget: Duration,
     presign_budget: Duration,
 }
@@ -44,6 +45,74 @@ impl AppState {
 
     fn conn_handle(&self) -> Option<Arc<Mutex<rusqlite::Connection>>> {
         self.conn.get().cloned()
+    }
+}
+
+/// How often queued last-accessed bumps are written. LRU needs only day
+/// granularity; this just batches a burst of hits into one transaction.
+const BUMP_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a bump flush waits on a Pusher write before giving up. Short: a
+/// dropped batch costs nothing, since its rows stay stale and re-queue on
+/// their next hit.
+const BUMP_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Last-accessed bumps waiting for the next flush (spec 02). A set, so a
+/// burst of hits on one hash is one write. Only hits on stale rows are
+/// queued, so it is bounded by the object count.
+#[derive(Default)]
+struct Bumps(Mutex<HashSet<String>>);
+
+impl Bumps {
+    /// Called on every narinfo hit with the `last_accessed_at` the read
+    /// already fetched. A fresh row, which is nearly every hit, costs no
+    /// write at all: not even the WAL write lock a no-op UPDATE would take.
+    fn hit(&self, hash: &str, last_accessed_at: i64, now: i64, debounce: i64) {
+        if last_accessed_at >= now - debounce {
+            metrics::counter!("garret_bump_debounced_total").increment(1);
+            return;
+        }
+        let mut pending = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !pending.contains(hash) {
+            pending.insert(hash.to_owned());
+        }
+        metrics::gauge!("garret_bump_queue_depth").set(pending.len() as f64);
+    }
+
+    /// Writes everything queued so far on `conn`, the Puller's dedicated bump
+    /// connection, and returns how many hashes it wrote. Blocking: callers
+    /// run it on the blocking pool, never under the pull-path lock.
+    fn flush(&self, conn: &mut rusqlite::Connection, now: i64, debounce: i64) -> Result<usize> {
+        let batch = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        metrics::gauge!("garret_bump_queue_depth").set(0.0);
+        if batch.is_empty() {
+            return Ok(0);
+        }
+        db::bump_last_accessed(conn, &batch, now, debounce)?;
+        Ok(batch.len())
+    }
+}
+
+/// Flushes queued bumps every [`BUMP_FLUSH_INTERVAL`] for the life of the
+/// process. A failed flush drops its batch; see [`BUMP_BUSY_TIMEOUT`].
+async fn flush_bumps(state: Arc<AppState>, conn: rusqlite::Connection) {
+    let conn = Arc::new(Mutex::new(conn));
+    let mut tick = tokio::time::interval(BUMP_FLUSH_INTERVAL);
+    loop {
+        tick.tick().await;
+        let (state, conn) = (state.clone(), conn.clone());
+        let flushed = tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
+            state.bumps.flush(&mut conn, now(), state.bump_debounce)
+        })
+        .await;
+        let error = match flushed {
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(e) => e.to_string(),
+        };
+        metrics::counter!("garret_bump_failures_total").increment(1);
+        tracing::warn!("last-accessed bump flush failed: {error}");
     }
 }
 
@@ -97,6 +166,7 @@ async fn main() -> Result<()> {
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
         bump_debounce: cfg.bump_debounce_secs,
+        bumps: Bumps::default(),
         db_read_budget: Duration::from_millis(cfg.db_read_budget_ms),
         presign_budget: Duration::from_millis(cfg.presign_budget_ms),
     });
@@ -107,9 +177,19 @@ async fn main() -> Result<()> {
         let db_path = cfg.db_path.clone();
         let timeout = Duration::from_secs(cfg.db_wait_timeout_secs);
         async move {
-            match db::open_when_ready(&db_path, timeout).await {
-                Ok(conn) => {
+            let opened = db::open_when_ready(&db_path, timeout)
+                .await
+                .and_then(|conn| {
+                    // Bumps get their own connection, so a flush waiting on
+                    // a Pusher write never holds up a pull-path read.
+                    let bump_conn = db::open(&db_path, false)?;
+                    bump_conn.busy_timeout(BUMP_BUSY_TIMEOUT)?;
+                    Ok((conn, bump_conn))
+                });
+            match opened {
+                Ok((conn, bump_conn)) => {
                     let _ = state.conn.set(Arc::new(Mutex::new(conn)));
+                    tokio::spawn(flush_bumps(state.clone(), bump_conn));
                     tracing::info!("database ready: serving");
                 }
                 // Nothing this process can do but let the supervisor restart it.
@@ -193,7 +273,7 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
     let object = {
         let hash = hash.clone();
         db_read(conn, state.db_read_budget, move |conn| {
-            db::get_object(conn, &hash)
+            db::get_object_and_last_accessed(conn, &hash)
         })
         .await
     };
@@ -207,25 +287,19 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
         return degraded_miss("db_timeout");
     };
 
-    // Fire-and-forget: LRU only needs day granularity, so a bump must never
-    // sit on the request path or hold up a substituter (spec 02-database).
-    if matches!(object, Ok(Some(_))) {
-        let state = state.clone();
-        let hash = hash.clone();
-        tokio::spawn(async move {
-            let Some(conn) = state.conn() else { return };
-            if let Err(e) = db::bump_last_accessed(&conn, &hash, now(), state.bump_debounce) {
-                metrics::counter!("garret_bump_failures_total").increment(1);
-                tracing::warn!("last-accessed bump for {hash} failed: {e:#}");
-            }
-        });
-    }
     match object {
-        Ok(Some(obj)) => (
-            [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
-            narinfo::render(&obj),
-        )
-            .into_response(),
+        Ok(Some((obj, last_accessed_at))) => {
+            // Queued, never written here: LRU only needs day granularity, so
+            // a bump must never sit on the request path (spec 02-database).
+            state
+                .bumps
+                .hit(&hash, last_accessed_at, now(), state.bump_debounce);
+            (
+                [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
+                narinfo::render(&obj),
+            )
+                .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => {
             tracing::error!("narinfo {hash}: {e:#}");
@@ -430,6 +504,77 @@ mod tests {
         let wedged = wedged.await.unwrap();
         assert!(wedged.is_none());
         assert!(queued.is_none(), "queued read should degrade, not wait");
+    }
+
+    fn object(hash: &str) -> db::Object {
+        db::Object {
+            store_path_hash: hash.into(),
+            store_path: format!("/nix/store/{hash}-thing"),
+            name: "thing".into(),
+            nar_hash: "sha256:x".into(),
+            nar_size: 10,
+            file_hash: "sha256:y".into(),
+            file_size: 5,
+            deriver: None,
+            ca: None,
+            references: vec![],
+            sigs: vec![],
+            pushed_by: None,
+        }
+    }
+
+    const DAY: i64 = 86400;
+
+    /// The pull-path read of `hash`'s `last_accessed_at`, fed to a hit the
+    /// way `narinfo_route` does.
+    fn hit(bumps: &Bumps, conn: &rusqlite::Connection, hash: &str, now: i64) {
+        let (_, last_accessed_at) = db::get_object_and_last_accessed(conn, hash)
+            .unwrap()
+            .unwrap();
+        bumps.hit(hash, last_accessed_at, now, DAY);
+    }
+
+    /// Nearly every hit is on a fresh row, and it must not write: not even
+    /// take the WAL write lock, which is what starved the Pusher. Proved
+    /// against a Pusher holding that lock, where any write attempt fails busy.
+    #[test]
+    fn a_debounced_hit_performs_no_write() {
+        let path = std::env::temp_dir().join(format!("garret-bump-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path = path.to_str().unwrap();
+        let mut pusher = db::open(path, true).unwrap();
+        db::migrate(&pusher).unwrap();
+        let hash = "a".repeat(32);
+        db::insert_object(&mut pusher, &object(&hash), 1000).unwrap();
+        let mut puller = db::open(path, false).unwrap();
+        puller.busy_timeout(Duration::from_millis(10)).unwrap();
+
+        pusher.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let bumps = Bumps::default();
+        hit(&bumps, &puller, &hash, 1000 + DAY - 1);
+        let flushed = bumps.flush(&mut puller, 1000 + DAY - 1, DAY);
+        pusher.execute_batch("ROLLBACK").unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(flushed.unwrap(), 0, "a fresh row must not be written");
+    }
+
+    #[test]
+    fn a_burst_of_hits_on_one_hash_is_one_write() {
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let hash = "a".repeat(32);
+        db::insert_object(&mut conn, &object(&hash), 1000).unwrap();
+        let now = 1000 + DAY + 1;
+
+        let bumps = Bumps::default();
+        for _ in 0..100 {
+            hit(&bumps, &conn, &hash, now);
+        }
+        assert_eq!(bumps.flush(&mut conn, now, DAY).unwrap(), 1);
+
+        // Written: later hits read the fresh value and queue nothing.
+        hit(&bumps, &conn, &hash, now + 1);
+        assert_eq!(bumps.flush(&mut conn, now + 1, DAY).unwrap(), 0);
     }
 
     #[tokio::test]
