@@ -64,6 +64,16 @@ pub enum Request {
         /// Report what would go without deleting anything.
         dry_run: bool,
     },
+    /// Incident response: delete every object a given subject pushed, through
+    /// the same path as [`Request::Delete`] (unconditional, closures and all).
+    DeletePushedBy {
+        /// The `pushed_by` value to match exactly: `<issuer>#<sub>`.
+        subject: String,
+        /// Unix time; only objects first pushed at or after it. `None` = all.
+        since: Option<i64>,
+        /// Report what would go without deleting anything.
+        dry_run: bool,
+    },
 }
 
 /// The Pusher's reply to a [`Request`]; variants mirror the request commands,
@@ -144,6 +154,13 @@ pub enum Response {
         /// Compressed bytes reclaimed (or reclaimable, on a dry run).
         bytes_freed: i64,
     },
+    /// Reply to [`Request::DeletePushedBy`].
+    DeletePushedBy {
+        /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
+        objects: Vec<String>,
+        /// Compressed bytes reclaimed (or reclaimable, on a dry run).
+        bytes_freed: i64,
+    },
     /// The command failed; `message` is operator-facing text.
     Error {
         /// Human-readable description of what went wrong.
@@ -201,6 +218,12 @@ mod tests {
             },
             Request::Prune {
                 before: 1234,
+                dry_run: true,
+            },
+            Request::DeletePushedBy {
+                subject: "https://token.actions.githubusercontent.com#repo:o/r:ref:refs/heads/main"
+                    .into(),
+                since: Some(1234),
                 dry_run: true,
             },
         ] {

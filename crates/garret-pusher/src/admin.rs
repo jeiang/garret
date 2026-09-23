@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use garret_common::admin::{Request, Response};
 use garret_server::{db, narinfo};
 use tokio::{
@@ -101,6 +101,11 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             }),
         },
         Request::Prune { before, dry_run } => prune(state, before, dry_run).await,
+        Request::DeletePushedBy {
+            subject,
+            since,
+            dry_run,
+        } => delete_pushed_by(state, &subject, since, dry_run).await,
     };
     result.unwrap_or_else(|e| Response::Error {
         message: format!("{e:#}"),
@@ -158,6 +163,71 @@ async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
     })
 }
 
+/// Incident response after a push credential leaks (spec 10-packaging): every
+/// object `subject` pushed, optionally only since a cutoff, removed through
+/// [`delete`] so it gets exactly the treatment a hand-typed hash list would.
+async fn delete_pushed_by(
+    state: &AppState,
+    subject: &str,
+    since: Option<i64>,
+    dry_run: bool,
+) -> Result<Response> {
+    let mut matched = {
+        let conn = state.conn.lock().unwrap();
+        pushed_by(&conn, subject, since)?
+    };
+    let bytes_freed = if dry_run {
+        matched.iter().map(|(_, _, size)| size).sum()
+    } else {
+        let hashes: Vec<String> = matched.iter().map(|(hash, _, _)| hash.clone()).collect();
+        let Response::Delete {
+            bytes_freed,
+            missing,
+            ..
+        } = delete(state, &hashes).await?
+        else {
+            bail!("delete answered with something other than Response::Delete");
+        };
+        // Gone between the listing and the delete (GC got there first): not
+        // deleted by this command, so not reported as such.
+        matched.retain(|(hash, _, _)| !missing.contains(hash));
+        tracing::info!(
+            subject,
+            since,
+            objects = matched.len(),
+            bytes_freed,
+            "deleted objects by pusher"
+        );
+        bytes_freed
+    };
+    Ok(Response::DeletePushedBy {
+        objects: matched
+            .into_iter()
+            .map(|(hash, name, _)| format!("{hash}-{name}"))
+            .collect(),
+        bytes_freed,
+    })
+}
+
+/// `(hash, name, file_size)` of every object first pushed by `subject`, at or
+/// after `since` when given. Exact match: a subject is `<issuer>#<sub>`, and
+/// a prefix of one GitHub ref's subject can be another's.
+fn pushed_by(
+    conn: &rusqlite::Connection,
+    subject: &str,
+    since: Option<i64>,
+) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT store_path_hash, name, file_size FROM objects
+         WHERE pushed_by = ?1 AND created_at >= ?2
+         ORDER BY created_at, store_path_hash",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![subject, since.unwrap_or(i64::MIN)], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
 /// chose the cutoff. Row first, blob second, as everywhere else.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
@@ -205,4 +275,60 @@ fn resign(state: &AppState) -> Result<usize> {
         }
     }
     Ok(resigned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push(conn: &mut rusqlite::Connection, hash: &str, subject: &str, at: i64) {
+        let object = db::Object {
+            store_path_hash: hash.into(),
+            store_path: format!("/nix/store/{hash}-thing"),
+            name: "thing".into(),
+            nar_hash: "sha256:x".into(),
+            nar_size: 10,
+            file_hash: "sha256:y".into(),
+            file_size: 5,
+            deriver: None,
+            ca: None,
+            references: vec![],
+            sigs: vec![],
+            pushed_by: Some(subject.into()),
+        };
+        db::insert_object(conn, &object, at).unwrap();
+    }
+
+    /// Matches only the exact subject -- never one it is a prefix of -- and
+    /// `since` is inclusive, so the first push after a leak is not missed.
+    #[test]
+    fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
+        let (a, b, c, d) = (
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(32),
+            "d".repeat(32),
+        );
+        push(&mut conn, &a, leaked, 100);
+        push(&mut conn, &b, leaked, 200);
+        push(&mut conn, &c, &format!("{leaked}-other"), 200);
+        push(&mut conn, &d, "https://issuer#someone-else", 300);
+
+        let hashes = |since| -> Vec<String> {
+            pushed_by(&conn, leaked, since)
+                .unwrap()
+                .into_iter()
+                .map(|(hash, name, size)| {
+                    assert_eq!((name.as_str(), size), ("thing", 5));
+                    hash
+                })
+                .collect()
+        };
+        assert_eq!(hashes(None), [a, b.clone()]);
+        assert_eq!(hashes(Some(200)), [b]);
+        assert!(hashes(Some(201)).is_empty());
+    }
 }

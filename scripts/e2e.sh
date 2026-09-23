@@ -398,6 +398,28 @@ fi
 echo "  old root pruned, recent dependency kept, too-recent cutoff refused"
 garret push "$path" >/dev/null
 
+# Incident response: everything one subject pushed, by the `pushed_by` the
+# browse API shows. A dry run lists without deleting; a cutoff after every
+# push matches nothing; --apply removes the lot, as `delete` would.
+subject=$(authed "$puller_url/api/v1/objects/$root_hash" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["pushed_by"])')
+admin delete --pushed-by "$subject" | tee "$root/pushed-by-dry.out"
+grep -q "would delete $root_hash-" "$root/pushed-by-dry.out"
+curl -sf "$puller_url/$root_hash.narinfo" >/dev/null \
+  || { echo "a --pushed-by dry run deleted the root"; exit 1; }
+admin delete --pushed-by "$subject" --since 2099-01-01 --apply | tee "$root/pushed-by-future.out"
+grep -q "deleted 0 object" "$root/pushed-by-future.out"
+admin delete --pushed-by "$subject" --since 1h --apply | tee "$root/pushed-by.out"
+grep -q "deleted $root_hash-" "$root/pushed-by.out"
+grep -q "deleted $leaf_hash-" "$root/pushed-by.out"
+for h in "$root_hash" "$leaf_hash"; do
+  if curl -sf "$puller_url/$h.narinfo" >/dev/null 2>&1; then
+    echo "narinfo $h still served after delete --pushed-by"; exit 1
+  fi
+done
+echo "  dry run lists, future cutoff matches nothing, --apply deletes the subject's pushes"
+garret push "$path" >/dev/null
+
 say "benchmark harness"
 # All three scenarios, wired end to end: push seeds the corpus (count 12),
 # stream exercises the single-stream path, pull reads the corpus back.
