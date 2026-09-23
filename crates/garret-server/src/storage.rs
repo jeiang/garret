@@ -14,9 +14,12 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
 };
 use bytes::{Bytes, BytesMut};
-use futures::{Stream, StreamExt, stream::FuturesUnordered};
+use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
 
 use crate::config::S3Config;
 
@@ -80,26 +83,23 @@ pub fn hash_for(key: &str) -> Option<&str> {
 }
 
 /// Pulls exactly `part_size` bytes (fewer only at end of stream), keeping any
-/// overshoot in `carry` for the next part.
-async fn read_part<S, E>(
-    body: &mut S,
-    carry: &mut Option<Bytes>,
-    part_size: usize,
-) -> Result<Vec<u8>>
+/// overshoot in `carry` for the next part. The part is handed on as-is, never
+/// copied again: a part slot must account for the part's only buffer.
+async fn read_part<S, E>(body: &mut S, carry: &mut Option<Bytes>, part_size: usize) -> Result<Bytes>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
     let mut part = BytesMut::with_capacity(part_size);
-    if let Some(left) = carry.take() {
+    if let Some(mut left) = carry.take() {
         // The carry can exceed a whole part when one chunk spans several, so
         // it is split too — a part over part_size would abort the upload.
         if left.len() >= part_size {
-            part.extend_from_slice(&left[..part_size]);
-            if left.len() > part_size {
-                *carry = Some(left.slice(part_size..));
+            let whole = left.split_to(part_size);
+            if !left.is_empty() {
+                *carry = Some(left);
             }
-            return Ok(part.to_vec());
+            return Ok(whole);
         }
         part.extend_from_slice(&left);
     }
@@ -116,16 +116,15 @@ where
         }
         part.extend_from_slice(&chunk);
     }
-    Ok(part.to_vec())
+    Ok(part.freeze())
 }
 
-async fn collect(
-    in_flight: &mut FuturesUnordered<impl Future<Output = Result<CompletedPart>>>,
-) -> Result<CompletedPart> {
+async fn collect(in_flight: &mut JoinSet<Result<CompletedPart>>) -> Result<CompletedPart> {
     in_flight
-        .next()
+        .join_next()
         .await
         .context("no part upload was in flight")?
+        .context("part upload task failed")?
 }
 
 impl Storage {
@@ -168,7 +167,7 @@ impl Storage {
 
     /// Single-request `PutObject` for bodies already in memory (at most one
     /// part; larger uploads go through [`Storage::put_streaming`]).
-    pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<()> {
+    pub async fn put(&self, key: &str, body: Bytes) -> Result<()> {
         let bytes = body.len() as u64;
         self.client
             .put_object()
@@ -189,7 +188,8 @@ impl Storage {
     ///
     /// One part is buffered at a time and a global permit is taken **before**
     /// each read, so the reader can never race ahead of S3 and server memory
-    /// stays bounded by configuration rather than by client behaviour.
+    /// stays bounded by configuration rather than by client behaviour. Parts
+    /// upload on their own tasks while the next one is read.
     pub async fn put_streaming<S, E>(
         &self,
         key: &str,
@@ -228,12 +228,13 @@ impl Storage {
         metrics::counter!("garret_s3_multipart_started_total").increment(1);
 
         // Any failure past this point must abort, or the parts linger and bill.
+        let mut parts = JoinSet::new();
+        parts.spawn(self.upload_part(key, &upload_id, 1, first, permit));
         match self
             .multipart_body(
                 key,
                 &upload_id,
-                first,
-                permit,
+                &mut parts,
                 &mut body,
                 &mut carry,
                 limits,
@@ -244,6 +245,9 @@ impl Storage {
         {
             Ok(()) => Ok((hasher.finalize().to_vec(), total)),
             Err(e) => {
+                // Stop the parts still uploading first: one landing after the
+                // abort would re-create what the abort freed.
+                parts.shutdown().await;
                 metrics::counter!("garret_s3_multipart_aborted_total").increment(1);
                 if let Err(abort) = self
                     .client
@@ -261,13 +265,18 @@ impl Storage {
         }
     }
 
+    /// Reads and uploads parts 2..N; part 1 is already in `in_flight`.
+    ///
+    /// Each part uploads on its own task, so it finishes, and frees its
+    /// permit, whether or not this loop is waiting. A permit is only ever
+    /// held by a part being read or uploaded, never by a waiter, so uploads
+    /// sharing the budget cannot wedge each other — whatever the slot count.
     #[allow(clippy::too_many_arguments)]
     async fn multipart_body<S, E>(
         &self,
         key: &str,
         upload_id: &str,
-        first: Vec<u8>,
-        first_permit: OwnedSemaphorePermit,
+        in_flight: &mut JoinSet<Result<CompletedPart>>,
         body: &mut S,
         carry: &mut Option<Bytes>,
         limits: &UploadLimits,
@@ -278,14 +287,15 @@ impl Storage {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        let mut in_flight = FuturesUnordered::new();
         let mut completed: Vec<CompletedPart> = Vec::new();
         let mut part_number = 1;
 
-        in_flight.push(self.upload_part(key, upload_id, part_number, first, first_permit));
-
         loop {
-            // Permit first, then read: never buffer a part we have no room for.
+            // Room, then permit, then read: a part is never buffered before it
+            // can be sent, so one NAR holds at most max_parts_in_flight slots.
+            while in_flight.len() >= limits.max_parts_in_flight {
+                completed.push(collect(in_flight).await?);
+            }
             let permit = limits.acquire().await?;
             let part = read_part(body, carry, limits.part_size).await?;
             if part.is_empty() {
@@ -296,19 +306,17 @@ impl Storage {
             *total += part.len() as i64;
             let is_final = part.len() < limits.part_size;
 
-            while in_flight.len() >= limits.max_parts_in_flight {
-                completed.push(collect(&mut in_flight).await?);
-            }
             part_number += 1;
-            in_flight.push(self.upload_part(key, upload_id, part_number, part, permit));
+            in_flight.spawn(self.upload_part(key, upload_id, part_number, part, permit));
             if is_final {
                 break;
             }
         }
 
         while !in_flight.is_empty() {
-            completed.push(collect(&mut in_flight).await?);
+            completed.push(collect(in_flight).await?);
         }
+
         completed.sort_by_key(|p| p.part_number());
 
         self.client
@@ -328,43 +336,46 @@ impl Storage {
         Ok(())
     }
 
-    async fn upload_part(
+    /// Owns everything it touches, so it can run on its own task.
+    fn upload_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: i32,
-        body: Vec<u8>,
+        body: Bytes,
         permit: OwnedSemaphorePermit,
-    ) -> Result<CompletedPart> {
+    ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
         let (client, bucket, key, upload_id) = (
             self.client.clone(),
             self.bucket.clone(),
             key.to_owned(),
             upload_id.to_owned(),
         );
-        let bytes = body.len() as u64;
-        let started = Instant::now();
-        let output = client
-            .upload_part()
-            .bucket(&bucket)
-            .key(&key)
-            .upload_id(&upload_id)
-            .part_number(part_number)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            // S4 forbids re-uploading a part, so there is no retry here: the
-            // caller aborts the whole multipart (spec 03-storage).
-            .with_context(|| format!("uploading part {part_number} of {key}"))?;
-        drop(permit);
+        async move {
+            let bytes = body.len() as u64;
+            let started = Instant::now();
+            let output = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(body))
+                .send()
+                .await
+                // S4 forbids re-uploading a part, so there is no retry here: the
+                // caller aborts the whole multipart (spec 03-storage).
+                .with_context(|| format!("uploading part {part_number} of {key}"))?;
+            drop(permit);
 
-        metrics::counter!("garret_s3_parts_total").increment(1);
-        metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
-        metrics::histogram!("garret_s3_part_duration_seconds").record(started.elapsed());
-        Ok(CompletedPart::builder()
-            .part_number(part_number)
-            .set_e_tag(output.e_tag)
-            .build())
+            metrics::counter!("garret_s3_parts_total").increment(1);
+            metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
+            metrics::histogram!("garret_s3_part_duration_seconds").record(started.elapsed());
+            Ok(CompletedPart::builder()
+                .part_number(part_number)
+                .set_e_tag(output.e_tag)
+                .build())
+        }
     }
 
     /// Every blob under `nar/`, with its age and size. Paginated — the
@@ -558,5 +569,84 @@ mod tests {
         // deadlocking every upload.
         let tiny = UploadLimits::new(64 * 1024 * 1024, 4, 1024);
         assert_eq!(tiny.total_slots(), 1);
+    }
+
+    /// Just enough S3 for uploads, on a loopback port: every call succeeds.
+    /// For tests where the question is scheduling, not S3 semantics.
+    async fn fake_s3() -> Storage {
+        use axum::{
+            extract::Request,
+            http::{Method, StatusCode},
+            response::{IntoResponse, Response},
+        };
+
+        async fn handle(req: Request) -> Response {
+            let (parts, body) = req.into_parts();
+            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            let query = parts.uri.query().unwrap_or_default();
+            let starts_multipart = query.split('&').any(|p| p == "uploads" || p == "uploads=");
+            let xml = |body: &'static str| ([("content-type", "application/xml")], body);
+            match parts.method {
+                Method::POST if starts_multipart => {
+                    xml("<InitiateMultipartUploadResult><UploadId>u</UploadId>\
+                     </InitiateMultipartUploadResult>")
+                    .into_response()
+                }
+                Method::POST => xml("<CompleteMultipartUploadResult/>").into_response(),
+                Method::PUT => [("etag", "\"e\"")].into_response(),
+                _ => StatusCode::NO_CONTENT.into_response(),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            async move { axum::serve(listener, axum::Router::new().fallback(handle)).await },
+        );
+        Storage::new(&S3Config {
+            bucket: "test".into(),
+            endpoint_url: Some(format!("http://{addr}")),
+            region: Some("us-east-1".into()),
+            path_style: true,
+            access_key_id: Some("x".into()),
+            secret_access_key: Some("x".into()),
+            operation_timeout_secs: 5,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Uploads that together want more part slots than exist must still all
+    /// finish. When parts were lazy futures polled only by their reader, a
+    /// reader parked on the next slot held slots nobody could free, and this
+    /// hung forever — so the timeout turns a regression into a failure.
+    #[tokio::test]
+    async fn concurrent_multiparts_finish_on_fewer_slots_than_they_want() {
+        let storage = fake_s3().await;
+        // Two slots, two parts in flight per upload, three 5-part uploads:
+        // one upload alone already wants every slot.
+        let limits = UploadLimits::new(1024, 2, 2048);
+        let body: Vec<u8> = (0..4 * 1024 + 100).map(|i| i as u8).collect();
+        let keys: Vec<String> = (0..3).map(|i| key_for(&i.to_string())).collect();
+        let uploads = keys.iter().map(|key| {
+            let chunks: Vec<_> = body
+                .chunks(300)
+                .map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c)))
+                .collect();
+            storage.put_streaming(key, futures::stream::iter(chunks), &limits)
+        });
+
+        let stored = tokio::time::timeout(
+            Duration::from_secs(10),
+            futures::future::try_join_all(uploads),
+        )
+        .await
+        .expect("uploads wedged on the shared part budget")
+        .unwrap();
+
+        let digest = Sha256::digest(&body).to_vec();
+        for (hash, len) in stored {
+            assert_eq!((hash, len), (digest.clone(), body.len() as i64));
+        }
     }
 }
