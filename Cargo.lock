@@ -1489,6 +1489,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "fastrand",
  "futures",
  "garret-common",
  "garret-server",
