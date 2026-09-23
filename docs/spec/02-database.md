@@ -91,7 +91,8 @@ Notes:
 WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
 `busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
 `foreign_keys=ON`; persistent WAL, so `-wal` and `-shm` outlive the last
-connection (the Puller cannot create them, spec 10). Delete the database
-only together with both, or the next open replays a stale WAL onto it.
+connection (the Puller cannot create them, spec 10). Replace or restore
+the database only with both removed, or the next open replays the stale
+WAL over it.
 Short write transactions only; the Pusher runs periodic checkpoint
 maintenance.

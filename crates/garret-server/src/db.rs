@@ -994,7 +994,7 @@ mod tests {
     async fn open_when_ready_waits_for_the_pusher_to_create_the_schema() {
         let path = std::env::temp_dir().join("garret-open-when-ready.sqlite");
         let path = path.to_str().unwrap().to_owned();
-        // A stale -wal would hand the fresh database the last run's schema.
+        // Sidecars outlive every connection, so clear an earlier run's too.
         remove_db(&path);
 
         let waiter = tokio::spawn({

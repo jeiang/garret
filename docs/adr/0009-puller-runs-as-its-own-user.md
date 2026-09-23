@@ -26,5 +26,5 @@ credentials, and needs only GetObject: a presigned URL carries exactly its
 key's authority. A static user rather than `DynamicUser`, so the uid the file
 modes are reasoned about is stable and nameable. Consequences: the Puller
 can still rewrite rows, which only moving the bumps behind the Pusher would
-close, and a deleted database must go together with its `-wal` and `-shm`,
-or the next open replays the stale WAL onto the new file.
+close, and a database replaced or restored in place must lose its `-wal`
+and `-shm` too, or the next open replays the stale WAL over it.

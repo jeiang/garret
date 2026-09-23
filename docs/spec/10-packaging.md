@@ -98,7 +98,9 @@ three files on every start. The Puller cannot create the sidecars either,
 so every connection runs in persistent-WAL mode (spec 02) and a last close
 leaves them in place: a Pusher that exits with an error after opening the
 database does not strand the Puller. The Puller can still write rows: its
-bumps need the write lock, and SQLite has no finer permission.
+bumps need the write lock, and SQLite has no finer permission. A database
+put in place by hand must be owned by `garret`: the start step runs as
+`garret` and fails on a file it cannot chmod.
 
 Upgrading from modules without the split: with the default `dbPath`,
 nothing to do — the first Pusher start makes the directory 0750 and the
