@@ -89,8 +89,16 @@ failure summary goes to stderr):
 ## Push behavior
 
 Per the protocol: worker pool of concurrent PUTs, client-side zstd
-(default level 3), jittered backoff on 429/5xx, idempotent retries.
-No client metrics endpoint in v1.
+(default level 3), idempotent retries. No client metrics endpoint in v1.
+
+**Retries** run on two schedules. A `429` is the server's queue, not a
+fault: the path waits out `Retry-After` (plus up to as much again in
+jitter) and tries again, for up to 15 minutes from its first attempt —
+long enough to queue behind several multi-minute uploads, short enough that
+a server that never frees a slot fails the run instead of hanging it — and
+never spends `max_retries`. `5xx` answers and dropped connections get
+`max_retries` (default 5) jittered waits doubling from 250 ms. Other `4xx`
+fail at once.
 
 Each NAR streams `nix nar dump-path` → zstd → the request body. A dump that
 exits non-zero (the path GC'd locally since `nix path-info`, a daemon error)

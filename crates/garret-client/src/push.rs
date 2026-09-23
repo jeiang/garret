@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, BufReader},
     process::Command,
+    time::Instant,
 };
 use tokio_util::io::ReaderStream;
 
@@ -382,8 +383,7 @@ impl Pusher {
     }
 
     async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
-        let mut delay = Duration::from_millis(250);
-        let mut retries = 0;
+        let mut backoff = Backoff::new(self.max_retries);
         let mut renewed = false;
         loop {
             let token = self.tokens.get().await?;
@@ -405,15 +405,10 @@ impl Pusher {
                 renewed = true;
                 continue;
             }
-            if retries < self.max_retries && is_retryable(&error) {
-                // Jitter so a fleet of pushers doesn't retry in lockstep.
-                let jitter = Duration::from_millis(fastrand_millis(delay));
-                tokio::time::sleep(delay + jitter).await;
-                delay *= 2;
-                retries += 1;
-                continue;
+            match backoff.next(&error) {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => return Err(error),
             }
-            return Err(error);
         }
     }
 
@@ -451,7 +446,7 @@ impl Pusher {
 
         let status = response.status();
         if let Some(after) = retry_after(status, &response) {
-            bail!("server is shedding load (429), retry after {after:?}");
+            return Err(Shed(after).into());
         }
         if status == StatusCode::UNAUTHORIZED {
             let body = response.text().await.unwrap_or_default();
@@ -494,6 +489,62 @@ impl std::fmt::Display for Unauthorized {
 }
 
 impl std::error::Error for Unauthorized {}
+
+/// The server shed the upload (429) and said when to come back. Typed so
+/// [`Backoff`] waits out `Retry-After` instead of parsing the message.
+#[derive(Debug)]
+struct Shed(Duration);
+
+impl std::fmt::Display for Shed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server is shedding load (429), retry after {:?}", self.0)
+    }
+}
+
+impl std::error::Error for Shed {}
+
+/// How long one path keeps waiting out 429s before it fails: long enough to
+/// queue behind several multi-minute uploads, short enough that a server that
+/// never frees a slot fails the run instead of hanging it.
+const SHED_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// One path's retry schedule (spec 01). A 429 is the server's queue, not a
+/// fault: it waits out `Retry-After` for as long as [`SHED_DEADLINE`] allows
+/// and never spends the error budget. Other retryable failures get
+/// `max_retries` doubling waits from 250 ms. Every wait is jittered so a fleet
+/// of pushers doesn't retry in lockstep.
+struct Backoff {
+    started: Instant,
+    retries: u32,
+    max_retries: u32,
+    delay: Duration,
+}
+
+impl Backoff {
+    fn new(max_retries: u32) -> Self {
+        Self {
+            started: Instant::now(),
+            retries: 0,
+            max_retries,
+            delay: Duration::from_millis(250),
+        }
+    }
+
+    /// How long to wait before trying again after `error`; `None` to give up.
+    fn next(&mut self, error: &anyhow::Error) -> Option<Duration> {
+        if let Some(Shed(after)) = error.downcast_ref::<Shed>() {
+            let wait = *after + Duration::from_millis(fastrand_millis(*after));
+            return (self.started.elapsed() + wait <= SHED_DEADLINE).then_some(wait);
+        }
+        if self.retries >= self.max_retries || !is_retryable(error) {
+            return None;
+        }
+        let wait = self.delay + Duration::from_millis(fastrand_millis(self.delay));
+        self.retries += 1;
+        self.delay *= 2;
+        Some(wait)
+    }
+}
 
 /// Streams `dump`'s stdout through zstd, then fails the stream if `dump` exited
 /// non-zero.
@@ -558,12 +609,10 @@ fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Durat
     })
 }
 
-/// 429 and 5xx are retryable; other 4xx are the client's fault (spec 01).
+/// 5xx and dropped or timed-out connections are retryable; 4xx are the
+/// client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
 fn is_retryable(error: &anyhow::Error) -> bool {
-    let text = error.to_string();
-    text.contains("429")
-        || text.contains("shedding load")
-        || text.contains(" 50")
+    error.to_string().contains(" 50")
         || error
             .downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_timeout() || e.is_connect() || connection_dropped(e))
@@ -696,14 +745,52 @@ mod tests {
         );
     }
 
+    fn shed(secs: u64) -> anyhow::Error {
+        Shed(Duration::from_secs(secs)).into()
+    }
+
+    fn rejected(status: u16) -> anyhow::Error {
+        let status = StatusCode::from_u16(status).unwrap();
+        anyhow::anyhow!("upload rejected with {status}: nope")
+    }
+
+    /// Six CI legs against sixteen upload slots is the normal load: a path
+    /// can be shed for minutes, and none of that may count against the
+    /// budget for real failures.
+    #[tokio::test(start_paused = true)]
+    async fn shedding_waits_out_retry_after_and_never_spends_the_error_budget() {
+        let mut backoff = Backoff::new(2);
+        for _ in 0..100 {
+            let wait = backoff.next(&shed(3)).expect("well inside the deadline");
+            assert!(
+                (Duration::from_secs(3)..Duration::from_secs(6)).contains(&wait),
+                "{wait:?}"
+            );
+            tokio::time::advance(wait).await;
+        }
+        assert!(backoff.next(&rejected(503)).is_some());
+        assert!(backoff.next(&rejected(503)).is_some());
+        assert!(backoff.next(&rejected(503)).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shedding_gives_up_at_the_deadline() {
+        let mut backoff = Backoff::new(5);
+        tokio::time::advance(SHED_DEADLINE - Duration::from_secs(10)).await;
+        assert!(backoff.next(&shed(1)).is_some());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(backoff.next(&shed(1)).is_none());
+    }
+
     #[test]
-    fn only_load_shedding_and_server_errors_are_retried() {
-        assert!(is_retryable(&anyhow::anyhow!(
-            "server is shedding load (429)"
-        )));
-        assert!(is_retryable(&anyhow::anyhow!("upload rejected with 503")));
-        assert!(!is_retryable(&anyhow::anyhow!("upload rejected with 400")));
-        assert!(!is_retryable(&anyhow::anyhow!("upload rejected with 401")));
+    fn server_errors_back_off_doubling_and_client_errors_fail_at_once() {
+        let mut backoff = Backoff::new(5);
+        let first = backoff.next(&rejected(503)).unwrap();
+        let second = backoff.next(&rejected(502)).unwrap();
+        assert!((Duration::from_millis(250)..Duration::from_millis(500)).contains(&first));
+        assert!((Duration::from_millis(500)..Duration::from_millis(1000)).contains(&second));
+        assert!(backoff.next(&rejected(400)).is_none());
+        assert!(backoff.next(&rejected(401)).is_none());
     }
 
     /// Stand-in for reqwest's wrapping: the io::Error sits at the bottom of a

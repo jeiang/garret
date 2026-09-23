@@ -19,7 +19,8 @@ pub struct Config {
     /// zstd level for NAR compression (client-side, per the push protocol).
     #[serde(default = "zstd_level")]
     pub zstd_level: i32,
-    /// Upload attempts per path beyond the first, for 429/5xx failures only.
+    /// Upload attempts per path beyond the first, for 5xx answers and dropped
+    /// connections. A 429 does not spend these: it waits out `Retry-After`.
     #[serde(default = "max_retries")]
     pub max_retries: u32,
     /// Puller base URL — `list` and `tree` query the browse API, not the Pusher.
