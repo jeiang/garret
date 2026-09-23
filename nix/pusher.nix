@@ -163,6 +163,9 @@ in
           github_owner_id = mkOption { type = types.nullOr types.str; default = null; description = "GitHub: immutable owner id."; };
           ref_patterns = mkOption { type = types.listOf types.str; default = [ ]; description = "GitHub: allowed refs."; };
           ref_protected = mkOption { type = types.nullOr types.bool; default = null; description = "GitHub: require protected or unprotected refs."; };
+          repository_ids = mkOption { type = types.listOf types.str; default = [ ]; description = "GitHub: allowed immutable repository ids."; };
+          event_names = mkOption { type = types.listOf types.str; default = [ ]; description = "GitHub: allowed triggering events, e.g. push."; };
+          job_workflow_refs = mkOption { type = types.listOf types.str; default = [ ]; description = "GitHub: allowed job_workflow_ref values (trailing-* globs)."; };
           allowed_groups = mkOption { type = types.listOf types.str; default = [ ]; description = "Optional group allowlist."; };
         };
       });

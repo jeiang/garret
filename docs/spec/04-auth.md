@@ -22,11 +22,40 @@ JWKS. There is no token-exchange service and no garret-issued token.
   user group there). Optional `allowed-groups` config exists as
   defense-in-depth, default off.
 - **GitHub issuer**: match the immutable `repository_owner_id` claim
-  (owner-wide — new repos work without config changes; never match
-  renameable names). Optional `ref_patterns` constraints limit the triggering
-  ref. An optional `ref_protected` boolean requires the token claim to be
-  present and equal; setting it to `true` alongside
-  `ref_patterns = ["refs/heads/main"]` restricts pushes to protected main.
+  (never match renameable names). Owner-wide on its own: every workflow in
+  every repository of that owner can mint a push token, so narrow it with
+  the optional constraints below. Each is off when unset; once set, a token
+  missing the claim is refused (fail closed).
+  - `ref_patterns`: allowed `ref`s (trailing-`*` globs).
+  - `ref_protected`: the claim must be present and equal; `true` requires a
+    protected ref.
+  - `repository_ids`: allowed immutable numeric `repository_id`s.
+  - `event_names`: allowed `event_name`s. `pull_request_target`,
+    `workflow_run` and `issue_comment` run with `ref` = the default branch
+    even when a stranger's pull request set them off, so `ref_patterns`
+    alone admits them.
+  - `job_workflow_refs`: allowed `job_workflow_ref`s
+    (`owner/repo/.github/workflows/file.yml@ref`, trailing-`*` globs). This
+    names the file the job actually runs: for a reusable workflow it is the
+    called file, so a third-party reusable workflow called from an allowed
+    repository — which inherits the caller's other claims — is refused.
+    It spells repositories by name, so a rename can only refuse tokens
+    (never grant one, given the id checks): update it alongside the rename.
+
+  Recommended policy: pin the repositories and the workflow that pushes, on
+  protected main, for push and manual runs only:
+
+  ```toml
+  github_owner_id = "31970261"
+  ref_patterns = ["refs/heads/main"]
+  ref_protected = true
+  repository_ids = ["553667153", "1324491067"] # jeiang/.dotfiles (cornn-flaek), jeiang/garret
+  event_names = ["push", "workflow_dispatch"]
+  job_workflow_refs = [
+    "jeiang/.dotfiles/.github/workflows/ci.yml@refs/heads/main",
+    "jeiang/garret/.github/workflows/ci.yml@refs/heads/main",
+  ]
+  ```
 
 ## Surface summary
 

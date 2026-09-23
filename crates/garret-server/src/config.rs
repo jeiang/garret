@@ -74,6 +74,20 @@ pub struct IssuerConfig {
     /// (`false`) triggering ref.
     #[serde(default)]
     pub ref_protected: Option<bool>,
+    /// GitHub only, optional: immutable numeric `repository_id`s allowed to
+    /// push. Names are renameable, so ids are the only stable scope.
+    #[serde(default)]
+    pub repository_ids: Vec<String>,
+    /// GitHub only, optional: allowed `event_name`s, e.g. `push`. Excludes
+    /// `pull_request_target` and `workflow_run`, whose ref is the default
+    /// branch even when a stranger triggered them.
+    #[serde(default)]
+    pub event_names: Vec<String>,
+    /// GitHub only, optional: allowed `job_workflow_ref`s — the workflow file
+    /// the job actually runs, `owner/repo/.github/workflows/f.yml@refs/heads/main`.
+    /// Same trailing-`*` globs as `ref_patterns`.
+    #[serde(default)]
+    pub job_workflow_refs: Vec<String>,
     /// Defense-in-depth, default off — group membership lives in Pocket ID.
     #[serde(default)]
     pub allowed_groups: Vec<String>,
