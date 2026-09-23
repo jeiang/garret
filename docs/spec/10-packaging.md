@@ -40,7 +40,7 @@ Pusher runs).
 | `fsck [--repair] [--verify-sizes] [--quiesce] [--json]` | socket — audit row⇔blob consistency, optionally repair |
 | `pin <name> <hash> [--expires <duration>]` | socket — GC-exempt root, closure-protecting (spec 05) |
 | `unpin <name>` | socket — remove a pin; unknown name is an error |
-| `prune --before <YYYY-MM-DD\|age> [--dry-run]` | socket — delete closures last pushed before the cutoff, keeping what newer pushes and pins need (spec 05) |
+| `prune --before <YYYY-MM-DD\|age> [--apply]` | socket — delete closures last pushed before the cutoff, keeping what newer pushes and pins need (spec 05); dry-run unless `--apply` |
 
 ## NixOS modules & flake outputs
 

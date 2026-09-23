@@ -376,16 +376,16 @@ backdate() {
 }
 backdate "'$root_hash', '$leaf_hash'"
 garret push "$path" >/dev/null
-admin prune --before 2d | tee "$root/prune-fresh.out"
+admin prune --before 2d --apply | tee "$root/prune-fresh.out"
 grep -q "deleted 0 object" "$root/prune-fresh.out"
 echo "  a re-pushed closure counts as recent"
 # An old root goes; its dependency, pushed recently, stays.
 backdate "'$root_hash'"
-admin prune --before 2d --dry-run | tee "$root/prune-dry.out"
+admin prune --before 2d | tee "$root/prune-dry.out"
 grep -q "would delete 1 object" "$root/prune-dry.out"
 curl -sf "$puller_url/$root_hash.narinfo" >/dev/null \
   || { echo "a dry run deleted the root"; exit 1; }
-admin prune --before 2d | tee "$root/prune.out"
+admin prune --before 2d --apply | tee "$root/prune.out"
 grep -q "deleted $root_hash-" "$root/prune.out"
 if curl -sf "$puller_url/$root_hash.narinfo" >/dev/null 2>&1; then
   echo "narinfo still served after prune"; exit 1

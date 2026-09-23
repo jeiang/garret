@@ -75,14 +75,14 @@ enum Command {
         json: bool,
     },
     /// Delete every closure last pushed before a cutoff, keeping anything a
-    /// newer push or a live pin still needs (spec 05)
+    /// newer push or a live pin still needs (spec 05); dry-run by default
     Prune {
         /// Cutoff: a UTC date (`2026-06-01`) or an age (`90d`); at least a day ago
         #[arg(long)]
         before: String,
-        /// List what would be deleted without deleting it
+        /// Delete; without this, only list what would be deleted
         #[arg(long)]
-        dry_run: bool,
+        apply: bool,
     },
 }
 
@@ -296,8 +296,9 @@ async fn main() -> Result<()> {
             other => print_unexpected(other),
         },
 
-        Command::Prune { before, dry_run } => {
+        Command::Prune { before, apply } => {
             let before = parse_cutoff(&before, unix_now())?;
+            let dry_run = !apply;
             match request(&cli.socket, Request::Prune { before, dry_run }).await? {
                 Response::Prune {
                     pruned,
