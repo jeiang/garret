@@ -103,12 +103,12 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
 
     let collector = cfg.gc.clone().map(|gc_cfg| {
-        Arc::new(gc::Gc {
-            conn: state.conn.clone(),
-            storage: state.storage.clone(),
-            in_flight: state.in_flight.clone(),
-            cfg: gc_cfg,
-        })
+        Arc::new(gc::Gc::new(
+            state.conn.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            gc_cfg,
+        ))
     });
 
     if let Some(admin_socket) = cfg.admin_socket.clone() {
