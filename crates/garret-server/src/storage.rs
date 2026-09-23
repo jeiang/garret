@@ -436,7 +436,9 @@ impl Storage {
     /// A 200 can still report per-key failures. Each one is logged and
     /// counted, and once every batch has been tried the call fails: the rows
     /// are already gone, so a blob that stayed must not pass for a deleted
-    /// one (spec 05).
+    /// one (spec 05). A key reported as already absent (`NoSuchKey`, which
+    /// Garage lists under `Errors` where S3 lists it as deleted) is not a
+    /// failure — absent is what the caller asked for.
     pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
         let (mut failed, mut first_failure) = (0, None);
         for batch in keys.chunks(1000) {
@@ -456,8 +458,11 @@ impl Storage {
                 .send()
                 .await
                 .context("deleting blobs")?;
-            let errors = output.errors();
-            for e in errors {
+            let before = failed;
+            for e in output.errors() {
+                if e.code() == Some("NoSuchKey") {
+                    continue;
+                }
                 let failure = format!(
                     "{} ({}: {})",
                     e.key().unwrap_or("?"),
@@ -468,9 +473,10 @@ impl Storage {
                 failed += 1;
                 first_failure.get_or_insert(failure);
             }
+            let batch_failed = failed - before;
             metrics::counter!("garret_s3_deletes_total")
-                .increment(requested.saturating_sub(errors.len()) as u64);
-            metrics::counter!("garret_s3_delete_failures_total").increment(errors.len() as u64);
+                .increment(requested.saturating_sub(batch_failed) as u64);
+            metrics::counter!("garret_s3_delete_failures_total").increment(batch_failed as u64);
         }
         if let Some(first) = first_failure {
             bail!("{failed} blob(s) not deleted, first: {first}");
@@ -646,8 +652,10 @@ mod tests {
     }
 
     /// Just enough S3 on a loopback port. Every call succeeds, except that
-    /// `DeleteObjects` fails keys containing `denied` the way S3 does: inside
-    /// a 200. For tests where the question is our side, not S3 semantics.
+    /// `DeleteObjects` answers inside a 200 the way S3 and Garage do: keys
+    /// containing `denied` fail, and keys containing `gone` come back as
+    /// Garage reports an already-absent key, a `NoSuchKey` error. For tests
+    /// where the question is our side, not S3 semantics.
     async fn fake_s3() -> Storage {
         use axum::{
             extract::Request,
@@ -677,14 +685,12 @@ mod tests {
                         .skip(1)
                         .filter_map(|s| s.split("</Key>").next())
                         .map(|key| {
-                            if key.contains("denied") {
-                                format!(
-                                    "<Error><Key>{key}</Key><Code>AccessDenied</Code>\
-                                     <Message>Access Denied</Message></Error>"
-                                )
-                            } else {
-                                format!("<Deleted><Key>{key}</Key></Deleted>")
-                            }
+                            let code = match key {
+                                k if k.contains("denied") => "AccessDenied",
+                                k if k.contains("gone") => "NoSuchKey",
+                                _ => return format!("<Deleted><Key>{key}</Key></Deleted>"),
+                            };
+                            format!("<Error><Key>{key}</Key><Code>{code}</Code></Error>")
                         })
                         .collect();
                     xml(format!("<DeleteResult>{results}</DeleteResult>")).into_response()
@@ -749,21 +755,23 @@ mod tests {
 
     /// `DeleteObjects` answers 200 even when some keys fail, listing them in
     /// the body. Those blobs are still there, so the call must fail and name
-    /// them rather than report the whole batch deleted.
+    /// them rather than report the whole batch deleted. A key that was
+    /// already absent is not one of them: absent is the goal (a dangling row
+    /// evicted by GC, say).
     #[tokio::test]
     async fn per_key_delete_failures_fail_the_call() {
         let storage = fake_s3().await;
-        let (ok, denied) = (key_for("ok"), key_for("denied"));
+        let (ok, gone, denied) = (key_for("ok"), key_for("gone"), key_for("denied"));
         storage
-            .delete_objects(std::slice::from_ref(&ok))
+            .delete_objects(&[ok.clone(), gone.clone()])
             .await
             .unwrap();
 
         let err = storage
-            .delete_objects(&[ok.clone(), denied.clone()])
+            .delete_objects(&[ok.clone(), gone.clone(), denied.clone()])
             .await
             .expect_err("a per-key failure must fail the delete");
         let err = format!("{err:#}");
-        assert!(err.contains(&denied) && !err.contains(&ok), "{err}");
+        assert!(err.contains(&denied), "{err}");
     }
 }
