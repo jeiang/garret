@@ -11,7 +11,10 @@ use indicatif::{MultiProgress, ProgressBar, ProgressBarIter, ProgressStyle};
 use reqwest::{Body, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::{io::AsyncRead, io::BufReader, process::Command};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, BufReader},
+    process::Command,
+};
 use tokio_util::io::ReaderStream;
 
 /// Where push output goes.
@@ -394,23 +397,13 @@ impl Pusher {
         };
 
         // `nix nar dump-path` → zstd → the wire, never landing whole in memory.
-        let mut child = Command::new("nix")
-            .args(["nar", "dump-path", &info.path])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("running `nix nar dump-path`")?;
-        let stdout = child.stdout.take().expect("stdout was piped");
-        // Counted here, before the encoder, so the ticks are in the same units
-        // as the bar's total.
-        let encoder = ZstdEncoder::with_quality(
-            BufReader::new(report.wrap(stdout)),
-            Level::Precise(self.zstd_level),
-        );
+        let mut dump = Command::new("nix");
+        dump.args(["nar", "dump-path", &info.path]);
+        let nar = compressed_nar(dump, report, self.zstd_level)?;
 
         let framed = preamble.to_framed()?;
         let body = stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(framed)) })
-            .chain(ReaderStream::new(encoder));
+            .chain(nar);
 
         let response = self
             .http
@@ -447,6 +440,57 @@ impl Pusher {
             _ => "pushed",
         })
     }
+}
+
+/// Streams `dump`'s stdout through zstd, then fails the stream if `dump` exited
+/// non-zero.
+///
+/// A dump that dies part-way (the path GC'd locally since `nix path-info`, a
+/// daemon error) still closes its stdout, so the encoder would seal a valid
+/// zstd frame around a truncated NAR — which the server signs under the
+/// claimed narHash and then answers `exists` for forever. An error as the
+/// stream's last item instead aborts the request before the body ends, so the
+/// server never sees a complete upload.
+fn compressed_nar(
+    mut dump: Command,
+    report: &Report,
+    zstd_level: i32,
+) -> Result<impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + use<>> {
+    let mut child = dump
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running `nix nar dump-path`")?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    // Drained alongside stdout, not after it: a child blocked writing to a
+    // full stderr pipe would never close stdout. The head is what explains the
+    // failure; the rest is discarded.
+    let stderr = tokio::spawn(async move {
+        let mut head = Vec::new();
+        let _ = (&mut stderr).take(4096).read_to_end(&mut head).await;
+        let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        head
+    });
+    // Counted here, before the encoder, so the ticks are in the same units as
+    // the bar's total.
+    let encoder = ZstdEncoder::with_quality(
+        BufReader::new(report.wrap(stdout)),
+        Level::Precise(zstd_level),
+    );
+    let exit = stream::once(async move {
+        let status = child.wait().await?;
+        if status.success() {
+            return Ok(None);
+        }
+        let stderr = stderr.await.unwrap_or_default();
+        Err(std::io::Error::other(format!(
+            "`nix nar dump-path` failed ({status}): {}",
+            String::from_utf8_lossy(&stderr).trim()
+        )))
+    })
+    .filter_map(|end: std::io::Result<Option<bytes::Bytes>>| async move { end.transpose() });
+    Ok(ReaderStream::new(encoder).chain(exit))
 }
 
 fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Duration> {
@@ -648,5 +692,33 @@ mod tests {
             let delay = Duration::from_millis(ms);
             assert!(fastrand_millis(delay) < ms.max(1));
         }
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[tokio::test]
+    async fn a_failed_dump_fails_the_body_instead_of_ending_it() {
+        let items: Vec<_> = compressed_nar(
+            sh("printf 'partial nar'; echo 'path is not valid' >&2; exit 3"),
+            &Report::plain(),
+            3,
+        )
+        .unwrap()
+        .collect()
+        .await;
+        let (last, streamed) = items.split_last().unwrap();
+        assert!(streamed.iter().all(Result::is_ok));
+        let error = last.as_ref().unwrap_err().to_string();
+        assert!(error.contains("path is not valid"), "{error}");
+
+        let items: Vec<_> = compressed_nar(sh("printf nar"), &Report::plain(), 3)
+            .unwrap()
+            .collect()
+            .await;
+        assert!(items.iter().all(Result::is_ok));
     }
 }

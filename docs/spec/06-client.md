@@ -92,6 +92,14 @@ Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), jittered backoff on 429/5xx, idempotent retries.
 No client metrics endpoint in v1.
 
+Each NAR streams `nix nar dump-path` → zstd → the request body. A dump that
+exits non-zero (the path GC'd locally since `nix path-info`, a daemon error)
+still closes its stdout cleanly, so the client checks the exit status at EOF
+and fails the body stream instead of ending it: the request aborts before the
+body completes, the server never stores a truncated NAR under the claimed
+narHash, and the path is reported failed with nix's stderr. The failure is not
+retried — the causes are local and mostly permanent.
+
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure
 assembly, paths whose `nix path-info` signatures carry a configured upstream
