@@ -64,6 +64,13 @@ pub enum Request {
         /// Report what would go without deleting anything.
         dry_run: bool,
     },
+    /// Write a consistent copy of the database to `path` while both services
+    /// keep running: the online backup (spec 10-packaging).
+    Backup {
+        /// Absolute destination path, as seen by the Pusher. Must not exist:
+        /// a backup never overwrites anything.
+        path: String,
+    },
 }
 
 /// The Pusher's reply to a [`Request`]; variants mirror the request commands,
@@ -144,6 +151,11 @@ pub enum Response {
         /// Compressed bytes reclaimed (or reclaimable, on a dry run).
         bytes_freed: i64,
     },
+    /// Reply to [`Request::Backup`].
+    Backup {
+        /// Size of the copy written, in bytes.
+        bytes: u64,
+    },
     /// The command failed; `message` is operator-facing text.
     Error {
         /// Human-readable description of what went wrong.
@@ -202,6 +214,9 @@ mod tests {
             Request::Prune {
                 before: 1234,
                 dry_run: true,
+            },
+            Request::Backup {
+                path: "/var/lib/garret/backup.db".into(),
             },
         ] {
             let line = serde_json::to_string(&request).unwrap();
