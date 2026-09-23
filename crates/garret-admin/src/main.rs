@@ -41,11 +41,23 @@ enum Command {
     },
     /// Re-sign every object with the currently configured keys
     Resign,
-    /// Remove objects by store-path hash, row and blob
+    /// Remove objects by store-path hash, row and blob; or, with
+    /// `--pushed-by`, everything one subject pushed (dry-run unless `--apply`)
     Delete {
         /// Store-path hashes (the 32 characters before the first `-`)
-        #[arg(required = true)]
+        #[arg(required_unless_present = "pushed_by", conflicts_with = "pushed_by")]
         hashes: Vec<String>,
+        /// Select every object this subject pushed (`<issuer>#<sub>`, as the
+        /// browse API's `pushed_by` shows it) instead of naming hashes
+        #[arg(long)]
+        pushed_by: Option<String>,
+        /// Only objects first pushed at or after this: a UTC date
+        /// (`2026-06-01`) or an age (`36h`)
+        #[arg(long, requires = "pushed_by", conflicts_with = "hashes")]
+        since: Option<String>,
+        /// Delete; without this, `--pushed-by` only lists what would go
+        #[arg(long, requires = "pushed_by", conflicts_with = "hashes")]
+        apply: bool,
     },
     /// Pin an object's closure as a GC-exempt root (spec 05)
     Pin {
@@ -188,22 +200,57 @@ async fn main() -> Result<()> {
             other => print_unexpected(other),
         },
 
-        Command::Delete { hashes } => match request(&cli.socket, Request::Delete { hashes }).await?
-        {
-            Response::Delete {
-                deleted,
-                bytes_freed,
-                missing,
-            } => {
-                println!("deleted {deleted} object(s), {bytes_freed} byte(s) freed");
-                // Reported, not swallowed: a mistyped hash would otherwise
-                // look exactly like a successful delete.
-                if !missing.is_empty() {
-                    println!("not in the cache: {}", missing.join(", "));
+        Command::Delete {
+            pushed_by: Some(subject),
+            since,
+            apply,
+            ..
+        } => {
+            let since = since
+                .map(|since| parse_cutoff(&since, unix_now()))
+                .transpose()?;
+            let dry_run = !apply;
+            match request(
+                &cli.socket,
+                Request::DeletePushedBy {
+                    subject,
+                    since,
+                    dry_run,
+                },
+            )
+            .await?
+            {
+                Response::DeletePushedBy {
+                    objects,
+                    bytes_freed,
+                } => {
+                    let verb = if dry_run { "would delete" } else { "deleted" };
+                    for basename in &objects {
+                        println!("{verb} {basename}");
+                    }
+                    println!("{verb} {} object(s), {}", objects.len(), human(bytes_freed));
                 }
+                other => print_unexpected(other),
             }
-            other => print_unexpected(other),
-        },
+        }
+
+        Command::Delete { hashes, .. } => {
+            match request(&cli.socket, Request::Delete { hashes }).await? {
+                Response::Delete {
+                    deleted,
+                    bytes_freed,
+                    missing,
+                } => {
+                    println!("deleted {deleted} object(s), {bytes_freed} byte(s) freed");
+                    // Reported, not swallowed: a mistyped hash would otherwise
+                    // look exactly like a successful delete.
+                    if !missing.is_empty() {
+                        println!("not in the cache: {}", missing.join(", "));
+                    }
+                }
+                other => print_unexpected(other),
+            }
+        }
 
         Command::Pin {
             name,
