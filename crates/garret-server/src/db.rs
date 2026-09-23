@@ -191,11 +191,21 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
         )
         .optional()?
         .unwrap_or(0);
+    // An upsert, not INSERT OR REPLACE: REPLACE deletes the old row first,
+    // and that delete cascades to the object's pins, so a re-push would
+    // silently unpin it.
     tx.execute(
-        "INSERT OR REPLACE INTO objects (store_path_hash, store_path, name, nar_hash, nar_size,
+        "INSERT INTO objects (store_path_hash, store_path, name, nar_hash, nar_size,
              file_hash, file_size, deriver, ca, sigs, pushed_by, created_at, last_accessed_at,
              pushed_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?12)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?12)
+         ON CONFLICT (store_path_hash) DO UPDATE SET
+             store_path = excluded.store_path, name = excluded.name,
+             nar_hash = excluded.nar_hash, nar_size = excluded.nar_size,
+             file_hash = excluded.file_hash, file_size = excluded.file_size,
+             deriver = excluded.deriver, ca = excluded.ca, sigs = excluded.sigs,
+             pushed_by = excluded.pushed_by, created_at = excluded.created_at,
+             last_accessed_at = excluded.last_accessed_at, pushed_at = excluded.pushed_at",
         params![
             obj.store_path_hash,
             obj.store_path,
@@ -765,6 +775,26 @@ mod tests {
     fn pinning_an_unknown_hash_is_a_hard_error() {
         let conn = db();
         assert!(pin(&conn, "nope", &"f".repeat(32), None, 100).is_err());
+    }
+
+    #[test]
+    fn re_pushing_a_pinned_object_keeps_it_pinned() {
+        let mut conn = db();
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        let dep = format!("{b}-dep");
+        insert_object(&mut conn, &object(&a, &[&dep]), 100).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        pin(&conn, "release", &a, None, 100).unwrap();
+
+        insert_object(&mut conn, &object(&a, &[&dep]), 200).unwrap();
+        assert!(
+            evictable(&conn, 10, 1000).unwrap().is_empty(),
+            "re-push dropped the pin: the pinned closure became evictable"
+        );
+        assert_eq!(
+            get_object(&conn, &a).unwrap().unwrap().references,
+            vec![dep]
+        );
     }
 
     #[test]

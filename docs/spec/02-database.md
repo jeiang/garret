@@ -85,6 +85,9 @@ Notes:
   finds the object present, debounced to one write per hour. It is the
   age `garret-admin prune` judges by (spec 05). Databases from before
   the column existed are migrated with `pushed_at = created_at`.
+- A re-push rewrites the object's row in place (an upsert), never
+  delete-then-insert: `pins` cascade on delete, so `INSERT OR REPLACE`
+  would silently unpin a re-pushed object.
 
 ## Pragmas
 
