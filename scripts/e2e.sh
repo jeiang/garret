@@ -50,6 +50,7 @@ check_401 "no token"
 check_401 "garbage token"   -H "Authorization: Bearer not-a-jwt"
 check_401 "wrong audience"  -H "Authorization: Bearer $(cat "$root/token-wrong-audience")"
 check_401 "expired token"   -H "Authorization: Bearer $(cat "$root/token-expired")"
+check_401 "not-yet-valid"   -H "Authorization: Bearer $(cat "$root/token-not-yet-valid")"
 
 say "building a two-path closure"
 # See scripts/e2e-fixture.nix for why these are runCommand derivations rather
