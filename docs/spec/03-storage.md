@@ -16,7 +16,9 @@ It has no versioning, no server-side encryption, and no lifecycle rules
 ## Layout
 
 Flat keys: `nar/<storePathHash>.nar.zst` — one blob per object, derivable
-from the DB row and vice versa. No prefix sharding.
+from the DB row and vice versa. No prefix sharding. The hash is checked to
+be 32 nix-base32 characters before it becomes a key
+([01](01-push-protocol.md#validation)), so a key never holds `/` or `..`.
 
 ## Uploads (Pusher → S3)
 
@@ -27,7 +29,14 @@ Defaults, all configurable:
   and the concurrency permit acquired **before** reading each part — the
   reader must never race ahead of S3. Worst-case buffering is 4×64 MiB
   per NAR; the protocol's global in-flight byte cap bounds the aggregate.
-- On any upload error, abort the multipart immediately so parts free.
+- Each part uploads on its own task while the next is read, so client
+  ingress and S3 egress overlap and a finished part frees its permit
+  whether or not its reader is waiting. A permit is held only by a part
+  being read or uploaded, never by a waiter, so uploads sharing the global
+  cap cannot wedge each other; a cap of fewer part slots than parts in
+  flight just serializes the parts.
+- On any upload error, stop the parts still uploading, then abort the
+  multipart immediately so parts free.
 - Every S3 call carries an **overall operation deadline** —
   `[s3] operation_timeout_secs`, default **60** — covering connect,
   transfer, and any SDK-internal retries (ticket 27). Overall rather

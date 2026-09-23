@@ -2,9 +2,9 @@
 //! anything reaching this socket is already privileged, so there is no
 //! separate auth layer to keep in sync.
 
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use garret_common::admin::{Request, Response};
 use garret_server::{db, narinfo};
 use tokio::{
@@ -101,6 +101,12 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             }),
         },
         Request::Prune { before, dry_run } => prune(state, before, dry_run).await,
+        Request::DeletePushedBy {
+            subject,
+            since,
+            dry_run,
+        } => delete_pushed_by(state, &subject, since, dry_run).await,
+        Request::Backup { path } => backup(state, path).await,
     };
     result.unwrap_or_else(|e| Response::Error {
         message: format!("{e:#}"),
@@ -158,6 +164,71 @@ async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
     })
 }
 
+/// Incident response after a push credential leaks (spec 10-packaging): every
+/// object `subject` pushed, optionally only since a cutoff, removed through
+/// [`delete`] so it gets exactly the treatment a hand-typed hash list would.
+async fn delete_pushed_by(
+    state: &AppState,
+    subject: &str,
+    since: Option<i64>,
+    dry_run: bool,
+) -> Result<Response> {
+    let mut matched = {
+        let conn = state.conn.lock().unwrap();
+        pushed_by(&conn, subject, since)?
+    };
+    let bytes_freed = if dry_run {
+        matched.iter().map(|(_, _, size)| size).sum()
+    } else {
+        let hashes: Vec<String> = matched.iter().map(|(hash, _, _)| hash.clone()).collect();
+        let Response::Delete {
+            bytes_freed,
+            missing,
+            ..
+        } = delete(state, &hashes).await?
+        else {
+            bail!("delete answered with something other than Response::Delete");
+        };
+        // Gone between the listing and the delete (GC got there first): not
+        // deleted by this command, so not reported as such.
+        matched.retain(|(hash, _, _)| !missing.contains(hash));
+        tracing::info!(
+            subject,
+            since,
+            objects = matched.len(),
+            bytes_freed,
+            "deleted objects by pusher"
+        );
+        bytes_freed
+    };
+    Ok(Response::DeletePushedBy {
+        objects: matched
+            .into_iter()
+            .map(|(hash, name, _)| format!("{hash}-{name}"))
+            .collect(),
+        bytes_freed,
+    })
+}
+
+/// `(hash, name, file_size)` of every object first pushed by `subject`, at or
+/// after `since` when given. Exact match: a subject is `<issuer>#<sub>`, and
+/// a prefix of one GitHub ref's subject can be another's.
+fn pushed_by(
+    conn: &rusqlite::Connection,
+    subject: &str,
+    since: Option<i64>,
+) -> Result<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT store_path_hash, name, file_size FROM objects
+         WHERE pushed_by = ?1 AND created_at >= ?2
+         ORDER BY created_at, store_path_hash",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![subject, since.unwrap_or(i64::MIN)], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
 /// chose the cutoff. Row first, blob second, as everywhere else.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
@@ -205,4 +276,173 @@ fn resign(state: &AppState) -> Result<usize> {
         }
     }
     Ok(resigned)
+}
+
+/// The online backup: a consistent copy of the whole database, taken while
+/// both services keep running (spec 10-packaging). Takes the source path from
+/// the shared connection and copies on a connection of its own, so pushes
+/// wait on nothing longer than that lookup.
+async fn backup(state: &AppState, dest: String) -> Result<Response> {
+    let source = state
+        .conn
+        .lock()
+        .unwrap()
+        .path()
+        // rusqlite reports an in-memory database as an empty path.
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .context("the database is in memory; there is no file to back up")?;
+    let bytes = tokio::task::spawn_blocking(move || backup_to(&source, Path::new(&dest))).await??;
+    Ok(Response::Backup { bytes })
+}
+
+/// `VACUUM INTO` reads inside one read transaction, which WAL lets run
+/// alongside the Pusher's writes, so the copy is a snapshot of a single
+/// moment -- WAL frames not yet checkpointed included.
+fn backup_to(source: &str, dest: &Path) -> Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Created here rather than by SQLite: `create_new` refuses to overwrite
+    // anything (a planted symlink included), and the copy is 0600 from its
+    // first byte -- it holds every row, pushers' subjects among them.
+    // `VACUUM INTO` accepts an empty existing file.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    let copy = || -> Result<u64> {
+        let conn = rusqlite::Connection::open_with_flags(
+            source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let dest = dest.to_str().context("backup path is not UTF-8")?;
+        conn.execute("VACUUM INTO ?1", [dest])?;
+        // A backup that a crash can lose is not one: flush the copy and its
+        // directory entry before reporting.
+        file.sync_all()?;
+        let dir = Path::new(dest)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(file.metadata()?.len())
+    };
+    copy().inspect_err(|_| {
+        // Ours, and incomplete: removing it lets a retry use the same path.
+        let _ = std::fs::remove_file(dest);
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(hash: &str) -> db::Object {
+        db::Object {
+            store_path_hash: hash.into(),
+            store_path: format!("/nix/store/{hash}-thing"),
+            name: "thing".into(),
+            nar_hash: "sha256:x".into(),
+            nar_size: 10,
+            file_hash: "sha256:y".into(),
+            file_size: 5,
+            deriver: None,
+            ca: None,
+            references: vec![],
+            sigs: vec![],
+            pushed_by: None,
+        }
+    }
+
+    fn push(conn: &mut rusqlite::Connection, hash: &str, subject: &str, at: i64) {
+        let object = db::Object {
+            pushed_by: Some(subject.into()),
+            ..object(hash)
+        };
+        db::insert_object(conn, &object, at).unwrap();
+    }
+
+    /// Matches only the exact subject -- never one it is a prefix of -- and
+    /// `since` is inclusive, so the first push after a leak is not missed.
+    #[test]
+    fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
+        let (a, b, c, d) = (
+            "a".repeat(32),
+            "b".repeat(32),
+            "c".repeat(32),
+            "d".repeat(32),
+        );
+        push(&mut conn, &a, leaked, 100);
+        push(&mut conn, &b, leaked, 200);
+        push(&mut conn, &c, &format!("{leaked}-other"), 200);
+        push(&mut conn, &d, "https://issuer#someone-else", 300);
+        // Negotiation refreshes pushed_at, never who pushed first or when.
+        conn.execute("UPDATE objects SET pushed_at = 500", [])
+            .unwrap();
+
+        let hashes = |since| -> Vec<String> {
+            pushed_by(&conn, leaked, since)
+                .unwrap()
+                .into_iter()
+                .map(|(hash, name, size)| {
+                    assert_eq!((name.as_str(), size), ("thing", 5));
+                    hash
+                })
+                .collect()
+        };
+        assert_eq!(hashes(None), [a, b.clone()]);
+        assert_eq!(hashes(Some(200)), [b]);
+        assert!(hashes(Some(201)).is_empty());
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("garret-backup-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The copy must hold rows that so far live only in the WAL: copying the
+    /// main file's bytes would silently drop everything since the last
+    /// checkpoint.
+    #[test]
+    fn backup_copies_uncheckpointed_rows_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("wal");
+        let source = dir.join("garret.db");
+        let mut conn = db::open(source.to_str().unwrap(), true).unwrap();
+        db::migrate(&conn).unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        db::insert_object(&mut conn, &object(&"a".repeat(32)), 1).unwrap();
+
+        let dest = dir.join("backup.db");
+        let bytes = backup_to(source.to_str().unwrap(), &dest).unwrap();
+
+        assert_eq!(bytes, std::fs::metadata(&dest).unwrap().len());
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let copy = db::open(dest.to_str().unwrap(), false).unwrap();
+        assert!(db::exists(&copy, &"a".repeat(32)).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An existing file is never overwritten, and never removed either -- it
+    /// may be yesterday's good backup.
+    #[test]
+    fn backup_refuses_to_overwrite() {
+        let dir = scratch("exists");
+        let source = dir.join("garret.db");
+        db::migrate(&db::open(source.to_str().unwrap(), true).unwrap()).unwrap();
+        let dest = dir.join("backup.db");
+        std::fs::write(&dest, "yesterday").unwrap();
+
+        assert!(backup_to(source.to_str().unwrap(), &dest).is_err());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "yesterday");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

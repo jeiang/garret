@@ -34,9 +34,11 @@ pub struct Object {
     pub pushed_by: Option<String>,
 }
 
-/// `<hash>-<name>` → hash. Store path basenames are hash-prefixed by construction.
+/// `<hash>-<name>` → hash. Store path basenames are hash-prefixed by
+/// construction; anything else (a row from before the Pusher validated its
+/// input) yields a hash that matches nothing rather than a panic mid-browse.
 pub fn hash_of(basename: &str) -> &str {
-    &basename[..basename.len().min(32)]
+    basename.get(..32).unwrap_or(basename)
 }
 
 const SCHEMA: &str = r#"
@@ -173,8 +175,13 @@ pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result
 
 /// Inserts the object, its refs and the usage counter in one transaction —
 /// only ever called after the blob is durable (row exists ⇒ blob exists).
+///
+/// IMMEDIATE, because it reads before it writes: a deferred transaction
+/// would take a read lock first, and SQLite fails the later upgrade to a
+/// write lock with SQLITE_BUSY at once, without waiting out `busy_timeout`,
+/// whenever another connection (the Puller's bumps) holds the write lock.
 pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // A re-push of an object we already hold must not count its bytes twice.
     let previous: i64 = tx
         .query_row(
@@ -184,11 +191,21 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
         )
         .optional()?
         .unwrap_or(0);
+    // An upsert, not INSERT OR REPLACE: REPLACE deletes the old row first,
+    // and that delete cascades to the object's pins, so a re-push would
+    // silently unpin it.
     tx.execute(
-        "INSERT OR REPLACE INTO objects (store_path_hash, store_path, name, nar_hash, nar_size,
+        "INSERT INTO objects (store_path_hash, store_path, name, nar_hash, nar_size,
              file_hash, file_size, deriver, ca, sigs, pushed_by, created_at, last_accessed_at,
              pushed_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?12)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12,?12)
+         ON CONFLICT (store_path_hash) DO UPDATE SET
+             store_path = excluded.store_path, name = excluded.name,
+             nar_hash = excluded.nar_hash, nar_size = excluded.nar_size,
+             file_hash = excluded.file_hash, file_size = excluded.file_size,
+             deriver = excluded.deriver, ca = excluded.ca, sigs = excluded.sigs,
+             pushed_by = excluded.pushed_by, created_at = excluded.created_at,
+             last_accessed_at = excluded.last_accessed_at, pushed_at = excluded.pushed_at",
         params![
             obj.store_path_hash,
             obj.store_path,
@@ -234,14 +251,24 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
 
 /// Fetches an object with its references sorted, ready for narinfo rendering.
 pub fn get_object(conn: &Connection, hash: &str) -> Result<Option<Object>> {
+    Ok(get_object_and_last_accessed(conn, hash)?.map(|(obj, _)| obj))
+}
+
+/// [`get_object`] plus the row's `last_accessed_at`, read by the same query,
+/// so the Puller decides whether a hit needs a bump without a second lookup
+/// and without a write (spec 02).
+pub fn get_object_and_last_accessed(
+    conn: &Connection,
+    hash: &str,
+) -> Result<Option<(Object, i64)>> {
     let mut obj = conn
         .query_row(
             "SELECT store_path, name, nar_hash, nar_size, file_hash, file_size, deriver, ca,
-                    sigs, pushed_by
+                    sigs, pushed_by, last_accessed_at
              FROM objects WHERE store_path_hash = ?1",
             params![hash],
             |row| {
-                Ok(Object {
+                let obj = Object {
                     store_path_hash: hash.to_owned(),
                     store_path: row.get(0)?,
                     name: row.get(1)?,
@@ -255,12 +282,13 @@ pub fn get_object(conn: &Connection, hash: &str) -> Result<Option<Object>> {
                     sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
                         .unwrap_or_default(),
                     pushed_by: row.get(9)?,
-                })
+                };
+                Ok((obj, row.get(10)?))
             },
         )
         .optional()?;
 
-    if let Some(obj) = obj.as_mut() {
+    if let Some((obj, _)) = obj.as_mut() {
         // Sorted: narinfo References order is part of what the signature covers.
         let mut stmt = conn
             .prepare("SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference")?;
@@ -376,8 +404,9 @@ pub fn unpin(conn: &Connection, name: &str) -> Result<bool> {
 /// Removes the row and its refs, and debits the usage counter, in one
 /// transaction. The blob is deleted after this returns — row-then-blob, so a
 /// failure leaves an orphan for the sweep rather than a row with no blob.
+/// IMMEDIATE for the same reason as [`insert_object`].
 pub fn delete_object(conn: &mut Connection, hash: &str) -> Result<i64> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let size: i64 = tx
         .query_row(
             "SELECT file_size FROM objects WHERE store_path_hash = ?1",
@@ -428,14 +457,28 @@ pub fn all_objects_brief(conn: &Connection) -> Result<Vec<(String, String, i64, 
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// Debounced last-accessed bump (spec 02): day granularity is enough for LRU,
-/// so a row touched in the last `stale_after` seconds is left alone.
-pub fn bump_last_accessed(conn: &Connection, hash: &str, now: i64, stale_after: i64) -> Result<()> {
-    conn.execute(
-        "UPDATE objects SET last_accessed_at = ?2
-         WHERE store_path_hash = ?1 AND last_accessed_at < ?2 - ?3",
-        params![hash, now, stale_after],
-    )?;
+/// Debounced last-accessed bumps (spec 02), one IMMEDIATE transaction per
+/// batch: the write lock is taken up front, so a busy database fails within
+/// the connection's busy timeout instead of partway through. Day granularity
+/// is enough for LRU, so a row touched in the last `stale_after` seconds is
+/// left alone.
+pub fn bump_last_accessed<S: AsRef<str>>(
+    conn: &mut Connection,
+    hashes: impl IntoIterator<Item = S>,
+    now: i64,
+    stale_after: i64,
+) -> Result<()> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    {
+        let mut stmt = tx.prepare(
+            "UPDATE objects SET last_accessed_at = ?2
+             WHERE store_path_hash = ?1 AND last_accessed_at < ?2 - ?3",
+        )?;
+        for hash in hashes {
+            stmt.execute(params![hash.as_ref(), now, stale_after])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -612,6 +655,15 @@ mod tests {
     }
 
     #[test]
+    fn hash_of_survives_a_multibyte_character_at_the_hash_boundary() {
+        // Byte 32 falls inside `é`: slicing there used to panic the Puller's
+        // browse tree while it held the connection mutex.
+        let base = format!("{}é-x", "a".repeat(31));
+        assert!(!crate::nix_base32::is_store_hash(hash_of(&base)));
+        assert_eq!(hash_of(&format!("{}-x", "a".repeat(32))), "a".repeat(32));
+    }
+
+    #[test]
     fn round_trips_an_object_with_sorted_references() {
         let mut conn = db();
         let a = "a".repeat(32);
@@ -751,6 +803,26 @@ mod tests {
     }
 
     #[test]
+    fn re_pushing_a_pinned_object_keeps_it_pinned() {
+        let mut conn = db();
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        let dep = format!("{b}-dep");
+        insert_object(&mut conn, &object(&a, &[&dep]), 100).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        pin(&conn, "release", &a, None, 100).unwrap();
+
+        insert_object(&mut conn, &object(&a, &[&dep]), 200).unwrap();
+        assert!(
+            evictable(&conn, 10, 1000).unwrap().is_empty(),
+            "re-push dropped the pin: the pinned closure became evictable"
+        );
+        assert_eq!(
+            get_object(&conn, &a).unwrap().unwrap().references,
+            vec![dep]
+        );
+    }
+
+    #[test]
     fn deleting_a_pinned_object_drops_the_pin() {
         // `garret-admin delete` is the explicit operator override; the pin
         // must not linger pointing at nothing (FK cascade).
@@ -781,6 +853,42 @@ mod tests {
             .unwrap();
         assert_eq!(reconcile_total_bytes(&conn).unwrap(), 5);
         assert_eq!(total_bytes(&conn).unwrap(), 5);
+    }
+
+    #[test]
+    fn pusher_writes_wait_out_another_connections_write_lock() {
+        // The Puller's bumps take the WAL write lock on its own connection.
+        // A read-then-write transaction that began deferred could not wait
+        // for it: SQLite fails the read-to-write upgrade with SQLITE_BUSY at
+        // once, ignoring busy_timeout, so uploads and GC failed under pull
+        // load. Needs a real file: WAL does not apply to `:memory:`.
+        let dir = std::env::temp_dir().join(format!("garret-db-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("garret.sqlite");
+        let path = path.to_str().unwrap();
+        let mut conn = open(path, true).unwrap();
+        migrate(&conn).unwrap();
+        let hold_write_lock = || {
+            let other = open(path, false).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                other.execute_batch("COMMIT").unwrap();
+            })
+        };
+        let a = "a".repeat(32);
+
+        let holder = hold_write_lock();
+        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        holder.join().unwrap();
+
+        let holder = hold_write_lock();
+        assert_eq!(delete_object(&mut conn, &a).unwrap(), 5);
+        holder.join().unwrap();
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -879,16 +987,22 @@ mod tests {
     #[test]
     fn last_accessed_bumps_are_debounced() {
         let mut conn = db();
-        let a = "a".repeat(32);
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
         insert_object(&mut conn, &object(&a, &[]), 1000).unwrap();
+        insert_object(&mut conn, &object(&b, &[]), 1000).unwrap();
 
-        // Within the debounce window: no write at all.
-        bump_last_accessed(&conn, &a, 1001, 86400).unwrap();
+        // Within the debounce window: the row stays put.
+        bump_last_accessed(&mut conn, [&a], 1001, 86400).unwrap();
         assert_eq!(last_accessed(&conn, &a), 1000);
 
-        // Past it: the row moves.
-        bump_last_accessed(&conn, &a, 1000 + 86401, 86400).unwrap();
+        // Past it: every row in the batch moves, as the pull path reads it.
+        bump_last_accessed(&mut conn, [&a, &b], 1000 + 86401, 86400).unwrap();
         assert_eq!(last_accessed(&conn, &a), 1000 + 86401);
+        assert_eq!(last_accessed(&conn, &b), 1000 + 86401);
+        assert_eq!(
+            get_object_and_last_accessed(&conn, &a).unwrap().unwrap().1,
+            1000 + 86401
+        );
     }
 
     fn last_accessed(conn: &Connection, hash: &str) -> i64 {

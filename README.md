@@ -15,8 +15,29 @@ substituter), colocated on one host over SQLite + S3.
 - Quota-driven GC: least-recently-accessed eviction that never breaks a
   surviving closure
 - Store watcher: pushes newly built store paths automatically
+- Online database backup (`garret-admin backup`) with a documented restore
+  ([docs/spec/10-packaging.md](docs/spec/10-packaging.md#backup-and-restore))
 - Browse API and extensive Prometheus metrics
 - Nix packaging and NixOS modules for both services
+
+## Install
+
+CI builds every commit on `main` and every `v*` tag for x86_64-linux and
+aarch64-darwin, then pushes the flake's packages (`garret`, `garret-pusher`,
+`garret-puller`, `garret-admin`, `garret-all`) to garret's own cache. Trust it
+in `nix.conf` (or `nix.settings` on NixOS; on a multi-user install
+`--option` on the command line only works for trusted users):
+
+```
+extra-substituters = https://cache.jeiang.dev
+extra-trusted-public-keys = cache.jeiang.dev-1:owXJK5/UX9NSf1lhmDDT3QTxMtbVk9YfHhjvOXyPhpA=
+```
+
+Then `nix profile install github:jeiang/garret#garret` (or pin a revision:
+`github:jeiang/garret/<rev>#garret`) substitutes the prebuilt client instead
+of compiling the workspace. The NixOS modules' default packages are the same
+outputs, so a host that imports them substitutes too, as long as it does not
+override garret's `nixpkgs` input with `follows`.
 
 ## Quickstart
 
