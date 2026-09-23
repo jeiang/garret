@@ -37,8 +37,10 @@ Prefix `garret_`; service distinguished by scrape job.
   `unknown_key`, `jwks_unavailable`, `invalid`, `unauthorized`);
   `garret_jwks_refreshes_total` (fetch attempts) and
   `garret_jwks_refresh_failures_total` by `issuer`. A rise in
-  `unknown_key` without matching refreshes is an unknown-kid flood the
-  JWKS floor is absorbing (spec 04).
+  `unknown_key` without matching refreshes is either an unknown-kid flood
+  the JWKS floor is absorbing (spec 04) or, if refresh failures rise too,
+  a down issuer: during the floor after a failed fetch, unknown kids count
+  as `unknown_key`, not `jwks_unavailable`.
 - **Pusher — GC**: usage and quota gauges; evicted objects/bytes per
   pass; pass duration; orphans found; candidates-exhausted alarm
   counter; last-successful-pass timestamp.
@@ -66,6 +68,6 @@ Prefix `garret_`; service distinguished by scrape job.
 OTLP/distributed tracing in v1. The client is metrics-free: progress
 output, logs, and the watcher skip-list.
 
-A rejected token's reason is logged escaped and cut to 256 characters: it
+A rejected token's reason is logged escaped and cut at 256 characters: it
 can carry attacker-controlled token text (the `kid`, header fields echoed
 by parse errors), which must not forge log lines or flood the journal.
