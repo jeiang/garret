@@ -124,7 +124,7 @@ in
       after = [ "network-online.target" "garret-pusher.service" ];
       wants = [ "network-online.target" ];
 
-      serviceConfig = {
+      serviceConfig = import ./sandbox.nix // {
         ExecStart = "${cfg.package}/bin/garret-puller ${configFile}";
         EnvironmentFile = cfg.s3.credentialsFile;
         Restart = "on-failure";
@@ -134,10 +134,6 @@ in
         # directory is the Pusher's, and systemd would chown it to this user.
         User = "garret-puller";
         Group = "garret";
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        NoNewPrivileges = true;
         ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
       };
     };
