@@ -758,7 +758,6 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
     /// The NAR is checked against its claim before the store commits: the
     /// storage is unreachable, so a 400 (not a 500) shows the mismatch
     /// stopped the push before anything was stored or signed.
@@ -789,7 +788,8 @@ mod tests {
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{case}: {}", err.1);
             assert!(err.1.contains(why), "{case}: {}", err.1);
         }
-=======
+    }
+
     /// A 500's body must not echo the error chain, yet must carry an id the
     /// operator can find in the log next to that chain.
     #[tokio::test]
@@ -848,6 +848,5 @@ mod tests {
             line.contains("inserting object: sqlite: disk I/O error at /var/lib/garret/db"),
             "{line}"
         );
->>>>>>> origin/main
     }
 }
