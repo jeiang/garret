@@ -1,7 +1,7 @@
 //! SQLite access. Schema per spec 02-database; the Pusher owns all writes.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 /// One cached store path: the unit of content in the cache, keyed by its
 /// store path hash. A row exists if and only if its blob does (spec 02).
@@ -145,8 +145,13 @@ pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result
 
 /// Inserts the object, its refs and the usage counter in one transaction —
 /// only ever called after the blob is durable (row exists ⇒ blob exists).
+///
+/// IMMEDIATE, because it reads before it writes: a deferred transaction
+/// would take a read lock first, and SQLite fails the later upgrade to a
+/// write lock with SQLITE_BUSY at once, without waiting out `busy_timeout`,
+/// whenever another connection (the Puller's bumps) holds the write lock.
 pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // A re-push of an object we already hold must not count its bytes twice.
     let previous: i64 = tx
         .query_row(
@@ -347,8 +352,9 @@ pub fn unpin(conn: &Connection, name: &str) -> Result<bool> {
 /// Removes the row and its refs, and debits the usage counter, in one
 /// transaction. The blob is deleted after this returns — row-then-blob, so a
 /// failure leaves an orphan for the sweep rather than a row with no blob.
+/// IMMEDIATE for the same reason as [`insert_object`].
 pub fn delete_object(conn: &mut Connection, hash: &str) -> Result<i64> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let size: i64 = tx
         .query_row(
             "SELECT file_size FROM objects WHERE store_path_hash = ?1",
@@ -616,6 +622,42 @@ mod tests {
             .unwrap();
         assert_eq!(reconcile_total_bytes(&conn).unwrap(), 5);
         assert_eq!(total_bytes(&conn).unwrap(), 5);
+    }
+
+    #[test]
+    fn pusher_writes_wait_out_another_connections_write_lock() {
+        // The Puller's bumps take the WAL write lock on its own connection.
+        // A read-then-write transaction that began deferred could not wait
+        // for it: SQLite fails the read-to-write upgrade with SQLITE_BUSY at
+        // once, ignoring busy_timeout, so uploads and GC failed under pull
+        // load. Needs a real file: WAL does not apply to `:memory:`.
+        let dir = std::env::temp_dir().join(format!("garret-db-busy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("garret.sqlite");
+        let path = path.to_str().unwrap();
+        let mut conn = open(path, true).unwrap();
+        migrate(&conn).unwrap();
+        let hold_write_lock = || {
+            let other = open(path, false).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                other.execute_batch("COMMIT").unwrap();
+            })
+        };
+        let a = "a".repeat(32);
+
+        let holder = hold_write_lock();
+        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        holder.join().unwrap();
+
+        let holder = hold_write_lock();
+        assert_eq!(delete_object(&mut conn, &a).unwrap(), 5);
+        holder.join().unwrap();
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

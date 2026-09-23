@@ -87,3 +87,9 @@ WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
 `busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
 `foreign_keys=ON`. Short write transactions only; the Pusher runs
 periodic checkpoint maintenance.
+
+A write transaction that reads before it writes (insert and delete, for
+their `stats` delta) begins `IMMEDIATE`. Begun deferred, it would take a
+read lock first, and SQLite fails the later upgrade to the write lock
+with `SQLITE_BUSY` at once, without consulting `busy_timeout`, whenever
+another connection holds it — which the Puller's bumps do.
