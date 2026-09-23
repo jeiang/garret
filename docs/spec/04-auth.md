@@ -39,6 +39,8 @@ JWKS. There is no token-exchange service and no garret-issued token.
     names the file the job actually runs: for a reusable workflow it is the
     called file, so a third-party reusable workflow called from an allowed
     repository — which inherits the caller's other claims — is refused.
+    It spells repositories by name, so a rename can only refuse tokens
+    (never grant one, given the id checks): update it alongside the rename.
 
   Recommended policy: pin the repositories and the workflow that pushes, on
   protected main, for push and manual runs only:
