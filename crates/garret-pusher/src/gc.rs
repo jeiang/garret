@@ -11,7 +11,7 @@ use anyhow::Result;
 use garret_server::{
     config::GcConfig,
     db,
-    inflight::InFlight,
+    inflight::{self, InFlight},
     now,
     storage::{self, Storage},
 };
@@ -116,7 +116,17 @@ impl Gc {
             }
 
             let mut keys = Vec::with_capacity(candidates.len());
+            // Held from each row delete until the blob delete returns: an
+            // upload of the path in between would write a blob that delete
+            // then removes, under the row the upload inserts (spec 05).
+            let mut claims = Vec::with_capacity(candidates.len());
+            let mut settled = false;
             for (hash, _) in &candidates {
+                // Being uploaded or deleted elsewhere: not ours to touch.
+                let Ok(claim) = self.in_flight.claim(hash, inflight::Kind::Delete) else {
+                    continue;
+                };
+                settled = true;
                 // Row first, blob second: a failed blob delete leaves an orphan
                 // for the sweep, never a row without a blob (spec 05). A
                 // candidate negotiated or referenced since the snapshot stays;
@@ -131,11 +141,19 @@ impl Gc {
                 result.evicted += 1;
                 result.bytes_freed += freed;
                 keys.push(storage::key_for(hash));
+                claims.push(claim);
                 if usage <= low {
                     break;
                 }
             }
             self.storage.delete_objects(&keys).await?;
+            drop(claims);
+            if !settled {
+                // Every candidate is claimed by an upload or deletion; the
+                // query would return them all again. The next tick retries.
+                tracing::warn!(usage, low, "GC pass stopped: every candidate is in flight");
+                break;
+            }
         }
 
         metrics::counter!("garret_gc_evicted_objects_total").increment(result.evicted as u64);
@@ -245,7 +263,9 @@ mod tests {
         ];
         let known: std::collections::HashSet<String> = ["known".to_string()].into();
         let in_flight = InFlight::new();
-        let _claim = in_flight.claim("uploading").unwrap();
+        let _claim = in_flight
+            .claim("uploading", garret_server::inflight::Kind::Upload)
+            .unwrap();
 
         assert_eq!(
             orphan_keys(&blobs, &known, &in_flight, grace),
@@ -351,6 +371,71 @@ mod tests {
         assert!(db::exists(&gc.conn.lock().unwrap(), &d).unwrap());
         assert_eq!(pass.evicted, 0);
         assert!(pass.candidates_exhausted, "over quota with no alarm");
+    }
+
+    #[tokio::test]
+    async fn an_evicted_path_stays_claimed_until_its_blob_is_deleted() {
+        // Between the row delete and the blob delete, an upload of the same
+        // path would write a blob the pending delete then removes, under the
+        // row that upload inserts.
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let r = "r".repeat(32);
+        db::insert_object(&mut conn, &object(&r, 100, &[]), 0).unwrap();
+        let (storage, held, release) = gated_s3().await;
+        let in_flight = InFlight::new();
+        let gc = Arc::new(Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage,
+            in_flight.clone(),
+            config(100),
+        ));
+
+        let pass = tokio::spawn({
+            let gc = gc.clone();
+            async move { gc.run().await.unwrap() }
+        });
+        held.await.unwrap();
+        assert!(!db::exists(&gc.conn.lock().unwrap(), &r).unwrap());
+        assert_eq!(
+            in_flight.claim(&r, inflight::Kind::Upload).err(),
+            Some(inflight::Kind::Delete),
+            "an upload got in before the blob delete"
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(pass.await.unwrap().evicted, 1);
+        assert!(in_flight.claim(&r, inflight::Kind::Upload).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_pass_whose_every_candidate_is_being_deleted_stops() {
+        // `garret-admin delete` holds the only candidate. The candidate query
+        // keeps returning it until that delete commits, so a pass that only
+        // skipped it would spin.
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let r = "r".repeat(32);
+        db::insert_object(&mut conn, &object(&r, 100, &[]), 0).unwrap();
+        let in_flight = InFlight::new();
+        let _deleting = in_flight.claim(&r, inflight::Kind::Delete).unwrap();
+        let gc = Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage_at("http://127.0.0.1:1", 1).await,
+            in_flight,
+            config(100),
+        );
+
+        let pass = tokio::time::timeout(Duration::from_secs(5), gc.run())
+            .await
+            .expect("the pass spun on a claimed candidate")
+            .unwrap();
+        assert_eq!(pass.evicted, 0);
+        assert!(
+            !pass.candidates_exhausted,
+            "a transient claim raised the alarm"
+        );
+        assert!(db::exists(&gc.conn.lock().unwrap(), &r).unwrap());
     }
 
     fn config(quota_bytes: u64) -> GcConfig {

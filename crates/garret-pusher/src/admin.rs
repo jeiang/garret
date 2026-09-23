@@ -2,11 +2,15 @@
 //! anything reaching this socket is already privileged, so there is no
 //! separate auth layer to keep in sync.
 
-use std::{path::Path, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use garret_common::admin::{Request, Response};
-use garret_server::{db, narinfo};
+use garret_server::{
+    db,
+    inflight::{Claim, InFlight, Kind},
+    narinfo,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -119,7 +123,7 @@ fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
         objects: conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?,
         total_bytes: db::total_bytes(&conn)?,
         quota_bytes: gc.map(|gc| gc.cfg.quota_bytes),
-        uploads_in_flight: state.in_flight.len(),
+        uploads_in_flight: state.in_flight.uploads(),
     })
 }
 
@@ -131,6 +135,13 @@ fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
 /// references the object. GC decides by reachability; this is the operator
 /// saying "remove it regardless", which is the whole reason it exists.
 async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
+    let mut seen = HashSet::new();
+    let hashes: Vec<&str> = hashes
+        .iter()
+        .map(String::as_str)
+        .filter(|hash| seen.insert(*hash))
+        .collect();
+    let _claims = claim_deletions(&state.in_flight, &hashes)?;
     let mut deleted = 0;
     let mut bytes_freed = 0;
     let mut missing = Vec::new();
@@ -142,7 +153,7 @@ async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
             db::exists(&conn, hash)?
         };
         if !present {
-            missing.push(hash.clone());
+            missing.push(hash.to_owned());
             continue;
         }
         let freed = {
@@ -232,9 +243,17 @@ fn pushed_by(
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
 /// chose the cutoff. Row first, blob second, as everywhere else.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
-    let pruned = {
+    let (pruned, claims) = {
         let mut conn = state.conn.lock().unwrap();
-        db::prune(&mut conn, before, garret_server::now(), dry_run)?
+        let doomed = db::prunable(&conn, before, garret_server::now())?;
+        if dry_run {
+            (doomed, Vec::new())
+        } else {
+            let hashes: Vec<&str> = doomed.iter().map(|(hash, _, _)| hash.as_str()).collect();
+            let claims = claim_deletions(&state.in_flight, &hashes)?;
+            db::delete_pruned(&mut conn, &doomed)?;
+            (doomed, claims)
+        }
     };
     let bytes_freed = pruned.iter().map(|(_, _, size)| size).sum();
     if !dry_run {
@@ -243,6 +262,7 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
             .map(|(hash, _, _)| garret_server::storage::key_for(hash))
             .collect();
         state.storage.delete_objects(&keys).await?;
+        drop(claims);
         tracing::info!(
             before,
             objects = pruned.len(),
@@ -257,6 +277,25 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
             .collect(),
         bytes_freed,
     })
+}
+
+/// Claims every path before the first row goes, for the caller to hold until
+/// the blob delete returns (spec 05): an upload of one in between would write
+/// a blob that delete then removes. A path already being uploaded or deleted
+/// fails the whole command before anything is deleted.
+fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> {
+    hashes
+        .iter()
+        .map(|hash| {
+            in_flight.claim(hash, Kind::Delete).map_err(|held| {
+                let doing = match held {
+                    Kind::Upload => "uploaded",
+                    Kind::Delete => "deleted",
+                };
+                anyhow::anyhow!("{hash} is being {doing}; nothing was deleted, retry")
+            })
+        })
+        .collect()
 }
 
 /// Backfills signatures after a key is added, so both the old and new key
@@ -338,6 +377,7 @@ fn backup_to(source: &str, dest: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::{open_db, test_state};
 
     fn object(hash: &str) -> db::Object {
         db::Object {
@@ -444,5 +484,43 @@ mod tests {
         assert!(backup_to(source.to_str().unwrap(), &dest).is_err());
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "yesterday");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// GC is between the row and blob delete of `b` (or an upload of it is
+    /// landing): an operator delete naming it stops before touching a row,
+    /// and keeps no claim on the rest.
+    #[tokio::test]
+    async fn a_delete_meeting_a_claimed_path_deletes_nothing() {
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        let mut conn = open_db();
+        for h in [&a, &b] {
+            db::insert_object(&mut conn, &object(h), 100).unwrap();
+        }
+        let state = test_state(conn).await;
+        let _gc = state.in_flight.claim(&b, Kind::Delete).unwrap();
+
+        let err = delete(&state, &[a.clone(), a.clone(), b.clone()])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&b), "{err:#}");
+        assert!(db::exists(&state.conn.lock().unwrap(), &a).unwrap());
+        assert!(state.in_flight.claim(&a, Kind::Upload).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_prune_meeting_a_claimed_path_deletes_nothing_but_can_still_list() {
+        let a = "a".repeat(32);
+        let mut conn = open_db();
+        db::insert_object(&mut conn, &object(&a), 100).unwrap();
+        let state = test_state(conn).await;
+        let _gc = state.in_flight.claim(&a, Kind::Delete).unwrap();
+        let before = garret_server::now() - 2 * 86400;
+
+        let Response::Prune { pruned, .. } = prune(&state, before, true).await.unwrap() else {
+            panic!("not a prune response");
+        };
+        assert_eq!(pruned, vec![format!("{a}-thing")]);
+        assert!(prune(&state, before, false).await.is_err());
+        assert!(db::exists(&state.conn.lock().unwrap(), &a).unwrap());
     }
 }

@@ -76,6 +76,10 @@ normal operation:
 - Already present → `200 {"status":"exists"}` with no body transfer.
 - In flight elsewhere → `200 {"status":"in-progress"}`; the second
   pusher treats it as success (first writer wins).
+- Being deleted (GC, `garret-admin delete` or `prune` has removed the
+  row but not yet the blob; spec 05) → `503` + `Retry-After: 1`. An
+  upload now would lose its blob to the pending delete; by the retry the
+  path is simply missing.
 - Completed → `201 {"status":"created"}`.
 
 ## Parallelism and transport
@@ -106,7 +110,7 @@ failed push restarts from zero. An `Upload-Offset`-style header is
 reserved so resume can be added without a version break.
 
 **Connection drops mid-upload are retryable too.** The early replies
-above (`exists`, `in-progress`, `429`) are all sent before the body is
+above (`exists`, `in-progress`, `503`, `429`) are all sent before the body is
 read, and the server then closes the connection with request bytes still
 unread — over HTTP/1.1 that close becomes a TCP RST. A client that is
 not waiting on `100-continue` and is still writing the body races the
