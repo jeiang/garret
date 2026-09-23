@@ -483,26 +483,31 @@ pub fn missing(conn: &mut Connection, hashes: &[String], now: i64) -> Result<Vec
 /// One object [`prune`] removed (or would remove): hash, name, blob size.
 pub type Pruned = (String, String, i64);
 
+/// Rows [`prune`] deletes per write transaction, like GC's batches: the
+/// Puller's last-accessed writes interleave between them instead of waiting
+/// out one long transaction.
+const PRUNE_BATCH: usize = 500;
+
 /// Removes every object last pushed before `before` that no surviving
 /// closure needs: mark from the roots that stay — objects pushed at or after
 /// the cutoff and live pins — through their references, then delete what the
 /// mark did not reach. Store paths form a DAG (self-edges aside), so this is
 /// exactly the set that repeated root-first deletion of old objects would
-/// reach, computed in one statement. Anything unmarked is older than the
-/// cutoff by construction.
+/// reach. Anything unmarked is older than the cutoff by construction.
 ///
-/// Rows are deleted in one transaction, so a concurrent Negotiation either
-/// lands first (its paths then count as recent and are kept) or sees them
-/// gone. The caller deletes the blobs afterwards: row first, blob second
-/// (spec 05).
+/// The mark is a plain read, so a dry run takes no write lock. Everything it
+/// reads is written only by the Pusher, and the caller holds the Pusher's
+/// connection for the whole call, so no Negotiation can refresh a doomed
+/// path between mark and delete. Deletes run in short batches, referrers
+/// before their references, so the cache is closed after every commit. The
+/// caller deletes the blobs afterwards: row first, blob second (spec 05).
 pub fn prune(conn: &mut Connection, before: i64, now: i64, dry_run: bool) -> Result<Vec<Pruned>> {
     anyhow::ensure!(
         before <= now - PRUNE_MIN_AGE,
         "the cutoff must be at least {} hours ago, so a push in progress keeps its closure",
         PRUNE_MIN_AGE / 3600
     );
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let doomed: Vec<Pruned> = tx
+    let doomed: Vec<Pruned> = conn
         .prepare(
             "WITH RECURSIVE keep(hash) AS (
                  SELECT store_path_hash FROM objects WHERE pushed_at >= ?1
@@ -522,19 +527,61 @@ pub fn prune(conn: &mut Connection, before: i64, now: i64, dry_run: bool) -> Res
     if dry_run {
         return Ok(doomed);
     }
-    {
-        let mut delete = tx.prepare("DELETE FROM objects WHERE store_path_hash = ?1")?;
-        for (hash, _, _) in &doomed {
-            delete.execute(params![hash])?;
+    for batch in referrers_first(conn, &doomed)?.chunks(PRUNE_BATCH) {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        {
+            let mut delete = tx.prepare("DELETE FROM objects WHERE store_path_hash = ?1")?;
+            for &i in batch {
+                delete.execute(params![doomed[i].0])?;
+            }
+        }
+        let freed: i64 = batch.iter().map(|&i| doomed[i].2).sum();
+        tx.execute(
+            "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
+            params![freed],
+        )?;
+        tx.commit()?;
+    }
+    Ok(doomed)
+}
+
+/// Indexes into `doomed`, every referrer before the objects it references
+/// (Kahn's algorithm over the edges inside the set; self-edges ignored).
+fn referrers_first(conn: &Connection, doomed: &[Pruned]) -> Result<Vec<usize>> {
+    let index: std::collections::HashMap<&str, usize> = doomed
+        .iter()
+        .enumerate()
+        .map(|(i, (hash, _, _))| (hash.as_str(), i))
+        .collect();
+    let mut references = vec![Vec::new(); doomed.len()];
+    let mut referrers = vec![0usize; doomed.len()];
+    let mut stmt = conn.prepare("SELECT reference_hash FROM object_refs WHERE referrer = ?1")?;
+    for (i, (hash, _, _)) in doomed.iter().enumerate() {
+        for reference in stmt.query_map(params![hash], |row| row.get::<_, String>(0))? {
+            if let Some(&j) = index.get(reference?.as_str())
+                && j != i
+            {
+                references[i].push(j);
+                referrers[j] += 1;
+            }
         }
     }
-    let freed: i64 = doomed.iter().map(|(_, _, size)| size).sum();
-    tx.execute(
-        "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
-        params![freed],
-    )?;
-    tx.commit()?;
-    Ok(doomed)
+    let mut ready: Vec<usize> = (0..doomed.len()).filter(|&i| referrers[i] == 0).collect();
+    let mut order = Vec::with_capacity(doomed.len());
+    while let Some(i) = ready.pop() {
+        order.push(i);
+        for &j in &references[i] {
+            referrers[j] -= 1;
+            if referrers[j] == 0 {
+                ready.push(j);
+            }
+        }
+    }
+    anyhow::ensure!(
+        order.len() == doomed.len(),
+        "reference cycle among objects to prune; nothing deleted"
+    );
+    Ok(order)
 }
 
 #[cfg(test)]
@@ -780,6 +827,34 @@ mod tests {
             assert!(exists(&conn, h).unwrap(), "{h} was pruned");
         }
         assert_eq!(total_bytes(&conn).unwrap(), 25);
+    }
+
+    #[test]
+    fn prune_deletes_referrers_before_their_references() {
+        // Batched deletes leave the cache closed after each commit only if no
+        // batch removes a dependency while its referrer survives.
+        let mut conn = db();
+        let [a, b, c, d] = ['a', 'b', 'c', 'd'].map(|x| x.to_string().repeat(32));
+        let dep = |h: &str| format!("{h}-dep");
+        // c ← b ← a, c ← d, and b refers to itself.
+        insert_object(&mut conn, &object(&c, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&b, &[&dep(&b), &dep(&c)]), 100).unwrap();
+        insert_object(&mut conn, &object(&a, &[&dep(&b)]), 100).unwrap();
+        insert_object(&mut conn, &object(&d, &[&dep(&c)]), 100).unwrap();
+        let doomed: Vec<Pruned> = [&c, &b, &a, &d]
+            .map(|h| (h.clone(), "thing".into(), 5))
+            .into();
+        let order: Vec<&str> = referrers_first(&conn, &doomed)
+            .unwrap()
+            .into_iter()
+            .map(|i| doomed[i].0.as_str())
+            .collect();
+        let at = |h: &str| order.iter().position(|x| *x == h).unwrap();
+        assert_eq!(order.len(), 4);
+        assert!(
+            at(&a) < at(&b) && at(&b) < at(&c) && at(&d) < at(&c),
+            "{order:?}"
+        );
     }
 
     #[test]
