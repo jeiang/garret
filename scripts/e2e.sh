@@ -264,6 +264,27 @@ import json, sys
 assert json.load(sys.stdin)['children'], 'tree must carry the leaf'
 "
 
+say "last-accessed bumps land off the request path"
+# The json path was pushed and never fetched from the Puller, so no earlier
+# hit can have queued its bump. bump_debounce_secs = 0 here, so a hit a second
+# after the insert is stale; the request only queues it, and it must land from
+# the Puller's flush, on its own connection, within a few flush intervals.
+json_hash=$(basename "$jsonpath" | cut -c1-32)
+accessed() {
+  sqlite3 -cmd ".timeout 2000" "$root/garret.db" \
+    "SELECT last_accessed_at FROM objects WHERE store_path_hash = '$1'"
+}
+before=$(accessed "$json_hash")
+sleep 1
+curl -sf "$puller_url/$json_hash.narinfo" >/dev/null
+for _ in $(seq 30); do
+  [ "$(accessed "$json_hash")" -gt "$before" ] && break
+  sleep 0.5
+done
+after=$(accessed "$json_hash")
+echo "  last_accessed_at $before -> $after"
+[ "$after" -gt "$before" ] || { echo "the bump was never flushed"; exit 1; }
+
 say "client UX: completions need no config, other commands say how to make one"
 # Guards the load-then-dispatch ordering: `login` and `completions` must run on
 # a machine that has no config at all, which is the state they exist to fix.
