@@ -83,26 +83,23 @@ pub fn hash_for(key: &str) -> Option<&str> {
 }
 
 /// Pulls exactly `part_size` bytes (fewer only at end of stream), keeping any
-/// overshoot in `carry` for the next part.
-async fn read_part<S, E>(
-    body: &mut S,
-    carry: &mut Option<Bytes>,
-    part_size: usize,
-) -> Result<Vec<u8>>
+/// overshoot in `carry` for the next part. The part is handed on as-is, never
+/// copied again: a part slot must account for the part's only buffer.
+async fn read_part<S, E>(body: &mut S, carry: &mut Option<Bytes>, part_size: usize) -> Result<Bytes>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
     let mut part = BytesMut::with_capacity(part_size);
-    if let Some(left) = carry.take() {
+    if let Some(mut left) = carry.take() {
         // The carry can exceed a whole part when one chunk spans several, so
         // it is split too — a part over part_size would abort the upload.
         if left.len() >= part_size {
-            part.extend_from_slice(&left[..part_size]);
-            if left.len() > part_size {
-                *carry = Some(left.slice(part_size..));
+            let whole = left.split_to(part_size);
+            if !left.is_empty() {
+                *carry = Some(left);
             }
-            return Ok(part.to_vec());
+            return Ok(whole);
         }
         part.extend_from_slice(&left);
     }
@@ -119,7 +116,7 @@ where
         }
         part.extend_from_slice(&chunk);
     }
-    Ok(part.to_vec())
+    Ok(part.freeze())
 }
 
 async fn collect(in_flight: &mut JoinSet<Result<CompletedPart>>) -> Result<CompletedPart> {
@@ -170,7 +167,7 @@ impl Storage {
 
     /// Single-request `PutObject` for bodies already in memory (at most one
     /// part; larger uploads go through [`Storage::put_streaming`]).
-    pub async fn put(&self, key: &str, body: Vec<u8>) -> Result<()> {
+    pub async fn put(&self, key: &str, body: Bytes) -> Result<()> {
         let bytes = body.len() as u64;
         self.client
             .put_object()
@@ -345,7 +342,7 @@ impl Storage {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        body: Vec<u8>,
+        body: Bytes,
         permit: OwnedSemaphorePermit,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
         let (client, bucket, key, upload_id) = (
