@@ -619,15 +619,15 @@ mod tests {
     const DEP: &str = "zyxwvsrqpnmlkjihgfdcba9876543210";
 
     /// What the client sends for a real input-addressed path: SRI hash, full
-    /// store paths, a self-reference and a `.drv` deriver.
+    /// store paths (unsorted), a self-reference and a `.drv` deriver.
     fn preamble() -> Preamble {
         Preamble {
             store_path: format!("/nix/store/{H}-hello-2.12.1"),
             nar_hash: "sha256-47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".into(),
             nar_size: 4096,
             references: vec![
-                format!("/nix/store/{H}-hello-2.12.1"),
                 format!("/nix/store/{DEP}-glibc-2.40-66"),
+                format!("/nix/store/{H}-hello-2.12.1"),
             ],
             deriver: Some(format!("/nix/store/{DEP}-hello-2.12.1.drv")),
             ca: None,
@@ -640,6 +640,7 @@ mod tests {
         p.ca = Some(format!("fixed:r:sha256:{}", "0".repeat(52)));
         let object = build_object(H, &p, "/nix/store", &Subject("test#user".into())).unwrap();
         assert_eq!(object.name, "hello-2.12.1");
+        // Sorted, as the signed fingerprint requires.
         assert_eq!(
             object.references,
             [format!("{H}-hello-2.12.1"), format!("{DEP}-glibc-2.40-66")]
