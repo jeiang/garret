@@ -135,6 +135,7 @@ mint("token-wrong-audience", aud="somebody-else")
 # Well past the server's 60s skew allowance: expired by exactly the leeway is
 # a coin flip on sub-second timing, not a test.
 mint("token-expired", exp=int(time.time()) - 3600)
+mint("token-not-yet-valid", nbf=int(time.time()) + 3600)
 PY
 }
 

@@ -108,9 +108,12 @@ GC quota bounds what the cache holds.
 ## Errors, retry, versioning
 
 `5xx` and `429` are retryable; other `4xx` are not. Error bodies are
-JSON. No upload resume in v1: a failed push restarts from zero. An
-`Upload-Offset`-style header is reserved so resume can be added without a
-version break.
+JSON (`{"error": "…"}`). A `4xx` body explains what the request got
+wrong. An unexpected `500` says only `internal error (id …)`: the error
+chain (S3, SQLite, filesystem detail) is logged by the Pusher under that
+`error_id` and never sent to the caller. No upload resume in v1: a
+failed push restarts from zero. An `Upload-Offset`-style header is
+reserved so resume can be added without a version break.
 
 **Connection drops mid-upload are retryable too.** The early replies
 above (`exists`, `in-progress`, `429`) are all sent before the body is

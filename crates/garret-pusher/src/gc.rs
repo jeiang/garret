@@ -26,6 +26,11 @@ pub struct Gc {
     pub storage: Storage,
     pub in_flight: InFlight,
     pub cfg: GcConfig,
+    /// Held for a whole eviction pass. The timer and `garret-admin gc run`
+    /// share this `Gc`, and a pass counts down from its own reconciled usage,
+    /// so two passes at once would each evict to the low watermark as if the
+    /// other's deletions had not happened.
+    pass: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -38,6 +43,21 @@ pub struct PassResult {
 }
 
 impl Gc {
+    pub fn new(
+        conn: Arc<Mutex<Connection>>,
+        storage: Storage,
+        in_flight: InFlight,
+        cfg: GcConfig,
+    ) -> Self {
+        Self {
+            conn,
+            storage,
+            in_flight,
+            cfg,
+            pass: tokio::sync::Mutex::new(()),
+        }
+    }
+
     /// Every tick is a cheap counter check; eviction only happens past the
     /// high watermark (spec 05).
     pub async fn tick(&self) -> Result<Option<PassResult>> {
@@ -55,8 +75,11 @@ impl Gc {
     }
 
     /// One eviction pass: loops until usage reaches the low watermark or no
-    /// candidate remains. Every surviving root keeps a complete closure.
+    /// candidate remains. Every surviving root keeps a complete closure. A
+    /// pass requested while another runs waits for it, then starts from the
+    /// usage it left behind.
     pub async fn run(&self) -> Result<PassResult> {
+        let _pass = self.pass.lock().await;
         let started = Instant::now();
         let mut result = PassResult::default();
         let low = self.cfg.low();
@@ -202,5 +225,107 @@ mod tests {
             orphan_keys(&blobs, &known, &in_flight, grace),
             vec!["nar/stale.nar.zst".to_string()],
         );
+    }
+
+    /// An S3 stand-in that acknowledges every `DeleteObjects`, holding the
+    /// first until the returned sender fires: it parks a GC pass between its
+    /// row deletes and its blob delete, where the pass yields.
+    async fn gated_s3() -> (
+        Storage,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let gate = Arc::new(Mutex::new(Some((held_tx, release_rx))));
+        let app = axum::Router::new().fallback(move || {
+            let gate = gate.lock().unwrap().take();
+            async move {
+                if let Some((held, release)) = gate {
+                    let _ = held.send(());
+                    let _ = release.await;
+                }
+                r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let storage = Storage::new(&garret_server::config::S3Config {
+            bucket: "test".into(),
+            endpoint_url: Some(endpoint),
+            region: Some("us-east-1".into()),
+            path_style: true,
+            access_key_id: Some("x".into()),
+            secret_access_key: Some("x".into()),
+            operation_timeout_secs: 30,
+        })
+        .await
+        .unwrap();
+        (storage, held_rx, release_tx)
+    }
+
+    fn object(hash: &str, size: i64, refs: &[&str]) -> db::Object {
+        db::Object {
+            store_path_hash: hash.into(),
+            store_path: format!("/nix/store/{hash}-x"),
+            name: "x".into(),
+            nar_hash: "sha256:x".into(),
+            nar_size: size,
+            file_hash: "sha256:y".into(),
+            file_size: size,
+            deriver: None,
+            ca: None,
+            references: refs.iter().map(|r| format!("{r}-x")).collect(),
+            sigs: vec![],
+            pushed_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pass_requested_mid_pass_does_not_evict_past_the_low_watermark() {
+        // Quota 100, low watermark 85. A pinned 70-byte filler plus the chain
+        // r → d → y of 10-byte objects: one pass evicts r, then (next batch)
+        // d, and stops at 80 with y kept.
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let [filler, r, d, y] = ["f", "r", "d", "y"].map(|c| c.repeat(32));
+        db::insert_object(&mut conn, &object(&filler, 70, &[]), 0).unwrap();
+        db::pin(&conn, "filler", &filler, None, 0).unwrap();
+        db::insert_object(&mut conn, &object(&r, 10, &[&d]), 0).unwrap();
+        db::insert_object(&mut conn, &object(&d, 10, &[&y]), 0).unwrap();
+        db::insert_object(&mut conn, &object(&y, 10, &[]), 0).unwrap();
+
+        let (storage, held, release) = gated_s3().await;
+        let gc = Arc::new(Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage,
+            InFlight::new(),
+            GcConfig {
+                quota_bytes: 100,
+                high_watermark: 0.95,
+                low_watermark: 0.85,
+                interval_secs: 300,
+                orphan_grace_secs: 86400,
+            },
+        ));
+        let run = |gc: Arc<Gc>| tokio::spawn(async move { gc.run().await.unwrap() });
+
+        // The timer's pass has deleted r's row and waits on its blob delete
+        // when `garret-admin gc run` asks for another.
+        let first = run(gc.clone());
+        held.await.unwrap();
+        let second = run(gc.clone());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        release.send(()).unwrap();
+        let evicted = first.await.unwrap().evicted + second.await.unwrap().evicted;
+
+        let conn = gc.conn.lock().unwrap();
+        assert!(
+            db::exists(&conn, &y).unwrap(),
+            "two passes evicted past the low watermark"
+        );
+        assert_eq!(db::total_bytes(&conn).unwrap(), 80);
+        assert_eq!(evicted, 2);
     }
 }

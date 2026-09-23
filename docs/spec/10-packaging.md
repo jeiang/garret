@@ -32,12 +32,14 @@ Pusher runs).
 
 | Command | Path |
 |---|---|
-| `key generate` | offline — writes nix-format keypair file |
+| `key generate` | offline — writes nix-format keypair file, created mode 0600; never overwrites |
 | `key show` | offline — prints public key for nix.conf |
 | `resign` | socket — backfill signatures after adding a key |
 | `gc run` | socket — trigger a GC pass |
 | `status` | socket — object count, usage vs quota, in-flight uploads |
 | `fsck [--repair] [--verify-sizes] [--quiesce] [--json]` | socket — audit row⇔blob consistency, optionally repair |
+| `delete <hash>...` | socket — remove objects, row then blob, whatever still references them |
+| `delete --pushed-by <subject> [--since <YYYY-MM-DD\|age>] [--apply]` | socket — incident response: every object that subject (`<issuer>#<sub>`, as browse shows `pushed_by`) first pushed, at or after the cutoff; lists them, and deletes through the same path as `delete` only with `--apply` |
 | `pin <name> <hash> [--expires <duration>]` | socket — GC-exempt root, closure-protecting (spec 05) |
 | `unpin <name>` | socket — remove a pin; unknown name is an error |
 | `prune --before <YYYY-MM-DD\|age> [--apply]` | socket — delete closures last pushed before the cutoff, keeping what newer pushes and pins need (spec 05); dry-run unless `--apply` |
@@ -100,8 +102,9 @@ Module option sketch (all under `services.garret.*`):
 - **pusher**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.{endpointUrl,
   bucket, region, credentialsFile}`, `quota`, `watermarks.{high,low}`,
   `limits.{maxConcurrentUploads, maxInFlightBytes}`, `oidc.{pocketId.{issuer,
-  audience}, github.{ownerId, refPatterns, refProtected}}`, `signingKeyFiles` (list —
-  active + retiring), `adminSocketPath`, `gcInterval`.
+  audience}, github.{ownerId, refPatterns, refProtected, repositoryIds,
+  eventNames, jobWorkflowRefs}}`, `signingKeyFiles` (list — active +
+  retiring), `adminSocketPath`, `gcInterval`.
 - **puller**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.*` (same),
   `presignTtl` (default 1 h), `browse.oidc.{issuer, audience}`,
   `bumpDebounce`, `dbReadBudgetMs` / `presignBudgetMs` (pull-path
