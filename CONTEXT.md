@@ -52,10 +52,16 @@ cursor is a backlog, not an error.
 ## Quota
 
 The configured storage budget for the cache. Eviction reclaims space when
-usage crosses it; nothing is deleted while usage stays below it.
+usage crosses it and deletes nothing while usage stays below it.
 
 ## Eviction
 
 Removing an object (and its blob) to reclaim quota. Only objects no
 surviving object references may be evicted, least-recently-accessed first
 — so every closure the cache still serves remains complete.
+
+## Prune
+
+Operator-requested removal of every closure last pushed before a cutoff,
+independent of quota. Like eviction, it never removes an object that a
+surviving object, a newer push, or a live pin still needs.

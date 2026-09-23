@@ -74,6 +74,16 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Delete every closure last pushed before a cutoff, keeping anything a
+    /// newer push or a live pin still needs (spec 05); dry-run by default
+    Prune {
+        /// Cutoff: a UTC date (`2026-06-01`) or an age (`90d`); at least a day ago
+        #[arg(long)]
+        before: String,
+        /// Delete; without this, only list what would be deleted
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -202,15 +212,7 @@ async fn main() -> Result<()> {
         } => {
             let expires_at = expires
                 .as_deref()
-                .map(|d| {
-                    parse_duration(d).map(|secs| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs() as i64
-                            + secs
-                    })
-                })
+                .map(|d| parse_duration(d).map(|secs| unix_now() + secs))
                 .transpose()?;
             match request(
                 &cli.socket,
@@ -293,6 +295,24 @@ async fn main() -> Result<()> {
             }
             other => print_unexpected(other),
         },
+
+        Command::Prune { before, apply } => {
+            let before = parse_cutoff(&before, unix_now())?;
+            let dry_run = !apply;
+            match request(&cli.socket, Request::Prune { before, dry_run }).await? {
+                Response::Prune {
+                    pruned,
+                    bytes_freed,
+                } => {
+                    let verb = if dry_run { "would delete" } else { "deleted" };
+                    for basename in &pruned {
+                        println!("{verb} {basename}");
+                    }
+                    println!("{verb} {} object(s), {}", pruned.len(), human(bytes_freed));
+                }
+                other => print_unexpected(other),
+            }
+        }
     }
     Ok(())
 }
@@ -415,9 +435,40 @@ fn parse_duration(text: &str) -> Result<i64> {
     Ok(n * scale)
 }
 
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// A prune cutoff: `YYYY-MM-DD` (UTC midnight) or an age understood by
+/// [`parse_duration`], counted back from `now`.
+fn parse_cutoff(text: &str, now: i64) -> Result<i64> {
+    if !text.contains('-') {
+        return Ok(now - parse_duration(text)?);
+    }
+    let bad = || anyhow::anyhow!("bad date {text:?} — use YYYY-MM-DD or an age like 90d");
+    let mut parts = text.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (Some(Some(y)), Some(Some(m)), Some(Some(d))) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad());
+    };
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return Err(bad());
+    }
+    // Days since the epoch (Howard Hinnant's days_from_civil).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Ok((era * 146_097 + doe - 719_468) * 86400)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_duration;
+    use super::{parse_cutoff, parse_duration};
 
     #[test]
     fn durations_parse_or_fail_loudly() {
@@ -427,6 +478,20 @@ mod tests {
         assert_eq!(parse_duration("30d").unwrap(), 2_592_000);
         for bad in ["", "d", "30", "-1d", "0h", "1w"] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn cutoffs_parse_dates_and_ages() {
+        assert_eq!(parse_cutoff("1970-01-01", 0).unwrap(), 0);
+        assert_eq!(parse_cutoff("2000-03-01", 0).unwrap(), 951_868_800);
+        assert_eq!(parse_cutoff("2026-09-23", 0).unwrap(), 1_790_121_600);
+        assert_eq!(
+            parse_cutoff("30d", 3_000_000).unwrap(),
+            3_000_000 - 2_592_000
+        );
+        for bad in ["2026-13-01", "2026-06", "2026-06-00", "yesterday", "-1d"] {
+            assert!(parse_cutoff(bad, 0).is_err(), "{bad:?} should be rejected");
         }
     }
 }

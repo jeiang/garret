@@ -55,6 +55,15 @@ pub enum Request {
         /// alone isn't trusted. Only meaningful with `repair: true`.
         quiesce: bool,
     },
+    /// Delete every closure last pushed before a cutoff, keeping anything a
+    /// newer push or a live pin still needs (spec 05).
+    Prune {
+        /// Unix time; objects last pushed before it are candidates. Must be
+        /// at least a day ago, so a push in progress keeps its closure.
+        before: i64,
+        /// Report what would go without deleting anything.
+        dry_run: bool,
+    },
 }
 
 /// The Pusher's reply to a [`Request`]; variants mirror the request commands,
@@ -128,6 +137,13 @@ pub enum Response {
         /// `repair` was requested.
         quiesce_drained: bool,
     },
+    /// Reply to [`Request::Prune`].
+    Prune {
+        /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
+        pruned: Vec<String>,
+        /// Compressed bytes reclaimed (or reclaimable, on a dry run).
+        bytes_freed: i64,
+    },
     /// The command failed; `message` is operator-facing text.
     Error {
         /// Human-readable description of what went wrong.
@@ -182,6 +198,10 @@ mod tests {
             },
             Request::Unpin {
                 name: "release".into(),
+            },
+            Request::Prune {
+                before: 1234,
+                dry_run: true,
             },
         ] {
             let line = serde_json::to_string(&request).unwrap();
