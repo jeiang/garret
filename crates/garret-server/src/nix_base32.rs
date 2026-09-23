@@ -1,6 +1,12 @@
-//! Nix's base32 alphabet — narinfo hashes are printed in it, nothing else uses it.
+//! Nix's base32 alphabet — narinfo hashes and store path hashes are spelled
+//! in it, nothing else uses it.
 
 const ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+/// Whether `s` is a store path hash: exactly 32 characters of the alphabet.
+pub fn is_store_hash(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| ALPHABET.contains(&b))
+}
 
 /// Encode bytes least-significant-group first, as `nix hash convert --to nix32` does.
 pub fn encode(bytes: &[u8]) -> String {

@@ -75,6 +75,17 @@ a whole client config (spec 06). Set `client_id` on the human issuer only.
 Secrets (S3 credentials, signing keys, OIDC client secrets) are file
 paths — agenix/sops-friendly, never in the nix store.
 
+## Prebuilt outputs
+
+CI builds `garret-all` and the `garret`, `garret-pusher`, `garret-puller`
+and `garret-admin` wrappers on x86_64-linux and aarch64-darwin, and for every
+push to `main` or a `v*` tag pushes their closures (plus the devshell) to
+garret's own deployment. The wrappers are pushed as well as the workspace:
+each is its own store path, and a consumer installing
+`#garret` or a NixOS module running the default `garret-pusher` would
+otherwise still build it. Consumers pin arbitrary `main` revisions, so `main`
+and tag runs are never cancelled by a later push; only pull request runs are.
+
 ## Shell completions
 
 The workspace derivation's `postInstall` runs the freshly built `garret
