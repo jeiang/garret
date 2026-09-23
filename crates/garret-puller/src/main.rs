@@ -83,8 +83,11 @@ impl Bumps {
     /// connection, and returns how many hashes it wrote. Blocking: callers
     /// run it on the blocking pool, never under the pull-path lock.
     fn flush(&self, conn: &mut rusqlite::Connection, now: i64, debounce: i64) -> Result<usize> {
-        let batch = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
-        metrics::gauge!("garret_bump_queue_depth").set(0.0);
+        let batch = {
+            let mut pending = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            metrics::gauge!("garret_bump_queue_depth").set(0.0);
+            std::mem::take(&mut *pending)
+        };
         if batch.is_empty() {
             return Ok(0);
         }
@@ -551,8 +554,10 @@ mod tests {
 
         pusher.execute_batch("BEGIN IMMEDIATE").unwrap();
         let bumps = Bumps::default();
-        hit(&bumps, &puller, &hash, 1000 + DAY - 1);
-        let flushed = bumps.flush(&mut puller, 1000 + DAY - 1, DAY);
+        // The last second of the window, where the UPDATE's WHERE would
+        // match nothing: still no write lock.
+        hit(&bumps, &puller, &hash, 1000 + DAY);
+        let flushed = bumps.flush(&mut puller, 1000 + DAY, DAY);
         pusher.execute_batch("ROLLBACK").unwrap();
         let _ = std::fs::remove_file(path);
         assert_eq!(flushed.unwrap(), 0, "a fresh row must not be written");
