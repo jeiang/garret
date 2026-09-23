@@ -195,11 +195,16 @@ in
             "head -c 65536 /dev/urandom > /tmp/blob && nix-store --add /tmp/blob"
         ).strip()
         builder.succeed(f"${packages.garret}/bin/garret enqueue --socket /run/garret/watch.sock {path}")
-        key = cache.succeed("garret-admin key show /etc/garret/signing-key").strip()
+        # Poll the narinfo, not `nix store verify`: nix caches a miss for an
+        # hour, so a verify that ran before the push landed would never pass.
+        hash_part = path.removeprefix("/nix/store/")[:32]
         cache.wait_until_succeeds(
+            f"curl -fsS http://127.0.0.1:8081/{hash_part}.narinfo", timeout=120
+        )
+        key = cache.succeed("garret-admin key show /etc/garret/signing-key").strip()
+        cache.succeed(
             "nix --extra-experimental-features nix-command store verify"
-            f" --store http://127.0.0.1:8081 --option trusted-public-keys '{key}' {path}",
-            timeout=120,
+            f" --store http://127.0.0.1:8081 --option trusted-public-keys '{key}' {path}"
         )
 
     with subtest("an online backup lands beside the database, owner-only"):

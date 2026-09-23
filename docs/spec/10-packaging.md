@@ -169,11 +169,11 @@ only the unit's own state writable (`ReadWritePaths` on the database or
 cursor directory, plus `StateDirectory`/`RuntimeDirectory`),
 `ProtectHome`, private `/tmp` and `/dev`, the kernel, clock, hostname and
 cgroup protections, no new namespaces, realtime or SUID/SGID files,
-`MemoryDenyWriteExecute`, native syscalls only filtered to
+`MemoryDenyWriteExecute`, native syscalls only, filtered to
 `@system-service` minus `@privileged` (a denied call fails with `EPERM`),
 address families limited to unix and IP, and `UMask=0077`. Files meant for
-another user get their mode set explicitly: the database files, the wake
-socket (0666) and the admin socket (0600).
+another user get their mode set explicitly: the database files (0660) and
+the wake socket (0666).
 
 The watcher still runs as root, with no capabilities: everything it touches
 (the nix database read-only, its credentials, cursor and wake socket, the
