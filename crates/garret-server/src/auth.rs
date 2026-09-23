@@ -601,6 +601,9 @@ mod tests {
             github_owner_id: None,
             ref_patterns: vec![],
             ref_protected: None,
+            repository_ids: vec![],
+            event_names: vec![],
+            job_workflow_refs: vec![],
             allowed_groups: vec![],
         }
     }
