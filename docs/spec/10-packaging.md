@@ -51,18 +51,24 @@ services keep serving. The Pusher creates the file itself with
 `O_CREAT|O_EXCL` and mode 0600 — it refuses any existing path, and the
 copy is never readable by others, even briefly — then fsyncs it before
 replying. The path is resolved by `garret-admin` and written by the Pusher,
-so it must be writable by the Pusher (under the NixOS module, inside the
-directory holding `dbPath`). Rotation is the caller's job: remove or rename
-the previous copy first.
+so it must be writable by the Pusher and visible outside it: under the NixOS
+module, inside the directory holding `dbPath` (the unit's `/tmp` is
+private). Rotation is the caller's job: remove or rename the previous copy
+first.
 
 Restoring a copy that is older than the bucket:
 
-1. Stop both services and put the copy in place of `dbPath` (removing any
-   `-wal`/`-shm` files beside the old database).
-2. Start **only the Pusher**.
-3. `garret-admin fsck --repair --quiesce` deletes the rows whose blobs were
-   evicted after the backup was taken.
+1. Stop both services. Put the copy in place of `dbPath` and delete any
+   `-wal`/`-shm` files beside it.
+2. Start **only the Pusher**, with its push endpoint unreachable to
+   clients (reverse-proxy route or firewall closed).
+3. `garret-admin fsck --repair --verify-sizes --quiesce` deletes the rows
+   whose blobs were evicted after the backup, and rows whose blob a later
+   delete and re-push replaced with one of a different size.
 4. Start the Puller.
+5. Once every restored row is older than `orphan_grace_secs` (fsck skips
+   younger rows), run step 3 again, then reopen the push endpoint.
+6. Re-apply any pins set or removed since the backup.
 
 Closures stay complete because GC evicts an object only once nothing
 surviving references it, roots first (spec 05). Anything evicted after the
@@ -73,12 +79,14 @@ exceptions are the ones that already break closures on the live cache:
 whose blob delete failed, whose orphaned blob makes the restored row look
 intact. Blobs uploaded after the backup have no row; clients re-push them
 through normal Negotiation, and the orphan sweep removes the rest. That
-costs cache misses, never correctness. fsck skips rows younger than
-`orphan_grace_secs`, so a backup taken within that window of the restore
-needs a second fsck once it has aged past it.
+costs cache misses, never correctness.
 
-The Puller stays down until fsck has run because until then it would
-redirect to blobs that no longer exist.
+The ordering protects that argument. Negotiation answers from rows alone,
+so while any restored row is unchecked it can tell a client that a path
+whose blob is gone is present, and the client then pushes a referrer
+without it; hence pushes stay closed until fsck has covered every row. The
+Puller only waits for the first fsck, which clears most of the rows that
+would redirect to missing blobs.
 
 ## NixOS modules & flake outputs
 

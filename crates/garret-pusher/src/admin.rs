@@ -187,6 +187,8 @@ async fn backup(state: &AppState, dest: String) -> Result<Response> {
         .lock()
         .unwrap()
         .path()
+        // rusqlite reports an in-memory database as an empty path.
+        .filter(|path| !path.is_empty())
         .map(str::to_owned)
         .context("the database is in memory; there is no file to back up")?;
     let bytes = tokio::task::spawn_blocking(move || backup_to(&source, Path::new(&dest))).await??;
@@ -216,8 +218,14 @@ fn backup_to(source: &str, dest: &Path) -> Result<u64> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let dest = dest.to_str().context("backup path is not UTF-8")?;
         conn.execute("VACUUM INTO ?1", [dest])?;
-        // A backup that a crash can lose is not one: flush before reporting.
+        // A backup that a crash can lose is not one: flush the copy and its
+        // directory entry before reporting.
         file.sync_all()?;
+        let dir = Path::new(dest)
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(file.metadata()?.len())
     };
     copy().inspect_err(|_| {
