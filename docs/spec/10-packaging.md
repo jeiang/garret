@@ -110,6 +110,17 @@ database files 0660. A custom `dbPath` directory must already be
 Puller can read it. Pointing `services.garret.puller.s3.credentialsFile` at
 a GetObject-only key is optional, and takes bucket write away from the Puller.
 
+## Prebuilt outputs
+
+CI builds `garret-all` and the `garret`, `garret-pusher`, `garret-puller`
+and `garret-admin` wrappers on x86_64-linux and aarch64-darwin, and for every
+push to `main` or a `v*` tag pushes their closures (plus the devshell) to
+garret's own deployment. The wrappers are pushed as well as the workspace:
+each is its own store path, and a consumer installing
+`#garret` or a NixOS module running the default `garret-pusher` would
+otherwise still build it. Consumers pin arbitrary `main` revisions, so `main`
+and tag runs are never cancelled by a later push; only pull request runs are.
+
 ## Shell completions
 
 The workspace derivation's `postInstall` runs the freshly built `garret

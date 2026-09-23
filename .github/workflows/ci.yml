@@ -3,12 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
+    # Releases are pinned too, so they get the same build and push as main.
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
-# A new push to the same ref makes the previous run's result irrelevant.
+# A new push to a pull request makes the previous run's result irrelevant, so
+# pull request runs share one group per ref and cancel each other. Every other
+# run gets a group of its own: consumers pin arbitrary main revisions and
+# install `github:jeiang/garret/<rev>#garret`, so each one must run through to
+# its push. A shared group would not do even without cancel-in-progress, since
+# GitHub keeps only one pending run per group and cancels the one it replaces.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -20,9 +27,9 @@ jobs:
     name: lint and formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -43,9 +50,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]  # macos-latest is aarch64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           # `garret` itself is the cache once it is running: when the repository
           # variables below are set, every job substitutes from it instead of
@@ -55,8 +62,16 @@ jobs:
             extra-substituters = ${{ vars.GARRET_PULLER }}
             extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
 
+      # garret-all is the workspace; the others are the per-binary wrappers
+      # consumers actually install (`#garret`) and the NixOS modules run by
+      # default (`garret-pusher`, `garret-puller`). Each is its own store path,
+      # so a cache holding only garret-all still leaves them to be built.
+      # garret-all goes first so ./result stays the workspace.
       - name: Build all binaries
-        run: nix build .#garret-all --print-build-logs
+        run: |
+          nix build --print-build-logs --print-out-paths \
+            .#garret-all .#garret .#garret-pusher .#garret-puller .#garret-admin \
+            > out-paths.txt
 
       - name: Show what was built
         run: ls -l result/bin
@@ -65,17 +80,18 @@ jobs:
       # refuses a path whose references are not already in the store, and the
       # importing job has no way to fetch them without building.
       - name: Export the build closure
+        # Store paths never contain whitespace; the splitting is the point.
         run: |
-          readlink -f result > out-path.txt
-          nix-store --export $(nix-store --query --requisites ./result) > closure.nar
+          # shellcheck disable=SC2046
+          nix-store --export $(nix-store --query --requisites $(cat out-paths.txt)) > closure.nar
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           # The push job wants both closures; e2e wants only the linux one.
           name: garret-closure-${{ matrix.os }}
           path: |
             closure.nar
-            out-path.txt
+            out-paths.txt
           # Only ever consumed by the jobs below, in this same run.
           retention-days: 1
           compression-level: 1
@@ -85,9 +101,9 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -106,9 +122,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -118,7 +134,7 @@ jobs:
             # only a trusted user may add such a path to the store.
             trusted-users = root runner
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: garret-closure-ubuntu-latest
 
@@ -179,9 +195,10 @@ jobs:
     name: push to garret
     runs-on: ubuntu-latest
     needs: [lint, build, test, e2e, nixos]
-    # Only what lands on main is cached, so pull requests never push. Manual
-    # dispatch is allowed too: only collaborators can trigger it, and it is the
-    # way to verify the cache without waiting for a merge.
+    # Only what lands on main or a release tag is cached, so pull requests
+    # never push. Manual dispatch is allowed too: only collaborators can
+    # trigger it, and it is the way to verify the cache without waiting for a
+    # merge.
     if: >-
       vars.GARRET_ENDPOINT != '' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
@@ -191,9 +208,9 @@ jobs:
       # No secret is stored anywhere; the token is minted per push and expires.
       id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -203,11 +220,11 @@ jobs:
             # only a trusted user may add such a path to the store.
             trusted-users = root runner
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: garret-closure-ubuntu-latest
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: garret-closure-macos-latest
           path: darwin
@@ -241,4 +258,6 @@ jobs:
 
       - name: Push build outputs and toolchain
         # The client walks each closure itself, so dependencies come along.
-        run: ./result/bin/garret push ./result ./toolchain "$(cat darwin/out-path.txt)"
+        run: |
+          # shellcheck disable=SC2046
+          ./result/bin/garret push $(cat out-paths.txt darwin/out-paths.txt) ./toolchain
