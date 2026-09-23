@@ -9,7 +9,7 @@ use tokio::time::Instant;
 
 /// What `garret login` persists: enough to mint fresh access tokens without
 /// re-running the device flow. Never the access token itself — that is
-/// short-lived by design and re-minted per run.
+/// short-lived by design and re-minted as it ages (see [`TokenSource`]).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredToken {
     /// The rotating refresh token. Each refresh may replace it, and the
