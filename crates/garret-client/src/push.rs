@@ -1,7 +1,14 @@
 //! Pushing closures: one negotiation round-trip, then parallel streamed PUTs
 //! (spec 01-push-protocol, 06-client).
 
-use std::{process::Stdio, time::Duration};
+use std::{
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use async_compression::{Level, tokio::bufread::ZstdEncoder};
@@ -316,6 +323,9 @@ impl Pusher {
                 .post(format!("{}/api/v1/missing-paths", self.endpoint))
                 .bearer_auth(token)
                 .json(&hashes)
+                // Small and quick when healthy; without a cap a stalled
+                // connection would hang the push or the watcher for good.
+                .timeout(NEGOTIATION_TIMEOUT)
                 .send()
         };
         let token = self.tokens.get().await?;
@@ -432,16 +442,15 @@ impl Pusher {
         let body = stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(framed)) })
             .chain(nar);
 
-        let response = self
+        let request = self
             .http
             .put(format!(
                 "{}/api/v1/nar/{}",
                 self.endpoint,
                 hash_of_store_path(&info.path)
             ))
-            .bearer_auth(token)
-            .body(Body::wrap_stream(body))
-            .send()
+            .bearer_auth(token);
+        let response = send_watched(request, body, UPLOAD_IDLE)
             .await
             .context("uploading NAR")?;
 
@@ -470,6 +479,97 @@ impl Pusher {
             "exists" | "in-progress" => "deduped",
             _ => "pushed",
         })
+    }
+}
+
+/// Generous for one missing-paths round-trip, even over a whole closure.
+const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+/// How long an upload may go without the connection taking another body
+/// chunk — or, once the body is sent, without an answer — before it is
+/// abandoned as [`Stalled`] and retried. Generous, because the server stops
+/// reading on purpose while it waits for a part slot behind other uploads.
+const UPLOAD_IDLE: Duration = Duration::from_secs(5 * 60);
+
+/// The upload went [`UPLOAD_IDLE`] without progress. Retryable: negotiation
+/// makes the retry idempotent, and a fresh connection may well not stall.
+#[derive(Debug)]
+struct Stalled(Duration);
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upload stalled: no progress for {:?}", self.0)
+    }
+}
+
+impl std::error::Error for Stalled {}
+
+/// When an upload last made progress: the moment the connection last took a
+/// body chunk. Milliseconds since `start`, so ticking needs no lock.
+#[derive(Clone)]
+struct Progress {
+    start: Instant,
+    since_start: Arc<AtomicU64>,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            since_start: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn tick(&self) {
+        let now = self.start.elapsed().as_millis() as u64;
+        self.since_start.store(now, Ordering::Relaxed);
+    }
+
+    fn last(&self) -> Instant {
+        self.start + Duration::from_millis(self.since_start.load(Ordering::Relaxed))
+    }
+}
+
+/// Sends `request` with `body`, failing it as [`Stalled`] once the connection
+/// goes `idle` without taking a chunk, or without answering after the last.
+///
+/// Not reqwest's `read_timeout`: that timer starts when the request is sent
+/// and is not reset until the response head arrives, so on an upload it caps
+/// the whole body transfer rather than detecting a stall. Progress is instead
+/// read off the body stream, which hyper only polls for more once the socket
+/// has taken what it had.
+async fn send_watched(
+    request: reqwest::RequestBuilder,
+    body: impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+    idle: Duration,
+) -> Result<reqwest::Response> {
+    let progress = Progress::new();
+    let ticks = progress.clone();
+    let body = body.inspect(move |_| ticks.tick());
+    Ok(unless_stalled(
+        request.body(Body::wrap_stream(body)).send(),
+        &progress,
+        idle,
+    )
+    .await??)
+}
+
+/// Runs `request` unless `progress` goes `idle` without a tick first.
+async fn unless_stalled<T>(
+    request: impl Future<Output = T>,
+    progress: &Progress,
+    idle: Duration,
+) -> Result<T, Stalled> {
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            done = &mut request => return Ok(done),
+            _ = tokio::time::sleep_until(progress.last() + idle) => {
+                if progress.last() + idle <= Instant::now() {
+                    return Err(Stalled(idle));
+                }
+            }
+        }
     }
 }
 
@@ -624,10 +724,11 @@ fn shed_for(retry_after: Option<&str>) -> Duration {
         .clamp(Duration::from_secs(1), SHED_DEADLINE)
 }
 
-/// 5xx and dropped or timed-out connections are retryable; 4xx are the
-/// client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
+/// 5xx and dropped, timed-out or stalled connections are retryable; 4xx are
+/// the client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
 fn is_retryable(error: &anyhow::Error) -> bool {
     error.to_string().contains(" 50")
+        || error.is::<Stalled>()
         || error
             .downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_timeout() || e.is_connect() || connection_dropped(e))
@@ -828,6 +929,57 @@ mod tests {
         assert!((Duration::from_millis(500)..Duration::from_millis(1000)).contains(&second));
         assert!(backoff.next(&rejected(400)).is_none());
         assert!(backoff.next(&rejected(401)).is_none());
+    }
+
+    /// An idle limit, not a total one: an upload that keeps moving may take
+    /// many times `idle`.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_upload_that_keeps_moving_is_not_a_stall() {
+        let idle = Duration::from_secs(10);
+        let progress = Progress::new();
+        let ticks = progress.clone();
+        let upload = async move {
+            for _ in 0..10 {
+                tokio::time::sleep(idle / 2).await;
+                ticks.tick();
+            }
+        };
+        assert!(unless_stalled(upload, &progress, idle).await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn going_idle_is_a_retryable_stall() {
+        let progress = Progress::new();
+        let stalled = unless_stalled(
+            std::future::pending::<()>(),
+            &progress,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(is_retryable(&stalled.into()));
+    }
+
+    /// The watchdog reads progress off the body stream, so it relies on hyper
+    /// pulling no more chunks once the socket stops draining. A server that
+    /// accepts and never reads is exactly that stall.
+    #[tokio::test]
+    async fn a_server_that_stops_reading_stalls_the_upload() {
+        static CHUNK: [u8; 65536] = [0; 65536];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _held_open = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let endless = stream::repeat_with(|| Ok(bytes::Bytes::from_static(&CHUNK)));
+        let request = reqwest::Client::new().put(format!("http://{addr}/api/v1/nar/x"));
+        let watched = send_watched(request, endless, Duration::from_millis(500));
+        let error = tokio::time::timeout(Duration::from_secs(30), watched)
+            .await
+            .expect("an unwatched upload hangs here forever")
+            .unwrap_err();
+        assert!(error.is::<Stalled>(), "{error:#}");
     }
 
     /// Stand-in for reqwest's wrapping: the io::Error sits at the bottom of a

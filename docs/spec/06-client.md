@@ -114,6 +114,16 @@ that count, so it bounds consecutive faults — sheds whose replies are lost to
 spec 01's connection-drop race must not add up over a long queue. Other `4xx`
 fail at once.
 
+**Timeouts** turn hangs into errors. Connecting gives up after
+30 s and a Negotiation after 2 minutes. An upload has no total limit — a
+large NAR over a slow link takes as long as it takes — but one that goes 5
+minutes without the connection taking another body chunk, or without an
+answer once the body is sent, is abandoned as stalled and retried like a
+dropped connection. Five minutes is generous on purpose: the server stops
+reading while it waits for a part slot behind other uploads. (reqwest's own
+read timeout cannot do this: it is not reset while the request body is
+sent, so on an upload it would cap the whole transfer.)
+
 Each NAR streams `nix nar dump-path` → zstd → the request body. A dump that
 exits non-zero (the path GC'd locally since `nix path-info`, a daemon error)
 still closes its stdout cleanly, so the client checks the exit status at EOF
