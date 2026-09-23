@@ -598,7 +598,9 @@ mod tests {
         assert!(auth.issuers[0].cached_key("old").0.is_some());
     }
 
-    #[tokio::test(start_paused = true)]
+    /// Real clock, and so ~10 s: under a paused clock the virtual timeouts
+    /// can fire before the connection is even made, hiding what this checks.
+    #[tokio::test]
     async fn a_hung_issuer_costs_one_timeout_not_one_per_caller() {
         // Accepts connections and never answers.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -614,12 +616,12 @@ mod tests {
         });
         let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
         let token = token_with_kid("k");
-        let started = tokio::time::Instant::now();
+        let started = Instant::now();
         let callers = futures::future::join_all((0..3).map(|_| auth.authenticate(&token)));
         let outcome = tokio::time::timeout(JWKS_TIMEOUT * 2, callers).await;
         let outcomes = outcome.expect("the fetch must give up on its own");
         assert!(outcomes.iter().all(Result::is_err));
         assert!(started.elapsed() <= JWKS_TIMEOUT + Duration::from_secs(1));
-        assert!(connections.load(Ordering::SeqCst) <= 1);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 }
