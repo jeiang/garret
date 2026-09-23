@@ -16,7 +16,9 @@ It has no versioning, no server-side encryption, and no lifecycle rules
 ## Layout
 
 Flat keys: `nar/<storePathHash>.nar.zst` — one blob per object, derivable
-from the DB row and vice versa. No prefix sharding.
+from the DB row and vice versa. No prefix sharding. The hash is checked to
+be 32 nix-base32 characters before it becomes a key
+([01](01-push-protocol.md#validation)), so a key never holds `/` or `..`.
 
 ## Uploads (Pusher → S3)
 
