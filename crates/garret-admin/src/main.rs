@@ -96,6 +96,13 @@ enum Command {
         #[arg(long)]
         apply: bool,
     },
+    /// Write a consistent copy of the database without stopping either
+    /// service. The Pusher writes it, so the path must be writable by the
+    /// Pusher; an existing file is never overwritten.
+    Backup {
+        /// Destination file (created with mode 0600)
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -357,6 +364,19 @@ async fn main() -> Result<()> {
                     }
                     println!("{verb} {} object(s), {}", pruned.len(), human(bytes_freed));
                 }
+                other => print_unexpected(other),
+            }
+        }
+
+        Command::Backup { path } => {
+            // The Pusher resolves the path, from its own working directory.
+            let path = std::path::absolute(&path)?;
+            let path = path
+                .to_str()
+                .context("backup path is not UTF-8")?
+                .to_owned();
+            match request(&cli.socket, Request::Backup { path: path.clone() }).await? {
+                Response::Backup { bytes } => println!("wrote {path} ({})", human(bytes as i64)),
                 other => print_unexpected(other),
             }
         }

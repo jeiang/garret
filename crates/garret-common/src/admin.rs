@@ -64,6 +64,13 @@ pub enum Request {
         /// Report what would go without deleting anything.
         dry_run: bool,
     },
+    /// Write a consistent copy of the database to `path` while both services
+    /// keep running: the online backup (spec 10-packaging).
+    Backup {
+        /// Absolute destination path, as seen by the Pusher. Must not exist:
+        /// a backup never overwrites anything.
+        path: String,
+    },
     /// Incident response: delete every object a given subject pushed, through
     /// the same path as [`Request::Delete`] (unconditional, closures and all).
     DeletePushedBy {
@@ -154,6 +161,11 @@ pub enum Response {
         /// Compressed bytes reclaimed (or reclaimable, on a dry run).
         bytes_freed: i64,
     },
+    /// Reply to [`Request::Backup`].
+    Backup {
+        /// Size of the copy written, in bytes.
+        bytes: u64,
+    },
     /// Reply to [`Request::DeletePushedBy`].
     DeletePushedBy {
         /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
@@ -219,6 +231,9 @@ mod tests {
             Request::Prune {
                 before: 1234,
                 dry_run: true,
+            },
+            Request::Backup {
+                path: "/var/lib/garret/backup.db".into(),
             },
             Request::DeletePushedBy {
                 subject: "https://token.actions.githubusercontent.com#repo:o/r:ref:refs/heads/main"

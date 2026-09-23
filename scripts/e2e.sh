@@ -398,6 +398,26 @@ fi
 echo "  old root pruned, recent dependency kept, too-recent cutoff refused"
 garret push "$path" >/dev/null
 
+# Online backup: taken while both services run, and the copy must stand on
+# its own -- a snapshot missing un-checkpointed WAL rows would pass a size
+# check and fail a restore.
+admin backup "$root/backup.db" | tee "$root/backup.out"
+grep -q "wrote $root/backup.db" "$root/backup.out"
+[ "$(stat -c %a "$root/backup.db" 2>/dev/null || stat -f %Lp "$root/backup.db")" = 600 ] \
+  || { echo "backup is not mode 0600"; exit 1; }
+python3 -c "
+import sqlite3, sys
+db = sqlite3.connect('file:$root/backup.db?mode=ro', uri=True)
+have = {h for (h,) in db.execute('SELECT store_path_hash FROM objects')}
+missing = {'$hash', '$leaf_hash'} - have
+assert not missing, f'backup lacks {missing}'
+print('  backup holds', len(have), 'objects, the pushed closure among them')
+"
+if admin backup "$root/backup.db" 2>/dev/null; then
+  echo "backup overwrote an existing file"; exit 1
+fi
+echo "  refuses to overwrite an existing backup"
+
 # Incident response: everything one subject pushed, by the `pushed_by` the
 # browse API shows. A dry run lists without deleting; a cutoff after every
 # push matches nothing; --apply removes the lot, as `delete` would.
