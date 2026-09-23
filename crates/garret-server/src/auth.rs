@@ -35,6 +35,16 @@ struct Claims {
     repository_owner_id: Option<String>,
     #[serde(rename = "ref", default)]
     git_ref: Option<String>,
+    /// GitHub Actions: the immutable repository id.
+    #[serde(default)]
+    repository_id: Option<String>,
+    /// GitHub Actions: the triggering event, e.g. `push`.
+    #[serde(default)]
+    event_name: Option<String>,
+    /// GitHub Actions: the workflow file the job runs (the called file, for a
+    /// reusable workflow).
+    #[serde(default)]
+    job_workflow_ref: Option<String>,
 }
 
 struct Issuer {
@@ -203,7 +213,8 @@ fn base64_url(s: &str) -> Result<Vec<u8>> {
 
 /// Authorization, which lives at the issuer wherever possible (ADR-0003):
 /// Pocket ID grants by audience alone unless groups are configured; GitHub
-/// grants by immutable owner id and optional ref constraints.
+/// grants by immutable owner id and optional ref, repository, event and
+/// workflow constraints.
 fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
     if let Some(expected) = &cfg.github_owner_id {
         let owner = claims
@@ -230,10 +241,46 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
             bail!("ref protection status is not authorized");
         }
     }
+    allowlisted(
+        &cfg.repository_ids,
+        claims.repository_id.as_deref(),
+        "repository_id",
+        |a, c| a == c,
+    )?;
+    allowlisted(
+        &cfg.event_names,
+        claims.event_name.as_deref(),
+        "event_name",
+        |a, c| a == c,
+    )?;
+    allowlisted(
+        &cfg.job_workflow_refs,
+        claims.job_workflow_ref.as_deref(),
+        "job_workflow_ref",
+        ref_matches,
+    )?;
     if !cfg.allowed_groups.is_empty()
         && !claims.groups.iter().any(|g| cfg.allowed_groups.contains(g))
     {
         bail!("subject is not in an allowed group");
+    }
+    Ok(())
+}
+
+/// An empty allowlist is off; a configured one fails closed on an absent
+/// claim, so a token from another issuer shape can't slip past it.
+fn allowlisted(
+    allowed: &[String],
+    claim: Option<&str>,
+    name: &str,
+    matches: impl Fn(&str, &str) -> bool,
+) -> Result<()> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let value = claim.ok_or_else(|| anyhow!("token has no {name}"))?;
+    if !allowed.iter().any(|a| matches(a, value)) {
+        bail!("{name} is not authorized");
     }
     Ok(())
 }
@@ -260,6 +307,9 @@ mod tests {
             github_owner_id: Some(owner.into()),
             ref_patterns: refs.iter().map(|r| (*r).to_owned()).collect(),
             ref_protected: None,
+            repository_ids: vec![],
+            event_names: vec![],
+            job_workflow_refs: vec![],
             allowed_groups: vec![],
         }
     }
@@ -272,6 +322,9 @@ mod tests {
             ref_protected: None,
             repository_owner_id: owner.map(str::to_owned),
             git_ref: git_ref.map(str::to_owned),
+            repository_id: None,
+            event_name: None,
+            job_workflow_ref: None,
         }
     }
 
@@ -316,6 +369,98 @@ mod tests {
     }
 
     #[test]
+    fn repository_ids_gate_when_configured() {
+        let mut cfg = github("1234", &[]);
+        cfg.repository_ids = vec!["42".into(), "43".into()];
+        let mut c = claims(Some("1234"), None, &[]);
+        c.repository_id = Some("43".into());
+        assert!(authorize(&cfg, &c).is_ok());
+        // Another repo of the same owner is exactly what this narrows away.
+        c.repository_id = Some("99".into());
+        assert!(authorize(&cfg, &c).is_err());
+        c.repository_id = None;
+        assert!(authorize(&cfg, &c).is_err());
+    }
+
+    #[test]
+    fn event_names_gate_when_configured() {
+        let mut cfg = github("1234", &["refs/heads/main"]);
+        cfg.event_names = vec!["push".into(), "workflow_dispatch".into()];
+        let with_event = |event: Option<&str>| {
+            let mut c = claims(Some("1234"), Some("refs/heads/main"), &[]);
+            c.event_name = event.map(str::to_owned);
+            authorize(&cfg, &c)
+        };
+        assert!(with_event(Some("push")).is_ok());
+        assert!(with_event(Some("workflow_dispatch")).is_ok());
+        // Both run on the default branch even when a stranger's PR set them
+        // off, so ref_patterns alone admits them.
+        assert!(with_event(Some("pull_request_target")).is_err());
+        assert!(with_event(Some("workflow_run")).is_err());
+        assert!(with_event(None).is_err());
+    }
+
+    #[test]
+    fn job_workflow_refs_gate_when_configured() {
+        let mut cfg = github("1234", &[]);
+        cfg.job_workflow_refs = vec![
+            "me/thing/.github/workflows/ci.yml@refs/heads/main".into(),
+            "me/other/.github/workflows/release.yml@refs/tags/v*".into(),
+        ];
+        let with_ref = |r: Option<&str>| {
+            let mut c = claims(Some("1234"), None, &[]);
+            c.job_workflow_ref = r.map(str::to_owned);
+            authorize(&cfg, &c)
+        };
+        assert!(with_ref(Some("me/thing/.github/workflows/ci.yml@refs/heads/main")).is_ok());
+        assert!(
+            with_ref(Some(
+                "me/other/.github/workflows/release.yml@refs/tags/v1.2"
+            ))
+            .is_ok()
+        );
+        // Another workflow in an allowed repo, and a third-party reusable
+        // workflow called from one, both carry the caller's other claims.
+        assert!(with_ref(Some("me/thing/.github/workflows/lint.yml@refs/heads/main")).is_err());
+        assert!(
+            with_ref(Some(
+                "them/tools/.github/workflows/build.yml@refs/heads/main"
+            ))
+            .is_err()
+        );
+        assert!(with_ref(None).is_err());
+    }
+
+    #[test]
+    fn recommended_policy_reads_real_github_claim_names() {
+        let mut cfg = github("31970261", &["refs/heads/main"]);
+        cfg.ref_protected = Some(true);
+        cfg.repository_ids = vec!["1324491067".into()];
+        cfg.event_names = vec!["push".into(), "workflow_dispatch".into()];
+        cfg.job_workflow_refs =
+            vec!["jeiang/garret/.github/workflows/ci.yml@refs/heads/main".into()];
+        // Shape of a GitHub Actions ID token payload: every claim a string.
+        let payload = |event: &str| {
+            serde_json::from_value::<Claims>(serde_json::json!({
+                "iss": "https://token.actions.githubusercontent.com",
+                "sub": "repo:jeiang/garret:ref:refs/heads/main",
+                "aud": "garret",
+                "ref": "refs/heads/main",
+                "ref_protected": "true",
+                "repository": "jeiang/garret",
+                "repository_id": "1324491067",
+                "repository_owner_id": "31970261",
+                "event_name": event,
+                "workflow_ref": "jeiang/garret/.github/workflows/ci.yml@refs/heads/main",
+                "job_workflow_ref": "jeiang/garret/.github/workflows/ci.yml@refs/heads/main",
+            }))
+            .unwrap()
+        };
+        assert!(authorize(&cfg, &payload("push")).is_ok());
+        assert!(authorize(&cfg, &payload("pull_request_target")).is_err());
+    }
+
+    #[test]
     fn pocket_id_grants_on_audience_alone_unless_groups_are_set() {
         let mut cfg = IssuerConfig {
             issuer: "https://id.example".into(),
@@ -325,6 +470,9 @@ mod tests {
             github_owner_id: None,
             ref_patterns: vec![],
             ref_protected: None,
+            repository_ids: vec![],
+            event_names: vec![],
+            job_workflow_refs: vec![],
             allowed_groups: vec![],
         };
         assert!(authorize(&cfg, &claims(None, None, &[])).is_ok());

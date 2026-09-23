@@ -100,8 +100,9 @@ Module option sketch (all under `services.garret.*`):
 - **pusher**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.{endpointUrl,
   bucket, region, credentialsFile}`, `quota`, `watermarks.{high,low}`,
   `limits.{maxConcurrentUploads, maxInFlightBytes}`, `oidc.{pocketId.{issuer,
-  audience}, github.{ownerId, refPatterns, refProtected}}`, `signingKeyFiles` (list —
-  active + retiring), `adminSocketPath`, `gcInterval`.
+  audience}, github.{ownerId, refPatterns, refProtected, repositoryIds,
+  eventNames, jobWorkflowRefs}}`, `signingKeyFiles` (list — active +
+  retiring), `adminSocketPath`, `gcInterval`.
 - **puller**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.*` (same),
   `presignTtl` (default 1 h), `browse.oidc.{issuer, audience}`,
   `bumpDebounce`, `dbReadBudgetMs` / `presignBudgetMs` (pull-path
