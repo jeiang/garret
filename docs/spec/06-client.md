@@ -48,6 +48,15 @@ must know is the one thing they would have had to configure anyway.
   `zstd_level`, and `[watch]` lives on daemon hosts whose config the NixOS
   module writes at an explicit `--config` path.
 
+Discovery is trusted with what nix trusts, so `login` refuses it rather than
+writing it: the Pusher URL, `puller_endpoint` and issuer must be `https`
+(plain `http` only to a loopback host), every URL and OIDC value must be
+printable ASCII with no whitespace, quotes or braces, and every key must be
+`name:base64`. A newline in any of them would otherwise become a new nix.conf
+setting, and an advertised key is trusted for every substituter, not just this
+one. `login` prints the keys it wrote; `use` re-checks the URL and keys before
+writing nix.conf, since the config may predate the check or be hand-edited.
+
 The written file is a hand-rendered subset with comments, not a serialization
 of the config struct — which would emit every default and the entire `[watch]`
 section into a laptop's config.
