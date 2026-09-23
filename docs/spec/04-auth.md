@@ -47,9 +47,23 @@ router reordering cannot silently re-authenticate it. See
 
 ## Validation mechanics
 
-Stacked per-issuer authorizers (jwt-authorizer-style): per-issuer JWKS
-cache with refresh-on-unknown-kid, RS256 pinned, audience required for
-both issuers, ~60 s clock skew.
+Stacked per-issuer authorizers (jwt-authorizer-style): RS256 pinned,
+audience required for both issuers, `exp` required and `nbf` checked when
+present, ~60 s clock skew.
+
+Each issuer's JWKS is cached in memory and refetched when a token names an
+unknown kid (rotation) or the cached set is over an hour old, so a key the
+issuer has removed stops being trusted without a restart. Fetches are
+bounded so that neither an unknown-kid flood (anyone can send one) nor a
+slow or down issuer turns into load on it or stalls requests:
+
+- one fetch per issuer at a time; concurrent callers wait for its result;
+- at most one fetch attempt per issuer every 10 s, failed or not;
+- 5 s connect and 10 s overall timeout per fetch;
+- a failed refresh of an expired set keeps the cached keys, since
+  refusing every token while the issuer blips is worse and a removal
+  needs the issuer up to be published anyway. An unknown kid with a
+  failed fetch is refused.
 
 Operational requirements: register a garret API/audience in Pocket ID;
 **pin Pocket ID ≥ the late-April-2026 release** (CVE-2026-43983 — the

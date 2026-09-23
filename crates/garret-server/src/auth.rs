@@ -18,8 +18,16 @@ use crate::config::IssuerConfig;
 
 /// Clock skew allowance, per spec 04-auth.
 const LEEWAY_SECS: u64 = 60;
-/// Floor between JWKS refetches, so an unknown-kid flood can't hammer the issuer.
+/// Floor between JWKS fetch attempts, successful or not, so neither an
+/// unknown-kid flood nor a down issuer turns into a stream of fetches.
 const MIN_REFRESH: Duration = Duration::from_secs(10);
+/// Cached keys are refetched once this old, so a key the issuer has removed
+/// (say, after a compromise) stops being trusted even if no unknown kid ever
+/// forces a refresh.
+const KEY_TTL: Duration = Duration::from_secs(3600);
+/// Bounds how long a slow or hung issuer can hold the triggering request.
+const JWKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const JWKS_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct Claims {
@@ -40,12 +48,17 @@ struct Claims {
 struct Issuer {
     cfg: IssuerConfig,
     keys: RwLock<KeyCache>,
+    /// Single-flight: at most one JWKS fetch per issuer at a time.
+    refreshing: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
 struct KeyCache {
     by_kid: HashMap<String, DecodingKey>,
-    fetched_at: Option<Instant>,
+    /// Last successful fetch + `KEY_TTL`; `None` until the first one.
+    expires_at: Option<Instant>,
+    /// Last fetch attempt + `MIN_REFRESH`.
+    next_attempt: Option<Instant>,
 }
 
 /// Validates bearer tokens against a fixed set of trusted issuers, caching
@@ -71,9 +84,13 @@ impl Authenticator {
                 .map(|cfg| Issuer {
                     cfg,
                     keys: RwLock::new(KeyCache::default()),
+                    refreshing: tokio::sync::Mutex::new(()),
                 })
                 .collect(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(JWKS_CONNECT_TIMEOUT)
+                .timeout(JWKS_TIMEOUT)
+                .build()?,
         })
     }
 
@@ -94,11 +111,23 @@ impl Authenticator {
             .kid
             .ok_or_else(|| anyhow!("token has no kid"))?;
 
-        let mut key = issuer.cached_key(&kid);
-        if key.is_none() {
-            // Unknown kid means rotation: refetch once, rate-limited.
-            self.refresh_jwks(issuer).await?;
-            key = issuer.cached_key(&kid);
+        let (mut key, expired) = issuer.cached_key(&kid);
+        if key.is_none() || expired {
+            // Unknown kid means rotation; expired keys may include one the
+            // issuer has since removed. Either way refetch, rate-limited.
+            if let Err(e) = self.refresh_jwks(issuer).await {
+                if key.is_none() {
+                    return Err(e);
+                }
+                // Keep the stale set rather than refuse every token while the
+                // issuer blips: dropping a removed key needs the issuer up to
+                // publish the removal anyway.
+                tracing::warn!(
+                    "JWKS refresh for {} failed, keeping cached keys: {e:#}",
+                    issuer.cfg.issuer
+                );
+            }
+            key = issuer.cached_key(&kid).0;
         }
         let key = key.ok_or_else(|| anyhow!("no signing key for kid {kid}"))?;
 
@@ -106,6 +135,7 @@ impl Authenticator {
         validation.set_issuer(&[&issuer.cfg.issuer]);
         validation.set_audience(&[&issuer.cfg.audience]);
         validation.leeway = LEEWAY_SECS;
+        validation.validate_nbf = true;
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
             .context("token failed validation")?
             .claims;
@@ -115,10 +145,16 @@ impl Authenticator {
     }
 
     async fn refresh_jwks(&self, issuer: &Issuer) -> Result<()> {
-        if let Some(at) = issuer.keys.read().unwrap().fetched_at
-            && at.elapsed() < MIN_REFRESH
+        // Requests queued behind an in-flight fetch find the floor already
+        // moved and return without fetching again.
+        let _flight = issuer.refreshing.lock().await;
         {
-            return Ok(());
+            let mut cache = issuer.keys.write().unwrap();
+            let now = Instant::now();
+            if cache.next_attempt.is_some_and(|t| now < t) {
+                return Ok(());
+            }
+            cache.next_attempt = Some(now + MIN_REFRESH);
         }
         let url = self.jwks_url(issuer).await?;
         // A local path is the sanctioned dev-issuer override (spec 04): test
@@ -146,7 +182,7 @@ impl Authenticator {
                 DecodingKey::from_jwk(jwk).ok().map(|k| (kid, k))
             })
             .collect();
-        cache.fetched_at = Some(Instant::now());
+        cache.expires_at = Some(Instant::now() + KEY_TTL);
         Ok(())
     }
 
@@ -176,8 +212,11 @@ impl Authenticator {
 }
 
 impl Issuer {
-    fn cached_key(&self, kid: &str) -> Option<DecodingKey> {
-        self.keys.read().unwrap().by_kid.get(kid).cloned()
+    /// The key for `kid`, if cached, and whether the cached set has expired.
+    fn cached_key(&self, kid: &str) -> (Option<DecodingKey>, bool) {
+        let cache = self.keys.read().unwrap();
+        let expired = cache.expires_at.is_none_or(|t| Instant::now() >= t);
+        (cache.by_kid.get(kid).cloned(), expired)
     }
 }
 
@@ -249,6 +288,11 @@ fn ref_matches(pattern: &str, git_ref: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
 
     fn github(owner: &str, refs: &[&str]) -> IssuerConfig {
@@ -349,5 +393,147 @@ mod tests {
             "https://id.example"
         );
         assert!(unverified_issuer("nope").is_err());
+    }
+
+    const DEV_ISSUER: &str = "https://issuer.example";
+
+    fn dev_issuer(jwks_url: &str) -> IssuerConfig {
+        IssuerConfig {
+            issuer: DEV_ISSUER.into(),
+            audience: "garret".into(),
+            client_id: None,
+            jwks_url: Some(jwks_url.into()),
+            github_owner_id: None,
+            ref_patterns: vec![],
+            ref_protected: None,
+            allowed_groups: vec![],
+        }
+    }
+
+    /// Routes to the dev issuer and names `kid`; the signature is never
+    /// reached by these tests.
+    fn token_with_kid(kid: &str) -> String {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let header = URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"RS256","kid":"{kid}"}}"#));
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"iss":"{DEV_ISSUER}"}}"#));
+        format!("{header}.{payload}.c2ln")
+    }
+
+    /// A key the test issuer publishes. No test token is signed by it, so
+    /// reaching signature validation is as far as any of them gets.
+    const ROTATED_IN: &str = r#"{"keys":[{"kty":"RSA","kid":"new","n":"AQAB","e":"AQAB"}]}"#;
+
+    /// An issuer serving `keys` with `status`, slowly enough that concurrent
+    /// callers overlap, and counting fetches.
+    async fn jwks_server(status: u16, keys: &'static str) -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/jwks",
+            axum::routing::get(move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                (axum::http::StatusCode::from_u16(status).unwrap(), keys)
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/jwks", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, hits)
+    }
+
+    fn preload(auth: &Authenticator, kid: &str, expires_at: Instant) {
+        let mut cache = auth.issuers[0].keys.write().unwrap();
+        cache
+            .by_kid
+            .insert(kid.into(), DecodingKey::from_secret(b"k"));
+        cache.expires_at = Some(expires_at);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_kid_flood_fetches_the_jwks_once() {
+        let (url, hits) = jwks_server(200, r#"{"keys":[]}"#).await;
+        let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
+        let token = token_with_kid("forged");
+        let flood = (0..20).map(|_| auth.authenticate(&token));
+        assert!(
+            futures::future::join_all(flood)
+                .await
+                .iter()
+                .all(Result::is_err)
+        );
+        assert!(auth.authenticate(&token).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn callers_during_a_rotation_wait_for_the_one_fetch() {
+        let (url, hits) = jwks_server(200, ROTATED_IN).await;
+        let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
+        let token = token_with_kid("new");
+        let burst = (0..20).map(|_| auth.authenticate(&token));
+        // Every caller got the rotated-in key and failed only on the (fake)
+        // signature, not on a missing key.
+        for outcome in futures::future::join_all(burst).await {
+            let e = outcome.unwrap_err();
+            assert!(format!("{e:#}").contains("failed validation"), "{e:#}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_not_retried_within_the_floor() {
+        let (url, hits) = jwks_server(500, r#"{"keys":[]}"#).await;
+        let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
+        for _ in 0..5 {
+            assert!(auth.authenticate(&token_with_kid("forged")).await.is_err());
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_keys_are_refetched_and_removed_keys_dropped() {
+        let (url, hits) = jwks_server(200, ROTATED_IN).await;
+        let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
+
+        preload(&auth, "old", Instant::now() + KEY_TTL);
+        let _ = auth.authenticate(&token_with_kid("old")).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "fresh keys need no fetch");
+
+        preload(&auth, "old", Instant::now());
+        let _ = auth.authenticate(&token_with_kid("old")).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        // The issuer no longer publishes it, so it is no longer trusted.
+        assert!(auth.issuers[0].cached_key("old").0.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_expired_keys() {
+        let (url, hits) = jwks_server(500, r#"{"keys":[]}"#).await;
+        let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
+        preload(&auth, "old", Instant::now());
+        let _ = auth.authenticate(&token_with_kid("old")).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(auth.issuers[0].cached_key("old").0.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_issuer_times_out() {
+        // Accepts connections and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/jwks", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
+        let outcome =
+            tokio::time::timeout(JWKS_TIMEOUT * 2, auth.authenticate(&token_with_kid("k"))).await;
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "the fetch must give up on its own"
+        );
     }
 }

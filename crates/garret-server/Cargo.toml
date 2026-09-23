@@ -33,3 +33,5 @@ sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Paused clock, so the JWKS timeout test needn't wait out the real timeout.
+tokio = { version = "1", features = ["test-util"] }
