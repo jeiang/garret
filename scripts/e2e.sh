@@ -50,6 +50,7 @@ check_401 "no token"
 check_401 "garbage token"   -H "Authorization: Bearer not-a-jwt"
 check_401 "wrong audience"  -H "Authorization: Bearer $(cat "$root/token-wrong-audience")"
 check_401 "expired token"   -H "Authorization: Bearer $(cat "$root/token-expired")"
+check_401 "not-yet-valid"   -H "Authorization: Bearer $(cat "$root/token-not-yet-valid")"
 
 say "building a two-path closure"
 # See scripts/e2e-fixture.nix for why these are runCommand derivations rather
@@ -306,6 +307,27 @@ grep -q "done: 1 pushed, 0 deduped, 0 failed" "$root/push-gh.out"
   echo "expected exactly one renewal, got $(cat "$root/gh-mints") mints"; exit 1; }
 echo "  the expired runner token was replaced once and the push went through"
 
+say "last-accessed bumps land off the request path"
+# The json path was pushed and never fetched from the Puller, so no earlier
+# hit can have queued its bump. bump_debounce_secs = 0 here, so a hit a second
+# after the insert is stale; the request only queues it, and it must land from
+# the Puller's flush, on its own connection, within a few flush intervals.
+json_hash=$(basename "$jsonpath" | cut -c1-32)
+accessed() {
+  sqlite3 -cmd ".timeout 2000" "$root/garret.db" \
+    "SELECT last_accessed_at FROM objects WHERE store_path_hash = '$1'"
+}
+before=$(accessed "$json_hash")
+sleep 1
+curl -sf "$puller_url/$json_hash.narinfo" >/dev/null
+for _ in $(seq 30); do
+  [ "$(accessed "$json_hash")" -gt "$before" ] && break
+  sleep 0.5
+done
+after=$(accessed "$json_hash")
+echo "  last_accessed_at $before -> $after"
+[ "$after" -gt "$before" ] || { echo "the bump was never flushed"; exit 1; }
+
 say "client UX: completions need no config, other commands say how to make one"
 # Guards the load-then-dispatch ordering: `login` and `completions` must run on
 # a machine that has no config at all, which is the state they exist to fix.
@@ -379,6 +401,9 @@ generated=$(awk '/public key:/ {print $3}' "$root/keygen.out")
 shown=$(admin key show "$root/rotate.key")
 [ "$generated" = "$shown" ] || { echo "generate and show disagree: $generated vs $shown"; exit 1; }
 echo "  offline keygen agrees with key show"
+[ "$(stat -c %a "$root/rotate.key" 2>/dev/null || stat -f %Lp "$root/rotate.key")" = 600 ] \
+  || { echo "signing key is not mode 0600"; exit 1; }
+echo "  signing key is created mode 0600"
 # It must refuse to clobber an existing key rather than destroying signatures.
 if admin key generate garret-rotate-2 "$root/rotate.key" 2>/dev/null; then
   echo "key generate overwrote an existing key"; exit 1
@@ -459,6 +484,30 @@ if admin backup "$root/backup.db" 2>/dev/null; then
   echo "backup overwrote an existing file"; exit 1
 fi
 echo "  refuses to overwrite an existing backup"
+
+# Incident response: everything one subject pushed, by the `pushed_by` the
+# browse API shows. A dry run lists without deleting; a cutoff after every
+# push matches nothing; --apply removes the lot, as `delete` would.
+subject=$(authed "$puller_url/api/v1/objects/$root_hash" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["pushed_by"])')
+admin delete --pushed-by "$subject" | tee "$root/pushed-by-dry.out"
+grep -q "would delete $root_hash-" "$root/pushed-by-dry.out"
+curl -sf "$puller_url/$root_hash.narinfo" >/dev/null \
+  || { echo "a --pushed-by dry run deleted the root"; exit 1; }
+admin delete --pushed-by "$subject" --since 2099-01-01 --apply | tee "$root/pushed-by-future.out"
+grep -q "deleted 0 object" "$root/pushed-by-future.out"
+admin delete --pushed-by "$subject" --since 1h --apply | tee "$root/pushed-by.out"
+grep -q "deleted $root_hash-" "$root/pushed-by.out"
+grep -q "deleted $leaf_hash-" "$root/pushed-by.out"
+for h in "$root_hash" "$leaf_hash"; do
+  if curl -sf "$puller_url/$h.narinfo" >/dev/null 2>&1; then
+    echo "narinfo $h still served after delete --pushed-by"; exit 1
+  fi
+done
+echo "  dry run lists, future cutoff matches nothing, --apply deletes the subject's pushes"
+# Everything the token pushed is gone; put it back so the GC stage below
+# still has the big path to evict and the watched closures to check.
+garret push "$path" "$big" "$jsonpath" "$watched" "$woken" >/dev/null
 
 say "benchmark harness"
 # All three scenarios, wired end to end: push seeds the corpus (count 12),

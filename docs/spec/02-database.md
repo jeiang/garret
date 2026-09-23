@@ -8,10 +8,18 @@ SQLite, one file, WAL mode, shared by both services on the same host.
 
 - The **Pusher owns all schema writes**: object+refs inserts (one
   transaction per object), GC deletes, resign, stats.
-- The **Puller** is read-only except debounced last-accessed bumps:
-  performed off the request path (fire-and-forget, batched on a dedicated
-  connection) and only when the stored value is >24 h stale. Day
-  granularity is sufficient for LRU (see [05-gc.md](05-gc.md)).
+- The **Puller** is read-only except debounced last-accessed bumps, and
+  only when the stored value is >24 h stale. Day granularity is
+  sufficient for LRU (see [05-gc.md](05-gc.md)).
+  - The narinfo read already returns `last_accessed_at`, so a hit on a
+    fresh row writes nothing. A no-op `UPDATE` would still take the WAL
+    write lock, and every hit would contend with the Pusher.
+  - Stale hashes are queued in memory as a set (a burst of hits on one
+    hash is one write) and flushed every 5 s in one `BEGIN IMMEDIATE`
+    transaction, on the blocking pool, on a dedicated connection with a
+    1 s busy timeout. A flush never touches the pull-path connection.
+  - A failed flush drops its batch. Those rows are still stale, so their
+    next hit queues them again.
 - **Upload-in-progress state is not in the DB.** It lives in the Pusher's
   memory; the object row is inserted only after the S3 blob completes.
 
@@ -85,6 +93,9 @@ Notes:
   finds the object present, debounced to one write per hour. It is the
   age `garret-admin prune` judges by (spec 05). Databases from before
   the column existed are migrated with `pushed_at = created_at`.
+- A re-push rewrites the object's row in place (an upsert), never
+  delete-then-insert: `pins` cascade on delete, so `INSERT OR REPLACE`
+  would silently unpin a re-pushed object.
 
 ## Pragmas
 
@@ -92,3 +103,9 @@ WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
 `busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
 `foreign_keys=ON`. Short write transactions only; the Pusher runs
 periodic checkpoint maintenance.
+
+A write transaction that reads before it writes (insert and delete, for
+their `stats` delta) begins `IMMEDIATE`. Begun deferred, it would take a
+read lock first, and SQLite fails the later upgrade to the write lock
+with `SQLITE_BUSY` at once, without consulting `busy_timeout`, whenever
+another connection holds it — which the Puller's bumps do.
