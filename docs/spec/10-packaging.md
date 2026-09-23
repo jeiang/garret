@@ -40,6 +40,7 @@ Pusher runs).
 | `fsck [--repair] [--verify-sizes] [--quiesce] [--json]` | socket — audit row⇔blob consistency, optionally repair |
 | `pin <name> <hash> [--expires <duration>]` | socket — GC-exempt root, closure-protecting (spec 05) |
 | `unpin <name>` | socket — remove a pin; unknown name is an error |
+| `prune --before <YYYY-MM-DD\|age> [--apply]` | socket — delete closures last pushed before the cutoff, keeping what newer pushes and pins need (spec 05); dry-run unless `--apply` |
 | `backup <path>` | socket — online copy of the DB, mode 0600, never overwrites |
 
 ### Backup and restore
@@ -70,10 +71,10 @@ Restoring a copy that is older than the bucket:
    younger rows), run step 3 again, then reopen the push endpoint.
 6. Re-apply any pins set or removed since the backup.
 
-Closures stay complete because GC evicts an object only once nothing
-surviving references it, roots first (spec 05). Anything evicted after the
-backup was therefore unreferenced by every object still present, so
-dropping its row leaves no surviving object with a missing reference. The
+Closures stay complete because GC and `prune` delete an object only once
+nothing surviving references it, roots first (spec 05). Anything deleted
+after the backup was therefore unreferenced by every object still present,
+so dropping its row leaves no surviving object with a missing reference. The
 exceptions are the ones that already break closures on the live cache:
 `garret-admin delete`, which is unconditional by design, and an eviction
 whose blob delete failed, whose orphaned blob makes the restored row look

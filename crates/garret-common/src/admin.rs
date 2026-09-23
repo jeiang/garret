@@ -55,6 +55,15 @@ pub enum Request {
         /// alone isn't trusted. Only meaningful with `repair: true`.
         quiesce: bool,
     },
+    /// Delete every closure last pushed before a cutoff, keeping anything a
+    /// newer push or a live pin still needs (spec 05).
+    Prune {
+        /// Unix time; objects last pushed before it are candidates. Must be
+        /// at least a day ago, so a push in progress keeps its closure.
+        before: i64,
+        /// Report what would go without deleting anything.
+        dry_run: bool,
+    },
     /// Write a consistent copy of the database to `path` while both services
     /// keep running: the online backup (spec 10-packaging).
     Backup {
@@ -135,6 +144,13 @@ pub enum Response {
         /// `repair` was requested.
         quiesce_drained: bool,
     },
+    /// Reply to [`Request::Prune`].
+    Prune {
+        /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
+        pruned: Vec<String>,
+        /// Compressed bytes reclaimed (or reclaimable, on a dry run).
+        bytes_freed: i64,
+    },
     /// Reply to [`Request::Backup`].
     Backup {
         /// Size of the copy written, in bytes.
@@ -194,6 +210,10 @@ mod tests {
             },
             Request::Unpin {
                 name: "release".into(),
+            },
+            Request::Prune {
+                before: 1234,
+                dry_run: true,
             },
             Request::Backup {
                 path: "/var/lib/garret/backup.db".into(),

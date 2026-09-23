@@ -100,6 +100,7 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
                 message: "no [gc] section is configured".into(),
             }),
         },
+        Request::Prune { before, dry_run } => prune(state, before, dry_run).await,
         Request::Backup { path } => backup(state, path).await,
     };
     result.unwrap_or_else(|e| Response::Error {
@@ -155,6 +156,36 @@ async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
         deleted,
         bytes_freed,
         missing,
+    })
+}
+
+/// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
+/// chose the cutoff. Row first, blob second, as everywhere else.
+async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
+    let pruned = {
+        let mut conn = state.conn.lock().unwrap();
+        db::prune(&mut conn, before, garret_server::now(), dry_run)?
+    };
+    let bytes_freed = pruned.iter().map(|(_, _, size)| size).sum();
+    if !dry_run {
+        let keys: Vec<String> = pruned
+            .iter()
+            .map(|(hash, _, _)| garret_server::storage::key_for(hash))
+            .collect();
+        state.storage.delete_objects(&keys).await?;
+        tracing::info!(
+            before,
+            objects = pruned.len(),
+            bytes_freed,
+            "prune complete"
+        );
+    }
+    Ok(Response::Prune {
+        pruned: pruned
+            .into_iter()
+            .map(|(hash, name, _)| format!("{hash}-{name}"))
+            .collect(),
+        bytes_freed,
     })
 }
 
