@@ -126,6 +126,12 @@ echo "  auth: invalid=$invalid malformed=$malformed accepted=$authed jwks refres
 [ "${malformed:-0}" = "1" ] || { echo "expected 1 malformed token"; exit 1; }
 [ "${authed:-0}" -ge 1 ] || { echo "expected accepted tokens"; exit 1; }
 [ "${refreshes:-0}" = "1" ] || { echo "expected exactly one JWKS fetch"; exit 1; }
+# GC ticks every second here, far below quota. A tick with nothing to evict
+# is still a successful run: a staleness alert on this must stay quiet.
+gc_ok=$(metric "$pusher_metrics_port" garret_gc_last_success_timestamp)
+echo "  gc last success: ${gc_ok:-never}"
+[ -n "$gc_ok" ] && [ "${gc_ok%.*}" -ge $(( $(date +%s) - 60 )) ] \
+  || { echo "GC success timestamp is not fresh while nothing needs evicting"; exit 1; }
 if curl -sf "http://127.0.0.1:$pusher_metrics_port/metrics" | grep -q '^garret_narinfo_requests_total'; then
   echo "pusher must not expose puller metrics"; exit 1
 fi
