@@ -55,6 +55,13 @@ pub enum Request {
         /// alone isn't trusted. Only meaningful with `repair: true`.
         quiesce: bool,
     },
+    /// Write a consistent copy of the database to `path` while both services
+    /// keep running: the online backup (spec 10-packaging).
+    Backup {
+        /// Absolute destination path, as seen by the Pusher. Must not exist:
+        /// a backup never overwrites anything.
+        path: String,
+    },
 }
 
 /// The Pusher's reply to a [`Request`]; variants mirror the request commands,
@@ -128,6 +135,11 @@ pub enum Response {
         /// `repair` was requested.
         quiesce_drained: bool,
     },
+    /// Reply to [`Request::Backup`].
+    Backup {
+        /// Size of the copy written, in bytes.
+        bytes: u64,
+    },
     /// The command failed; `message` is operator-facing text.
     Error {
         /// Human-readable description of what went wrong.
@@ -182,6 +194,9 @@ mod tests {
             },
             Request::Unpin {
                 name: "release".into(),
+            },
+            Request::Backup {
+                path: "/var/lib/garret/backup.db".into(),
             },
         ] {
             let line = serde_json::to_string(&request).unwrap();

@@ -15,6 +15,8 @@ substituter), colocated on one host over SQLite + S3.
 - Quota-driven GC: least-recently-accessed eviction that never breaks a
   surviving closure
 - Store watcher: pushes newly built store paths automatically
+- Online database backup (`garret-admin backup`) with a documented restore
+  ([docs/spec/10-packaging.md](docs/spec/10-packaging.md#backup-and-restore))
 - Browse API and extensive Prometheus metrics
 - Nix packaging and NixOS modules for both services
 
