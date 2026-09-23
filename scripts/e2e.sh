@@ -271,6 +271,48 @@ import json, sys
 assert json.load(sys.stdin)['children'], 'tree must carry the leaf'
 "
 
+say "GitHub Actions tokens: a rejected token is renewed and the request retried"
+# A stand-in for the runner's OIDC endpoint. Its first token is already
+# expired and every later one is valid, so the push succeeds only if the
+# client renews the token on the 401 and asks again.
+python3 - "$root" <<'PY' &
+import http.server, json, os, sys
+root = sys.argv[1]
+mints = 0
+class Mint(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        global mints
+        mints += 1
+        with open(f"{root}/gh-mints", "w") as f:
+            f.write(str(mints))
+        name = "token-expired" if mints == 1 else "token"
+        body = json.dumps({"value": open(f"{root}/{name}").read()}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), Mint)
+with open(f"{root}/gh-port.tmp", "w") as f:
+    f.write(str(server.server_port))
+os.rename(f"{root}/gh-port.tmp", f"{root}/gh-port")
+server.serve_forever()
+PY
+gh_pid=$!
+for _ in $(seq 50); do [ -s "$root/gh-port" ] && break; sleep 0.1; done
+head -c 4096 /dev/urandom > "$root/gh.bin"
+ghpath=$(nix store add-path "$root/gh.bin" --name garret-e2e-gh)
+env -u GARRET_TOKEN \
+  ACTIONS_ID_TOKEN_REQUEST_URL="http://127.0.0.1:$(cat "$root/gh-port")/token" \
+  ACTIONS_ID_TOKEN_REQUEST_TOKEN=runner-secret \
+  "$bin"/garret --config "$root/client.toml" push "$ghpath" | tee "$root/push-gh.out"
+kill $gh_pid 2>/dev/null || true
+grep -q "done: 1 pushed, 0 deduped, 0 failed" "$root/push-gh.out"
+[ "$(cat "$root/gh-mints")" = "2" ] || {
+  echo "expected exactly one renewal, got $(cat "$root/gh-mints") mints"; exit 1; }
+echo "  the expired runner token was replaced once and the push went through"
+
 say "last-accessed bumps land off the request path"
 # The json path was pushed and never fetched from the Puller, so no earlier
 # hit can have queued its bump. bump_debounce_secs = 0 here, so a hit a second
