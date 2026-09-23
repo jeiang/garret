@@ -123,18 +123,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Key(KeyCommand::Generate { name, out }) => {
-            if out.exists() {
-                bail!(
-                    "{} already exists — refusing to overwrite a signing key",
-                    out.display()
-                );
-            }
             let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
             // Nix's format: name:base64(seed ++ public), the whole 64 bytes.
             let mut material = key.to_bytes().to_vec();
             material.extend_from_slice(&key.verifying_key().to_bytes());
-            std::fs::write(&out, format!("{name}:{}\n", B64.encode(&material)))?;
-            restrict(&out)?;
+            write_secret(&out, &format!("{name}:{}\n", B64.encode(&material)))?;
             println!("wrote {}", out.display());
             println!(
                 "public key: {name}:{}",
@@ -461,10 +454,27 @@ fn print_unexpected(response: Response) {
     std::process::exit(1);
 }
 
-#[cfg(unix)]
-fn restrict(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+/// Creates `path` holding `contents`, mode 0600 from the moment it exists:
+/// writing first and chmod-ing after leaves a window in which anyone can open
+/// the key and keep the descriptor. `create_new` (O_EXCL) also refuses
+/// whatever is already there -- a key, or a symlink planted to redirect the
+/// write.
+fn write_secret(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
+                "{} already exists — refusing to overwrite a signing key",
+                path.display()
+            ),
+            _ => anyhow::Error::new(e).context(format!("creating {}", path.display())),
+        })?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -535,7 +545,7 @@ fn parse_cutoff(text: &str, now: i64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cutoff, parse_duration};
+    use super::{parse_cutoff, parse_duration, write_secret};
 
     #[test]
     fn durations_parse_or_fail_loudly() {
@@ -560,5 +570,42 @@ mod tests {
         for bad in ["2026-13-01", "2026-06", "2026-06-00", "yesterday", "-1d"] {
             assert!(parse_cutoff(bad, 0).is_err(), "{bad:?} should be rejected");
         }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("garret-admin-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn secrets_are_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("mode");
+        let key = dir.join("key");
+        write_secret(&key, "k:secret\n").unwrap();
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "k:secret\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Existing keys and planted symlinks are both refused: following a
+    /// dangling symlink would write the key wherever it points.
+    #[test]
+    fn secrets_never_replace_or_follow_what_is_there() {
+        let dir = scratch("exists");
+        let key = dir.join("key");
+        std::fs::write(&key, "old").unwrap();
+        assert!(write_secret(&key, "new").is_err());
+        assert_eq!(std::fs::read_to_string(&key).unwrap(), "old");
+
+        let link = dir.join("link");
+        let target = dir.join("elsewhere");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_secret(&link, "new").is_err());
+        assert!(!target.exists(), "the write followed the symlink");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
