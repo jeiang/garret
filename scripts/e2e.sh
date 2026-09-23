@@ -115,6 +115,17 @@ accepted=$(metric "$pusher_metrics_port" garret_uploads_accepted_total)   # 2 cl
 echo "  uploads accepted: $accepted"
 [ "$accepted" = "3" ] || { echo "expected 3 accepted uploads, got $accepted"; exit 1; }
 [ "$(metric "$pusher_metrics_port" garret_uploads_limit)" = "4" ] || { echo "cap not exported"; exit 1; }
+# Auth outcomes from the refused tokens above, plus the pushes since.
+dev='issuer="https://dev.garret.test"'
+invalid=$(metric "$pusher_metrics_port" "garret_auth_validations_total{$dev,outcome=\"invalid\"}")
+malformed=$(metric "$pusher_metrics_port" 'garret_auth_validations_total{issuer="unknown",outcome="malformed"}')
+authed=$(metric "$pusher_metrics_port" "garret_auth_validations_total{$dev,outcome=\"accepted\"}")
+refreshes=$(metric "$pusher_metrics_port" "garret_jwks_refreshes_total{$dev}")
+echo "  auth: invalid=$invalid malformed=$malformed accepted=$authed jwks refreshes=$refreshes"
+[ "${invalid:-0}" = "3" ] || { echo "expected 3 invalid tokens (audience, expired, nbf)"; exit 1; }
+[ "${malformed:-0}" = "1" ] || { echo "expected 1 malformed token"; exit 1; }
+[ "${authed:-0}" -ge 1 ] || { echo "expected accepted tokens"; exit 1; }
+[ "${refreshes:-0}" = "1" ] || { echo "expected exactly one JWKS fetch"; exit 1; }
 if curl -sf "http://127.0.0.1:$pusher_metrics_port/metrics" | grep -q '^garret_narinfo_requests_total'; then
   echo "pusher must not expose puller metrics"; exit 1
 fi
