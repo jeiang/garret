@@ -80,6 +80,9 @@ Notes:
 - Name search uses the indexed `name` column with LIKE; FTS5 only if
   scale ever demands it.
 - `total_bytes` is reconciled against `SUM(file_size)` at each GC pass.
+- A re-push rewrites the object's row in place (an upsert), never
+  delete-then-insert: `pins` cascade on delete, so `INSERT OR REPLACE`
+  would silently unpin a re-pushed object.
 
 ## Pragmas
 
