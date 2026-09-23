@@ -73,9 +73,23 @@ in
         machine.fail(as_puller("touch /var/lib/garret/planted"))
 
     with subtest("the Puller reaches neither the signing key nor the admin socket"):
+        machine.wait_for_file("/run/garret/admin.sock")
         machine.fail(as_puller("cat /etc/garret/signing-key"))
         machine.fail(as_puller("garret-admin status"))
         machine.succeed("garret-admin status")
+
+    with subtest("the Puller starts while the Pusher cannot"):
+        machine.succeed("systemctl stop garret-puller garret-pusher")
+        # The Pusher opens the database, then fails on a key it cannot read;
+        # its clean close must leave the -wal and -shm the Puller cannot make.
+        machine.succeed("chown root /etc/garret/signing-key")
+        machine.succeed("systemctl start garret-pusher")
+        machine.wait_until_succeeds("systemctl is-failed garret-pusher")
+        machine.succeed("systemctl start garret-puller")
+        machine.wait_until_succeeds("curl -fsS http://127.0.0.1:8081/ready", timeout=60)
+        machine.succeed("chown garret /etc/garret/signing-key")
+        machine.succeed("systemctl reset-failed garret-pusher")
+        machine.succeed("systemctl start garret-pusher")
 
     with subtest("files left by a module without the split are repaired on start"):
         machine.succeed("systemctl stop garret-puller garret-pusher")

@@ -97,10 +97,9 @@ in
       default = "/var/lib/garret/garret.db";
       description = ''
         SQLite database, shared with the Puller on this host. Its directory
-        must be owned by `garret` and not group-writable, so the Puller can
-        open the database but never create or replace files beside it. The
-        default location gets that from `StateDirectory`; provide it yourself
-        for any other path.
+        must be `garret:garret` mode 0750, so the Puller can open the database
+        but never create or replace files beside it. The default location gets
+        that from `StateDirectory`; provide it yourself for any other path.
       '';
     };
 

@@ -93,13 +93,16 @@ socket, nor bucket write:
 SQLite gives `-wal` and `-shm` the database file's mode but creates the
 database itself 0644, so the pusher unit's `ExecStartPre` (as `garret`)
 creates it 0660 before SQLite first opens it, and re-applies 0660 to all
-three files on every start. The Puller can still write rows: its bumps need
-the write lock, and SQLite has no finer permission.
+three files on every start. The Puller cannot create the sidecars either,
+so every connection runs in persistent-WAL mode (spec 02) and a last close
+leaves them in place: a Pusher that exits with an error after opening the
+database does not strand the Puller. The Puller can still write rows: its
+bumps need the write lock, and SQLite has no finer permission.
 
 Upgrading from modules without the split: with the default `dbPath`,
 nothing to do — the first Pusher start makes the directory 0750 and the
-database files 0660. A custom `dbPath` directory must already be owned by
-`garret:garret` and not group-writable. A signing key readable by group
+database files 0660. A custom `dbPath` directory must already be
+`garret:garret` 0750. A signing key readable by group
 `garret` (say `root:garret` 0440) must become `garret`-owned 0400, or the
 Puller can read it. Pointing `services.garret.puller.s3.credentialsFile` at
 a GetObject-only key is optional, and takes bucket write away from the Puller.

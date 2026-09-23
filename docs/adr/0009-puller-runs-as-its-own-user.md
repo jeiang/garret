@@ -10,16 +10,21 @@ use the Pusher's bucket-write S3 key. The Puller now runs as
 database access cannot be read-only — last-accessed bumps are writes, and a
 WAL reader writes the `-shm` file — so the database and its `-wal`/`-shm`
 are 0660 while the directory stays 0750: the Puller writes those three files
-but cannot create or replace anything beside them. SQLite creates a
-database 0644 and gives `-wal`/`-shm` the database's mode, so the Pusher's
-unit creates the file 0660 before SQLite first opens it, and re-applies
-0660 on every start, which is also the upgrade path for older deployments.
-That step runs as `garret`, not root, so nothing in the directory can turn
-it against a file the Pusher does not already own. Signing keys stay
-owner-only (0400 `garret`) and the admin socket stays 0600; both are now
-out of the Puller's reach, and a key made group-readable would put it back.
-The Puller takes its own S3 credentials, and needs only GetObject: a
-presigned URL carries exactly its key's authority. A static user rather
-than `DynamicUser`, so the uid the file modes are reasoned about is stable
-and nameable. Consequence: the Puller can still rewrite rows, which only
-moving the bumps behind the Pusher would close.
+but cannot create or replace anything beside them, the sidecars included.
+So they must always exist once the Pusher has opened the database: every
+connection sets SQLite's persistent-WAL mode, and a last close (a Pusher
+exiting with an error, say) leaves them in place rather than stranding the
+Puller until the Pusher recovers. SQLite creates a database 0644 and gives
+`-wal`/`-shm` the database's mode, so the Pusher's unit creates the file
+0660 before SQLite first opens it, and re-applies 0660 on every start, which
+is also the upgrade path for older deployments. That step runs as `garret`,
+not root, so nothing in the directory can turn it against a file the Pusher
+does not already own. Signing keys stay owner-only (0400 `garret`) and the
+admin socket stays 0600; both are now out of the Puller's reach, and a key
+made group-readable would put it back. The Puller takes its own S3
+credentials, and needs only GetObject: a presigned URL carries exactly its
+key's authority. A static user rather than `DynamicUser`, so the uid the file
+modes are reasoned about is stable and nameable. Consequences: the Puller
+can still rewrite rows, which only moving the bumps behind the Pusher would
+close, and a deleted database must go together with its `-wal` and `-shm`,
+or the next open replays the stale WAL onto the new file.
