@@ -45,7 +45,8 @@ CREATE TABLE objects (
   sigs              TEXT NOT NULL,     -- signed on write; multi-key JSON list
   pushed_by         TEXT,              -- OIDC subject (audit)
   created_at        INTEGER NOT NULL,
-  last_accessed_at  INTEGER NOT NULL
+  last_accessed_at  INTEGER NOT NULL,
+  pushed_at         INTEGER NOT NULL   -- last upload or Negotiation hit
 );
 CREATE INDEX objects_name          ON objects(name);
 CREATE INDEX objects_last_accessed ON objects(last_accessed_at); -- LRU order
@@ -88,6 +89,10 @@ Notes:
 - Name search uses the indexed `name` column with LIKE; FTS5 only if
   scale ever demands it.
 - `total_bytes` is reconciled against `SUM(file_size)` at each GC pass.
+- `pushed_at` is set on insert and refreshed by every Negotiation that
+  finds the object present, debounced to one write per hour. It is the
+  age `garret-admin prune` judges by (spec 05). Databases from before
+  the column existed are migrated with `pushed_at = created_at`.
 
 ## Pragmas
 
