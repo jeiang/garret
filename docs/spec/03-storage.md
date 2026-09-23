@@ -30,6 +30,12 @@ Defaults, all configurable:
   reader must never race ahead of S3. Worst-case buffering is 4×64 MiB
   per NAR; the protocol's global in-flight byte cap bounds the aggregate.
 - On any upload error, abort the multipart immediately so parts free.
+- On SIGTERM/SIGINT the Pusher stops accepting connections and lets
+  in-flight uploads finish for up to **60 s**, then aborts every
+  multipart still open (it is the bucket's only writer) and exits. Drain
+  plus a 20 s abort budget stays under systemd's default 90 s stop
+  timeout, so a restart neither cuts off a push that could finish nor
+  leaves parts for the weekly sweep ([05-gc.md](05-gc.md)).
 - Every S3 call carries an **overall operation deadline** —
   `[s3] operation_timeout_secs`, default **60** — covering connect,
   transfer, and any SDK-internal retries (ticket 27). Overall rather
