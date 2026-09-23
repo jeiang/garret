@@ -101,11 +101,21 @@ Notes:
 
 WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
 `busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
-`foreign_keys=ON`. Short write transactions only; the Pusher runs
-periodic checkpoint maintenance.
+`journal_size_limit=64MiB`; `foreign_keys=ON`. Short write transactions
+only.
 
 A write transaction that reads before it writes (insert and delete, for
 their `stats` delta) begins `IMMEDIATE`. Begun deferred, it would take a
 read lock first, and SQLite fails the later upgrade to the write lock
 with `SQLITE_BUSY` at once, without consulting `busy_timeout`, whenever
 another connection holds it — which the Puller's bumps do.
+
+Checkpointing is SQLite's own; there is no periodic checkpoint task.
+Auto-checkpoint (PASSIVE, every 1000 WAL pages, on commit on either
+connection) keeps the WAL at a few MiB even under continuous pull reads,
+because no read transaction is long-lived. It never shrinks the file,
+though, so `journal_size_limit` trims it back after one large
+transaction, and the Pusher truncates it at startup. A timed PASSIVE
+checkpoint would repeat auto-checkpoint; a timed TRUNCATE would stall
+writers behind readers, for up to `busy_timeout`, to reclaim what the
+size limit already reclaims.
