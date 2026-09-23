@@ -6,9 +6,14 @@
 //! scan and an offline backlog are all just "the cursor is old", not special
 //! cases needing their own code.
 
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
+use futures::{StreamExt, stream};
 use rusqlite::{Connection, OpenFlags, params};
 use tokio::net::UnixDatagram;
 
@@ -24,7 +29,8 @@ pub struct Watcher {
     pub poll_interval: Duration,
     /// What not to push.
     pub filters: Filters,
-    /// Failures per path before it lands on the skip-list.
+    /// Push attempts per path in one process, the first included, before the
+    /// watcher leaves it on the failed list for a restart or a drain.
     pub max_attempts: u32,
     /// Where the wake socket listens; `garret enqueue` pokes it to collapse
     /// push latency from `poll_interval` to "right after the build".
@@ -129,11 +135,59 @@ pub fn read_cursor(path: &std::path::Path) -> Option<i64> {
 }
 
 /// Persists the cursor, creating its directory on first write.
-pub fn write_cursor(path: &std::path::Path, cursor: i64) -> Result<()> {
+pub fn write_cursor(path: &Path, cursor: i64) -> Result<()> {
+    write_atomic(path, &cursor.to_string()).with_context(|| format!("writing cursor {path:?}"))
+}
+
+/// Where the failed list lives: beside the cursor, as `<cursor>.failed`.
+///
+/// The cursor passes a path whether or not its push worked — one poison path
+/// must never wedge the pipeline — so a failure is recorded here instead, one
+/// store path per line, until a later poll, a restart or a drain pushes it.
+pub fn failed_path(cursor_path: &Path) -> PathBuf {
+    let mut name = cursor_path.file_name().unwrap_or_default().to_os_string();
+    name.push(".failed");
+    cursor_path.with_file_name(name)
+}
+
+/// Reads the failed list; a missing file is an empty list.
+pub fn read_failed(path: &Path) -> BTreeSet<String> {
+    std::fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Persists the failed list, removing the file once it is empty.
+pub fn write_failed(path: &Path, failed: &BTreeSet<String>) -> Result<()> {
+    if failed.is_empty() {
+        return match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {path:?}"))
+            }
+            _ => Ok(()),
+        };
+    }
+    let text: String = failed.iter().map(|p| format!("{p}\n")).collect();
+    write_atomic(path, &text).with_context(|| format!("writing failed list {path:?}"))
+}
+
+/// Replaces `path` whole: the daemon is stopped by a signal (CI kills it before
+/// draining), and a kill between truncate and write would leave an empty
+/// cursor that bootstraps past the backlog.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, cursor.to_string()).with_context(|| format!("writing cursor {path:?}"))
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Binds the wake socket `garret enqueue` datagrams land on. A stale file from
@@ -179,8 +233,9 @@ pub async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
 
 impl Watcher {
     /// Runs until killed. The cursor always advances: one poison path must
-    /// never wedge the pipeline, so repeated failures land on a skip-list and
-    /// the watcher moves on, loudly (spec 06).
+    /// never wedge the pipeline, so a failed push goes on the failed list and
+    /// the watcher moves on, retrying it on idle polls up to `max_attempts`
+    /// times, then loudly giving up until a restart or a drain (spec 06).
     pub async fn run(&self, pusher: &Pusher, full_sync: bool) -> Result<()> {
         let conn = open_nix_db(&self.nix_db)?;
         let mut cursor = match read_cursor(&self.cursor_path) {
@@ -190,6 +245,9 @@ impl Watcher {
             None if full_sync => 0,
             None => max_id(&conn)?,
         };
+        // Written at once, so a drain later in the same CI job knows where
+        // the job began even if nothing is built before it runs.
+        write_cursor(&self.cursor_path, cursor)?;
         tracing::info!(cursor, full_sync, "store watcher starting");
 
         // The socket is an optimization, never a reason the backstop won't
@@ -207,49 +265,143 @@ impl Watcher {
             }
         };
 
-        let mut skipped: HashSet<String> = HashSet::new();
-        let mut attempts: std::collections::HashMap<String, u32> = Default::default();
+        let failed_file = failed_path(&self.cursor_path);
+        let mut failed = read_failed(&failed_file);
+        // Attempts spent in this process. The list itself outlives it, so a
+        // restart or a drain gives every failed path a fresh budget.
+        let mut attempts: HashMap<String, u32> = HashMap::new();
 
         loop {
             let batch = paths_after(&conn, cursor, 500)?;
             if batch.is_empty() {
+                self.retry_failed(pusher, &mut failed, &mut attempts)
+                    .await?;
                 wait_for_wake(wake.as_ref(), self.poll_interval).await;
                 continue;
             }
 
             for entry in batch {
                 cursor = entry.id;
-                if skipped.contains(&entry.path) {
-                    continue;
-                }
                 if let Some(reason) = self.filters.should_skip(&entry) {
                     tracing::debug!(path = entry.path, reason, "skipping");
-                    continue;
-                }
-                match self.push_path(pusher, &entry.path).await {
-                    Ok(()) => {
-                        attempts.remove(&entry.path);
-                    }
-                    Err(e) => {
-                        let count = attempts.entry(entry.path.clone()).or_default();
-                        *count += 1;
-                        if *count >= self.max_attempts {
-                            tracing::error!(
-                                path = entry.path,
-                                attempts = *count,
-                                "giving up on this path; adding to the skip list: {e:#}"
-                            );
-                            skipped.insert(entry.path.clone());
-                        } else {
-                            tracing::warn!(path = entry.path, "push failed, will retry: {e:#}");
-                        }
-                    }
+                } else if let Err(e) = self.push_path(pusher, &entry.path).await {
+                    tracing::warn!(
+                        path = entry.path,
+                        "push failed; on the failed list, retried when idle: {e:#}"
+                    );
+                    attempts.insert(entry.path.clone(), 1);
+                    failed.insert(entry.path);
+                    write_failed(&failed_file, &failed)?;
                 }
                 // Advance regardless of outcome — an old cursor is a backlog,
                 // but a stuck cursor is an outage.
                 write_cursor(&self.cursor_path, cursor)?;
             }
         }
+    }
+
+    /// One more try for each failed path with attempts left in this process.
+    async fn retry_failed(
+        &self,
+        pusher: &Pusher,
+        failed: &mut BTreeSet<String>,
+        attempts: &mut HashMap<String, u32>,
+    ) -> Result<()> {
+        let due: Vec<String> = failed
+            .iter()
+            .filter(|p| attempts.get(*p).copied().unwrap_or(0) < self.max_attempts)
+            .cloned()
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        for path in due {
+            match self.push_path(pusher, &path).await {
+                Ok(()) => {
+                    tracing::info!(path, "pushed on retry");
+                    attempts.remove(&path);
+                    failed.remove(&path);
+                }
+                Err(e) => {
+                    let count = attempts.entry(path.clone()).or_default();
+                    *count += 1;
+                    if *count >= self.max_attempts {
+                        tracing::error!(
+                            path,
+                            attempts = *count,
+                            "giving up on this path until the watcher restarts or \
+                             `garret watch-store --drain` runs: {e:#}"
+                        );
+                    } else {
+                        tracing::warn!(path, attempts = *count, "retry failed: {e:#}");
+                    }
+                }
+            }
+        }
+        write_failed(&failed_path(&self.cursor_path), failed)
+    }
+
+    /// Pushes everything validated after the cursor as of now, and every path
+    /// on the failed list, then stops: CI's end-of-job step, after the daemon
+    /// that pushed during the build is killed. Returns the paths that still
+    /// failed, which stay on the list; the cursor ends at the newest path seen.
+    pub async fn drain(&self, pusher: &Pusher, full_sync: bool) -> Result<Vec<String>> {
+        let conn = open_nix_db(&self.nix_db)?;
+        let target = max_id(&conn)?;
+        let mut cursor = match read_cursor(&self.cursor_path) {
+            Some(cursor) => cursor,
+            None if full_sync => 0,
+            // Nothing recorded where to start, so "nothing to push" would be
+            // a guess — and a green CI step that pushed nothing.
+            None => bail!(
+                "no Watcher Cursor at {:?}: start `garret watch-store` before building \
+                 so it records where to drain from, or pass --full-sync",
+                self.cursor_path
+            ),
+        };
+        let failed_file = failed_path(&self.cursor_path);
+        let mut failed = read_failed(&failed_file);
+        let mut todo: Vec<String> = failed.iter().cloned().collect();
+        'walk: while cursor < target {
+            let batch = paths_after(&conn, cursor, 500)?;
+            if batch.is_empty() {
+                break;
+            }
+            for entry in batch {
+                if entry.id > target {
+                    break 'walk;
+                }
+                cursor = entry.id;
+                if self.filters.should_skip(&entry).is_none() && !failed.contains(&entry.path) {
+                    todo.push(entry.path);
+                }
+            }
+        }
+        tracing::info!(cursor, paths = todo.len(), "draining");
+
+        // Oldest first, so dependencies tend to land before their referrers.
+        let results: Vec<(String, Result<()>)> = stream::iter(todo)
+            .map(|path| async move {
+                let result = self.push_path(pusher, &path).await;
+                (path, result)
+            })
+            .buffered(pusher.jobs.max(1))
+            .collect()
+            .await;
+        for (path, result) in results {
+            match result {
+                Ok(()) => {
+                    failed.remove(&path);
+                }
+                Err(e) => {
+                    tracing::error!(path, "push failed: {e:#}");
+                    failed.insert(path);
+                }
+            }
+        }
+        write_failed(&failed_file, &failed)?;
+        write_cursor(&self.cursor_path, cursor)?;
+        Ok(failed.into_iter().collect())
     }
 
     async fn push_path(&self, pusher: &Pusher, path: &str) -> Result<()> {
@@ -274,8 +426,8 @@ impl Watcher {
             return Ok(());
         }
         // The daemon reports per path into the journal and draws no bar. A
-        // failure must surface as an error here, because the watcher's retry
-        // and skip-list logic is what decides whether the cursor advances.
+        // failure must surface as an error here: it is what puts the path on
+        // the failed list.
         let summary = pusher
             .push_all(missing, &crate::push::Report::plain())
             .await;
@@ -383,6 +535,27 @@ mod tests {
         assert_eq!(read_cursor(&file), None);
         write_cursor(&file, 42).unwrap();
         assert_eq!(read_cursor(&file), Some(42));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The failed list is what a restart or a drain retries, so it must
+    /// survive the process, and an empty one must not linger as a file.
+    #[test]
+    fn the_failed_list_lives_beside_the_cursor_and_goes_when_empty() {
+        let dir = std::env::temp_dir().join(format!("garret-failed-{}", std::process::id()));
+        let file = failed_path(&dir.join("watcher-cursor"));
+        assert_eq!(file, dir.join("watcher-cursor.failed"));
+        assert!(read_failed(&file).is_empty());
+
+        let list: BTreeSet<String> = ["/nix/store/bbb-y", "/nix/store/aaa-x"]
+            .map(String::from)
+            .into();
+        write_failed(&file, &list).unwrap();
+        assert_eq!(read_failed(&file), list);
+
+        write_failed(&file, &BTreeSet::new()).unwrap();
+        assert!(!file.exists());
+        write_failed(&file, &BTreeSet::new()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

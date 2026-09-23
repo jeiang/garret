@@ -471,6 +471,49 @@ echo "  enqueue woke the watcher; pushed well inside the poll interval"
   echo "enqueue must exit 0 when the socket is dead"; exit 1; }
 echo "  enqueue exits 0 against a dead socket"
 
+say "drain: CI's last step pushes what the watcher has not, and fails loudly"
+# The CI shape (spec 06): watch-store runs through the build, is killed, and
+# `watch-store --drain` pushes the rest. A 300 s poll keeps this daemon from
+# pushing anything itself, so the path below is the drain's alone.
+sed -e 's/poll_interval_secs = 1/poll_interval_secs = 300/' -e 's/watcher-cursor/drain-cursor/' \
+  "$root/client.toml" > "$root/client-drain.toml"
+echo "socket_path = \"$root/drain.sock\"" >> "$root/client-drain.toml"
+drain() { "$bin"/garret --config "$root/client-drain.toml" watch-store --drain; }
+# No cursor means nothing recorded where the job began: refuse, don't guess.
+if drain > "$root/drain-nocursor.out" 2>&1; then
+  echo "a drain with no cursor must fail"; cat "$root/drain-nocursor.out"; exit 1
+fi
+grep -q "no Watcher Cursor" "$root/drain-nocursor.out"
+"$bin"/garret --config "$root/client-drain.toml" watch-store > "$root/drain-watch.log" 2>&1 &
+drain_watch_pid=$!
+for _ in $(seq 50); do [ -s "$root/drain-cursor" ] && break; sleep 0.1; done
+[ -s "$root/drain-cursor" ] || {
+  echo "watch-store never wrote its cursor"; cat "$root/drain-watch.log"; exit 1; }
+drained=$(fixture drained)
+drained_hash=$(basename "$drained" | cut -c1-32)
+kill $drain_watch_pid
+wait $drain_watch_pid 2>/dev/null || true
+if curl -sf "$puller_url/$drained_hash.narinfo" >/dev/null 2>&1; then
+  echo "the daemon pushed the path; this stage needs the drain to"; exit 1
+fi
+# A Pusher that cannot be reached: the drain must fail and keep the path.
+sed 's|^endpoint = .*|endpoint = "http://127.0.0.1:1"|' "$root/client-drain.toml" \
+  > "$root/client-drain-dead.toml"
+if "$bin"/garret --config "$root/client-drain-dead.toml" watch-store --drain \
+  > "$root/drain-dead.out" 2>&1; then
+  echo "a drain that pushed nothing must fail"; cat "$root/drain-dead.out"; exit 1
+fi
+grep -q "path(s) failed to push" "$root/drain-dead.out"
+grep -qx "$drained" "$root/drain-cursor.failed" || {
+  echo "the failed path is not on the failed list"; cat "$root/drain-dead.out"; exit 1; }
+# The next drain retries it from the list, though the cursor is past it.
+drain | tee "$root/drain.out"
+curl -sf "$puller_url/$drained_hash.narinfo" >/dev/null || {
+  echo "the drain never pushed the path"; exit 1; }
+[ ! -e "$root/drain-cursor.failed" ] || {
+  echo "a pushed path stayed on the failed list"; cat "$root/drain-cursor.failed"; exit 1; }
+echo "  refused without a cursor, failed against a dead Pusher, then pushed from the failed list"
+
 say "admin socket"
 admin() { "$bin"/garret-admin --socket "$root/admin.sock" "$@"; }
 admin status | tee "$root/status.out"

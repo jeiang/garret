@@ -47,7 +47,9 @@ paths the cache is missing, and pushes only those.
 
 The store watcher's persisted position in the local Nix store's history of
 validated paths. Everything after the cursor is yet to be pushed; an old
-cursor is a backlog, not an error.
+cursor is a backlog, not an error. A path the cursor passed whose push failed
+is kept on the **failed list** beside it until a retry, restart or drain
+pushes it.
 
 ## Quota
 

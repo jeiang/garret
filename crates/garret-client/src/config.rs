@@ -65,8 +65,9 @@ pub struct Watch {
     /// Substring patterns; a matching store path is never pushed.
     #[serde(default)]
     pub exclude_patterns: Vec<String>,
-    /// Failed pushes per path before it lands on the skip-list and the
-    /// watcher moves on.
+    /// Push attempts per path in one watcher process, the first included,
+    /// before it stops retrying and leaves the path on the failed list for a
+    /// restart or a drain.
     #[serde(default = "max_attempts")]
     pub max_attempts: u32,
     /// Where the wake socket listens; `garret enqueue` (the post-build-hook

@@ -64,6 +64,11 @@ enum Command {
         /// Walk the whole store history instead of starting at the newest path
         #[arg(long)]
         full_sync: bool,
+        /// Push everything built since the cursor, and earlier failures, then
+        /// exit; non-zero if any path failed. CI's end-of-job step, run after
+        /// stopping the watch-store that pushed during the build.
+        #[arg(long)]
+        drain: bool,
     },
     /// Wake a running watch-store so it polls now (the post-build-hook stub).
     /// Exits 0 unconditionally: a hook must never block or fail the build.
@@ -240,7 +245,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::WatchStore { full_sync } => {
+        Command::WatchStore { full_sync, drain } => {
             let cfg = cfg.unwrap();
             // A daemon authenticates as itself, not as whoever last logged in.
             let tokens = match &cfg.watch.credentials_file {
@@ -287,7 +292,19 @@ async fn main() -> Result<()> {
                 max_attempts: cfg.watch.max_attempts,
                 socket_path: cfg.watch.socket_path.clone().into(),
             };
-            watcher.run(&pusher, full_sync).await?;
+            if !drain {
+                watcher.run(&pusher, full_sync).await?;
+            } else {
+                let failed = watcher.drain(&pusher, full_sync).await?;
+                if !failed.is_empty() {
+                    anyhow::bail!(
+                        "{} path(s) failed to push and stay on the failed list:\n  {}",
+                        failed.len(),
+                        failed.join("\n  ")
+                    );
+                }
+                eprintln!("drained: nothing left to push");
+            }
         }
 
         Command::Enqueue { paths, socket } => enqueue(paths, &socket).await,
