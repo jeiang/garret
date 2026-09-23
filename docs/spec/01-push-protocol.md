@@ -26,7 +26,7 @@ Body layout (streamed, never buffered whole):
 1. A 4-byte little-endian length prefix.
 2. A JSON metadata preamble of that length: `storePath`, `narHash`,
    `narSize`, `references` (**full store paths**), `deriver?`, `ca?`.
-3. The zstd-compressed NAR stream (single frame) to EOF.
+3. The zstd-compressed NAR stream (one or more complete frames) to EOF.
 
 The length-prefixed preamble avoids header-size limits for long reference
 lists while keeping the request a single streamed body.

@@ -194,6 +194,13 @@ mod tests {
         (passed, nar.refused)
     }
 
+    /// Asserts the stream was refused, and by the check named in `why`: a
+    /// refusal for some other reason must not satisfy a test.
+    fn assert_refused(refused: Option<String>, why: &str) {
+        let reason = refused.expect("the NAR was accepted");
+        assert!(reason.contains(why), "refused for {reason:?}, not {why:?}");
+    }
+
     #[tokio::test]
     async fn an_honest_nar_passes_through_untouched() {
         let (_, compressed, hash, size) = nar();
@@ -220,7 +227,7 @@ mod tests {
         let (_, compressed, _, size) = nar();
         let other = format!("sha256:{}", nix_base32::encode(&Sha256::digest(b"other")));
         let (_, refused) = run(&compressed, &other, size).await;
-        assert!(refused.is_some());
+        assert_refused(refused, "NarHash is");
     }
 
     #[tokio::test]
@@ -228,21 +235,24 @@ mod tests {
         let (_, compressed, hash, size) = nar();
         // Claimed too small: refused as soon as the NAR outgrows it.
         let (passed, refused) = run(&compressed, &hash, size - 1).await;
-        assert!(refused.is_some());
+        assert_refused(refused, "larger than its claimed NarSize");
         assert!(passed.len() < compressed.len());
         // Claimed too large: refused at end of stream.
-        assert!(run(&compressed, &hash, size + 1).await.1.is_some());
+        assert_refused(run(&compressed, &hash, size + 1).await.1, "NarSize is");
     }
 
     #[tokio::test]
     async fn a_truncated_or_corrupt_stream_is_refused() {
         let (_, compressed, hash, size) = nar();
         let truncated = &compressed[..compressed.len() - 10];
-        assert!(run(truncated, &hash, size).await.1.is_some());
+        assert_refused(run(truncated, &hash, size).await.1, "mid-frame");
         let mut trailing = compressed.clone();
         trailing.extend_from_slice(b"not zstd");
-        assert!(run(&trailing, &hash, size).await.1.is_some());
-        assert!(run(b"", &hash, size).await.1.is_some());
+        assert_refused(
+            run(&trailing, &hash, size).await.1,
+            "not a valid zstd stream",
+        );
+        assert_refused(run(b"", &hash, size).await.1, "mid-frame");
     }
 
     #[tokio::test]
@@ -253,6 +263,6 @@ mod tests {
         encoder.window_log(WINDOW_LOG_MAX + 1).unwrap();
         std::io::Write::write_all(&mut encoder, &nar).unwrap();
         let wide = encoder.finish().unwrap();
-        assert!(run(&wide, &hash, size).await.1.is_some());
+        assert_refused(run(&wide, &hash, size).await.1, "not a valid zstd stream");
     }
 }

@@ -759,10 +759,10 @@ mod tests {
             |bytes: &[u8]| format!("sha256:{}", nix_base32::encode(&Sha256::digest(bytes)));
         let size = nar.len() as i64;
         let claims = [
-            ("wrong NarHash", hash_of(b"another NAR"), size),
-            ("wrong NarSize", hash_of(&nar), size + 1),
+            ("wrong NarHash", hash_of(b"another NAR"), size, "NarHash is"),
+            ("wrong NarSize", hash_of(&nar), size + 1, "NarSize is"),
         ];
-        for (case, nar_hash, nar_size) in claims {
+        for (case, nar_hash, nar_size, why) in claims {
             let mut p = preamble();
             (p.nar_hash, p.nar_size) = (nar_hash, nar_size);
             let mut body = p.to_framed().unwrap();
@@ -776,6 +776,7 @@ mod tests {
             .await
             .expect_err(case);
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{case}: {}", err.1);
+            assert!(err.1.contains(why), "{case}: {}", err.1);
         }
     }
 }
