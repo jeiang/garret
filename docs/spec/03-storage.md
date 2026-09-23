@@ -37,6 +37,10 @@ Defaults, all configurable:
   flight just serializes the parts.
 - On any upload error, stop the parts still uploading, then abort the
   multipart immediately so parts free.
+- A body that sends nothing for **60 s** is an upload error like any
+  other (spec [01](01-push-protocol.md#backpressure)): the multipart
+  aborts and the part slot frees, so a stalled client cannot hold a slot
+  indefinitely.
 - Every S3 call carries an **overall operation deadline** —
   `[s3] operation_timeout_secs`, default **60** — covering connect,
   transfer, and any SDK-internal retries (ticket 27). Overall rather
