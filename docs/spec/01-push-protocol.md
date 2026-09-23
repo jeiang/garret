@@ -37,6 +37,24 @@ Negotiation (`missing-paths`) still speaks hashes; only the upload
 preamble needs the name. (Corrected at M1: the original spec said hashes
 here, which made a valid narinfo impossible to produce.)
 
+### Validation
+
+Every field ends up in the DB, the narinfo, the signed fingerprint or an
+S3 key, so the server accepts only what nix itself would produce and
+answers anything else with `400`:
+
+- `{storePathHash}` is exactly 32 nix-base32 characters. It is checked
+  before the body is read — it keys the DB row and the blob.
+- `storePath` is exactly `{store_dir}/{storePathHash}-{name}`, with a
+  name of 1–211 characters from `[A-Za-z0-9+-._?=]`.
+- Each reference and the `deriver` are store paths under `store_dir` by
+  the same rule.
+- `ca` is a single line. It and `deriver` are printed into the narinfo
+  but not signed, so a newline would inject unsigned narinfo lines.
+
+The preamble is checked as soon as it is parsed, before any NAR byte is
+stored.
+
 ### Compression and verification
 
 - The **client** compresses (zstd, default level 3, configurable).

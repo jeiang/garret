@@ -34,9 +34,11 @@ pub struct Object {
     pub pushed_by: Option<String>,
 }
 
-/// `<hash>-<name>` → hash. Store path basenames are hash-prefixed by construction.
+/// `<hash>-<name>` → hash. Store path basenames are hash-prefixed by
+/// construction; anything else (a row from before the Pusher validated its
+/// input) yields a hash that matches nothing rather than a panic mid-browse.
 pub fn hash_of(basename: &str) -> &str {
-    &basename[..basename.len().min(32)]
+    basename.get(..32).unwrap_or(basename)
 }
 
 const SCHEMA: &str = r#"
@@ -444,6 +446,15 @@ mod tests {
         let conn = open(":memory:", true).unwrap();
         migrate(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn hash_of_survives_a_multibyte_character_at_the_hash_boundary() {
+        // Byte 32 falls inside `é`: slicing there used to panic the Puller's
+        // browse tree while it held the connection mutex.
+        let base = format!("{}é-x", "a".repeat(31));
+        assert!(!crate::nix_base32::is_store_hash(hash_of(&base)));
+        assert_eq!(hash_of(&format!("{}-x", "a".repeat(32))), "a".repeat(32));
     }
 
     #[test]
