@@ -91,7 +91,8 @@ Notes:
 - `total_bytes` is reconciled against `SUM(file_size)` at each GC pass.
 - `pushed_at` is set on insert and refreshed by every Negotiation that
   finds the object present, debounced to one write per hour. It is the
-  age `garret-admin prune` judges by (spec 05). Databases from before
+  age `garret-admin prune` judges by, and GC leaves anything pushed in
+  the last day alone (the push grace, spec 05). Databases from before
   the column existed are migrated with `pushed_at = created_at`.
 - A re-push rewrites the object's row in place (an upsert), never
   delete-then-insert: `pins` cascade on delete, so `INSERT OR REPLACE`

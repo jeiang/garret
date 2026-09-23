@@ -543,6 +543,15 @@ grep -q "quota_bytes = 1000" "$root/pusher-gc.toml"
 "$bin"/garret-pusher "$root/pusher-gc.toml" &
 wait_for pusher "$pusher_url/api/v1/missing-paths"
 
+# Everything here was pushed or negotiated minutes ago, inside the push grace
+# (spec 05): a push may still be relying on it, so GC alarms rather than
+# evicts. Backdated, it is ordinary LRU fodder again.
+admin gc run | tee "$root/gcrun-fresh.out"
+grep -q "evicted 0 object" "$root/gcrun-fresh.out"
+grep -q "pushed in the last day" "$root/gcrun-fresh.out"
+echo "  nothing inside the push grace was evicted"
+backdate "SELECT store_path_hash FROM objects"
+
 # GC on demand through the admin socket, rather than waiting on the timer.
 admin gc run | tee "$root/gcrun.out"
 grep -q "evicted" "$root/gcrun.out"

@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
                 if candidates_exhausted {
                     println!(
                         "warning: still above the low watermark with nothing evictable — \
-                         everything left is referenced"
+                         everything left is referenced, pinned, or pushed in the last day"
                     );
                 }
             }
