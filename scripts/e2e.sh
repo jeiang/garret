@@ -487,9 +487,15 @@ kill -TERM $pusher_pid
 wait $upload_pid || true
 echo "  upload across SIGTERM -> $(cat "$root/drain.code") $(cat "$root/drain.out")"
 [ "$(cat "$root/drain.code")" = "201" ] || { echo "SIGTERM cut off an in-flight upload"; exit 1; }
-pusher_status=0
-wait $pusher_pid || pusher_status=$?
-[ "$pusher_status" = "0" ] || { echo "pusher exited $pusher_status after draining"; exit 1; }
+if [ -n "${GARRET_WRAP:-}" ]; then
+  # Not our child under a forking wrapper: its status is out of reach, but
+  # the exit is not.
+  while kill -0 $pusher_pid 2>/dev/null; do sleep 0.3; done
+else
+  pusher_status=0
+  wait $pusher_pid || pusher_status=$?
+  [ "$pusher_status" = "0" ] || { echo "pusher exited $pusher_status after draining"; exit 1; }
+fi
 curl -sf "$puller_url/$drain_hash.narinfo" >/dev/null \
   || { echo "the drained upload was not committed"; exit 1; }
 garage -c "$root/garage.toml" bucket info garret | tee "$root/bucket-info.out" | grep -i multipart

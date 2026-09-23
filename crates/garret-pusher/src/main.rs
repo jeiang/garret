@@ -240,16 +240,27 @@ async fn serve_until_stopped(
     }
     // The Pusher is the bucket's only writer and is exiting, so every open
     // multipart is one of the uploads being cut off here: abort them all.
+    // The cut-off handlers are still running until `main` returns, so one
+    // may open a multipart after a listing, or finish one before its abort
+    // (which fails the pass): list again until a pass finds nothing.
     tracing::warn!("uploads still in flight after {DRAIN:?}: aborting their multiparts");
-    match tokio::time::timeout(
-        ABORT_BUDGET,
-        storage.abort_stale_multiparts(Duration::ZERO, &InFlight::new()),
-    )
-    .await
-    {
-        Ok(Ok(n)) => tracing::info!("aborted {n} multipart upload(s)"),
-        Ok(Err(e)) => tracing::error!("aborting multiparts on shutdown failed: {e:#}"),
-        Err(_) => tracing::error!("aborting multiparts on shutdown timed out"),
+    let abort_all = async {
+        loop {
+            match storage
+                .abort_stale_multiparts(Duration::ZERO, &InFlight::new())
+                .await
+            {
+                Ok(0) => return,
+                Ok(n) => tracing::info!("aborted {n} multipart upload(s)"),
+                Err(e) => {
+                    tracing::warn!("aborting multiparts on shutdown: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(ABORT_BUDGET, abort_all).await.is_err() {
+        tracing::error!("multiparts still open after {ABORT_BUDGET:?}: left to the orphan sweep");
     }
     Ok(())
 }
