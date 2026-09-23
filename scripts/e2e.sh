@@ -418,7 +418,9 @@ for h in "$root_hash" "$leaf_hash"; do
   fi
 done
 echo "  dry run lists, future cutoff matches nothing, --apply deletes the subject's pushes"
-garret push "$path" >/dev/null
+# Everything the token pushed is gone; put it back so the GC stage below
+# still has the big path to evict and the watched closures to check.
+garret push "$path" "$big" "$jsonpath" "$watched" "$woken" >/dev/null
 
 say "benchmark harness"
 # All three scenarios, wired end to end: push seeds the corpus (count 12),

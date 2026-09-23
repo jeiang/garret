@@ -316,6 +316,9 @@ mod tests {
         push(&mut conn, &b, leaked, 200);
         push(&mut conn, &c, &format!("{leaked}-other"), 200);
         push(&mut conn, &d, "https://issuer#someone-else", 300);
+        // Negotiation refreshes pushed_at, never who pushed first or when.
+        conn.execute("UPDATE objects SET pushed_at = 500", [])
+            .unwrap();
 
         let hashes = |since| -> Vec<String> {
             pushed_by(&conn, leaked, since)
