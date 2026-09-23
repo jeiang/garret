@@ -115,6 +115,12 @@ accepted=$(metric "$pusher_metrics_port" garret_uploads_accepted_total)   # 2 cl
 echo "  uploads accepted: $accepted"
 [ "$accepted" = "3" ] || { echo "expected 3 accepted uploads, got $accepted"; exit 1; }
 [ "$(metric "$pusher_metrics_port" garret_uploads_limit)" = "4" ] || { echo "cap not exported"; exit 1; }
+# GC ticks every second here, far below quota. A tick with nothing to evict
+# is still a successful run: a staleness alert on this must stay quiet.
+gc_ok=$(metric "$pusher_metrics_port" garret_gc_last_success_timestamp)
+echo "  gc last success: ${gc_ok:-never}"
+[ -n "$gc_ok" ] && [ "${gc_ok%.*}" -ge $(( $(date +%s) - 60 )) ] \
+  || { echo "GC success timestamp is not fresh while nothing needs evicting"; exit 1; }
 if curl -sf "http://127.0.0.1:$pusher_metrics_port/metrics" | grep -q '^garret_narinfo_requests_total'; then
   echo "pusher must not expose puller metrics"; exit 1
 fi
@@ -536,6 +542,15 @@ sed 's/^quota_bytes = .*/quota_bytes = 1000/; s/^interval_secs = .*/interval_sec
 grep -q "quota_bytes = 1000" "$root/pusher-gc.toml"
 "$bin"/garret-pusher "$root/pusher-gc.toml" &
 wait_for pusher "$pusher_url/api/v1/missing-paths"
+
+# Everything here was pushed or negotiated minutes ago, inside the push grace
+# (spec 05): a push may still be relying on it, so GC alarms rather than
+# evicts. Backdated, it is ordinary LRU fodder again.
+admin gc run | tee "$root/gcrun-fresh.out"
+grep -q "evicted 0 object" "$root/gcrun-fresh.out"
+grep -q "pushed in the last day" "$root/gcrun-fresh.out"
+echo "  nothing inside the push grace was evicted"
+backdate "SELECT store_path_hash FROM objects"
 
 # GC on demand through the admin socket, rather than waiting on the timer.
 admin gc run | tee "$root/gcrun.out"

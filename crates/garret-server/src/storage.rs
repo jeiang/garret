@@ -650,7 +650,6 @@ mod tests {
         let part = read_part(&mut body, &mut None, 1024).await.unwrap();
         assert_eq!(part.len(), 8);
     }
-
     /// Just enough S3 on a loopback port. Every call succeeds, except that
     /// `DeleteObjects` answers inside a 200 the way S3 and Garage do: keys
     /// containing `denied` fail, and keys containing `gone` come back as

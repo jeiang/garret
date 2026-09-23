@@ -38,7 +38,8 @@ pub struct PassResult {
     pub evicted: usize,
     pub bytes_freed: i64,
     /// True when usage is still above the low watermark but nothing is
-    /// evictable — everything left is referenced. Alarm, do not break closures.
+    /// evictable — everything left is referenced, pinned, or pushed within
+    /// the push grace. Alarm, do not break closures.
     pub candidates_exhausted: bool,
 }
 
@@ -59,16 +60,18 @@ impl Gc {
     }
 
     /// Every tick is a cheap counter check; eviction only happens past the
-    /// high watermark (spec 05).
+    /// high watermark (spec 05). A check that finds nothing to evict is a
+    /// successful run too: the timestamp says GC is alive, not that it evicted.
     pub async fn tick(&self) -> Result<Option<PassResult>> {
         let usage = {
             let conn = self.conn.lock().unwrap();
-            db::total_bytes(&conn)?
+            counted("pass", db::total_bytes(&conn))?
         };
         metrics::gauge!("garret_gc_usage_bytes").set(usage as f64);
         metrics::gauge!("garret_gc_quota_bytes").set(self.cfg.quota_bytes as f64);
 
         if usage < self.cfg.high() {
+            metrics::gauge!("garret_gc_last_success_timestamp").set(now() as f64);
             return Ok(None);
         }
         Ok(Some(self.run().await?))
@@ -80,6 +83,10 @@ impl Gc {
     /// usage it left behind.
     pub async fn run(&self) -> Result<PassResult> {
         let _pass = self.pass.lock().await;
+        counted("pass", self.evict().await)
+    }
+
+    async fn evict(&self) -> Result<PassResult> {
         let started = Instant::now();
         let mut result = PassResult::default();
         let low = self.cfg.low();
@@ -91,9 +98,10 @@ impl Gc {
         };
 
         while usage > low {
+            let at = now();
             let candidates = {
                 let conn = self.conn.lock().unwrap();
-                db::evictable(&conn, BATCH, now())?
+                db::evictable(&conn, BATCH, at)?
             };
             if candidates.is_empty() {
                 result.candidates_exhausted = true;
@@ -101,7 +109,8 @@ impl Gc {
                 tracing::error!(
                     usage,
                     low,
-                    "GC cannot reach the low watermark: everything left is referenced"
+                    "GC cannot reach the low watermark: everything left is referenced, \
+                     pinned, or pushed within the last day"
                 );
                 break;
             }
@@ -109,10 +118,14 @@ impl Gc {
             let mut keys = Vec::with_capacity(candidates.len());
             for (hash, _) in &candidates {
                 // Row first, blob second: a failed blob delete leaves an orphan
-                // for the sweep, never a row without a blob (spec 05).
-                let freed = {
+                // for the sweep, never a row without a blob (spec 05). A
+                // candidate negotiated or referenced since the snapshot stays;
+                // the next query no longer returns it.
+                let Some(freed) = ({
                     let mut conn = self.conn.lock().unwrap();
-                    db::delete_object(&mut conn, hash)?
+                    db::evict_object(&mut conn, hash, at)?
+                }) else {
+                    continue;
                 };
                 usage -= freed;
                 result.evicted += 1;
@@ -142,6 +155,10 @@ impl Gc {
     /// are only touched past `orphan_grace`, so an upload in progress — whose
     /// row is written only after the blob completes — is never swept away.
     pub async fn sweep_orphans(&self) -> Result<usize> {
+        counted("sweep", self.sweep().await)
+    }
+
+    async fn sweep(&self) -> Result<usize> {
         let grace = Duration::from_secs(self.cfg.orphan_grace_secs);
         let known = {
             let conn = self.conn.lock().unwrap();
@@ -168,6 +185,15 @@ impl Gc {
         }
         Ok(count)
     }
+}
+
+/// Counts a failed pass or sweep (spec 08): the timer loop only logs them,
+/// and a log line is nothing an alert can watch.
+fn counted<T>(phase: &'static str, result: Result<T>) -> Result<T> {
+    if result.is_err() {
+        metrics::counter!("garret_gc_failures_total", "phase" => phase).increment(1);
+    }
+    result
 }
 
 /// Blob keys with no DB row, past both guards: an upload in the in-flight
@@ -251,18 +277,90 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let storage = Storage::new(&garret_server::config::S3Config {
+        (storage_at(&endpoint, 30).await, held_rx, release_tx)
+    }
+
+    async fn storage_at(endpoint: &str, timeout_secs: u64) -> Storage {
+        Storage::new(&garret_server::config::S3Config {
             bucket: "test".into(),
-            endpoint_url: Some(endpoint),
+            endpoint_url: Some(endpoint.into()),
             region: Some("us-east-1".into()),
             path_style: true,
             access_key_id: Some("x".into()),
             secret_access_key: Some("x".into()),
-            operation_timeout_secs: 30,
+            operation_timeout_secs: timeout_secs,
         })
         .await
-        .unwrap();
-        (storage, held_rx, release_tx)
+        .unwrap()
+    }
+
+    /// The process-wide recorder, installed on first use and shared by every
+    /// test in this binary.
+    static METRICS: std::sync::LazyLock<metrics_exporter_prometheus::PrometheusHandle> =
+        std::sync::LazyLock::new(|| garret_server::metrics::install("garret-pusher").unwrap());
+
+    fn gc_failures(phase: &str) -> u64 {
+        let series = format!("garret_gc_failures_total{{phase=\"{phase}\"}} ");
+        METRICS
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix(&series)?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn failed_passes_and_sweeps_are_counted() {
+        // Failures used to be logged only, which no alert can watch.
+        let (passes, sweeps) = (gc_failures("pass"), gc_failures("sweep"));
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        db::insert_object(&mut conn, &object(&"a".repeat(32), 100, &[]), 0).unwrap();
+        let gc = Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage_at("http://127.0.0.1:1", 1).await,
+            InFlight::new(),
+            config(100),
+        );
+
+        // Over quota, so the pass evicts and then fails on the blob delete.
+        assert!(gc.run().await.is_err());
+        assert!(gc.sweep_orphans().await.is_err());
+        assert!(gc_failures("pass") > passes, "failed pass not counted");
+        assert!(gc_failures("sweep") > sweeps, "failed sweep not counted");
+    }
+
+    #[tokio::test]
+    async fn a_pass_keeps_what_negotiation_just_reported_present_and_alarms() {
+        // Over quota with one candidate, d. A push negotiates d, is told it
+        // is present, and will upload d's referrers next: evicting d now
+        // would leave them with a hole. The pass must stop and alarm instead.
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let d = "d".repeat(32);
+        db::insert_object(&mut conn, &object(&d, 100, &[]), 0).unwrap();
+        let reported = db::missing(&mut conn, std::slice::from_ref(&d), now()).unwrap();
+        assert!(reported.is_empty(), "d should be reported present");
+        let gc = Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage_at("http://127.0.0.1:1", 1).await,
+            InFlight::new(),
+            config(100),
+        );
+
+        let pass = gc.run().await.unwrap();
+        assert!(db::exists(&gc.conn.lock().unwrap(), &d).unwrap());
+        assert_eq!(pass.evicted, 0);
+        assert!(pass.candidates_exhausted, "over quota with no alarm");
+    }
+
+    fn config(quota_bytes: u64) -> GcConfig {
+        GcConfig {
+            quota_bytes,
+            high_watermark: 0.95,
+            low_watermark: 0.85,
+            interval_secs: 300,
+            orphan_grace_secs: 86400,
+        }
     }
 
     fn object(hash: &str, size: i64, refs: &[&str]) -> db::Object {
@@ -301,13 +399,7 @@ mod tests {
             Arc::new(Mutex::new(conn)),
             storage,
             InFlight::new(),
-            GcConfig {
-                quota_bytes: 100,
-                high_watermark: 0.95,
-                low_watermark: 0.85,
-                interval_secs: 300,
-                orphan_grace_secs: 86400,
-            },
+            config(100),
         ));
         let run = |gc: Arc<Gc>| tokio::spawn(async move { gc.run().await.unwrap() });
 
