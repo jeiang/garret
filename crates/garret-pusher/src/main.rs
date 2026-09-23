@@ -278,8 +278,8 @@ async fn missing_paths(
     Json(hashes): Json<Vec<String>>,
 ) -> Result<Json<Vec<String>>, Error> {
     let missing = {
-        let conn = state.conn.lock().unwrap();
-        db::missing(&conn, &hashes)?
+        let mut conn = state.conn.lock().unwrap();
+        db::missing(&mut conn, &hashes, garret_server::now())?
     };
     metrics::histogram!("garret_negotiation_batch_size").record(hashes.len() as f64);
     if !hashes.is_empty() {

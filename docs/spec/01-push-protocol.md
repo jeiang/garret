@@ -13,7 +13,9 @@ token (see [04-auth.md](04-auth.md)).
 
 Request: JSON array of store path hashes (the closure, or any batch).
 Response: the subset not present in the cache. This is the only
-pre-upload round-trip.
+pre-upload round-trip. Each present path's `pushed_at` is refreshed
+(debounced, spec 02), so re-pushing an unchanged closure keeps it young
+for `garret-admin prune` (spec 05).
 
 ## Upload
 
