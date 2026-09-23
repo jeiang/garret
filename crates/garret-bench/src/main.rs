@@ -22,10 +22,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
 use garret_common::Preamble;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Parser)]
 #[command(name = "garret-bench", about = "Load-test a garret deployment")]
@@ -471,8 +473,10 @@ async fn run_stream(
         let mut failed = 0u64;
         for rep in 0..reps {
             let entry = corpus::stream_entry(cli.seed, size as usize, rep, salt);
+            // A second pass over the generated body, kept out of the timing.
+            let nar_hash = nar_hash(entry.chunks(RAW_BLOCK));
             let started = Instant::now();
-            match push_streaming(http, &cli.endpoint, token, &entry).await {
+            match push_streaming(http, &cli.endpoint, token, &entry, &nar_hash).await {
                 Ok(()) => walls.push(started.elapsed().as_secs_f64()),
                 Err(e) => {
                     eprintln!("stream {} ({size} B) failed: {e:#}", entry.name);
@@ -620,18 +624,25 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[index.min(sorted.len() - 1)]
 }
 
-fn preamble_for(entry: &corpus::Entry) -> Preamble {
+/// The Pusher verifies the NarHash and NarSize (ADR-0010), so both are real.
+fn preamble_for(entry: &corpus::Entry, nar_hash: String) -> Preamble {
     Preamble {
         store_path: entry.store_path(),
-        // The server trusts the client's claimed NarHash on this
-        // single-tenant infrastructure (ADR-0002), so a synthetic one is
-        // exactly as valid here as a computed one.
-        nar_hash: format!("sha256:{}", "0".repeat(52)),
+        nar_hash,
         nar_size: entry.size as i64,
         references: vec![],
         deriver: None,
         ca: None,
     }
+}
+
+/// `sha256-<base64>` of the NAR, the spelling `nix path-info` reports.
+fn nar_hash(chunks: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
+    let mut hasher = Sha256::new();
+    for chunk in chunks {
+        hasher.update(chunk);
+    }
+    format!("sha256-{}", B64.encode(hasher.finalize()))
 }
 
 async fn push(
@@ -642,8 +653,9 @@ async fn push(
     level: i32,
     counters: &Counters,
 ) -> Result<()> {
-    let mut body = preamble_for(entry).to_framed()?;
-    body.extend(zstd::encode_all(entry.body().as_slice(), level).context("compressing")?);
+    let nar = entry.body();
+    let mut body = preamble_for(entry, nar_hash([&nar])).to_framed()?;
+    body.extend(zstd::encode_all(nar.as_slice(), level).context("compressing")?);
     counters
         .wire
         .fetch_add(body.len() as u64, Ordering::Relaxed);
@@ -690,20 +702,42 @@ async fn push(
     bail!("still shed or dropped after 6 attempts")
 }
 
-/// One PUT with a lazily generated body. No zstd: the server never
-/// decompresses — everything after the preamble streams to S3 as-is — so
-/// compressing random bytes would only measure this client's CPU.
+/// Largest zstd block, and the window the frame header declares.
+const RAW_BLOCK: usize = 128 * 1024;
+
+/// Wraps NAR chunks, each at most [`RAW_BLOCK`], in one zstd frame of raw
+/// (stored) blocks. The Pusher decompresses and verifies it like any other
+/// frame, but building it costs this client none of the CPU that
+/// compressing random bytes would — so the scenario still measures the
+/// server.
+fn raw_zstd_frame(chunks: impl Iterator<Item = Vec<u8>>) -> impl Iterator<Item = Vec<u8>> {
+    // A 3-byte little-endian block header: size, then type 0 (raw), then
+    // the last-block bit.
+    fn block(len: usize, last: bool) -> Vec<u8> {
+        (((len as u32) << 3) | u32::from(last)).to_le_bytes()[..3].to_vec()
+    }
+    // Magic, a descriptor with no content size or checksum, and a window
+    // descriptor of 2^17 bytes (one block).
+    let header = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38];
+    std::iter::once(header)
+        .chain(chunks.flat_map(|c| [block(c.len(), false), c]))
+        .chain(std::iter::once(block(0, true)))
+}
+
+/// One PUT with a lazily generated body, framed as raw zstd blocks. The
+/// NarHash is computed up front by the caller, outside the timed push.
 async fn push_streaming(
     http: &reqwest::Client,
     endpoint: &str,
     token: &str,
     entry: &corpus::Entry,
+    nar_hash: &str,
 ) -> Result<()> {
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
         // Rebuilt per attempt: a streamed body cannot be cloned.
-        let framed = preamble_for(entry).to_framed()?;
-        let chunks = std::iter::once(framed).chain(entry.chunks(256 * 1024));
+        let framed = preamble_for(entry, nar_hash.to_owned()).to_framed()?;
+        let chunks = std::iter::once(framed).chain(raw_zstd_frame(entry.chunks(RAW_BLOCK)));
         let body = reqwest::Body::wrap_stream(stream::iter(
             chunks.map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c))),
         ));

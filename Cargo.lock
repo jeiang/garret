@@ -1419,6 +1419,7 @@ name = "garret-bench"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "clap",
  "criterion",
@@ -1495,9 +1496,11 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

@@ -16,3 +16,8 @@ row⇒blob trivial, and push negotiation is path-level only. Revisit only if reb
 cost — and then with ≥1 MiB average chunks, never attic's 64 KiB.
 Evidence: `.scratch/spec/research/dedup-measurement.md` and
 `chunking-state-of-the-art.md`.
+
+The trusted-NarHash part is superseded by
+[ADR-0010](0010-pusher-verifies-nar-hash.md): the Pusher now
+decompresses and verifies the claimed NarHash and NarSize on the way
+through. Everything else here stands.

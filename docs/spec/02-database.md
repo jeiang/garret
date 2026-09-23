@@ -28,7 +28,7 @@ CREATE TABLE objects (
   store_path_hash   TEXT PRIMARY KEY,  -- 32-char base32, the object key
   store_path        TEXT NOT NULL,
   name              TEXT NOT NULL,     -- basename after the hash
-  nar_hash          TEXT NOT NULL,     -- client-claimed
+  nar_hash          TEXT NOT NULL,     -- client-claimed, server-verified
   nar_size          INTEGER NOT NULL,
   file_hash         TEXT NOT NULL,     -- server-computed over stored zstd
   file_size         INTEGER NOT NULL,
