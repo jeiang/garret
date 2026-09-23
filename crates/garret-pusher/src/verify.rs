@@ -69,6 +69,7 @@ impl<S> VerifiedNar<S> {
         let mut src = InBuffer::around(chunk);
         loop {
             let mut dst = OutBuffer::around(&mut self.scratch[..]);
+            let consumed = src.pos();
             let hint = self
                 .decoder
                 .run(&mut src, &mut dst)
@@ -83,7 +84,13 @@ impl<S> VerifiedNar<S> {
                 ));
             }
             self.hasher.update(out);
-            self.frame_done = hint == 0;
+            // Only a call that did something says where the frame stands: an
+            // idle call at a frame boundary (a drain after a full buffer, an
+            // empty chunk) reports the header of a next frame that never
+            // comes, and would refuse an honest NAR.
+            if src.pos() > consumed || !out.is_empty() {
+                self.frame_done = hint == 0;
+            }
             // Done once the chunk is consumed and the decoder had room to
             // spare, so it holds no more output.
             if src.pos() == chunk.len() && out.len() < SCRATCH {
@@ -191,6 +198,19 @@ mod tests {
     async fn an_honest_nar_passes_through_untouched() {
         let (_, compressed, hash, size) = nar();
         let (passed, refused) = run(&compressed, &hash, size).await;
+        assert_eq!(refused, None);
+        assert_eq!(passed, compressed);
+    }
+
+    /// A NAR that ends exactly on a 128 KiB output buffer: the decoder is
+    /// drained once more, idle, at the frame boundary. That must not read as
+    /// "mid-frame" (about 1 in 16k real NARs is sized like this).
+    #[tokio::test]
+    async fn an_honest_nar_ending_on_a_buffer_boundary_passes() {
+        let nar = vec![b'n'; 4 * SCRATCH];
+        let compressed = zstd::encode_all(nar.as_slice(), 3).unwrap();
+        let hash = format!("sha256:{}", nix_base32::encode(&Sha256::digest(&nar)));
+        let (passed, refused) = run(&compressed, &hash, nar.len() as i64).await;
         assert_eq!(refused, None);
         assert_eq!(passed, compressed);
     }
