@@ -1474,6 +1474,7 @@ dependencies = [
  "axum",
  "garret-server",
  "metrics",
+ "reqwest",
  "rusqlite",
  "serde",
  "tokio",

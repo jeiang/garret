@@ -569,6 +569,18 @@ pub fn bump_last_accessed<S: AsRef<str>>(
     Ok(())
 }
 
+/// The object read most recently: the blob least likely to be evicted from
+/// under the Puller's deep-readiness probe. `None` on an empty cache.
+pub fn most_recently_accessed(conn: &Connection) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT store_path_hash FROM objects ORDER BY last_accessed_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 /// Negotiation: the subset of `hashes` the cache does not hold. Every hash it
 /// does hold has its `pushed_at` refreshed (debounced): the client will now
 /// rely on that path instead of uploading it, so to [`prune`] it counts as

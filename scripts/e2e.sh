@@ -145,6 +145,35 @@ location=$(curl -s -o /dev/null -w '%{redirect_url}' "$puller_url/nar/$hash.nar.
 echo "$code -> ${location%%\?*}?<presigned>"
 [ "$code" = "307" ] || { echo "expected a redirect, got $code"; exit 1; }
 
+say "deep readiness reads a real blob through a presigned URL"
+code=$(curl -s -o "$root/deep.out" -w '%{http_code}' "$puller_url/ready/deep")
+echo "  /ready/deep -> $code $(cat "$root/deep.out")"
+[ "$code" = "200" ] || { echo "deep readiness failed on a healthy cache"; exit 1; }
+# The route is public: hammering it must stay one S3 read per cache window.
+for _ in $(seq 20); do curl -s -o /dev/null "$puller_url/ready/deep"; done
+probes=$(metric "$puller_metrics_port" 'garret_s3_read_probes_total{outcome="ok"}')
+echo "  21 requests -> ${probes:-0} S3 probe(s)"
+[ "$probes" = "1" ] || { echo "expected one S3 probe for 21 requests"; exit 1; }
+# Rotated credentials: presigning is signature-only, so /ready and the NAR
+# redirect both stay green. The deep check must not.
+bad_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+sed -e "s/^listen = .*/listen = \"127.0.0.1:$bad_port\"/" \
+  -e 's/^metrics_listen = .*/metrics_listen = "127.0.0.1:0"/' \
+  -e 's/^secret_access_key = .*/secret_access_key = "rotated-away"/' \
+  "$root/puller.toml" > "$root/puller-rotated.toml"
+"$bin"/garret-puller "$root/puller-rotated.toml" &
+rotated_pid=$!
+for i in $(seq 100); do
+  curl -sf -o /dev/null "http://127.0.0.1:$bad_port/ready" && break
+  [ "$i" = 100 ] && { echo "the stale-key puller never became ready"; exit 1; }
+  sleep 0.3
+done
+code=$(curl -s -o "$root/deep-rotated.out" -w '%{http_code}' "http://127.0.0.1:$bad_port/ready/deep")
+kill $rotated_pid 2>/dev/null || true
+echo "  stale S3 key: /ready/deep -> $code $(cat "$root/deep-rotated.out")"
+[ "$code" = "503" ] && grep -q "S3 read path" "$root/deep-rotated.out" \
+  || { echo "deep readiness missed a broken S3 read path"; exit 1; }
+
 say "nix copy out of the puller (signature-checked)"
 dest="$root/dest"
 nix copy --from "$puller_url" --to "$dest" "$path" \
