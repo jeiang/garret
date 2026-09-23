@@ -71,6 +71,16 @@ pub enum Request {
         /// a backup never overwrites anything.
         path: String,
     },
+    /// Incident response: delete every object a given subject pushed, through
+    /// the same path as [`Request::Delete`] (unconditional, closures and all).
+    DeletePushedBy {
+        /// The `pushed_by` value to match exactly: `<issuer>#<sub>`.
+        subject: String,
+        /// Unix time; only objects first pushed at or after it. `None` = all.
+        since: Option<i64>,
+        /// Report what would go without deleting anything.
+        dry_run: bool,
+    },
 }
 
 /// The Pusher's reply to a [`Request`]; variants mirror the request commands,
@@ -156,6 +166,13 @@ pub enum Response {
         /// Size of the copy written, in bytes.
         bytes: u64,
     },
+    /// Reply to [`Request::DeletePushedBy`].
+    DeletePushedBy {
+        /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
+        objects: Vec<String>,
+        /// Compressed bytes reclaimed (or reclaimable, on a dry run).
+        bytes_freed: i64,
+    },
     /// The command failed; `message` is operator-facing text.
     Error {
         /// Human-readable description of what went wrong.
@@ -217,6 +234,12 @@ mod tests {
             },
             Request::Backup {
                 path: "/var/lib/garret/backup.db".into(),
+            },
+            Request::DeletePushedBy {
+                subject: "https://token.actions.githubusercontent.com#repo:o/r:ref:refs/heads/main"
+                    .into(),
+                since: Some(1234),
+                dry_run: true,
             },
         ] {
             let line = serde_json::to_string(&request).unwrap();

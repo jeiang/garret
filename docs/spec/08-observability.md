@@ -48,8 +48,11 @@ Prefix `garret_`; service distinguished by scrape job.
   `presign_error`) — pull-path requests degraded to a 404 miss when a
   budget tripped or a read failed (spec
   [03-storage](03-storage.md#bounded-budgets-degrade-to-a-miss); a
-  degraded narinfo request also counts as a miss); last-accessed bump
-  queue depth and debounce-skip counter; browse requests by endpoint;
+  degraded narinfo request also counts as a miss); last-accessed bumps
+  (spec [02](02-database.md#concurrency-discipline)):
+  `garret_bump_queue_depth` gauge, `garret_bump_debounced_total`
+  (hits on a fresh row, no write) and `garret_bump_failures_total`
+  (failed flushes, batch dropped); browse requests by endpoint;
   browse auth failures. The Puller no longer sees NAR bytes
   ([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md)), so
   bytes-served, serve-duration, first-byte and Range counters are gone —
