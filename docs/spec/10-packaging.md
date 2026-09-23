@@ -96,8 +96,10 @@ would redirect to missing blobs.
 
 Flake outputs: `packages.{garret,garret-pusher,garret-puller,garret-admin,garret-bench}`,
 `nixosModules.{pusher,puller,watcher}`, `devShells.default`, `checks`
-(`build`; on Linux also `module`, a NixOS VM test that boots the pusher and
-puller modules on one host and checks the service-user boundary below).
+(`build`; on Linux also `module`, a NixOS VM test: a cache host running the
+pusher and puller modules over Garage, and a builder whose watcher pushes a
+path the Puller then serves back, all under the sandbox below; it also checks
+the service-user boundary).
 
 Module option sketch (all under `services.garret.*`):
 
@@ -159,6 +161,27 @@ database files 0660. A custom `dbPath` directory must already be
 `garret` (say `root:garret` 0440) must become `garret`-owned 0400, or the
 Puller can read it. Pointing `services.garret.puller.s3.credentialsFile` at
 a GetObject-only key is optional, and takes bucket write away from the Puller.
+
+### Sandboxing
+
+All three units share one systemd sandbox (`nix/sandbox.nix`): an empty
+capability bounding set and `NoNewPrivileges`, `ProtectSystem=strict` with
+only the unit's own state writable (`ReadWritePaths` on the database or
+cursor directory, plus `StateDirectory`/`RuntimeDirectory`),
+`ProtectHome`, private `/tmp` and `/dev`, the kernel, clock, hostname and
+cgroup protections, no new namespaces, realtime or SUID/SGID files,
+`MemoryDenyWriteExecute`, native syscalls only, filtered to
+`@system-service` minus `@privileged` (a denied call fails with `EPERM`),
+address families limited to unix and IP, and `UMask=0077`. Files meant for
+another user get their mode set explicitly: the database files (0660) and
+the wake socket (0666).
+
+The watcher still runs as root, with no capabilities: everything it touches
+(the nix database read-only, its credentials, cursor and wake socket, the
+nix daemon's socket) is root-owned or world-accessible. It runs `nix
+path-info` and `nix nar dump-path` with the host's `nix.package` on its
+`PATH`, through the daemon (`NIX_REMOTE=daemon`, as `/nix/var` is read-only
+to it), and with `nix-command` enabled for itself only via `NIX_CONFIG`.
 
 ## Prebuilt outputs
 

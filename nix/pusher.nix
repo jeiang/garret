@@ -224,7 +224,7 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
-      serviceConfig = {
+      serviceConfig = import ./sandbox.nix // {
         ExecStart = "${cfg.package}/bin/garret-pusher ${configFile}";
         EnvironmentFile = cfg.s3.credentialsFile;
         Restart = "on-failure";
@@ -240,10 +240,6 @@ in
         DynamicUser = false;
         User = "garret";
         Group = "garret";
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        NoNewPrivileges = true;
         ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
       };
     };
