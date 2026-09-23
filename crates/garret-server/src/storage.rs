@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use aws_sdk_s3::{
     Client,
     config::Credentials,
@@ -413,7 +413,13 @@ impl Storage {
     }
 
     /// Batched at 1,000 keys — the S3 limit for a single `DeleteObjects`.
+    ///
+    /// A 200 can still report per-key failures. Each one is logged and
+    /// counted, and once every batch has been tried the call fails: the rows
+    /// are already gone, so a blob that stayed must not pass for a deleted
+    /// one (spec 05).
     pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
+        let (mut failed, mut first_failure) = (0, None);
         for batch in keys.chunks(1000) {
             let objects: Vec<ObjectIdentifier> = batch
                 .iter()
@@ -422,14 +428,33 @@ impl Storage {
             if objects.is_empty() {
                 continue;
             }
-            self.client
+            let requested = objects.len();
+            let output = self
+                .client
                 .delete_objects()
                 .bucket(&self.bucket)
                 .delete(Delete::builder().set_objects(Some(objects)).build()?)
                 .send()
                 .await
                 .context("deleting blobs")?;
-            metrics::counter!("garret_s3_deletes_total").increment(batch.len() as u64);
+            let errors = output.errors();
+            for e in errors {
+                let failure = format!(
+                    "{} ({}: {})",
+                    e.key().unwrap_or("?"),
+                    e.code().unwrap_or("unknown"),
+                    e.message().unwrap_or_default()
+                );
+                tracing::error!("blob not deleted: {failure}");
+                failed += 1;
+                first_failure.get_or_insert(failure);
+            }
+            metrics::counter!("garret_s3_deletes_total")
+                .increment(requested.saturating_sub(errors.len()) as u64);
+            metrics::counter!("garret_s3_delete_failures_total").increment(errors.len() as u64);
+        }
+        if let Some(first) = first_failure {
+            bail!("{failed} blob(s) not deleted, first: {first}");
         }
         Ok(())
     }
@@ -571,8 +596,9 @@ mod tests {
         assert_eq!(tiny.total_slots(), 1);
     }
 
-    /// Just enough S3 for uploads, on a loopback port: every call succeeds.
-    /// For tests where the question is scheduling, not S3 semantics.
+    /// Just enough S3 on a loopback port. Every call succeeds, except that
+    /// `DeleteObjects` fails keys containing `denied` the way S3 does: inside
+    /// a 200. For tests where the question is our side, not S3 semantics.
     async fn fake_s3() -> Storage {
         use axum::{
             extract::Request,
@@ -582,17 +608,39 @@ mod tests {
 
         async fn handle(req: Request) -> Response {
             let (parts, body) = req.into_parts();
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
+            let body = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .unwrap_or_default();
             let query = parts.uri.query().unwrap_or_default();
-            let starts_multipart = query.split('&').any(|p| p == "uploads" || p == "uploads=");
-            let xml = |body: &'static str| ([("content-type", "application/xml")], body);
+            let has = |name: &str| query.split('&').any(|p| p.split('=').next() == Some(name));
+            let xml = |body: String| ([("content-type", "application/xml")], body);
             match parts.method {
-                Method::POST if starts_multipart => {
+                Method::POST if has("uploads") => {
                     xml("<InitiateMultipartUploadResult><UploadId>u</UploadId>\
-                     </InitiateMultipartUploadResult>")
+                     </InitiateMultipartUploadResult>"
+                        .into())
                     .into_response()
                 }
-                Method::POST => xml("<CompleteMultipartUploadResult/>").into_response(),
+                Method::POST if has("delete") => {
+                    let request = String::from_utf8_lossy(&body);
+                    let results: String = request
+                        .split("<Key>")
+                        .skip(1)
+                        .filter_map(|s| s.split("</Key>").next())
+                        .map(|key| {
+                            if key.contains("denied") {
+                                format!(
+                                    "<Error><Key>{key}</Key><Code>AccessDenied</Code>\
+                                     <Message>Access Denied</Message></Error>"
+                                )
+                            } else {
+                                format!("<Deleted><Key>{key}</Key></Deleted>")
+                            }
+                        })
+                        .collect();
+                    xml(format!("<DeleteResult>{results}</DeleteResult>")).into_response()
+                }
+                Method::POST => xml("<CompleteMultipartUploadResult/>".into()).into_response(),
                 Method::PUT => [("etag", "\"e\"")].into_response(),
                 _ => StatusCode::NO_CONTENT.into_response(),
             }
@@ -648,5 +696,25 @@ mod tests {
         for (hash, len) in stored {
             assert_eq!((hash, len), (digest.clone(), body.len() as i64));
         }
+    }
+
+    /// `DeleteObjects` answers 200 even when some keys fail, listing them in
+    /// the body. Those blobs are still there, so the call must fail and name
+    /// them rather than report the whole batch deleted.
+    #[tokio::test]
+    async fn per_key_delete_failures_fail_the_call() {
+        let storage = fake_s3().await;
+        let (ok, denied) = (key_for("ok"), key_for("denied"));
+        storage
+            .delete_objects(std::slice::from_ref(&ok))
+            .await
+            .unwrap();
+
+        let err = storage
+            .delete_objects(&[ok.clone(), denied.clone()])
+            .await
+            .expect_err("a per-key failure must fail the delete");
+        let err = format!("{err:#}");
+        assert!(err.contains(&denied) && !err.contains(&ok), "{err}");
     }
 }
