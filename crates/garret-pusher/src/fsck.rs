@@ -5,13 +5,14 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
 use anyhow::Result;
 use garret_common::admin::{FsckRow, FsckSizeMismatch, Response};
 use garret_server::{db, inflight::InFlight, now, storage};
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
 use crate::{AppState, gc};
@@ -48,7 +49,7 @@ pub async fn run(
     let grace = Duration::from_secs(gc.cfg.orphan_grace_secs);
     let blobs = state.storage.list_blobs().await?;
     let db_rows = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.lock();
         db::all_objects_brief(&conn)?
     };
 
@@ -160,7 +161,7 @@ fn repair_rows<'a>(
 ) -> Result<usize> {
     let mut repaired = 0;
     for hash in hashes {
-        let mut conn = conn.lock().unwrap();
+        let mut conn = conn.lock();
         if db::exists(&conn, hash)? {
             db::delete_object(&mut conn, hash)?;
             repaired += 1;
@@ -291,7 +292,7 @@ mod tests {
         let conn = Arc::new(Mutex::new(conn));
 
         let db_rows = {
-            let c = conn.lock().unwrap();
+            let c = conn.lock();
             db::all_objects_brief(&c).unwrap()
         };
         let in_flight = InFlight::new();
@@ -300,7 +301,7 @@ mod tests {
 
         let repaired = apply_repair(&conn, &dangling, &mismatches).unwrap();
         assert_eq!(repaired, 1);
-        let c = conn.lock().unwrap();
+        let c = conn.lock();
         assert!(!db::exists(&c, &hash).unwrap());
     }
 
@@ -324,7 +325,7 @@ mod tests {
 
         let repaired = apply_repair(&conn, &dangling, &mismatches).unwrap();
         assert_eq!(repaired, 2, "the vanished row counted as repaired");
-        let conn = conn.lock().unwrap();
+        let conn = conn.lock();
         assert!(!db::exists(&conn, &b).unwrap());
         assert!(!db::exists(&conn, &c).unwrap());
     }

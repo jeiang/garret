@@ -6,7 +6,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, RwLock},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -16,6 +16,7 @@ use futures::{
     future::{BoxFuture, Shared},
 };
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
+use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 
 use crate::config::IssuerConfig;
@@ -278,7 +279,7 @@ async fn jwks_url(http: &reqwest::Client, cfg: &IssuerConfig) -> Result<String> 
 impl Issuer {
     /// The key for `kid`, if cached, and whether the cached set has expired.
     fn cached_key(&self, kid: &str) -> (Option<DecodingKey>, bool) {
-        let cache = self.keys.read().unwrap();
+        let cache = self.keys.read();
         let expired = cache.expires_at.is_none_or(|t| Instant::now() >= t);
         (cache.by_kid.get(kid).cloned(), expired)
     }
@@ -286,7 +287,7 @@ impl Issuer {
     /// Joins the in-flight JWKS fetch or starts one; `None` while the floor
     /// since the last completed attempt holds.
     fn refresh(self: &Arc<Self>, http: &reqwest::Client) -> Option<Attempt> {
-        let mut state = self.refresh.lock().unwrap();
+        let mut state = self.refresh.lock();
         if let Some(attempt) = &state.in_flight {
             return Some(attempt.clone());
         }
@@ -303,7 +304,7 @@ impl Issuer {
                 .increment(1);
             let outcome = match fetch_keys(&http, &issuer.cfg).await {
                 Ok(by_kid) => {
-                    let mut cache = issuer.keys.write().unwrap();
+                    let mut cache = issuer.keys.write();
                     cache.by_kid = by_kid;
                     cache.expires_at = Some(Instant::now() + KEY_TTL);
                     Ok(())
@@ -315,7 +316,7 @@ impl Issuer {
                     Err(Arc::new(e))
                 }
             };
-            let mut state = issuer.refresh.lock().unwrap();
+            let mut state = issuer.refresh.lock();
             state.in_flight = None;
             state.next_attempt = Some(Instant::now() + MIN_REFRESH);
             outcome
@@ -701,14 +702,14 @@ mod tests {
 
     /// Waits out any in-flight attempt, e.g. one started in the background.
     async fn settle(auth: &Authenticator) {
-        let pending = auth.issuers[0].refresh.lock().unwrap().in_flight.clone();
+        let pending = auth.issuers[0].refresh.lock().in_flight.clone();
         if let Some(attempt) = pending {
             let _ = attempt.await;
         }
     }
 
     fn preload(auth: &Authenticator, kid: &str, expires_at: Instant) {
-        let mut cache = auth.issuers[0].keys.write().unwrap();
+        let mut cache = auth.issuers[0].keys.write();
         cache
             .by_kid
             .insert(kid.into(), DecodingKey::from_secret(b"k"));

@@ -4,8 +4,10 @@
 
 use std::{
     collections::{HashMap, hash_map::Entry},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
+
+use parking_lot::Mutex;
 
 /// What a claim on a store path is for. One claim per path at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +40,7 @@ impl InFlight {
 
     /// First claimer wins; `Err` names the kind of claim already held.
     pub fn claim(&self, hash: &str, kind: Kind) -> Result<Claim, Kind> {
-        match self.0.lock().unwrap().entry(hash.to_owned()) {
+        match self.0.lock().entry(hash.to_owned()) {
             Entry::Occupied(held) => Err(*held.get()),
             Entry::Vacant(slot) => {
                 slot.insert(kind);
@@ -53,7 +55,7 @@ impl InFlight {
     /// Whether an upload or delete of this path is live — the guard the GC
     /// orphan sweep and fsck check before treating the path as drift.
     pub fn contains(&self, hash: &str) -> bool {
-        self.0.lock().unwrap().contains_key(hash)
+        self.0.lock().contains_key(hash)
     }
 
     /// How many uploads are in progress; exported as a gauge and drained by
@@ -61,7 +63,6 @@ impl InFlight {
     pub fn uploads(&self) -> usize {
         self.0
             .lock()
-            .unwrap()
             .values()
             .filter(|kind| **kind == Kind::Upload)
             .count()
@@ -70,7 +71,7 @@ impl InFlight {
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        self.set.0.lock().unwrap().remove(&self.hash);
+        self.set.0.lock().remove(&self.hash);
     }
 }
 

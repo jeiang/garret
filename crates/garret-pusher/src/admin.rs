@@ -86,11 +86,11 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             hash,
             expires_at,
         } => {
-            let conn = state.conn.lock().unwrap();
+            let conn = state.conn.lock();
             db::pin(&conn, &name, &hash, expires_at, garret_server::now()).map(|()| Response::Pin)
         }
         Request::Unpin { name } => {
-            let conn = state.conn.lock().unwrap();
+            let conn = state.conn.lock();
             db::unpin(&conn, &name).map(|removed| Response::Unpin { removed })
         }
         Request::Fsck {
@@ -120,7 +120,7 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
 }
 
 fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
-    let conn = state.conn.lock().unwrap();
+    let conn = state.conn.lock();
     Ok(Response::Status {
         objects: conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?,
         total_bytes: db::total_bytes(&conn)?,
@@ -151,7 +151,7 @@ async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
 
     for hash in hashes {
         let present = {
-            let conn = state.conn.lock().unwrap();
+            let conn = state.conn.lock();
             db::exists(&conn, hash)?
         };
         if !present {
@@ -159,7 +159,7 @@ async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
             continue;
         }
         let freed = {
-            let mut conn = state.conn.lock().unwrap();
+            let mut conn = state.conn.lock();
             db::delete_object(&mut conn, hash)?
         };
         deleted += 1;
@@ -187,7 +187,7 @@ async fn delete_pushed_by(
     dry_run: bool,
 ) -> Result<Response> {
     let mut matched = {
-        let conn = state.conn.lock().unwrap();
+        let conn = state.conn.lock();
         pushed_by(&conn, subject, since)?
     };
     let bytes_freed = if dry_run {
@@ -246,7 +246,7 @@ fn pushed_by(
 /// chose the cutoff. Row first, blob second, as everywhere else.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
     let (pruned, claims) = {
-        let mut conn = state.conn.lock().unwrap();
+        let mut conn = state.conn.lock();
         let doomed = db::prunable(&conn, before, garret_server::now())?;
         if dry_run {
             (doomed, Vec::new())
@@ -303,7 +303,7 @@ fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> 
 /// Backfills signatures after a key is added, so both the old and new key
 /// appear on every object during an overlap rotation (spec 10-packaging).
 fn resign(state: &AppState) -> Result<usize> {
-    let mut conn = state.conn.lock().unwrap();
+    let mut conn = state.conn.lock();
     let hashes = db::all_hashes(&conn)?;
     let mut resigned = 0;
     for hash in hashes {
@@ -327,7 +327,6 @@ async fn backup(state: &AppState, dest: String) -> Result<Response> {
     let source = state
         .conn
         .lock()
-        .unwrap()
         .path()
         // rusqlite reports an in-memory database as an empty path.
         .filter(|path| !path.is_empty())
@@ -505,7 +504,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains(&b), "{err:#}");
-        assert!(db::exists(&state.conn.lock().unwrap(), &a).unwrap());
+        assert!(db::exists(&state.conn.lock(), &a).unwrap());
         assert!(state.in_flight.claim(&a, Kind::Upload).is_ok());
     }
 
@@ -523,6 +522,6 @@ mod tests {
         };
         assert_eq!(pruned, vec![format!("{a}-thing")]);
         assert!(prune(&state, before, false).await.is_err());
-        assert!(db::exists(&state.conn.lock().unwrap(), &a).unwrap());
+        assert!(db::exists(&state.conn.lock(), &a).unwrap());
     }
 }
