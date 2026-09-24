@@ -185,6 +185,8 @@ async fn main() -> Result<()> {
         }))?
     };
 
+    // Kept for shutdown: `state` itself moves into the router.
+    let storage = state.storage.clone();
     let app = Router::new()
         .route("/api/v1/missing-paths", post(missing_paths))
         .route("/api/v1/nar/{hash}", put(upload))
@@ -204,8 +206,74 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("pusher listening on {addr}");
-    axum::serve(listener, app).await?;
+    serve_until_stopped(listener, app, storage).await
+}
+
+/// How long a SIGTERM/SIGINT waits for in-flight uploads to finish. With
+/// [`ABORT_BUDGET`] it stays under systemd's default 90 s stop timeout.
+const DRAIN: Duration = Duration::from_secs(60);
+/// How long aborting the uploads that outlived [`DRAIN`] may take.
+const ABORT_BUDGET: Duration = Duration::from_secs(20);
+
+/// Serves until SIGTERM or SIGINT, then stops accepting and lets in-flight
+/// uploads finish for up to [`DRAIN`]. Whatever is still uploading after
+/// that has its multipart aborted, so a restart leaks no parts (spec 03).
+async fn serve_until_stopped(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    storage: Storage,
+) -> Result<()> {
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        stop_signal().await;
+        tracing::info!("stopping: draining in-flight uploads for up to {DRAIN:?}");
+        let _ = stop.send(());
+    });
+    let deadline = async {
+        match stopped.await {
+            Ok(()) => tokio::time::sleep(DRAIN).await,
+            // The server ended on its own; its branch has already won.
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        served = std::future::IntoFuture::into_future(server) => return Ok(served?),
+        () = deadline => {}
+    }
+    // The Pusher is the bucket's only writer and is exiting, so every open
+    // multipart is one of the uploads being cut off here: abort them all.
+    // The cut-off handlers are still running until `main` returns, so one
+    // may open a multipart after a listing, or finish one before its abort
+    // (which fails the pass): list again until a pass finds nothing.
+    tracing::warn!("uploads still in flight after {DRAIN:?}: aborting their multiparts");
+    let abort_all = async {
+        loop {
+            match storage
+                .abort_stale_multiparts(Duration::ZERO, &InFlight::new())
+                .await
+            {
+                Ok(0) => return,
+                Ok(n) => tracing::info!("aborted {n} multipart upload(s)"),
+                Err(e) => {
+                    tracing::warn!("aborting multiparts on shutdown: {e:#}");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    };
+    if tokio::time::timeout(ABORT_BUDGET, abort_all).await.is_err() {
+        tracing::error!("multiparts still open after {ABORT_BUDGET:?}: left to the orphan sweep");
+    }
     Ok(())
+}
+
+async fn stop_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 #[derive(Debug)]

@@ -193,7 +193,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("nothing to push");
             }
             let cfg = cfg.unwrap();
-            let pusher = pusher(&cfg, &http, jobs).await?;
+            let pusher = pusher(&cfg, &http, jobs);
             let closure = push::closure(&paths).await?;
             let closure_len = closure.len();
             // Paths an upstream cache already signs never enter the
@@ -221,25 +221,28 @@ async fn main() -> Result<()> {
         Command::WatchStore { full_sync } => {
             let cfg = cfg.unwrap();
             // A daemon authenticates as itself, not as whoever last logged in.
-            let token = match &cfg.watch.credentials_file {
+            let tokens = match &cfg.watch.credentials_file {
                 Some(path) => {
                     let (id, secret) = auth::read_client_credentials(path)?;
-                    auth::client_credentials(
+                    auth::TokenSource::client_credentials(
                         &http,
                         &cfg.oidc.issuer,
                         &id,
                         &secret,
                         cfg.oidc.resource.as_deref(),
                     )
-                    .await?
                 }
-                None => {
-                    auth::bearer_token(&http, &cfg.oidc.audience, cfg.oidc.resource.as_deref())
-                        .await?
-                }
+                None => auth::TokenSource::from_env(
+                    &http,
+                    &cfg.oidc.audience,
+                    cfg.oidc.resource.as_deref(),
+                ),
             };
+            // Minted once up front so a daemon that cannot authenticate exits
+            // saying so, rather than failing every path it sees.
+            tokens.get().await?;
             let pusher = push::Pusher {
-                token,
+                tokens,
                 http: http.clone(),
                 endpoint: cfg.endpoint.clone(),
                 jobs: cfg.jobs,
@@ -419,6 +422,12 @@ async fn login(
             }
             config::write(&path, &rendered)?;
             eprintln!("wrote {}", path.display());
+            if !discovered.public_keys.is_empty() {
+                eprintln!(
+                    "`garret use` will make nix trust these signing keys: {}",
+                    discovered.public_keys.join(" ")
+                );
+            }
             config::load(explicit)?
         }
     };
@@ -515,6 +524,12 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
             cfg.endpoint
         );
     }
+    // Checked again here, not only at login: the config may predate the check
+    // or be hand-edited, and this is the write that makes nix trust the values.
+    discovery::check_url("puller_endpoint", puller)?;
+    for key in &cfg.public_keys {
+        discovery::check_key(key)?;
+    }
 
     if print {
         print!("{}", nixconf::lines(puller, &cfg.public_keys));
@@ -589,19 +604,15 @@ fn dry_run_report(
     Ok(())
 }
 
-async fn pusher(
-    cfg: &config::Config,
-    http: &reqwest::Client,
-    jobs: Option<usize>,
-) -> Result<push::Pusher> {
-    Ok(push::Pusher {
-        token: auth::bearer_token(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()).await?,
+fn pusher(cfg: &config::Config, http: &reqwest::Client, jobs: Option<usize>) -> push::Pusher {
+    push::Pusher {
+        tokens: auth::TokenSource::from_env(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()),
         http: http.clone(),
         endpoint: cfg.endpoint.clone(),
         jobs: jobs.unwrap_or(cfg.jobs),
         zstd_level: cfg.zstd_level,
         max_retries: cfg.max_retries,
-    })
+    }
 }
 
 async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(String, String)> {
