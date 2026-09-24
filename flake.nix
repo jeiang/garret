@@ -66,6 +66,9 @@
 
       checks = forAllSystems (pkgs: {
         build = garret pkgs;
+      } // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        # The modules on a booted host: service users, file modes, sockets.
+        module = pkgs.testers.runNixOSTest (import ./nix/test.nix self);
       });
 
       devShells = forAllSystems (pkgs: {

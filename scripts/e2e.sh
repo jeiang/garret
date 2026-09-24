@@ -282,6 +282,48 @@ import json, sys
 assert json.load(sys.stdin)['children'], 'tree must carry the leaf'
 "
 
+say "GitHub Actions tokens: a rejected token is renewed and the request retried"
+# A stand-in for the runner's OIDC endpoint. Its first token is already
+# expired and every later one is valid, so the push succeeds only if the
+# client renews the token on the 401 and asks again.
+python3 - "$root" <<'PY' &
+import http.server, json, os, sys
+root = sys.argv[1]
+mints = 0
+class Mint(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        global mints
+        mints += 1
+        with open(f"{root}/gh-mints", "w") as f:
+            f.write(str(mints))
+        name = "token-expired" if mints == 1 else "token"
+        body = json.dumps({"value": open(f"{root}/{name}").read()}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_):
+        pass
+server = http.server.HTTPServer(("127.0.0.1", 0), Mint)
+with open(f"{root}/gh-port.tmp", "w") as f:
+    f.write(str(server.server_port))
+os.rename(f"{root}/gh-port.tmp", f"{root}/gh-port")
+server.serve_forever()
+PY
+gh_pid=$!
+for _ in $(seq 50); do [ -s "$root/gh-port" ] && break; sleep 0.1; done
+head -c 4096 /dev/urandom > "$root/gh.bin"
+ghpath=$(nix store add-path "$root/gh.bin" --name garret-e2e-gh)
+env -u GARRET_TOKEN \
+  ACTIONS_ID_TOKEN_REQUEST_URL="http://127.0.0.1:$(cat "$root/gh-port")/token" \
+  ACTIONS_ID_TOKEN_REQUEST_TOKEN=runner-secret \
+  "$bin"/garret --config "$root/client.toml" push "$ghpath" | tee "$root/push-gh.out"
+kill $gh_pid 2>/dev/null || true
+grep -q "done: 1 pushed, 0 deduped, 0 failed" "$root/push-gh.out"
+[ "$(cat "$root/gh-mints")" = "2" ] || {
+  echo "expected exactly one renewal, got $(cat "$root/gh-mints") mints"; exit 1; }
+echo "  the expired runner token was replaced once and the push went through"
+
 say "last-accessed bumps land off the request path"
 # The json path was pushed and never fetched from the Puller, so no earlier
 # hit can have queued its bump. bump_debounce_secs = 0 here, so a hit a second
@@ -542,10 +584,55 @@ if admin pin typo 00000000000000000000000000000000 2>/dev/null; then
 fi
 echo "  pin set, listed, and unknown hashes refused"
 
-# Restart the Pusher under a quota the corpus already exceeds. Only one
-# process ever writes the DB, so the old one goes first.
-kill $pusher_pid 2>/dev/null || true
-wait $pusher_pid 2>/dev/null || true
+say "SIGTERM drains an in-flight upload instead of leaking its multipart"
+# Rate-limited so SIGTERM lands mid-body: 12 MB at 2 MB/s is ~6 s across
+# three 5 MiB parts. The Pusher must finish it (201) and only then exit.
+head -c 12000000 /dev/urandom > "$root/drain.bin"
+drain=$(nix store add-path "$root/drain.bin" --name garret-e2e-drain)
+drain_hash=$(basename "$drain" | cut -c1-32)
+nix path-info --json --json-format 1 "$drain" > "$root/drain-info.json"
+python3 - "$drain" "$root/drain-info.json" > "$root/drain.body" <<'PY'
+import json, struct, sys
+path, info = sys.argv[1], json.load(open(sys.argv[2]))
+if isinstance(info, list):  # older nix: an array of objects with "path"
+    info = {entry["path"]: entry for entry in info}
+preamble = json.dumps({
+    "store_path": path,
+    "nar_hash": info[path]["narHash"],
+    "nar_size": info[path]["narSize"],
+    "references": [], "deriver": None, "ca": None,
+}).encode()
+sys.stdout.buffer.write(struct.pack("<I", len(preamble)) + preamble)
+PY
+nix-store --dump "$drain" | zstd -q -c >> "$root/drain.body"
+curl -s -o "$root/drain.out" -w '%{http_code}' --limit-rate 2M -X PUT \
+  -H "Authorization: Bearer $GARRET_TOKEN" --data-binary @"$root/drain.body" \
+  "$pusher_url/api/v1/nar/$drain_hash" > "$root/drain.code" &
+upload_pid=$!
+sleep 3
+kill -0 $upload_pid 2>/dev/null || { echo "the upload ended before SIGTERM; nothing drained"; exit 1; }
+kill -TERM $pusher_pid
+wait $upload_pid || true
+echo "  upload across SIGTERM -> $(cat "$root/drain.code") $(cat "$root/drain.out")"
+[ "$(cat "$root/drain.code")" = "201" ] || { echo "SIGTERM cut off an in-flight upload"; exit 1; }
+if [ -n "${GARRET_WRAP:-}" ]; then
+  # Not our child under a forking wrapper: its status is out of reach, but
+  # the exit is not.
+  while kill -0 $pusher_pid 2>/dev/null; do sleep 0.3; done
+else
+  pusher_status=0
+  wait $pusher_pid || pusher_status=$?
+  [ "$pusher_status" = "0" ] || { echo "pusher exited $pusher_status after draining"; exit 1; }
+fi
+curl -sf "$puller_url/$drain_hash.narinfo" >/dev/null \
+  || { echo "the drained upload was not committed"; exit 1; }
+garage -c "$root/garage.toml" bucket info garret | tee "$root/bucket-info.out" | grep -i multipart
+grep -qiE "unfinished multipart uploads: +0$" "$root/bucket-info.out" \
+  || { echo "a multipart upload was left open"; exit 1; }
+echo "  drained, committed, exited cleanly, and no multipart left open"
+
+# Restart the Pusher (stopped above) under a quota the corpus already
+# exceeds. Only one process ever writes the DB, so the old one went first.
 # 1000 bytes: the 12 MB path must go, the small closure need not — so there
 # are survivors whose references can be checked.
 sed 's/^quota_bytes = .*/quota_bytes = 1000/; s/^interval_secs = .*/interval_secs = 1\nlow_watermark = 0.5/' \
@@ -553,6 +640,15 @@ sed 's/^quota_bytes = .*/quota_bytes = 1000/; s/^interval_secs = .*/interval_sec
 grep -q "quota_bytes = 1000" "$root/pusher-gc.toml"
 "$bin"/garret-pusher "$root/pusher-gc.toml" &
 wait_for pusher "$pusher_url/api/v1/missing-paths"
+
+# Everything here was pushed or negotiated minutes ago, inside the push grace
+# (spec 05): a push may still be relying on it, so GC alarms rather than
+# evicts. Backdated, it is ordinary LRU fodder again.
+admin gc run | tee "$root/gcrun-fresh.out"
+grep -q "evicted 0 object" "$root/gcrun-fresh.out"
+grep -q "pushed in the last day" "$root/gcrun-fresh.out"
+echo "  nothing inside the push grace was evicted"
+backdate "SELECT store_path_hash FROM objects"
 
 # GC on demand through the admin socket, rather than waiting on the timer.
 admin gc run | tee "$root/gcrun.out"

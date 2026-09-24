@@ -50,6 +50,7 @@ CREATE TABLE objects (
 );
 CREATE INDEX objects_name          ON objects(name);
 CREATE INDEX objects_last_accessed ON objects(last_accessed_at); -- LRU order
+CREATE INDEX objects_created       ON objects(created_at DESC, store_path_hash); -- browse listing order
 
 CREATE TABLE object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
@@ -77,8 +78,10 @@ Notes:
 
 - References are normalized (recursive CTEs for dependency trees;
   referrer lookups via the reverse index). References may point outside
-  the cache. **Self-references are excluded at insert time** (a
-  self-referencing path would never be evictable under closure-safe GC).
+  the cache. **Self-references are stored**: the signed fingerprint
+  covers them. A path is not its own dependency, though, so GC's
+  evictability check, the referrers endpoint and the browse tree all
+  ignore self-edges.
 - `reference` holds the **basename**, not the bare hash: narinfo prints
   reference names and the signed fingerprint needs full store paths, and
   neither can be reconstructed from a hash — least of all for references
@@ -91,7 +94,8 @@ Notes:
 - `total_bytes` is reconciled against `SUM(file_size)` at each GC pass.
 - `pushed_at` is set on insert and refreshed by every Negotiation that
   finds the object present, debounced to one write per hour. It is the
-  age `garret-admin prune` judges by (spec 05). Databases from before
+  age `garret-admin prune` judges by, and GC leaves anything pushed in
+  the last day alone (the push grace, spec 05). Databases from before
   the column existed are migrated with `pushed_at = created_at`.
 - A re-push rewrites the object's row in place (an upsert), never
   delete-then-insert: `pins` cascade on delete, so `INSERT OR REPLACE`
@@ -101,8 +105,10 @@ Notes:
 
 WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
 `busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
-`journal_size_limit=64MiB`; `foreign_keys=ON`. Short write transactions
-only.
+`journal_size_limit=64MiB`; `foreign_keys=ON`; persistent WAL, so `-wal`
+and `-shm` outlive the last connection (the Puller cannot create them,
+spec 10). Replace or restore the database only with both removed, or the
+next open replays the stale WAL over it. Short write transactions only.
 
 A write transaction that reads before it writes (insert and delete, for
 their `stats` delta) begins `IMMEDIATE`. Begun deferred, it would take a

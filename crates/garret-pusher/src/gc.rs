@@ -38,7 +38,8 @@ pub struct PassResult {
     pub evicted: usize,
     pub bytes_freed: i64,
     /// True when usage is still above the low watermark but nothing is
-    /// evictable — everything left is referenced. Alarm, do not break closures.
+    /// evictable — everything left is referenced, pinned, or pushed within
+    /// the push grace. Alarm, do not break closures.
     pub candidates_exhausted: bool,
 }
 
@@ -97,9 +98,10 @@ impl Gc {
         };
 
         while usage > low {
+            let at = now();
             let candidates = {
                 let conn = self.conn.lock().unwrap();
-                db::evictable(&conn, BATCH, now())?
+                db::evictable(&conn, BATCH, at)?
             };
             if candidates.is_empty() {
                 result.candidates_exhausted = true;
@@ -107,7 +109,8 @@ impl Gc {
                 tracing::error!(
                     usage,
                     low,
-                    "GC cannot reach the low watermark: everything left is referenced"
+                    "GC cannot reach the low watermark: everything left is referenced, \
+                     pinned, or pushed within the last day"
                 );
                 break;
             }
@@ -115,10 +118,14 @@ impl Gc {
             let mut keys = Vec::with_capacity(candidates.len());
             for (hash, _) in &candidates {
                 // Row first, blob second: a failed blob delete leaves an orphan
-                // for the sweep, never a row without a blob (spec 05).
-                let freed = {
+                // for the sweep, never a row without a blob (spec 05). A
+                // candidate negotiated or referenced since the snapshot stays;
+                // the next query no longer returns it.
+                let Some(freed) = ({
                     let mut conn = self.conn.lock().unwrap();
-                    db::delete_object(&mut conn, hash)?
+                    db::evict_object(&mut conn, hash, at)?
+                }) else {
+                    continue;
                 };
                 usage -= freed;
                 result.evicted += 1;
@@ -320,6 +327,30 @@ mod tests {
         assert!(gc.sweep_orphans().await.is_err());
         assert!(gc_failures("pass") > passes, "failed pass not counted");
         assert!(gc_failures("sweep") > sweeps, "failed sweep not counted");
+    }
+
+    #[tokio::test]
+    async fn a_pass_keeps_what_negotiation_just_reported_present_and_alarms() {
+        // Over quota with one candidate, d. A push negotiates d, is told it
+        // is present, and will upload d's referrers next: evicting d now
+        // would leave them with a hole. The pass must stop and alarm instead.
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let d = "d".repeat(32);
+        db::insert_object(&mut conn, &object(&d, 100, &[]), 0).unwrap();
+        let reported = db::missing(&mut conn, std::slice::from_ref(&d), now()).unwrap();
+        assert!(reported.is_empty(), "d should be reported present");
+        let gc = Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage_at("http://127.0.0.1:1", 1).await,
+            InFlight::new(),
+            config(100),
+        );
+
+        let pass = gc.run().await.unwrap();
+        assert!(db::exists(&gc.conn.lock().unwrap(), &d).unwrap());
+        assert_eq!(pass.evicted, 0);
+        assert!(pass.candidates_exhausted, "over quota with no alarm");
     }
 
     fn config(quota_bytes: u64) -> GcConfig {

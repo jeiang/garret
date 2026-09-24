@@ -29,7 +29,10 @@ Prefix `garret_`; service distinguished by scrape job.
   negotiation batch-size and missing-ratio histograms; idempotent-skip
   counters (exists / in-progress).
 - **Pusher — S3**: put/multipart-part counters, part duration, retries,
-  aborted multiparts.
+  aborted multiparts; blob deletes (`garret_s3_deletes_total`, only keys
+  the response did not report as failed) and per-key delete failures
+  (`garret_s3_delete_failures_total`: keys a `DeleteObjects` 200 reported
+  as not deleted — each an orphan until a later sweep succeeds).
 - **Pusher — auth** (also on the Puller, for browse tokens):
   `garret_auth_validations_total` by `issuer` (a configured issuer URL,
   or `unknown` when the token names none: never the token's own `iss`)
