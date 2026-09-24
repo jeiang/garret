@@ -57,6 +57,73 @@ Also: `garret whoami`, `garret logout`, `garret push --dry-run`, `--json` on
 (installed automatically by the Nix package). Full reference:
 [docs/spec/06-client.md](docs/spec/06-client.md).
 
+## Push as built in CI
+
+A job that fails late should still cache everything it built. Run
+`garret watch-store` in the background with `garret enqueue` as nix's
+post-build hook, then stop it and drain in an always-run last step:
+`watch-store --drain` pushes whatever is left and fails the step if anything
+would not push. No secret is needed: on a GitHub Actions runner with
+`id-token: write`, garret mints its push tokens from the runner. For GitHub
+Actions:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write # garret mints push tokens from the runner
+
+steps:
+  - uses: actions/checkout@v5
+
+  # Before nix is installed: the hook must exist before the first build,
+  # and must succeed while garret itself is not installed yet.
+  - name: Write garret's post-build hook
+    run: |
+      cat > "$RUNNER_TEMP/garret-hook" <<EOF
+      #!/bin/sh
+      [ -x "$RUNNER_TEMP/garret/bin/garret" ] || exit 0
+      exec "$RUNNER_TEMP/garret/bin/garret" enqueue --socket "$RUNNER_TEMP/garret.sock"
+      EOF
+      chmod +x "$RUNNER_TEMP/garret-hook"
+
+  - uses: cachix/install-nix-action@v31
+    with:
+      extra_nix_config: |
+        experimental-features = nix-command flakes
+        post-build-hook = ${{ runner.temp }}/garret-hook
+
+  - name: Start pushing as paths are built
+    run: |
+      nix build --out-link "$RUNNER_TEMP/garret" github:jeiang/garret#garret
+      cat > "$RUNNER_TEMP/garret.toml" <<EOF
+      endpoint = "https://push.cache.example"
+
+      [oidc]
+      issuer = "https://token.actions.githubusercontent.com"
+      audience = "garret"
+
+      [watch]
+      cursor_path = "$RUNNER_TEMP/garret-cursor"
+      socket_path = "$RUNNER_TEMP/garret.sock"
+      EOF
+      nohup "$RUNNER_TEMP/garret/bin/garret" --config "$RUNNER_TEMP/garret.toml" \
+        watch-store > "$RUNNER_TEMP/garret-watch.log" 2>&1 &
+      echo $! > "$RUNNER_TEMP/garret-watch.pid"
+      # The cursor appears once it has authenticated and bootstrapped.
+      for _ in $(seq 30); do [ -s "$RUNNER_TEMP/garret-cursor" ] && exit 0; sleep 1; done
+      cat "$RUNNER_TEMP/garret-watch.log"; exit 1
+
+  - run: nix build .#everything
+
+  - name: Push whatever the watcher has not
+    if: always()
+    run: |
+      kill "$(cat "$RUNNER_TEMP/garret-watch.pid")" || true
+      "$RUNNER_TEMP/garret/bin/garret" --config "$RUNNER_TEMP/garret.toml" watch-store --drain
+```
+
+Details: [docs/spec/06-client.md](docs/spec/06-client.md#ci-push-as-built).
+
 ## Development
 
 ```

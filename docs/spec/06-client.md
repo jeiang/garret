@@ -14,7 +14,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret doctor [path]` | Layer-by-layer diagnosis (below); with a path, a Negotiation round answers "is this cached" |
 | `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter |
 | `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers |
-| `garret watch-store` | Watcher daemon (below) |
+| `garret watch-store [--full-sync] [--drain]` | Watcher daemon (below); `--drain` pushes what it has not yet and exits, for CI |
 | `garret enqueue [paths…] [--socket]` | Wake a running `watch-store` to poll now; paths default to `$OUT_PATHS`, for use as nix's `post-build-hook`. Exits 0 unconditionally |
 | `garret list` | Search/filter cache contents (browse API) |
 | `garret tree <path>` | Dependency tree (browse API) |
@@ -265,8 +265,9 @@ configured key, so a rotation has several live at once.
   exits 0 even when nothing listens — a hook must never block or fail
   a build. The cursor is the durability story; the socket is latency
   only.
-- **Privilege**: root systemd service managed by the NixOS module. No
-  unprivileged mode in v1.
+- **Privilege**: root systemd service managed by the NixOS module. It
+  needs only read access to the Nix database, so CI runs it as the job's
+  user ([below](#ci-push-as-built)).
 - **Scope**: pushes bare paths as they become valid — dependencies
   register before roots, so closures self-assemble. The server never
   requires closed closures.
@@ -276,12 +277,24 @@ configured key, so a rotation has several live at once.
   overrides it per daemon), read from the DB's sigs rather than
   `nix path-info`. Keep `-source` and fixed-output paths. Configurable
   exclude patterns.
-- **Failure handling**: capped retries with backoff (default 5), then
-  local skip-list + loud log + metrics-visible counter; the cursor always
-  advances — one poison path never wedges the pipeline. Paths nix-GC'd
-  before push are skipped silently.
-- **Bootstrap**: cursor starts at `MAX(id)` (only new paths push);
-  `--full-sync` opts into walking history from id 0.
+- **Failure handling**: the cursor always advances — one poison path
+  never wedges the pipeline — so a path whose push fails (after push's own
+  retries) goes on the **failed list**, `<cursor_path>.failed`, one store
+  path per line. The daemon retries the list whenever a poll finds nothing
+  new, up to `max_attempts` (default 5) per path, then logs loudly and
+  leaves the path on the list for a restart (which starts every path's
+  count afresh) or a drain. Paths nix-GC'd before push are dropped
+  silently. The cursor and the list are each replaced whole by a rename,
+  so a kill mid-write cannot lose the backlog.
+- **Bootstrap**: cursor starts at `MAX(id)` (only new paths push) and is
+  written at startup; `--full-sync` opts into walking history from id 0.
+- **Drain** (`--drain`): push every path validated after the cursor as of
+  invocation, plus the failed list, then exit — non-zero, naming the
+  paths, if any failed; those stay on the list. The cursor ends at the
+  newest path seen. Run it after stopping the daemon, which shares the
+  cursor. With no cursor it refuses rather than guessing where to start
+  (unless `--full-sync`), since "nothing to push" would be a green step
+  that pushed nothing.
 
 ### Hook setup
 
@@ -295,3 +308,67 @@ exec garret enqueue
 ```
 
 and set `post-build-hook = /path/to/that-script` in `nix.conf`.
+
+### CI: push as built
+
+A CI job that fails late should still leave behind everything it built,
+so the next run substitutes it. The shape: the hook wakes a background
+`watch-store` as each build finishes, and an always-run last step stops it
+and drains. Authentication needs no secret: with no `credentials_file`,
+`watch-store` takes its token from the environment, and on a GitHub
+Actions runner with `id-token: write` that is the runner's OIDC token,
+re-minted as it ages. For GitHub Actions:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write # garret mints push tokens from the runner
+
+steps:
+  - uses: actions/checkout@v5
+
+  # Before nix is installed: the hook must exist before the first build,
+  # and must succeed while garret itself is not installed yet.
+  - name: Write garret's post-build hook
+    run: |
+      cat > "$RUNNER_TEMP/garret-hook" <<EOF
+      #!/bin/sh
+      [ -x "$RUNNER_TEMP/garret/bin/garret" ] || exit 0
+      exec "$RUNNER_TEMP/garret/bin/garret" enqueue --socket "$RUNNER_TEMP/garret.sock"
+      EOF
+      chmod +x "$RUNNER_TEMP/garret-hook"
+
+  - uses: cachix/install-nix-action@v31
+    with:
+      extra_nix_config: |
+        experimental-features = nix-command flakes
+        post-build-hook = ${{ runner.temp }}/garret-hook
+
+  - name: Start pushing as paths are built
+    run: |
+      nix build --out-link "$RUNNER_TEMP/garret" github:jeiang/garret#garret
+      cat > "$RUNNER_TEMP/garret.toml" <<EOF
+      endpoint = "https://push.cache.example"
+
+      [oidc]
+      issuer = "https://token.actions.githubusercontent.com"
+      audience = "garret"
+
+      [watch]
+      cursor_path = "$RUNNER_TEMP/garret-cursor"
+      socket_path = "$RUNNER_TEMP/garret.sock"
+      EOF
+      nohup "$RUNNER_TEMP/garret/bin/garret" --config "$RUNNER_TEMP/garret.toml" \
+        watch-store > "$RUNNER_TEMP/garret-watch.log" 2>&1 &
+      echo $! > "$RUNNER_TEMP/garret-watch.pid"
+      # The cursor appears once it has authenticated and bootstrapped.
+      for _ in $(seq 30); do [ -s "$RUNNER_TEMP/garret-cursor" ] && exit 0; sleep 1; done
+      cat "$RUNNER_TEMP/garret-watch.log"; exit 1
+
+  - run: nix build .#everything
+
+  - name: Push whatever the watcher has not
+    if: always()
+    run: |
+      kill "$(cat "$RUNNER_TEMP/garret-watch.pid")" || true
+      "$RUNNER_TEMP/garret/bin/garret" --config "$RUNNER_TEMP/garret.toml" watch-store --drain

@@ -771,10 +771,10 @@ impl Backoff {
 ///
 /// A dump that dies part-way (the path GC'd locally since `nix path-info`, a
 /// daemon error) still closes its stdout, so the encoder would seal a valid
-/// zstd frame around a truncated NAR — which the server signs under the
-/// claimed narHash and then answers `exists` for forever. An error as the
+/// zstd frame around a truncated NAR. The server rejects that as a NarHash
+/// mismatch (spec 01), but with a `400` that hides the cause. An error as the
 /// stream's last item instead aborts the request before the body ends, so the
-/// server never sees a complete upload.
+/// push fails with the dump's own error.
 fn compressed_nar(
     mut dump: Command,
     report: &Report,

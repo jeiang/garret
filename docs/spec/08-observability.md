@@ -105,7 +105,7 @@ Prefix `garret_`; service distinguished by scrape job.
 `tracing` crate: human-readable by default, JSON via config
 (journald-friendly); per-request spans with request ids. No
 OTLP/distributed tracing in v1. The client is metrics-free: progress
-output, logs, and the watcher skip-list.
+output, logs, and the watcher's failed list.
 
 A rejected token's reason is logged escaped and cut at 256 characters: it
 can carry attacker-controlled token text (the `kid`, header fields echoed
