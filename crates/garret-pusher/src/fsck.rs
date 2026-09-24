@@ -131,28 +131,44 @@ fn classify_rows(
 
 /// Deletes every dangling and size-mismatched row (`db::delete_object`,
 /// row+refs+stats in one transaction each — never the S3 object, which is
-/// left for the orphan sweep by design). Returns the count actually
+/// left for the orphan sweep by design). A row gone since the listing — GC
+/// evicted it, say — is skipped, not counted. Returns the count actually
 /// deleted.
 fn apply_repair(
     conn: &Arc<Mutex<Connection>>,
     dangling: &[FsckRow],
     size_mismatches: &[FsckSizeMismatch],
 ) -> Result<usize> {
-    for row in dangling {
-        let mut conn = conn.lock().unwrap();
-        db::delete_object(&mut conn, &row.store_path_hash)?;
-    }
-    metrics::counter!("garret_fsck_rows_repaired_total", "reason" => "dangling")
-        .increment(dangling.len() as u64);
+    let dangling = repair_rows(
+        conn,
+        dangling.iter().map(|r| r.store_path_hash.as_str()),
+        "dangling",
+    )?;
+    let mismatched = repair_rows(
+        conn,
+        size_mismatches.iter().map(|r| r.store_path_hash.as_str()),
+        "size_mismatch",
+    )?;
+    Ok(dangling + mismatched)
+}
 
-    for row in size_mismatches {
+/// Deletes each row still present, counting the deletions under `reason`.
+fn repair_rows<'a>(
+    conn: &Mutex<Connection>,
+    hashes: impl Iterator<Item = &'a str>,
+    reason: &'static str,
+) -> Result<usize> {
+    let mut repaired = 0;
+    for hash in hashes {
         let mut conn = conn.lock().unwrap();
-        db::delete_object(&mut conn, &row.store_path_hash)?;
+        if db::exists(&conn, hash)? {
+            db::delete_object(&mut conn, hash)?;
+            repaired += 1;
+        }
     }
-    metrics::counter!("garret_fsck_rows_repaired_total", "reason" => "size_mismatch")
-        .increment(size_mismatches.len() as u64);
-
-    Ok(dangling.len() + size_mismatches.len())
+    metrics::counter!("garret_fsck_rows_repaired_total", "reason" => reason)
+        .increment(repaired as u64);
+    Ok(repaired)
 }
 
 /// Polls until no upload is in progress or `timeout` elapses.
@@ -271,25 +287,7 @@ mod tests {
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         let hash = "a".repeat(32);
-        db::insert_object(
-            &mut conn,
-            &db::Object {
-                store_path_hash: hash.clone(),
-                store_path: format!("/nix/store/{hash}-thing"),
-                name: "thing".into(),
-                nar_hash: "sha256:x".into(),
-                nar_size: 10,
-                file_hash: "sha256:y".into(),
-                file_size: 5,
-                deriver: None,
-                ca: None,
-                references: vec![],
-                sigs: vec![],
-                pushed_by: None,
-            },
-            NOW - 2 * 86400,
-        )
-        .unwrap();
+        db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
         let db_rows = {
@@ -304,6 +302,48 @@ mod tests {
         assert_eq!(repaired, 1);
         let c = conn.lock().unwrap();
         assert!(!db::exists(&c, &hash).unwrap());
+    }
+
+    #[test]
+    fn a_row_gone_before_the_repair_is_skipped_and_the_rest_repaired() {
+        // GC evicts `a` between fsck's listing and its repair.
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let [a, b, c] = ["a", "b", "c"].map(|h| h.repeat(32));
+        for hash in [&a, &b, &c] {
+            db::insert_object(&mut conn, &object(hash), NOW - 2 * 86400).unwrap();
+        }
+        let rows = db::all_objects_brief(&conn).unwrap();
+        // `c`'s blob is the wrong size; `a` and `b` have none.
+        let blobs = [blob(&c, 90000, 9)];
+        let (dangling, mismatches) =
+            classify_rows(&rows, &blobs, &InFlight::new(), GRACE, NOW, true);
+        assert_eq!((dangling.len(), mismatches.len()), (2, 1));
+        db::delete_object(&mut conn, &a).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let repaired = apply_repair(&conn, &dangling, &mismatches).unwrap();
+        assert_eq!(repaired, 2, "the vanished row counted as repaired");
+        let conn = conn.lock().unwrap();
+        assert!(!db::exists(&conn, &b).unwrap());
+        assert!(!db::exists(&conn, &c).unwrap());
+    }
+
+    fn object(hash: &str) -> db::Object {
+        db::Object {
+            store_path_hash: hash.into(),
+            store_path: format!("/nix/store/{hash}-thing"),
+            name: "thing".into(),
+            nar_hash: "sha256:x".into(),
+            nar_size: 10,
+            file_hash: "sha256:y".into(),
+            file_size: 5,
+            deriver: None,
+            ca: None,
+            references: vec![],
+            sigs: vec![],
+            pushed_by: None,
+        }
     }
 
     #[tokio::test]
