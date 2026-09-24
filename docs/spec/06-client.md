@@ -48,6 +48,16 @@ must know is the one thing they would have had to configure anyway.
   `zstd_level`, and `[watch]` lives on daemon hosts whose config the NixOS
   module writes at an explicit `--config` path.
 
+Discovery is trusted with what nix trusts, so `login` refuses it rather than
+writing it: the Pusher URL, `puller_endpoint` and issuer must be `https`
+(plain `http` only to a loopback host) and printable ASCII with no whitespace,
+quotes or braces, the OIDC audience and client id printable ASCII with no
+whitespace or quotes, and every key `name:base64`. A newline in any of them
+would otherwise become a new nix.conf setting, and an advertised key is
+trusted for every substituter, not just this one. `login` prints the keys it
+wrote; `use` re-checks the URL and keys before writing nix.conf, since the
+config may predate the check or be hand-edited.
+
 The written file is a hand-rendered subset with comments, not a serialization
 of the config struct — which would emit every default and the entire `[watch]`
 section into a laptop's config.
@@ -65,7 +75,7 @@ non-zero if any check failed:
 
 | Check | What it probes |
 |---|---|
-| `discovery` | `GET /api/v1/discovery` on the Pusher — the server is reachable at all |
+| `discovery` | `GET /api/v1/discovery` on the Pusher — the server is reachable at all, and its document passes the checks `login` applies |
 | `config` | The local config against the discovery document — drift in `puller_endpoint` or `[oidc]` since `garret login` wrote it. Fields the server does not advertise are sparse, not drifted |
 | `keys` | Configured `public_keys` against discovery's — a configured key the server no longer signs with fails; *extra* server keys pass with a re-login nudge (rotation in progress) |
 | `auth` | Token acquisition plus the empty-Negotiation liveness probe `whoami` uses — the token is not merely present but accepted |

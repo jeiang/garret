@@ -235,10 +235,22 @@ pub fn render(endpoint: &str, discovery: &crate::discovery::Discovery) -> Result
 /// whole point being that a fresh machine needs no manual setup.
 pub fn write(path: &std::path::Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_private_dir(parent)?;
     }
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Creates `dir` and any missing parents mode 0700. `~/.config/garret/` holds
+/// the refresh token beside the config, and `login` writes the config first,
+/// so whichever write comes first must create it private (spec 04-auth). An
+/// existing directory is left as it is.
+pub fn create_private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))
 }
 
 #[cfg(test)]

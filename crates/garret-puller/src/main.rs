@@ -30,6 +30,9 @@ struct AppState {
     /// answers 503 instead of dying. Arc'd so pull-path reads can move onto
     /// the blocking pool under a budget (ticket 25).
     conn: OnceLock<Arc<Mutex<rusqlite::Connection>>>,
+    /// Browse's own connection, set alongside `conn`. An async lock, so
+    /// browse requests queue without holding blocking threads (spec 07).
+    browse_conn: OnceLock<Arc<tokio::sync::Mutex<rusqlite::Connection>>>,
     storage: Storage,
     presign_ttl: Duration,
     bump_debounce: i64,
@@ -39,10 +42,6 @@ struct AppState {
 }
 
 impl AppState {
-    fn conn(&self) -> Option<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-        Some(self.conn.get()?.lock().unwrap())
-    }
-
     fn conn_handle(&self) -> Option<Arc<Mutex<rusqlite::Connection>>> {
         self.conn.get().cloned()
     }
@@ -119,6 +118,12 @@ async fn flush_bumps(state: Arc<AppState>, conn: rusqlite::Connection) {
     }
 }
 
+/// How long a browse request may take, queueing included, before it answers
+/// 503. Only there so requests cannot pile up behind a slow one without end:
+/// browse is interactive and rare, and a slow query delays only other
+/// browse requests.
+const BROWSE_BUDGET: Duration = Duration::from_secs(10);
+
 fn unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response()
 }
@@ -156,6 +161,30 @@ where
     }
 }
 
+/// A browse query (spec 07) on the browse connection: one at a time, on the
+/// blocking pool, never on the pull-path connection, so a big tree walk or a
+/// full-scan search cannot delay a narinfo read. Queued requests wait on the
+/// async lock, not on blocking threads the pull path also needs. `None`
+/// means the budget tripped; the orphaned query keeps the connection until
+/// it returns.
+async fn browse_read<T, F>(
+    conn: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    budget: Duration,
+    read: F,
+) -> Option<anyhow::Result<T>>
+where
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let query = async move {
+        let conn = conn.lock_owned().await;
+        tokio::task::spawn_blocking(move || read(&conn))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("browse task failed: {e}")))
+    };
+    tokio::time::timeout(budget, query).await.ok()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -166,6 +195,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         conn: OnceLock::new(),
+        browse_conn: OnceLock::new(),
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
         bump_debounce: cfg.bump_debounce_secs,
@@ -183,14 +213,18 @@ async fn main() -> Result<()> {
             let opened = db::open_when_ready(&db_path, timeout)
                 .await
                 .and_then(|conn| {
-                    // Bumps get their own connection, so a flush waiting on
-                    // a Pusher write never holds up a pull-path read.
+                    // Bumps and browse get their own connections, so neither
+                    // a flush waiting on a Pusher write nor a slow browse
+                    // query ever holds up a pull-path read.
                     let bump_conn = db::open(&db_path, false)?;
                     bump_conn.busy_timeout(BUMP_BUSY_TIMEOUT)?;
-                    Ok((conn, bump_conn))
+                    Ok((conn, bump_conn, db::open(&db_path, false)?))
                 });
             match opened {
-                Ok((conn, bump_conn)) => {
+                Ok((conn, bump_conn, browse_conn)) => {
+                    let _ = state
+                        .browse_conn
+                        .set(Arc::new(tokio::sync::Mutex::new(browse_conn)));
                     let _ = state.conn.set(Arc::new(Mutex::new(conn)));
                     tokio::spawn(flush_bumps(state.clone(), bump_conn));
                     tracing::info!("database ready: serving");
@@ -246,7 +280,7 @@ async fn main() -> Result<()> {
         .route(
             "/ready",
             get(|State(state): State<Arc<AppState>>| async move {
-                match state.conn().is_some() {
+                match state.conn.get().is_some() {
                     true => (StatusCode::OK, "ready").into_response(),
                     false => unavailable(),
                 }
@@ -395,17 +429,28 @@ fn default_limit() -> usize {
     50
 }
 
-fn browse_response<T: serde::Serialize>(
+/// Answers a browse route: `read` through [`browse_read`], rendered as JSON;
+/// `None` is a 404.
+async fn browse<T, F>(
+    conn: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
     endpoint: &'static str,
-    result: anyhow::Result<Option<T>>,
-) -> Response {
+    read: F,
+) -> Response
+where
+    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Option<T>> + Send + 'static,
+    T: serde::Serialize + Send + 'static,
+{
     metrics::counter!("garret_browse_requests_total", "endpoint" => endpoint).increment(1);
-    match result {
-        Ok(Some(value)) => axum::Json(value).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
+    match browse_read(conn, BROWSE_BUDGET, read).await {
+        Some(Ok(Some(value))) => axum::Json(value).into_response(),
+        Some(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Some(Err(e)) => {
             tracing::error!("browse {endpoint}: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        None => {
+            tracing::warn!("browse {endpoint}: over its {BROWSE_BUDGET:?} budget");
+            (StatusCode::SERVICE_UNAVAILABLE, "browse query timed out").into_response()
         }
     }
 }
@@ -414,50 +459,53 @@ async fn list_objects(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
-    let Some(conn) = state.conn() else {
+    let Some(conn) = state.browse_conn.get().cloned() else {
         return unavailable();
     };
-    browse_response(
-        "objects",
+    browse(conn, "objects", move |conn| {
         browse::list(
-            &conn,
+            conn,
             query.q.as_deref(),
             query.limit,
             query.cursor.as_deref(),
         )
-        .map(Some),
-    )
+        .map(Some)
+    })
+    .await
 }
 
 async fn object_detail(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    let Some(conn) = state.conn() else {
+    let Some(conn) = state.browse_conn.get().cloned() else {
         return unavailable();
     };
-    browse_response("object", db::get_object(&conn, &hash))
+    browse(conn, "object", move |conn| db::get_object(conn, &hash)).await
 }
 
 async fn object_tree(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    let Some(conn) = state.conn() else {
+    let Some(conn) = state.browse_conn.get().cloned() else {
         return unavailable();
     };
-    browse_response("tree", browse::tree(&conn, &hash, 64))
+    browse(conn, "tree", move |conn| browse::tree(conn, &hash, 64)).await
 }
 
 async fn object_referrers(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Response {
-    let Some(conn) = state.conn() else {
+    let Some(conn) = state.browse_conn.get().cloned() else {
         return unavailable();
     };
-    browse_response("referrers", browse::referrers(&conn, &hash).map(Some))
+    browse(conn, "referrers", move |conn| {
+        browse::referrers(conn, &hash).map(Some)
+    })
+    .await
 }
 
 async fn list_pins(State(state): State<Arc<AppState>>) -> Response {
-    let Some(conn) = state.conn() else {
+    let Some(conn) = state.browse_conn.get().cloned() else {
         return unavailable();
     };
-    browse_response("pins", browse::pins(&conn).map(Some))
+    browse(conn, "pins", |conn| browse::pins(conn).map(Some)).await
 }
 
 #[cfg(test)]
@@ -580,6 +628,51 @@ mod tests {
         // Written: later hits read the fresh value and queue nothing.
         hit(&bumps, &conn, &hash, now + 1);
         assert_eq!(bumps.flush(&mut conn, now + 1, DAY).unwrap(), 0);
+    }
+
+    /// A slow browse query (a big tree walk, a full-scan search) must not
+    /// delay a pull-path read. With one runtime thread, a query run on the
+    /// async worker would stall the narinfo read's own task. (Sharing the
+    /// pull-path connection is ruled out by type: browse's is an async lock.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_slow_browse_query_does_not_delay_pull_reads() {
+        let browse_conn = Arc::new(tokio::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        let (running_tx, running_rx) = tokio::sync::oneshot::channel();
+        let started = std::time::Instant::now();
+        let slow = tokio::spawn(browse_read(browse_conn, Duration::from_secs(5), |_| {
+            running_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+            Ok(())
+        }));
+        running_rx.await.unwrap();
+
+        let read = db_read(conn(), Duration::from_millis(900), |_| Ok(42)).await;
+        assert_eq!(read.expect("the pull read tripped its budget").unwrap(), 42);
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "the pull read waited on the browse query: {:?}",
+            started.elapsed()
+        );
+        slow.await.unwrap().unwrap().unwrap();
+    }
+
+    /// The budget covers the wait for the browse lock too: requests queued
+    /// behind a slow query answer 503 instead of piling up.
+    #[tokio::test]
+    async fn a_browse_request_queued_behind_a_slow_one_trips_its_budget() {
+        let browse_conn = Arc::new(tokio::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        let _slow = browse_conn.clone().lock_owned().await;
+        let queued = tokio::time::timeout(
+            Duration::from_secs(5),
+            browse_read(browse_conn, Duration::from_millis(25), |_| Ok(())),
+        )
+        .await
+        .expect("the queued request waited past its budget");
+        assert!(queued.is_none());
     }
 
     #[tokio::test]

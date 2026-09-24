@@ -225,7 +225,8 @@ pub struct PusherConfig {
     pub limits: Limits,
     /// Absent means no quota is enforced and GC never evicts.
     pub gc: Option<GcConfig>,
-    /// Root-only unix socket for garret-admin. Absent means no admin surface.
+    /// Unix socket for garret-admin, mode 0600 under the Pusher's user. Absent
+    /// means no admin surface.
     pub admin_socket: Option<String>,
     /// Internal metrics listener (spec 08). Default `127.0.0.1:9091`.
     #[serde(default = "pusher_metrics_listen")]

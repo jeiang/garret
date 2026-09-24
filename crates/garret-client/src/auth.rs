@@ -70,26 +70,39 @@ pub fn peek_claims(token: &str) -> Result<Claims> {
     serde_json::from_slice(&bytes).context("token payload is not JSON")
 }
 
-/// Writes the token file mode 0600, creating `~/.config/garret/` if needed.
+/// Writes the token file, creating `~/.config/garret/` mode 0700 if needed.
 pub fn save_token(token: &StoredToken) -> Result<()> {
-    let path = token_path()?;
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    std::fs::write(&path, serde_json::to_vec_pretty(token)?)?;
-    restrict(&path)?;
-    Ok(())
+    write_private(&token_path()?, &serde_json::to_vec_pretty(token)?)
 }
 
-/// Mode 0600 — a refresh token is a credential (spec 04-auth).
-#[cfg(unix)]
-fn restrict(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict(_path: &std::path::Path) -> Result<()> {
-    Ok(())
+/// A refresh token is a credential (spec 04-auth), so its file is never
+/// readable by anyone else, not even for a moment: the bytes go to a fresh
+/// sibling created mode 0600 in the same open (`O_EXCL`, so nothing already
+/// there is written through), which is then renamed over `path`. The rename
+/// also makes a rotation atomic — a crash mid-write leaves the previous token,
+/// not a truncated one — and replaces a symlink planted at `path` rather than
+/// following it.
+fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let dir = path.parent().context("the token path has no directory")?;
+    crate::config::create_private_dir(dir)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("writing {}", path.display()))
 }
 
 /// The two OIDC endpoints the client uses, out of everything discovery offers.
@@ -544,6 +557,43 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    /// The refresh token is never readable by others, a rotation replaces the
+    /// file whole, and a symlink planted at the path is replaced, not followed.
+    /// `login` writes the config before the token, so that write must already
+    /// create the shared directory private.
+    #[test]
+    fn the_token_file_is_private_from_creation_and_replaced_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("garret-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let path = root.join("garret").join("token.json");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        crate::config::write(&root.join("garret").join("config.toml"), "").unwrap();
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        write_private(&path, b"first").unwrap();
+        assert_eq!(mode(&path), 0o600);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, b"second").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(mode(&path), 0o600);
+
+        let elsewhere = root.join("elsewhere");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        write_private(&path, b"third").unwrap();
+        assert!(!elsewhere.exists(), "the write followed the symlink");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(std::fs::read(&path).unwrap(), b"third");
+        // Nothing but the config and the token is left in the directory.
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            2
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// A JWT-shaped token declaring `lifetime` seconds; `n` tells mints apart.
     fn jwt(n: usize, lifetime: Option<i64>) -> String {
