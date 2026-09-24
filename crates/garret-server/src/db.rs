@@ -764,7 +764,7 @@ mod tests {
         // Byte 32 falls inside `é`: slicing there used to panic the Puller's
         // browse tree while it held the connection mutex.
         let base = format!("{}é-x", "a".repeat(31));
-        assert!(!crate::nix_base32::is_store_hash(hash_of(&base)));
+        assert!(!garret_common::is_store_hash(hash_of(&base)));
         assert_eq!(hash_of(&format!("{}-x", "a".repeat(32))), "a".repeat(32));
     }
 
