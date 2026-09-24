@@ -460,7 +460,7 @@ async fn store_upload(
         if let Some(preamble) = take_preamble(&mut head)? {
             break preamble;
         }
-        let Some(chunk) = stream.next().await else {
+        let Some(chunk) = storage::next_chunk(&mut stream).await? else {
             return Err(Error(
                 StatusCode::BAD_REQUEST,
                 "body ended before the preamble was complete".into(),

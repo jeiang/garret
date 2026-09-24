@@ -37,6 +37,10 @@ Defaults, all configurable:
   flight just serializes the parts.
 - On any upload error, stop the parts still uploading, then abort the
   multipart immediately so parts free.
+- A body that sends nothing for **60 s** is an upload error like any
+  other (spec [01](01-push-protocol.md#backpressure)): the multipart
+  aborts and the part slot frees, so a stalled client cannot hold a slot
+  indefinitely.
 - On SIGTERM/SIGINT the Pusher stops accepting connections and lets
   in-flight uploads finish for up to **60 s**, then aborts every
   multipart still open (it is the bucket's only writer), listing again

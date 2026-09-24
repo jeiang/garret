@@ -101,6 +101,16 @@ deadline allows rather than a retry count — a 429 is a place in the queue,
 not a failure. The queue lives in the clients;
 server memory is provably bounded by configuration.
 
+**A stalled body is abandoned.** An admitted upload holds an upload
+slot, its in-flight claim and, mid-NAR, a part slot, so a sender that
+stops sending would hold them forever. If the body delivers nothing for
+**60 s** (a fixed bound), the server gives up: any multipart upload is
+aborted and the reply is a `500`, retryable like any `5xx`. The bound is
+on silence, not total time — only time spent waiting for the next chunk
+counts, so a slow sender that keeps moving is never cut off. There is
+deliberately no per-NAR size cap: every pusher is authenticated, and the
+GC quota bounds what the cache holds.
+
 ## Errors, retry, versioning
 
 `5xx` and `429` are retryable; other `4xx` are not. Error bodies are

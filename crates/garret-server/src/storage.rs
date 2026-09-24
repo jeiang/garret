@@ -82,6 +82,25 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .filter(|h| !h.is_empty())
 }
 
+/// How long an upload body may send nothing before the upload is abandoned
+/// (spec 01). A stalled body holds an upload slot, its in-flight claim and,
+/// mid-NAR, a part slot, so without a bound a few quiet senders starve every
+/// other push. Idle, not total: a slow sender that keeps moving is fine.
+pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The body's next chunk, or an error once it has sent nothing for
+/// [`BODY_IDLE_TIMEOUT`].
+pub async fn next_chunk<S: Stream + Unpin>(body: &mut S) -> Result<Option<S::Item>> {
+    tokio::time::timeout(BODY_IDLE_TIMEOUT, body.next())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "upload body stalled: nothing received for {}s",
+                BODY_IDLE_TIMEOUT.as_secs()
+            )
+        })
+}
+
 /// Pulls exactly `part_size` bytes (fewer only at end of stream), keeping any
 /// overshoot in `carry` for the next part. The part is handed on as-is, never
 /// copied again: a part slot must account for the part's only buffer.
@@ -104,7 +123,7 @@ where
         part.extend_from_slice(&left);
     }
     while part.len() < part_size {
-        let Some(chunk) = body.next().await else {
+        let Some(chunk) = next_chunk(body).await? else {
             break;
         };
         let chunk = chunk.map_err(|e| anyhow!("reading request body: {e}"))?;
@@ -541,7 +560,12 @@ mod tests {
     /// S4 requires parts 1..N-1 to be identical in size, so this is the check
     /// that matters most: only the final part may be short.
     fn parts_of(chunks: Vec<&'static [u8]>, part_size: usize) -> Vec<usize> {
-        futures::executor::block_on(async {
+        // Tokio, not a bare executor: reads carry the body idle timeout.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
             let mut body = futures::stream::iter(
                 chunks
                     .into_iter()
@@ -602,6 +626,30 @@ mod tests {
         assert_eq!(tiny.total_slots(), 1);
     }
 
+    /// A sender that goes quiet mid-part must fail the read rather than hold
+    /// its slots forever. Paused clock: the idle bound passes at once, and a
+    /// read that ignores it trips the outer bound instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_body_fails_the_read() {
+        let mut body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
+            .chain(futures::stream::pending());
+        let read =
+            tokio::time::timeout(BODY_IDLE_TIMEOUT * 2, read_part(&mut body, &mut None, 1024))
+                .await;
+        assert!(read.expect("a stalled body hung the read").is_err());
+    }
+
+    /// The bound is on silence, not on total time: a sender that keeps
+    /// trickling bytes is never cut off, however long the part takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_body_that_keeps_moving_is_not_cut_off() {
+        let mut body = Box::pin(futures::stream::iter(0..4).then(|_| async {
+            tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
+        }));
+        let part = read_part(&mut body, &mut None, 1024).await.unwrap();
+        assert_eq!(part.len(), 8);
+    }
     /// Just enough S3 on a loopback port. Every call succeeds, except that
     /// `DeleteObjects` answers inside a 200 the way S3 and Garage do: keys
     /// containing `denied` fail, and keys containing `gone` come back as
