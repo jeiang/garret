@@ -2,6 +2,7 @@
 //! (spec 01-push-protocol, 06-client).
 
 use std::{
+    collections::HashMap,
     process::Stdio,
     sync::{
         Arc,
@@ -153,6 +154,27 @@ impl Report {
         }
     }
 
+    /// The closing Negotiation found `gone` missing again after a clean run;
+    /// they are pushed next and their events follow this one.
+    pub fn rechecked(&self, gone: &[PathInfo]) {
+        let nar_bytes: u64 = gone.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        if let Some(bar) = &self.bar {
+            bar.inc_length(nar_bytes);
+        }
+        if self.json {
+            self.event(json!({
+                "event": "rechecked",
+                "missing": gone.len(),
+                "nar_bytes": nar_bytes,
+            }));
+        } else {
+            self.out(&format!(
+                "re-check: {} path(s) went missing during the run, pushing them",
+                gone.len()
+            ));
+        }
+    }
+
     /// Clears the bar and emits the totals — the `done` event under `--json`,
     /// which is what makes a truncated NDJSON stream detectable.
     pub fn finish(&self, summary: &Summary) {
@@ -179,9 +201,11 @@ impl Report {
     /// bar's total is denominated in.
     ///
     /// A retried path is re-read and so counted twice, nudging the bar past its
-    /// total on a rare failure. That is cosmetic, and correcting it would mean
-    /// threading a per-attempt counter through the body stream to decrement on
-    /// error; the bar clamps its display, so it is left alone.
+    /// total — routinely while an `in-progress` path is polled, since each poll
+    /// streams part of the body before the early reply. That is cosmetic, and
+    /// correcting it would mean threading a per-attempt counter through the
+    /// body stream to decrement on error; the bar clamps its display, so it is
+    /// left alone.
     fn wrap<R: AsyncRead + Unpin>(&self, reader: R) -> ProgressBarIter<R> {
         match &self.bar {
             Some(bar) => bar.clone().wrap_async_read(reader),
@@ -196,13 +220,23 @@ impl Report {
 pub struct Summary {
     /// Paths whose upload created a new Object.
     pub pushed: usize,
-    /// Paths another writer beat us to (`exists` or `in-progress` acks).
+    /// Paths another writer beat us to: an `exists` ack, including one
+    /// reached by waiting out another pusher's `in-progress` upload.
     pub deduped: usize,
     /// Paths that failed even after retries; a non-zero count is what turns
     /// into a non-zero exit code.
     pub failed: usize,
     /// Total uncompressed NAR bytes across the attempted paths.
     pub nar_bytes: u64,
+}
+
+impl std::ops::AddAssign for Summary {
+    fn add_assign(&mut self, other: Self) {
+        self.pushed += other.pushed;
+        self.deduped += other.deduped;
+        self.failed += other.failed;
+        self.nar_bytes += other.nar_bytes;
+    }
 }
 
 /// A configured connection to the Pusher: everything [`missing`] and
@@ -361,14 +395,14 @@ impl Pusher {
             .collect())
     }
 
-    /// Uploads every path with at most `jobs` in flight.
+    /// Uploads every path with at most `jobs` in flight, references first.
     ///
     /// A failure does not abort the run: every path is attempted and reported,
     /// and the caller decides the exit code from `Summary::failed`. That way a
     /// `--json` consumer always receives the terminating `done` event.
     pub async fn push_all(&self, paths: Vec<PathInfo>, report: &Report) -> Summary {
         let nar_bytes: u64 = paths.iter().map(|p| p.nar_size.max(0) as u64).sum();
-        let statuses = stream::iter(paths)
+        let statuses = stream::iter(references_first(paths))
             .map(|info| async move {
                 match self.push_one(&info, report).await {
                     Ok(status) => {
@@ -472,14 +506,64 @@ impl Pusher {
             status: String,
         }
         let ack: Ack = response.json().await.context("parsing upload response")?;
-        Ok(match ack.status.as_str() {
-            // First writer wins; a concurrent pusher finishing it is success.
+        match ack.status.as_str() {
             // "deduped", not "skipped": the bytes were uploaded and only then
             // found redundant, so the bandwidth was spent either way.
-            "exists" | "in-progress" => "deduped",
-            _ => "pushed",
-        })
+            "exists" => Ok("deduped"),
+            // Not success yet: the other upload may still fail. Wait until
+            // the server answers `exists`, or lets this one through.
+            "in-progress" => Err(InProgress.into()),
+            _ => Ok("pushed"),
+        }
     }
+}
+
+/// Orders `paths` so each comes after the paths in the batch it references.
+/// The worker pool only *starts* uploads in this order: with `jobs > 1` a
+/// referrer can still finish before its references, and a reference that
+/// fails does not hold its referrers back, so an interrupted or failed run can
+/// leave a referrer without its references until the next push's Negotiation
+/// finds them. At `jobs = 1` an interrupted run leaves only whole closures.
+/// Self-references and references outside the batch impose nothing; a cycle
+/// (nix forbids them) keeps its original order at the end rather than dropping
+/// a path.
+fn references_first(paths: Vec<PathInfo>) -> Vec<PathInfo> {
+    let index: HashMap<&str, usize> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.path.as_str(), i))
+        .collect();
+    // Kahn's algorithm: `waiting[i]` counts i's references not yet placed.
+    let mut waiting = vec![0usize; paths.len()];
+    let mut referrers = vec![Vec::new(); paths.len()];
+    for (i, info) in paths.iter().enumerate() {
+        for reference in &info.references {
+            if let Some(&j) = index.get(reference.as_str())
+                && j != i
+            {
+                waiting[i] += 1;
+                referrers[j].push(i);
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..paths.len()).filter(|&i| waiting[i] == 0).collect();
+    let mut next = 0;
+    while let Some(&i) = order.get(next) {
+        next += 1;
+        for &k in &referrers[i] {
+            waiting[k] -= 1;
+            if waiting[k] == 0 {
+                order.push(k);
+            }
+        }
+    }
+    order.extend((0..paths.len()).filter(|&i| waiting[i] > 0));
+
+    let mut slots: Vec<Option<PathInfo>> = paths.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each index is placed once"))
+        .collect()
 }
 
 /// Generous for one missing-paths round-trip, even over a whole closure.
@@ -604,23 +688,44 @@ impl std::fmt::Display for Shed {
 
 impl std::error::Error for Shed {}
 
-/// How long one path keeps waiting out 429s before it fails: long enough to
-/// queue behind several multi-minute uploads, short enough that a server that
-/// never frees a slot fails the run instead of hanging it.
-const SHED_DEADLINE: Duration = Duration::from_secs(15 * 60);
+/// Another pusher is uploading the path right now. Typed so [`Backoff`]
+/// waits for it to finish instead of counting the path as pushed: that upload
+/// may yet fail, and then nobody would have pushed it.
+#[derive(Debug)]
+struct InProgress;
 
-/// One path's retry schedule (spec 01). A 429 is the server's queue, not a
-/// fault: it waits out `Retry-After` for as long as [`SHED_DEADLINE`] allows
-/// and never spends the error budget. Other retryable failures get
-/// `max_retries` doubling waits from 250 ms; a shed resets that budget, so it
-/// counts consecutive faults — a shed whose reply is lost to the connection
-/// race (spec 01) must not add up over a quarter hour of queueing. Every wait
-/// is jittered so a fleet of pushers doesn't retry in lockstep.
+impl std::fmt::Display for InProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another pusher is still uploading this path")
+    }
+}
+
+impl std::error::Error for InProgress {}
+
+/// How long one path keeps waiting out 429s and other pushers' uploads before
+/// it fails: long enough to queue behind several multi-minute uploads, short
+/// enough that a server that never frees a slot fails the run instead of
+/// hanging it.
+const WAIT_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// The longest pause between asking whether another pusher's upload is done.
+const IN_PROGRESS_MAX_POLL: Duration = Duration::from_secs(30);
+
+/// One path's retry schedule (spec 01). A 429 is the server's queue and an
+/// `in-progress` ack another pusher's upload, not faults: both are waited out
+/// for as long as [`WAIT_DEADLINE`] allows and never spend the error budget —
+/// 429s for `Retry-After`, `in-progress` in waits doubling from 1 s to
+/// [`IN_PROGRESS_MAX_POLL`]. Other retryable failures get `max_retries`
+/// doubling waits from 250 ms; either wait resets that budget, so it counts
+/// consecutive faults — early replies lost to the connection race (spec 01)
+/// must not add up over a quarter hour of waiting. Every wait is jittered so a
+/// fleet of pushers doesn't retry in lockstep.
 struct Backoff {
     started: Instant,
     retries: u32,
     max_retries: u32,
     delay: Duration,
+    poll: Duration,
 }
 
 impl Backoff {
@@ -630,16 +735,26 @@ impl Backoff {
             retries: 0,
             max_retries,
             delay: Duration::from_millis(250),
+            poll: Duration::from_secs(1),
         }
     }
 
     /// How long to wait before trying again after `error`; `None` to give up.
     fn next(&mut self, error: &anyhow::Error) -> Option<Duration> {
-        if let Some(Shed(after)) = error.downcast_ref::<Shed>() {
+        let queued = if let Some(Shed(after)) = error.downcast_ref::<Shed>() {
+            Some(*after)
+        } else if error.is::<InProgress>() {
+            let poll = self.poll;
+            self.poll = (poll * 2).min(IN_PROGRESS_MAX_POLL);
+            Some(poll)
+        } else {
+            None
+        };
+        if let Some(base) = queued {
             self.retries = 0;
             self.delay = Duration::from_millis(250);
-            let wait = *after + Duration::from_millis(fastrand_millis(*after));
-            return (self.started.elapsed() + wait <= SHED_DEADLINE).then_some(wait);
+            let wait = base + Duration::from_millis(fastrand_millis(base));
+            return (self.started.elapsed() + wait <= WAIT_DEADLINE).then_some(wait);
         }
         if self.retries >= self.max_retries || !is_retryable(error) {
             return None;
@@ -715,13 +830,13 @@ fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Durat
 
 /// A 429's `Retry-After`, in seconds; absent or unparseable (an HTTP date)
 /// means 1 s. Clamped to at least 1 s, so a `0` cannot spin, and at most
-/// [`SHED_DEADLINE`], so an absurd value cannot overflow the wait arithmetic.
+/// [`WAIT_DEADLINE`], so an absurd value cannot overflow the wait arithmetic.
 fn shed_for(retry_after: Option<&str>) -> Duration {
     retry_after
         .and_then(|v| v.trim().parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(1))
-        .clamp(Duration::from_secs(1), SHED_DEADLINE)
+        .clamp(Duration::from_secs(1), WAIT_DEADLINE)
 }
 
 /// 5xx and dropped, timed-out or stalled connections are retryable; 4xx are
@@ -899,7 +1014,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shedding_gives_up_at_the_deadline() {
         let mut backoff = Backoff::new(5);
-        tokio::time::advance(SHED_DEADLINE - Duration::from_secs(10)).await;
+        tokio::time::advance(WAIT_DEADLINE - Duration::from_secs(10)).await;
         assert!(backoff.next(&shed(1)).is_some());
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(backoff.next(&shed(1)).is_none());
@@ -915,9 +1030,70 @@ mod tests {
         assert_eq!(shed_for(None), second);
         assert_eq!(shed_for(Some("Wed, 21 Oct 2015 07:28:00 GMT")), second);
         let absurd = shed_for(Some("18446744073709551615"));
-        assert_eq!(absurd, SHED_DEADLINE);
+        assert_eq!(absurd, WAIT_DEADLINE);
         let mut backoff = Backoff::new(0);
         assert!(backoff.next(&Shed(absurd).into()).is_none());
+    }
+
+    /// Another pusher's upload may yet fail, so it is waited out — polling
+    /// less and less often — rather than counted as pushed, and the wait
+    /// spends none of the budget for real failures.
+    #[tokio::test(start_paused = true)]
+    async fn another_pushers_upload_is_polled_off_the_error_budget_until_the_deadline() {
+        let mut backoff = Backoff::new(1);
+        for base in [1, 2, 4, 8, 16, 30, 30, 30] {
+            let wait = backoff
+                .next(&InProgress.into())
+                .expect("inside the deadline");
+            let base = Duration::from_secs(base);
+            assert!((base..base * 2).contains(&wait), "{wait:?} for {base:?}");
+            tokio::time::advance(wait).await;
+        }
+        assert!(backoff.next(&rejected(503)).is_some());
+        assert!(backoff.next(&rejected(503)).is_none());
+        tokio::time::advance(WAIT_DEADLINE).await;
+        assert!(backoff.next(&InProgress.into()).is_none());
+    }
+
+    fn node(name: &str, references: &[&str]) -> PathInfo {
+        PathInfo {
+            references: references
+                .iter()
+                .map(|r| format!("/nix/store/{r}"))
+                .collect(),
+            ..info(&format!("/nix/store/{name}"), &[])
+        }
+    }
+
+    /// Every path starts after the paths in the batch it references, so a
+    /// sequential run cut short leaves whole closures behind.
+    #[test]
+    fn references_are_pushed_before_their_referrers() {
+        let batch = vec![
+            node("root", &["root", "tool", "lib"]),
+            node("tool", &["lib", "elsewhere"]),
+            node("other", &[]),
+            node("lib", &["lib", "elsewhere"]),
+        ];
+        let order = references_first(batch.clone());
+        let at = |path: &str| order.iter().position(|p| p.path == path).unwrap();
+        assert_eq!(order.len(), batch.len());
+        for info in &batch {
+            for reference in &info.references {
+                if reference != &info.path && batch.iter().any(|p| &p.path == reference) {
+                    assert!(
+                        at(reference) < at(&info.path),
+                        "{reference} after {}",
+                        info.path
+                    );
+                }
+            }
+        }
+        // Nix forbids cycles, but one must not drop a path.
+        assert_eq!(
+            references_first(vec![node("a", &["b"]), node("b", &["a"])]).len(),
+            2
+        );
     }
 
     #[test]

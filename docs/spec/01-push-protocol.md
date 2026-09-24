@@ -87,8 +87,10 @@ normal operation:
 - Client sends `Expect: 100-continue`; the server checks the DB before
   requesting the body.
 - Already present → `200 {"status":"exists"}` with no body transfer.
-- In flight elsewhere → `200 {"status":"in-progress"}`; the second
-  pusher treats it as success (first writer wins).
+- In flight elsewhere → `200 {"status":"in-progress"}`. The second
+  pusher does **not** count this as pushed — the first upload may yet
+  fail — but waits it out and asks again until it gets `exists` or its
+  own upload is taken (first writer wins).
 - Being deleted (GC, `garret-admin delete` or `prune` has removed the
   row but not yet the blob; spec 05) → `503` + `Retry-After: 1`. An
   upload now would lose its blob to the pending delete; by the retry the
@@ -129,7 +131,8 @@ GC quota bounds what the cache holds.
 
 ## Errors, retry, versioning
 
-`5xx` and `429` are retryable; other `4xx` are not. Error bodies are
+`5xx` and `429` are retryable; other `4xx` are not. So is `in-progress`,
+which is waited out on the same deadline as a `429`. Error bodies are
 JSON (`{"error": "…"}`). A `4xx` body explains what the request got
 wrong. An unexpected `500` says only `internal error (id …)`: the error
 chain (S3, SQLite, filesystem detail) is logged by the Pusher under that

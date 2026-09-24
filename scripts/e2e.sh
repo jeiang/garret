@@ -590,6 +590,55 @@ echo "  dry run lists, future cutoff matches nothing, --apply deletes the subjec
 # still has the big path to evict and the watched closures to check.
 garret push "$path" "$big" "$jsonpath" "$watched" "$woken" >/dev/null
 
+say "closure completeness: in-progress is waited out, and a re-check restores a lost dependency"
+# Another pusher holds the root in-progress while the push starts, and the
+# dependency the Negotiation found present is deleted before the push ends.
+# Counting in-progress as pushed would leave both missing; the push must wait
+# the other upload out, push the root itself when it dies, and have its
+# closing re-check notice the dependency is gone and push it again.
+inflight=$(fixture inflight)
+inflight_hash=$(basename "$inflight" | cut -c1-32)
+inflight_dep=$(nix path-info --recursive "$inflight" | grep -- '-garret-e2e-inflight-dep$')
+inflight_dep_hash=$(basename "$inflight_dep" | cut -c1-32)
+garret push "$inflight_dep" >/dev/null
+# A stalled upload: headers sent, which takes the in-flight claim, then nothing.
+python3 - "$pusher_port" "$inflight_hash" "$GARRET_TOKEN" <<'PY' &
+import socket, sys, time
+port, h, token = sys.argv[1:]
+s = socket.create_connection(("127.0.0.1", int(port)))
+s.sendall(f"PUT /api/v1/nar/{h} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+          f"Authorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n\r\n".encode())
+time.sleep(300)
+PY
+hold_pid=$!
+# Integer value of a Pusher metric; 0 before it is first recorded.
+count() { local v; v=$(metric "$pusher_metrics_port" "$1"); v=${v%%.*}; echo "${v:-0}"; }
+wait_until() {
+  local i
+  for i in $(seq 100); do eval "$1" && return 0; sleep 0.1; done
+  return 1
+}
+wait_until '[ "$(count garret_uploads_in_flight)" -ge 1 ]' \
+  || { echo "the stalled upload never took the claim"; exit 1; }
+in_progress='garret_upload_skipped_total{reason="in-progress"}'
+skipped=$(count "$in_progress")
+garret push "$inflight" > "$root/push-inflight.out" 2>&1 &
+push_pid=$!
+wait_until '[ "$(count "$in_progress")" -gt "$skipped" ]' \
+  || { echo "the push never met the in-progress claim"; cat "$root/push-inflight.out"; exit 1; }
+kill -0 $push_pid 2>/dev/null \
+  || { echo "the push ended while another upload held its path"; cat "$root/push-inflight.out"; exit 1; }
+admin delete "$inflight_dep_hash" >/dev/null
+kill $hold_pid
+wait $push_pid || { echo "the push failed"; cat "$root/push-inflight.out"; exit 1; }
+cat "$root/push-inflight.out"
+grep -q "re-check: 1 path(s)" "$root/push-inflight.out"
+grep -q "done: 2 pushed, 0 deduped, 0 failed" "$root/push-inflight.out"
+for h in "$inflight_hash" "$inflight_dep_hash"; do
+  curl -sf "$puller_url/$h.narinfo" >/dev/null || { echo "$h is missing after the push"; exit 1; }
+done
+echo "  waited out the stalled upload, pushed the root, and re-pushed the deleted dependency"
+
 say "benchmark harness"
 # All three scenarios, wired end to end: push seeds the corpus (count 12),
 # stream exercises the single-stream path, pull reads the corpus back.

@@ -31,4 +31,10 @@ in
 
   # A path pushed via `garret enqueue` waking the watcher, not via its poll.
   woken = pkgs.runCommand "garret-e2e-woken" { } "echo woken ${stamp} > $out";
+
+  # A fresh two-path closure for the in-progress and re-check stage, which
+  # deletes its dependency mid-push.
+  inflight = pkgs.runCommand "garret-e2e-inflight" { } "echo ${
+    pkgs.runCommand "garret-e2e-inflight-dep" { } "echo inflight ${stamp} > $out"
+  } > $out";
 }

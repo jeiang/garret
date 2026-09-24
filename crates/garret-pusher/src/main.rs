@@ -409,9 +409,9 @@ async fn upload(
     };
     let _claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
         Ok(claim) => claim,
-        // Second pusher for the same path: first writer wins, and the loser
-        // treats it as success rather than racing to overwrite an identical
-        // blob.
+        // Second pusher for the same path: first writer wins. The loser is
+        // told `in-progress` and asks again later (spec 01) — this upload may
+        // yet fail — rather than racing to overwrite an identical blob.
         Err(inflight::Kind::Upload) => {
             metrics::counter!("garret_upload_skipped_total", "reason" => "in-progress")
                 .increment(1);
