@@ -35,8 +35,17 @@ Prefix `garret_`; service distinguished by scrape job.
   the response did not report as failed) and per-key delete failures
   (`garret_s3_delete_failures_total`: keys a `DeleteObjects` 200 reported
   as not deleted — each an orphan until a later sweep succeeds).
-- **Pusher — auth**: validations by issuer+outcome; JWKS refreshes and
-  failures.
+- **Pusher — auth** (also on the Puller, for browse tokens):
+  `garret_auth_validations_total` by `issuer` (a configured issuer URL,
+  or `unknown` when the token names none: never the token's own `iss`)
+  and `outcome` (`accepted`, `malformed`, `untrusted_issuer`,
+  `unknown_key`, `jwks_unavailable`, `invalid`, `unauthorized`);
+  `garret_jwks_refreshes_total` (fetch attempts) and
+  `garret_jwks_refresh_failures_total` by `issuer`. A rise in
+  `unknown_key` without matching refreshes is either an unknown-kid flood
+  the JWKS floor is absorbing (spec 04) or, if refresh failures rise too,
+  a down issuer: during the floor after a failed fetch, unknown kids count
+  as `unknown_key`, not `jwks_unavailable`.
 - **Pusher — GC**: usage and quota gauges; evicted objects/bytes per
   pass; pass duration; orphans found; candidates-exhausted alarm
   counter; `garret_gc_failures_total` by `phase` (`pass`, `sweep`), for
@@ -71,3 +80,7 @@ Prefix `garret_`; service distinguished by scrape job.
 (journald-friendly); per-request spans with request ids. No
 OTLP/distributed tracing in v1. The client is metrics-free: progress
 output, logs, and the watcher skip-list.
+
+A rejected token's reason is logged escaped and cut at 256 characters: it
+can carry attacker-controlled token text (the `kid`, header fields echoed
+by parse errors), which must not forge log lines or flood the journal.

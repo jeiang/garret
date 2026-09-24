@@ -26,7 +26,7 @@ use axum::{
 use futures::StreamExt;
 use garret_common::Preamble;
 use garret_server::{
-    auth::{Authenticator, Subject},
+    auth::{self, Authenticator, Subject},
     config::PusherConfig,
     db::{self, Object},
     inflight::{self, InFlight},
@@ -333,7 +333,7 @@ async fn require_oidc(
         }
         // The reason stays in the log; the caller learns only that it failed.
         Err(e) => {
-            tracing::warn!("rejected token: {e:#}");
+            tracing::warn!("rejected token: {}", auth::loggable(&e));
             unauthorized("invalid token")
         }
     }

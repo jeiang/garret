@@ -121,21 +121,46 @@ impl Authenticator {
     }
 
     /// Validates a bearer token and returns its subject, or an error naming
-    /// only what the caller may safely learn.
+    /// only what the caller may safely learn (log it via [`loggable`]).
     pub async fn authenticate(&self, token: &str) -> Result<Subject> {
-        // Unverified read of `iss` picks which issuer to verify against. It
-        // decides routing only; every claim is re-read after verification.
-        let issuer_name = unverified_issuer(token)?;
-        let issuer = self
-            .issuers
+        let (issuer, verdict) = self.check(token).await;
+        let outcome = match &verdict {
+            Ok(_) => "accepted",
+            Err((outcome, _)) => *outcome,
+        };
+        metrics::counter!(
+            "garret_auth_validations_total",
+            "issuer" => issuer, "outcome" => outcome,
+        )
+        .increment(1);
+        verdict.map_err(|(_, e)| e)
+    }
+
+    /// The verdict and the issuer label: the configured issuer's URL, never
+    /// the token's own `iss`, which anyone can set; labels must stay bounded
+    /// (spec 08).
+    async fn check(&self, token: &str) -> (String, Result<Subject, Refusal>) {
+        match self.route(token) {
+            Ok(issuer) => (issuer.cfg.issuer.clone(), self.verify(issuer, token).await),
+            Err(refusal) => ("unknown".to_owned(), Err(refusal)),
+        }
+    }
+
+    /// Unverified read of `iss` picks which issuer to verify against. It
+    /// decides routing only; every claim is re-read after verification.
+    fn route(&self, token: &str) -> Result<&Arc<Issuer>, Refusal> {
+        let issuer_name = unverified_issuer(token).map_err(|e| ("malformed", e))?;
+        self.issuers
             .iter()
             .find(|i| i.cfg.issuer == issuer_name)
-            .ok_or_else(|| anyhow!("untrusted issuer"))?;
+            .ok_or_else(|| ("untrusted_issuer", anyhow!("untrusted issuer")))
+    }
 
+    async fn verify(&self, issuer: &Arc<Issuer>, token: &str) -> Result<Subject, Refusal> {
         let kid = jsonwebtoken::decode_header(token)
-            .context("malformed token header")?
-            .kid
-            .ok_or_else(|| anyhow!("token has no kid"))?;
+            .context("malformed token header")
+            .and_then(|h| h.kid.ok_or_else(|| anyhow!("token has no kid")))
+            .map_err(|e| ("malformed", e))?;
 
         let (key, expired) = issuer.cached_key(&kid);
         let key = match key {
@@ -152,12 +177,14 @@ impl Authenticator {
                 // Unknown kid means rotation: wait for the shared,
                 // rate-limited refetch.
                 if let Some(attempt) = issuer.refresh(&self.http) {
-                    attempt.await.map_err(|e| anyhow!("{e:#}"))?;
+                    attempt
+                        .await
+                        .map_err(|e| ("jwks_unavailable", anyhow!("{e:#}")))?;
                 }
                 issuer
                     .cached_key(&kid)
                     .0
-                    .ok_or_else(|| anyhow!("no signing key for kid {kid}"))?
+                    .ok_or_else(|| ("unknown_key", anyhow!("no signing key for kid {kid}")))?
             }
         };
 
@@ -167,14 +194,33 @@ impl Authenticator {
         validation.leeway = LEEWAY_SECS;
         validation.validate_nbf = true;
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
-            .context("token failed validation")?
+            .context("token failed validation")
+            .map_err(|e| ("invalid", e))?
             .claims;
 
-        authorize(&issuer.cfg, &claims)?;
+        authorize(&issuer.cfg, &claims).map_err(|e| ("unauthorized", e))?;
         Ok(Subject(format!("{}#{}", claims.iss, claims.sub)))
     }
 }
 
+/// A refused token: the bounded `outcome` label for
+/// `garret_auth_validations_total`, and the reason for the log.
+type Refusal = (&'static str, anyhow::Error);
+
+/// Renders an authentication error for the log. The chain can carry
+/// attacker-controlled token text (the kid, header fields echoed by parse
+/// errors), so it is escaped, leaving no way to forge a log line, and
+/// bounded.
+pub fn loggable(e: &anyhow::Error) -> String {
+    const MAX_CHARS: usize = 256;
+    let rendered = format!("{e:#}");
+    let mut escaped = rendered.escape_debug();
+    let mut out: String = escaped.by_ref().take(MAX_CHARS).collect();
+    if escaped.next().is_some() {
+        out.push('…');
+    }
+    out
+}
 /// Fetches and parses an issuer's current key set.
 async fn fetch_keys(
     http: &reqwest::Client,
@@ -252,6 +298,9 @@ impl Issuer {
         // The task can't finish before `in_flight` is set: it needs the
         // state lock held here to clear it.
         let task = tokio::spawn(async move {
+            let label = issuer.cfg.issuer.clone();
+            metrics::counter!("garret_jwks_refreshes_total", "issuer" => label.clone())
+                .increment(1);
             let outcome = match fetch_keys(&http, &issuer.cfg).await {
                 Ok(by_kid) => {
                     let mut cache = issuer.keys.write().unwrap();
@@ -260,6 +309,8 @@ impl Issuer {
                     Ok(())
                 }
                 Err(e) => {
+                    metrics::counter!("garret_jwks_refresh_failures_total", "issuer" => label)
+                        .increment(1);
                     tracing::warn!("JWKS refresh for {} failed: {e:#}", issuer.cfg.issuer);
                     Err(Arc::new(e))
                 }
@@ -608,15 +659,17 @@ mod tests {
         }
     }
 
-    /// Routes to the dev issuer and names `kid`; the signature is never
-    /// reached by these tests.
-    fn token_with_kid(kid: &str) -> String {
+    /// Routes to `iss` and names `kid`, with a signature nothing verifies.
+    fn token_from(iss: &str, kid: &str) -> String {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let header = URL_SAFE_NO_PAD.encode(format!(r#"{{"alg":"RS256","kid":"{kid}"}}"#));
-        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"iss":"{DEV_ISSUER}"}}"#));
+        let payload = URL_SAFE_NO_PAD.encode(format!(r#"{{"iss":"{iss}"}}"#));
         format!("{header}.{payload}.c2ln")
     }
 
+    fn token_with_kid(kid: &str) -> String {
+        token_from(DEV_ISSUER, kid)
+    }
     /// A key the test issuer publishes. No test token is signed by it, so
     /// reaching signature validation is as far as any of them gets.
     const ROTATED_IN: &str = r#"{"keys":[{"kty":"RSA","kid":"new","n":"AQAB","e":"AQAB"}]}"#;
@@ -774,5 +827,39 @@ mod tests {
         assert!(outcomes.iter().all(Result::is_err));
         assert!(started.elapsed() <= JWKS_TIMEOUT + Duration::from_secs(1));
         assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refusals_are_classified_for_the_metric() {
+        let (url, _) = jwks_server(200, ROTATED_IN, SLOW).await;
+        let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
+        let outcome = async |token: &str| match auth.check(token).await {
+            (_, Ok(_)) => "accepted",
+            (_, Err((outcome, _))) => outcome,
+        };
+        let elsewhere = token_from("https://elsewhere.example", "new");
+        assert_eq!(outcome("not-a-jwt").await, "malformed");
+        assert_eq!(outcome(&elsewhere).await, "untrusted_issuer");
+        assert_eq!(outcome(&token_with_kid("forged")).await, "unknown_key");
+        assert_eq!(outcome(&token_with_kid("new")).await, "invalid");
+        // The token's own `iss` never becomes a label.
+        assert_eq!(auth.check(&elsewhere).await.0, "unknown");
+
+        let (down, _) = jwks_server(500, ROTATED_IN, SLOW).await;
+        let auth = Authenticator::new(vec![dev_issuer(&down)]).unwrap();
+        let (issuer, verdict) = auth.check(&token_with_kid("new")).await;
+        assert_eq!(issuer, DEV_ISSUER);
+        assert_eq!(verdict.unwrap_err().0, "jwks_unavailable");
+    }
+
+    #[test]
+    fn logged_errors_cannot_forge_lines_and_are_bounded() {
+        let forged = anyhow!("no signing key for kid x\nINFO accepted token for admin");
+        let logged = loggable(&forged);
+        assert!(!logged.contains('\n'), "{logged}");
+        assert!(logged.contains(r"x\nINFO"), "{logged}");
+
+        let flood = anyhow!("no signing key for kid {}", "k".repeat(10_000));
+        assert!(loggable(&flood).chars().count() <= 257);
     }
 }
