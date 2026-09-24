@@ -16,6 +16,20 @@ All JSON under `/api/v1`:
 | `GET /objects/{hash}/referrers` | Reverse dependencies (reverse-ref index) |
 | `GET /pins` | GC-exempt pins (spec 05), expired ones included, name-ordered |
 
-Ticket 07's indices (name, PK, reverse-ref) serve all four; trees are
-recursive CTEs. Exact response shapes are an implementation detail —
-keep them stable once shipped.
+Indices serve every endpoint: name, creation order (`objects_created`,
+the listing's exact order, so a page never sorts the table), PK, and
+reverse-ref. Exact response shapes are an implementation detail — keep
+them stable once shipped.
+
+## Isolation from the pull path
+
+A big closure tree or a full-scan search must never delay a narinfo
+read, so browse shares neither the pull path's connection nor its async
+workers, and takes at most one blocking thread:
+
+- Queries run on the Puller's own browse connection, one at a time, on
+  the blocking pool.
+- A request waits for its turn on an async lock, so queued requests
+  hold no threads.
+- A request over 10 s, queueing included, answers 503. Its query still
+  finishes in the background before the next one starts.

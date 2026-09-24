@@ -52,6 +52,7 @@ CREATE TABLE objects (
 );
 CREATE INDEX objects_name          ON objects(name);
 CREATE INDEX objects_last_accessed ON objects(last_accessed_at); -- LRU order
+CREATE INDEX objects_created       ON objects(created_at DESC, store_path_hash); -- browse listing order
 
 CREATE TABLE object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
