@@ -183,14 +183,37 @@ impl Gc {
             db::all_hashes(&conn)?
         };
         let blobs = self.storage.list_blobs().await?;
-        let orphans = orphan_keys(&blobs, &known, &self.in_flight, grace);
-
+        // Before the orphans are claimed: the abort skips in-flight paths.
         let aborted = self
             .storage
             .abort_stale_multiparts(grace, &self.in_flight)
             .await?;
+
+        // Each orphan is claimed from a final row check until its blob delete
+        // returns: an upload re-pushing the path in between would otherwise
+        // land a row whose blob the pending delete then removes (spec 05).
+        // A path claimed elsewhere is skipped, and one whose row landed since
+        // `known` was read is no orphan.
+        let (orphans, claims) = {
+            let conn = self.conn.lock().unwrap();
+            let mut orphans = Vec::new();
+            let mut claims = Vec::new();
+            for key in orphan_keys(&blobs, &known, &self.in_flight, grace) {
+                let hash = storage::hash_for(&key).unwrap_or_default();
+                let Ok(claim) = self.in_flight.claim(hash, inflight::Kind::Delete) else {
+                    continue;
+                };
+                if db::exists(&conn, hash)? {
+                    continue;
+                }
+                orphans.push(key);
+                claims.push(claim);
+            }
+            (orphans, claims)
+        };
         let count = orphans.len();
         self.storage.delete_objects(&orphans).await?;
+        drop(claims);
 
         metrics::counter!("garret_gc_orphans_deleted_total").increment(count as u64);
         metrics::counter!("garret_gc_stale_multiparts_aborted_total").increment(aborted as u64);
@@ -406,6 +429,103 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(pass.await.unwrap().evicted, 1);
         assert!(in_flight.claim(&r, inflight::Kind::Upload).is_ok());
+    }
+
+    /// An S3 stand-in whose bucket holds one blob, `nar/<hash>.nar.zst`, long
+    /// past the orphan grace. `on_list` runs as the blobs are listed, and the
+    /// first `DeleteObjects` is held as in `gated_s3`.
+    async fn orphan_s3(
+        hash: &str,
+        on_list: impl Fn() + Send + Sync + 'static,
+    ) -> (
+        Storage,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let gate = Arc::new(Mutex::new(Some((held_tx, release_rx))));
+        let listing = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><Prefix>nar/</Prefix><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><Contents><Key>{}</Key><LastModified>2000-01-01T00:00:00.000Z</LastModified><Size>1</Size></Contents></ListBucketResult>"#,
+            storage::key_for(hash)
+        );
+        let on_list = Arc::new(on_list);
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let query = uri.query().unwrap_or_default().to_owned();
+            let (gate, listing, on_list) = (gate.clone(), listing.clone(), on_list.clone());
+            async move {
+                if query.contains("list-type=2") {
+                    on_list();
+                    return listing;
+                }
+                if query.contains("uploads") {
+                    return r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"#.to_owned();
+                }
+                let gate = gate.lock().unwrap().take();
+                if let Some((held, release)) = gate {
+                    let _ = held.send(());
+                    let _ = release.await;
+                }
+                r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#.to_owned()
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (storage_at(&endpoint, 30).await, held_rx, release_tx)
+    }
+
+    #[tokio::test]
+    async fn an_orphan_stays_claimed_until_its_blob_is_deleted() {
+        // Between the orphan check and the blob delete, an upload re-pushing
+        // the path would land a row whose blob the pending delete removes.
+        let o = "o".repeat(32);
+        let conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let (storage, held, release) = orphan_s3(&o, || {}).await;
+        let in_flight = InFlight::new();
+        let gc = Arc::new(Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage,
+            in_flight.clone(),
+            config(100),
+        ));
+
+        let sweep = tokio::spawn({
+            let gc = gc.clone();
+            async move { gc.sweep_orphans().await.unwrap() }
+        });
+        held.await.unwrap();
+        assert_eq!(
+            in_flight.claim(&o, inflight::Kind::Upload).err(),
+            Some(inflight::Kind::Delete),
+            "an upload got in before the blob delete"
+        );
+
+        release.send(()).unwrap();
+        assert_eq!(sweep.await.unwrap(), 1);
+        assert!(in_flight.claim(&o, inflight::Kind::Upload).is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_orphan_whose_row_lands_mid_sweep_is_kept() {
+        // An upload of the path completes, row and all, after the sweep read
+        // the rows but before it claims the path: its blob is no orphan.
+        let o = "o".repeat(32);
+        let conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let (storage, mut held, _release) = orphan_s3(&o, {
+            let (conn, o) = (conn.clone(), o.clone());
+            move || {
+                db::insert_object(&mut conn.lock().unwrap(), &object(&o, 1, &[]), 0).unwrap();
+            }
+        })
+        .await;
+        let gc = Gc::new(conn, storage, InFlight::new(), config(100));
+
+        assert_eq!(gc.sweep_orphans().await.unwrap(), 0);
+        assert!(held.try_recv().is_err(), "the blob was deleted");
     }
 
     #[tokio::test]
