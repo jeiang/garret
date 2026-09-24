@@ -957,7 +957,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(is_retryable(&stalled.into()));
+        // As `upload` returns it: wrapped in context.
+        assert!(is_retryable(
+            &anyhow::Error::from(stalled).context("uploading NAR")
+        ));
     }
 
     /// The watchdog reads progress off the body stream, so it relies on hyper

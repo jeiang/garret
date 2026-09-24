@@ -115,7 +115,9 @@ spec 01's connection-drop race must not add up over a long queue. Other `4xx`
 fail at once.
 
 **Timeouts** turn hangs into errors. Connecting gives up after
-30 s and a Negotiation after 2 minutes. An upload has no total limit — a
+30 s, a Negotiation after 2 minutes, and a request to the token provider
+(discovery, device flow, refresh, GitHub OIDC, client credentials) after
+60 s. An upload has no total limit — a
 large NAR over a slow link takes as long as it takes — but one that goes 5
 minutes without the connection taking another body chunk, or without an
 answer once the body is sent, is abandoned as stalled and retried like a
