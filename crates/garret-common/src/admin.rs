@@ -2,7 +2,7 @@
 //!
 //! Everything that touches the DB goes through the Pusher (spec 10-packaging):
 //! it owns all writes, so `garret-admin` never opens the database itself.
-//! Line-delimited JSON over a root-only unix socket keeps both ends free of an
+//! Line-delimited JSON over an owner-only unix socket keeps both ends free of an
 //! HTTP stack — the socket's file permissions are the whole access story.
 
 use serde::{Deserialize, Serialize};

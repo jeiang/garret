@@ -108,8 +108,17 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" "nix-daemon.service" ];
       wants = [ "network-online.target" ];
+      # Pushing runs `nix path-info` and `nix nar dump-path`. Through the
+      # daemon: the sandbox leaves /nix/var read-only, and a root client
+      # would otherwise open the store directly. The nix-command feature is
+      # enabled for these commands only, not in the host's nix.conf.
+      path = [ config.nix.package ];
+      environment = {
+        NIX_REMOTE = "daemon";
+        NIX_CONFIG = "extra-experimental-features = nix-command";
+      };
 
-      serviceConfig = {
+      serviceConfig = import ./sandbox.nix // {
         ExecStart = lib.concatStringsSep " " ([
           "${cfg.package}/bin/garret"
           "--config ${configFile}"
@@ -123,9 +132,6 @@ in
         # Root: reading the nix database and the credentials file both need it,
         # and there is no unprivileged mode in v1 (spec 06-client).
         User = "root";
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        NoNewPrivileges = true;
         ReadWritePaths = [ (builtins.dirOf cfg.cursorPath) ];
       };
     };

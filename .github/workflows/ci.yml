@@ -153,6 +153,40 @@ jobs:
           GARRET_BIN: ${{ github.workspace }}/result/bin
         run: nix develop --command scripts/e2e.sh
 
+  # ---------------------------------------------------------------- nixos ---
+  nixos:
+    name: NixOS module test
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # enable_kvm (on by default) is what lets the test driver boot its VM
+      # with hardware acceleration rather than timing out under emulation.
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-substituters = ${{ vars.GARRET_PULLER }}
+            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+            # The imported closure is locally built and therefore unsigned;
+            # only a trusted user may add such a path to the store.
+            trusted-users = root runner
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: garret-closure-ubuntu-latest
+
+      # The VM runs the packages this closure already holds, so what gets
+      # built below is the test, not garret.
+      - name: Import the build closure
+        run: nix-store --import < closure.nar
+
+      - name: NixOS module test
+        # Boots the pusher and puller modules and checks the service-user
+        # boundary between them (ADR-0009).
+        run: nix build .#checks.x86_64-linux.module --print-build-logs
+
   # ----------------------------------------------------------------- push ---
   # Populates the cache with this build's outputs and the dev toolchain, so
   # later runs substitute instead of compiling. Skipped until garret is
@@ -160,7 +194,7 @@ jobs:
   push:
     name: push to garret
     runs-on: ubuntu-latest
-    needs: [lint, build, test, e2e]
+    needs: [lint, build, test, e2e, nixos]
     # Only what lands on main or a release tag is cached, so pull requests
     # never push. Manual dispatch is allowed too: only collaborators can
     # trigger it, and it is the way to verify the cache without waiting for a

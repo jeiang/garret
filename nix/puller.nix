@@ -86,7 +86,16 @@ in
       endpointUrl = mkOption { type = types.nullOr types.str; default = null; description = "S3 endpoint."; };
       region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
       pathStyle = mkOption { type = types.bool; default = true; description = "Path-style addressing."; };
-      credentialsFile = mkOption { type = types.path; description = "EnvironmentFile with AWS_* credentials."; };
+      credentialsFile = mkOption {
+        type = types.path;
+        description = ''
+          EnvironmentFile providing AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY.
+          Give the Puller a key of its own limited to GetObject: it only
+          presigns GETs, and a presigned URL carries exactly its key's
+          authority. The Pusher's key works too, but hands the public-facing
+          process write access to the bucket.
+        '';
+      };
     };
 
     browseOidc = mkOption {
@@ -110,26 +119,26 @@ in
     systemd.services.garret-puller = {
       description = "garret Puller";
       wantedBy = [ "multi-user.target" ];
-      # The Pusher owns the schema and must create the database first.
+      # The Pusher owns the schema and must create the database first; its
+      # start is also what makes the database group-writable for us.
       after = [ "network-online.target" "garret-pusher.service" ];
       wants = [ "network-online.target" ];
 
-      serviceConfig = {
+      serviceConfig = import ./sandbox.nix // {
         ExecStart = "${cfg.package}/bin/garret-puller ${configFile}";
         EnvironmentFile = cfg.s3.credentialsFile;
         Restart = "on-failure";
-        StateDirectory = "garret";
-        User = "garret";
+        # Its own user, in group `garret` only to share the database
+        # (ADR-0009): the signing keys and the admin socket are owner-only, so
+        # the public-facing process can reach neither. No StateDirectory: the
+        # directory is the Pusher's, and systemd would chown it to this user.
+        User = "garret-puller";
         Group = "garret";
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        NoNewPrivileges = true;
         ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
       };
     };
 
-    users.users.garret = {
+    users.users.garret-puller = {
       isSystemUser = true;
       group = "garret";
     };
