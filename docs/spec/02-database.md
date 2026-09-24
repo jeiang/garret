@@ -50,6 +50,7 @@ CREATE TABLE objects (
 );
 CREATE INDEX objects_name          ON objects(name);
 CREATE INDEX objects_last_accessed ON objects(last_accessed_at); -- LRU order
+CREATE INDEX objects_created       ON objects(created_at DESC, store_path_hash); -- browse listing order
 
 CREATE TABLE object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
@@ -102,8 +103,10 @@ Notes:
 
 WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
 `busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
-`journal_size_limit=64MiB`; `foreign_keys=ON`. Short write transactions
-only.
+`journal_size_limit=64MiB`; `foreign_keys=ON`; persistent WAL, so `-wal`
+and `-shm` outlive the last connection (the Puller cannot create them,
+spec 10). Replace or restore the database only with both removed, or the
+next open replays the stale WAL over it. Short write transactions only.
 
 A write transaction that reads before it writes (insert and delete, for
 their `stats` delta) begins `IMMEDIATE`. Begun deferred, it would take a
