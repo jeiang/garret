@@ -217,7 +217,7 @@ A run with no failures may end with a re-check before `done`:
 ```
 {"event":"rechecked","missing":1,"nar_bytes":81920}
 {"event":"path","path":"/nix/store/…","status":"pushed","nar_size":81920}
-{"event":"done","pushed":47,"deduped":0,"failed":0,"nar_bytes":4021456896}
+{"event":"done","pushed":48,"deduped":0,"failed":0,"nar_bytes":4021456896}
 ```
 
 `rechecked` appears only when the closing re-check found paths missing; their
