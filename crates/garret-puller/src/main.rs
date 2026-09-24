@@ -4,7 +4,7 @@
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex, OnceLock, PoisonError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -39,6 +39,11 @@ struct AppState {
     bumps: Bumps,
     db_read_budget: Duration,
     presign_budget: Duration,
+    /// The last deep-readiness answer and when it was taken; see
+    /// [`cached_probe`].
+    read_probe: ProbeCache,
+    /// Fetches the probe's presigned URL, as a substituter would.
+    http: reqwest::Client,
 }
 
 impl AppState {
@@ -124,6 +129,13 @@ async fn flush_bumps(state: Arc<AppState>, conn: rusqlite::Connection) {
 /// browse requests.
 const BROWSE_BUDGET: Duration = Duration::from_secs(10);
 
+/// How long a deep-readiness answer is reused. However hard `/ready/deep`
+/// is hit, it costs at most one S3 read per window.
+const READ_PROBE_TTL: Duration = Duration::from_secs(30);
+
+/// Deadline for one whole probe: pick a blob, presign, fetch its first byte.
+const READ_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response()
 }
@@ -207,6 +219,8 @@ async fn main() -> Result<()> {
         bumps: Bumps::default(),
         db_read_budget: Duration::from_millis(cfg.db_read_budget_ms),
         presign_budget: Duration::from_millis(cfg.presign_budget_ms),
+        read_probe: ProbeCache::default(),
+        http: reqwest::Client::new(),
     });
 
     // Opened off the request path so the listener (and /ready) comes up now.
@@ -291,6 +305,7 @@ async fn main() -> Result<()> {
                 }
             }),
         )
+        .route("/ready/deep", get(ready_deep))
         // axum 0.8 wants whole-segment params, so the suffix is split here.
         .route("/{file}", get(narinfo_route))
         .route("/nar/{file}", get(nar_route))
@@ -347,6 +362,100 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
             tracing::error!("narinfo {hash}: {e:#}");
             degraded_miss("db_error")
         }
+    }
+}
+
+/// The last probe answer and when it was taken.
+type ProbeCache = Arc<tokio::sync::Mutex<Option<(Instant, Result<(), String>)>>>;
+
+/// The cached answer while it is younger than `ttl`, else `probe`'s. The
+/// probe runs in its own task holding the cache lock: concurrent callers
+/// wait for it rather than start their own, and a caller that goes away
+/// mid-probe (a client disconnect cancels its handler) still leaves the
+/// answer cached, rather than an empty cache for the next caller to probe
+/// again.
+async fn cached_probe<F>(cache: &ProbeCache, ttl: Duration, probe: F) -> Result<(), String>
+where
+    F: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let mut cached = Arc::clone(cache).lock_owned().await;
+    if let Some((at, outcome)) = &*cached
+        && at.elapsed() < ttl
+    {
+        return outcome.clone();
+    }
+    tokio::spawn(async move {
+        let outcome = probe.await;
+        *cached = Some((Instant::now(), outcome.clone()));
+        outcome
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("probe task failed: {e}")))
+}
+
+/// Deep readiness (spec 08): `/ready`, plus one real read through the
+/// presigned-URL path a substituter follows. Presigning is signature-only
+/// (spec 03), so revoked or rotated S3 credentials or an S4 outage fail
+/// neither `/ready` nor the NAR redirect itself; only a fetch shows them.
+/// Cached for [`READ_PROBE_TTL`] by [`cached_probe`], so the public route
+/// cannot be used to hammer S4.
+async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
+    let Some(conn) = state.conn_handle() else {
+        return unavailable();
+    };
+    let probe = {
+        let state = state.clone();
+        async move {
+            let outcome = tokio::time::timeout(READ_PROBE_TIMEOUT, probe_read(&state, conn))
+                .await
+                .unwrap_or_else(|_| Err(format!("no answer within {READ_PROBE_TIMEOUT:?}")));
+            let label = if outcome.is_ok() { "ok" } else { "failed" };
+            metrics::counter!("garret_s3_read_probes_total", "outcome" => label).increment(1);
+            if let Err(e) = &outcome {
+                tracing::warn!("deep readiness: {e}");
+            }
+            outcome
+        }
+    };
+    match cached_probe(&state.read_probe, READ_PROBE_TTL, probe).await {
+        Ok(()) => (StatusCode::OK, "ready").into_response(),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("S3 read path failing: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Fetches the first byte of the most recently accessed blob through a
+/// presigned URL. An empty cache has nothing to read, so it passes.
+async fn probe_read(
+    state: &AppState,
+    conn: Arc<Mutex<rusqlite::Connection>>,
+) -> Result<(), String> {
+    let hash = db_read(conn, state.db_read_budget, db::most_recently_accessed)
+        .await
+        .ok_or("database read over budget")?
+        .map_err(|e| format!("{e:#}"))?;
+    let Some(hash) = hash else {
+        return Ok(());
+    };
+    let url = state
+        .storage
+        .presigned_get(&storage::key_for(&hash), state.presign_ttl)
+        .await
+        .map_err(|e| format!("presigning: {e:#}"))?;
+    // The URL carries a live signature: keep it out of errors and logs.
+    let response = state
+        .http
+        .get(url)
+        .header(header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| format!("fetching: {}", e.without_url()))?;
+    match response.status() {
+        status if status.is_success() => Ok(()),
+        status => Err(format!("presigned GET answered {}", status.as_u16())),
     }
 }
 
@@ -678,6 +787,30 @@ mod tests {
         .await
         .expect("the queued request waited past its budget");
         assert!(queued.is_none());
+    }
+
+    /// A client that disconnects mid-probe cancels its handler. That must not
+    /// leave the cache empty, or a loop of abandoned requests would cost one
+    /// S3 read each instead of one per TTL.
+    #[tokio::test]
+    async fn an_abandoned_probe_still_fills_the_cache() {
+        let cache = ProbeCache::default();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe = |probes: Arc<std::sync::atomic::AtomicUsize>| async move {
+            probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err("presigned GET answered 403".to_owned())
+        };
+        let abandoned = tokio::spawn({
+            let (cache, probe) = (cache.clone(), probe(probes.clone()));
+            async move { cached_probe(&cache, READ_PROBE_TTL, probe).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        abandoned.abort();
+
+        let next = cached_probe(&cache, READ_PROBE_TTL, probe(probes.clone())).await;
+        assert_eq!(next, Err("presigned GET answered 403".to_owned()));
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// One bad row that panics a read must cost that request, not the

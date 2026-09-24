@@ -9,6 +9,31 @@ Each service binds a dedicated internal metrics listener — defaults
 **9091 (Pusher)** and **9092 (Puller)**, interface configurable — serving
 `/metrics` and `/healthz`. The public listener never exposes metrics.
 
+## Readiness
+
+The Puller's public listener answers two readiness probes:
+
+- `/ready`: 200 once the database is open, 503 before. No I/O.
+- `/ready/deep`: `/ready`, plus one real read through the path a
+  substituter follows. It presigns the blob of the most recently
+  accessed object exactly as the NAR route does and fetches its first
+  byte (`Range: bytes=0-0`). On failure it answers 503 naming the
+  failing step, e.g. `presigned GET answered 403`.
+  - Presigning is signature-only (spec
+    [03](03-storage.md)), so revoked or rotated S3 credentials or an S4
+    outage fail neither `/ready` nor the NAR redirect. Only a fetch
+    shows them.
+  - An empty cache has nothing to read and passes.
+  - The fetch trusts the bundled webpki roots, like the JWKS client, not
+    the system store, so an S4 endpoint with a private CA fails it.
+  - The answer is cached for 30 s, and concurrent callers share one
+    probe that finishes even if its caller disconnects. However often
+    the public route is hit, it costs at most one one-byte S3 read per
+    30 s. Each probe counts in `garret_s3_read_probes_total` by
+    `outcome` (`ok`, `failed`).
+  - Monitoring should probe `/ready/deep` rather than `/ready`, at an
+    interval of 30 s or more, and alert on a few consecutive failures.
+
 ## Cardinality rules
 
 Bounded labels only: route, status class, issuer, phase, outcome.
@@ -69,7 +94,8 @@ Prefix `garret_`; service distinguished by scrape job.
   `garret_bump_queue_depth` gauge, `garret_bump_debounced_total`
   (hits on a fresh row, no write) and `garret_bump_failures_total`
   (failed flushes, batch dropped); browse requests by endpoint;
-  browse auth failures. The Puller no longer sees NAR bytes
+  browse auth failures; `garret_s3_read_probes_total` by `outcome`
+  (deep readiness, [above](#readiness)). The Puller no longer sees NAR bytes
   ([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md)), so
   bytes-served, serve-duration, first-byte and Range counters are gone —
   served-byte volume is now S4's to report, not ours.
