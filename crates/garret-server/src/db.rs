@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE INDEX IF NOT EXISTS objects_name          ON objects(name);
 CREATE INDEX IF NOT EXISTS objects_last_accessed ON objects(last_accessed_at);
+CREATE INDEX IF NOT EXISTS objects_created       ON objects(created_at DESC, store_path_hash);
 
 CREATE TABLE IF NOT EXISTS object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
@@ -110,7 +111,37 @@ pub fn open(path: &str, create: bool) -> Result<Connection> {
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    persist_wal(&conn)?;
     Ok(conn)
+}
+
+/// Keeps `-wal` and `-shm` on disk when the last connection closes. The Puller
+/// runs as its own user and cannot create files in the database directory
+/// (ADR-0009), so it can open the database only while they exist, and a
+/// Pusher exiting with an error after opening would otherwise delete them on
+/// its way out and take the Puller down with it.
+fn persist_wal(conn: &Connection) -> Result<()> {
+    let mut on: std::ffi::c_int = 1;
+    // SAFETY: `conn` holds an open handle for the whole call, the schema name
+    // is NUL-terminated, and PERSIST_WAL only reads the int behind the pointer,
+    // during the call.
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+            (&raw mut on).cast(),
+        )
+    };
+    // An in-memory database has no file to keep.
+    anyhow::ensure!(
+        matches!(
+            rc,
+            rusqlite::ffi::SQLITE_OK | rusqlite::ffi::SQLITE_NOTFOUND
+        ),
+        "enabling persistent WAL: sqlite error {rc}"
+    );
+    Ok(())
 }
 
 /// How stale `pushed_at` must be before Negotiation rewrites it: a closure
@@ -1146,11 +1177,39 @@ mod tests {
         assert_eq!(referrers, vec![a]);
     }
 
+    /// A database and its WAL sidecars, which outlive every connection.
+    fn remove_db(path: &str) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
+    #[test]
+    fn closing_leaves_the_wal_sidecars_for_the_puller() {
+        let path = std::env::temp_dir().join("garret-persist-wal.sqlite");
+        let path = path.to_str().unwrap().to_owned();
+        remove_db(&path);
+
+        let conn = open(&path, true).unwrap();
+        migrate(&conn).unwrap();
+        drop(conn);
+        // The Puller cannot create them (spec 10), so the last close must not
+        // remove them.
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                std::path::Path::new(&format!("{path}{suffix}")).exists(),
+                "{suffix} was removed on close"
+            );
+        }
+        remove_db(&path);
+    }
+
     #[tokio::test]
     async fn open_when_ready_waits_for_the_pusher_to_create_the_schema() {
         let path = std::env::temp_dir().join("garret-open-when-ready.sqlite");
-        let _ = std::fs::remove_file(&path);
         let path = path.to_str().unwrap().to_owned();
+        // Sidecars outlive every connection, so clear an earlier run's too.
+        remove_db(&path);
 
         let waiter = tokio::spawn({
             let path = path.clone();
@@ -1170,7 +1229,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!exists(&conn, "nope").unwrap());
-        let _ = std::fs::remove_file(&path);
+        remove_db(&path);
     }
 
     #[tokio::test]

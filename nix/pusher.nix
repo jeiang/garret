@@ -52,6 +52,23 @@ let
   };
 
   configFile = (pkgs.formats.toml { }).generate "garret-pusher.toml" (stripNulls settings);
+
+  # The Puller runs as its own user in group `garret` (ADR-0009) and must
+  # write the database: last-accessed bumps, and every WAL reader writes the
+  # -shm file. SQLite gives -wal and -shm the database file's mode but creates
+  # the database itself 0644, so it is created group-writable here, before
+  # SQLite ever opens it. The loop also repairs the 0644 files of a deployment
+  # that predates the split. It runs as `garret`, not root, and only the
+  # Pusher can create files in the directory, so there is nothing planted
+  # there for it to follow.
+  dbPerms = pkgs.writeShellScript "garret-db-perms" ''
+    set -eu
+    db=${lib.escapeShellArg cfg.dbPath}
+    [ -e "$db" ] || ${pkgs.coreutils}/bin/install -m 0660 /dev/null "$db"
+    for f in "$db" "$db-wal" "$db-shm"; do
+      [ ! -e "$f" ] || ${pkgs.coreutils}/bin/chmod 0660 "$f"
+    done
+  '';
 in
 {
   options.services.garret.pusher = {
@@ -78,7 +95,12 @@ in
     dbPath = mkOption {
       type = types.str;
       default = "/var/lib/garret/garret.db";
-      description = "SQLite database, shared with the Puller on this host.";
+      description = ''
+        SQLite database, shared with the Puller on this host. Its directory
+        must be `garret:garret` mode 0750, so the Puller can open the database
+        but never create or replace files beside it. The default location gets
+        that from `StateDirectory`; provide it yourself for any other path.
+      '';
     };
 
     storeDir = mkOption {
@@ -110,6 +132,9 @@ in
       description = ''
         Nix-format secret keys. List several during an overlap rotation: every
         object is signed with all of them, and `garret-admin resign` backfills.
+        Each must be readable by the `garret` user and nobody else: the Puller
+        is in group `garret` for the database, so a group-readable key is one
+        the Puller can read.
       '';
     };
 
@@ -178,7 +203,12 @@ in
     adminSocketPath = mkOption {
       type = types.nullOr types.str;
       default = "/run/garret/admin.sock";
-      description = "Root-only socket for garret-admin.";
+      description = ''
+        Socket for garret-admin, created mode 0600 and owned by the `garret`
+        user: root and the Pusher itself can connect, the Puller (its own user)
+        cannot. The file mode is the whole authorization. Null serves no admin
+        socket.
+      '';
     };
   };
 
@@ -194,20 +224,22 @@ in
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
 
-      serviceConfig = {
+      serviceConfig = import ./sandbox.nix // {
         ExecStart = "${cfg.package}/bin/garret-pusher ${configFile}";
         EnvironmentFile = cfg.s3.credentialsFile;
         Restart = "on-failure";
         StateDirectory = "garret";
+        # Group `garret` (the Puller) may reach the database, never create
+        # files beside it.
+        StateDirectoryMode = "0750";
         RuntimeDirectory = "garret";
+        # After any ExecStartPre a deployment adds (a mount guard creating the
+        # directory, say): this one needs the directory to exist and be ours.
+        ExecStartPre = lib.mkAfter [ "${dbPerms}" ];
         # The Pusher reads signing keys and writes only its own state.
         DynamicUser = false;
         User = "garret";
         Group = "garret";
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        NoNewPrivileges = true;
         ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
       };
     };

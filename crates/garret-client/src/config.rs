@@ -19,7 +19,8 @@ pub struct Config {
     /// zstd level for NAR compression (client-side, per the push protocol).
     #[serde(default = "zstd_level")]
     pub zstd_level: i32,
-    /// Upload attempts per path beyond the first, for 429/5xx failures only.
+    /// Upload attempts per path beyond the first, for 5xx answers and dropped
+    /// connections. A 429 does not spend these: it waits out `Retry-After`.
     #[serde(default = "max_retries")]
     pub max_retries: u32,
     /// Puller base URL — `list` and `tree` query the browse API, not the Pusher.
@@ -234,10 +235,22 @@ pub fn render(endpoint: &str, discovery: &crate::discovery::Discovery) -> Result
 /// whole point being that a fresh machine needs no manual setup.
 pub fn write(path: &std::path::Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+        create_private_dir(parent)?;
     }
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Creates `dir` and any missing parents mode 0700. `~/.config/garret/` holds
+/// the refresh token beside the config, and `login` writes the config first,
+/// so whichever write comes first must create it private (spec 04-auth). An
+/// existing directory is left as it is.
+pub fn create_private_dir(dir: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))
 }
 
 #[cfg(test)]

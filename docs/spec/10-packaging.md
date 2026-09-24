@@ -26,7 +26,8 @@ resource accounting, and restarts stay independent.
 ## Admin CLI (`garret-admin`)
 
 Key operations are offline file operations; everything touching the DB
-goes through the Pusher's **admin API on a root-only unix socket**
+goes through the Pusher's **admin API on an owner-only unix socket** (0600,
+the Pusher's user: root and the Pusher can connect, the Puller cannot)
 (single-writer discipline — garret-admin never opens the DB while the
 Pusher runs).
 
@@ -61,8 +62,10 @@ first.
 
 Restoring a copy that is older than the bucket:
 
-1. Stop both services. Put the copy in place of `dbPath` and delete any
-   `-wal`/`-shm` files beside it.
+1. Stop both services. Put the copy in place of `dbPath`, owned by the
+   Pusher's user (`garret` under the NixOS module, whose Pusher start makes
+   it group-writable for the Puller), and delete any `-wal`/`-shm` files
+   beside it.
 2. Start **only the Pusher**, with its push endpoint unreachable to
    clients (reverse-proxy route or firewall closed).
 3. `garret-admin fsck --repair --verify-sizes --quiesce` deletes the rows
@@ -95,7 +98,10 @@ would redirect to missing blobs.
 
 Flake outputs: `packages.{garret,garret-pusher,garret-puller,garret-admin,garret-bench}`,
 `nixosModules.{pusher,puller,watcher}`, `devShells.default`, `checks`
-(unit + NixOS integration test that pushes and pulls a closure).
+(`build`; on Linux also `module`, a NixOS VM test: a cache host running the
+pusher and puller modules over Garage, and a builder whose watcher pushes a
+path the Puller then serves back, all under the sandbox below; it also checks
+the service-user boundary).
 
 Module option sketch (all under `services.garret.*`):
 
@@ -122,6 +128,62 @@ a whole client config (spec 06). Set `client_id` on the human issuer only.
 
 Secrets (S3 credentials, signing keys, OIDC client secrets) are file
 paths — agenix/sops-friendly, never in the nix store.
+
+### Service users and file modes
+
+The Pusher and the Puller run as different users
+([ADR-0009](../adr/0009-puller-runs-as-its-own-user.md)), so a compromise
+of the public-facing Puller reaches neither the signing keys, the admin
+socket, nor bucket write:
+
+| | Pusher | Puller |
+|---|---|---|
+| User / group | `garret` / `garret` | `garret-puller` / `garret` |
+| Database directory, `garret:garret` 0750 | owner | enter only: cannot create or replace files |
+| `garret.db`, `-wal`, `-shm`, 0660 | read/write | read/write: last-accessed bumps, and WAL readers write `-shm` |
+| Signing keys, `garret`-only (0400) | read | none |
+| Admin socket, `garret` 0600 | serves | cannot connect |
+| S3 credentials | its key (bucket write) | its own key; GetObject suffices |
+
+SQLite gives `-wal` and `-shm` the database file's mode but creates the
+database itself 0644, so the pusher unit's `ExecStartPre` (as `garret`)
+creates it 0660 before SQLite first opens it, and re-applies 0660 to all
+three files on every start. The Puller cannot create the sidecars either,
+so every connection runs in persistent-WAL mode (spec 02) and a last close
+leaves them in place: a Pusher that exits with an error after opening the
+database does not strand the Puller. The Puller can still write rows: its
+bumps need the write lock, and SQLite has no finer permission. A database
+put in place by hand must be owned by `garret`: the start step runs as
+`garret` and fails on a file it cannot chmod.
+
+Upgrading from modules without the split: with the default `dbPath`,
+nothing to do — the first Pusher start makes the directory 0750 and the
+database files 0660. A custom `dbPath` directory must already be
+`garret:garret` 0750. A signing key readable by group
+`garret` (say `root:garret` 0440) must become `garret`-owned 0400, or the
+Puller can read it. Pointing `services.garret.puller.s3.credentialsFile` at
+a GetObject-only key is optional, and takes bucket write away from the Puller.
+
+### Sandboxing
+
+All three units share one systemd sandbox (`nix/sandbox.nix`): an empty
+capability bounding set and `NoNewPrivileges`, `ProtectSystem=strict` with
+only the unit's own state writable (`ReadWritePaths` on the database or
+cursor directory, plus `StateDirectory`/`RuntimeDirectory`),
+`ProtectHome`, private `/tmp` and `/dev`, the kernel, clock, hostname and
+cgroup protections, no new namespaces, realtime or SUID/SGID files,
+`MemoryDenyWriteExecute`, native syscalls only, filtered to
+`@system-service` minus `@privileged` (a denied call fails with `EPERM`),
+address families limited to unix and IP, and `UMask=0077`. Files meant for
+another user get their mode set explicitly: the database files (0660) and
+the wake socket (0666).
+
+The watcher still runs as root, with no capabilities: everything it touches
+(the nix database read-only, its credentials, cursor and wake socket, the
+nix daemon's socket) is root-owned or world-accessible. It runs `nix
+path-info` and `nix nar dump-path` with the host's `nix.package` on its
+`PATH`, through the daemon (`NIX_REMOTE=daemon`, as `/nix/var` is read-only
+to it), and with `nix-command` enabled for itself only via `NIX_CONFIG`.
 
 ## Prebuilt outputs
 
