@@ -83,16 +83,9 @@ pub fn save_token(token: &StoredToken) -> Result<()> {
 /// not a truncated one — and replaces a symlink planted at `path` rather than
 /// following it.
 fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
-    use std::{
-        io::Write,
-        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    };
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let dir = path.parent().context("the token path has no directory")?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    crate::config::create_private_dir(dir)?;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
@@ -567,6 +560,8 @@ mod tests {
 
     /// The refresh token is never readable by others, a rotation replaces the
     /// file whole, and a symlink planted at the path is replaced, not followed.
+    /// `login` writes the config before the token, so that write must already
+    /// create the shared directory private.
     #[test]
     fn the_token_file_is_private_from_creation_and_replaced_whole() {
         use std::os::unix::fs::PermissionsExt;
@@ -575,9 +570,10 @@ mod tests {
         let path = root.join("garret").join("token.json");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
 
+        crate::config::write(&root.join("garret").join("config.toml"), "").unwrap();
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
         write_private(&path, b"first").unwrap();
         assert_eq!(mode(&path), 0o600);
-        assert_eq!(mode(path.parent().unwrap()), 0o700);
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         write_private(&path, b"second").unwrap();
@@ -591,10 +587,10 @@ mod tests {
         assert!(!elsewhere.exists(), "the write followed the symlink");
         assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
         assert_eq!(std::fs::read(&path).unwrap(), b"third");
-        // Nothing but the token itself is left in the directory.
+        // Nothing but the config and the token is left in the directory.
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
+            2
         );
         std::fs::remove_dir_all(&root).ok();
     }
