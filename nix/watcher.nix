@@ -129,8 +129,8 @@ in
         StateDirectory = "garret";
         # /run/garret, where the wake socket lives.
         RuntimeDirectory = "garret";
-        # Root: reading the nix database and the credentials file both need it,
-        # and there is no unprivileged mode in v1 (spec 06-client).
+        # Root: the credentials file is root's. Reading the nix database needs
+        # only read access (spec 06-client), which the CI user has too.
         User = "root";
         ReadWritePaths = [ (builtins.dirOf cfg.cursorPath) ];
       };

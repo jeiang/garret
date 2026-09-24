@@ -178,13 +178,15 @@ pub fn write_failed(path: &Path, failed: &BTreeSet<String>) -> Result<()> {
 
 /// Replaces `path` whole: the daemon is stopped by a signal (CI kills it before
 /// draining), and a kill between truncate and write would leave an empty
-/// cursor that bootstraps past the backlog.
+/// cursor that bootstraps past the backlog. The temporary file is named per
+/// process, so a drain overlapping a daemon cannot rename the other's
+/// half-written file into place.
 fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", std::process::id()));
     std::fs::write(&tmp, contents)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
