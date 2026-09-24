@@ -92,12 +92,16 @@ Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), idempotent retries. No client metrics endpoint in v1.
 
 **Retries** run on two schedules. A `429` is the server's queue, not a
-fault: the path waits out `Retry-After` (plus up to as much again in
-jitter) and tries again, for up to 15 minutes from its first attempt —
-long enough to queue behind several multi-minute uploads, short enough that
-a server that never frees a slot fails the run instead of hanging it — and
-never spends `max_retries`. `5xx` answers and dropped connections get
-`max_retries` (default 5) jittered waits doubling from 250 ms. Other `4xx`
+fault: the path waits out `Retry-After` (held between 1 s and 15 minutes,
+plus up to as much again in jitter) and tries again, for up to 15 minutes
+from the path's first attempt — long enough to queue behind several
+multi-minute uploads, short enough that each path fails rather than waits
+forever on a server that never frees a slot. The deadline is per path, so
+such a run fails after roughly 15 minutes per `jobs` paths, not 15 in all.
+Sheds never spend `max_retries`. `5xx` answers and dropped connections get
+`max_retries` (default 5) jittered waits doubling from 250 ms; a shed resets
+that count, so it bounds consecutive faults — sheds whose replies are lost to
+spec 01's connection-drop race must not add up over a long queue. Other `4xx`
 fail at once.
 
 Each NAR streams `nix nar dump-path` → zstd → the request body. A dump that

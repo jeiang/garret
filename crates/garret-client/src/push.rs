@@ -214,7 +214,8 @@ pub struct Pusher {
     pub jobs: usize,
     /// zstd level for compressing NARs on the way out.
     pub zstd_level: i32,
-    /// Retries per path on 429/5xx, with exponential jittered backoff.
+    /// Retries per path on 5xx and dropped connections, with exponential
+    /// jittered backoff; 429s wait out `Retry-After` instead.
     pub max_retries: u32,
 }
 
@@ -511,8 +512,10 @@ const SHED_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// One path's retry schedule (spec 01). A 429 is the server's queue, not a
 /// fault: it waits out `Retry-After` for as long as [`SHED_DEADLINE`] allows
 /// and never spends the error budget. Other retryable failures get
-/// `max_retries` doubling waits from 250 ms. Every wait is jittered so a fleet
-/// of pushers doesn't retry in lockstep.
+/// `max_retries` doubling waits from 250 ms; a shed resets that budget, so it
+/// counts consecutive faults — a shed whose reply is lost to the connection
+/// race (spec 01) must not add up over a quarter hour of queueing. Every wait
+/// is jittered so a fleet of pushers doesn't retry in lockstep.
 struct Backoff {
     started: Instant,
     retries: u32,
@@ -533,6 +536,8 @@ impl Backoff {
     /// How long to wait before trying again after `error`; `None` to give up.
     fn next(&mut self, error: &anyhow::Error) -> Option<Duration> {
         if let Some(Shed(after)) = error.downcast_ref::<Shed>() {
+            self.retries = 0;
+            self.delay = Duration::from_millis(250);
             let wait = *after + Duration::from_millis(fastrand_millis(*after));
             return (self.started.elapsed() + wait <= SHED_DEADLINE).then_some(wait);
         }
@@ -599,14 +604,24 @@ fn compressed_nar(
 
 fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Duration> {
     (status == StatusCode::TOO_MANY_REQUESTS).then(|| {
-        response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1))
+        shed_for(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+        )
     })
+}
+
+/// A 429's `Retry-After`, in seconds; absent or unparseable (an HTTP date)
+/// means 1 s. Clamped to at least 1 s, so a `0` cannot spin, and at most
+/// [`SHED_DEADLINE`], so an absurd value cannot overflow the wait arithmetic.
+fn shed_for(retry_after: Option<&str>) -> Duration {
+    retry_after
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(1))
+        .clamp(Duration::from_secs(1), SHED_DEADLINE)
 }
 
 /// 5xx and dropped or timed-out connections are retryable; 4xx are the
@@ -649,13 +664,15 @@ pub fn connection_dropped(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Jitter without a rand dependency: nanosecond noise, capped at the delay.
+/// Jitter without a rand dependency: sub-second clock noise, capped at the
+/// delay. Microseconds, not nanoseconds: macOS clocks tick in whole
+/// microseconds, so nanoseconds modulo a whole second would always be 0.
 fn fastrand_millis(delay: Duration) -> u64 {
-    let nanos = std::time::SystemTime::now()
+    let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
+        .map(|d| d.subsec_micros() as u64)
         .unwrap_or(0);
-    nanos % delay.as_millis().max(1) as u64
+    micros % delay.as_millis().max(1) as u64
 }
 
 #[cfg(test)]
@@ -770,6 +787,11 @@ mod tests {
         }
         assert!(backoff.next(&rejected(503)).is_some());
         assert!(backoff.next(&rejected(503)).is_some());
+        // A shed in between resets the budget: it counts consecutive faults,
+        // not every reply lost to the connection race over a long queue.
+        assert!(backoff.next(&shed(1)).is_some());
+        assert!(backoff.next(&rejected(503)).is_some());
+        assert!(backoff.next(&rejected(503)).is_some());
         assert!(backoff.next(&rejected(503)).is_none());
     }
 
@@ -780,6 +802,21 @@ mod tests {
         assert!(backoff.next(&shed(1)).is_some());
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(backoff.next(&shed(1)).is_none());
+    }
+
+    /// The header is the server's (or a proxy's) to set: a `0` must not spin
+    /// and an absurd value must not overflow the wait, which would panic.
+    #[test]
+    fn retry_after_is_held_between_a_second_and_the_deadline() {
+        let second = Duration::from_secs(1);
+        assert_eq!(shed_for(Some("7")), Duration::from_secs(7));
+        assert_eq!(shed_for(Some("0")), second);
+        assert_eq!(shed_for(None), second);
+        assert_eq!(shed_for(Some("Wed, 21 Oct 2015 07:28:00 GMT")), second);
+        let absurd = shed_for(Some("18446744073709551615"));
+        assert_eq!(absurd, SHED_DEADLINE);
+        let mut backoff = Backoff::new(0);
+        assert!(backoff.next(&Shed(absurd).into()).is_none());
     }
 
     #[test]
