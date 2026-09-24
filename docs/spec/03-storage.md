@@ -41,6 +41,14 @@ Defaults, all configurable:
   other (spec [01](01-push-protocol.md#backpressure)): the multipart
   aborts and the part slot frees, so a stalled client cannot hold a slot
   indefinitely.
+- On SIGTERM/SIGINT the Pusher stops accepting connections and lets
+  in-flight uploads finish for up to **60 s**, then aborts every
+  multipart still open (it is the bucket's only writer), listing again
+  until none remain or a 20 s budget runs out, and exits. Drain plus
+  abort stays under systemd's default 90 s stop timeout. A push that
+  finishes within the drain completes; a longer one is cut off (the
+  client retries it), and its parts normally go with it rather than
+  waiting for the weekly sweep ([05-gc.md](05-gc.md)).
 - Every S3 call carries an **overall operation deadline** —
   `[s3] operation_timeout_secs`, default **60** — covering connect,
   transfer, and any SDK-internal retries (ticket 27). Overall rather
@@ -102,7 +110,8 @@ handle — and increments `garret_degraded_total{reason}`
 (spec [08-observability](08-observability.md)). The not-yet-created
 database still answers **503** (`/ready` models that state); degradation
 covers a database or object store that is present but wedged. The browse
-API is outside this contract and keeps its 500s.
+API is outside this contract: it keeps its 500s and answers 503 over its
+own budget (spec [07-browse-api](07-browse-api.md)).
 (Ticket 25; prior art: sccache's timed-out-lookup → local-compile miss.)
 
 ## Cleanup

@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, BufReader},
     process::Command,
+    time::Instant,
 };
 use tokio_util::io::ReaderStream;
 
@@ -207,13 +208,14 @@ pub struct Pusher {
     pub http: reqwest::Client,
     /// Pusher base URL.
     pub endpoint: String,
-    /// Bearer token sent with every request.
-    pub token: String,
+    /// Bearer tokens, asked for per request: a run can outlive any one token.
+    pub tokens: crate::auth::TokenSource,
     /// Maximum concurrent uploads.
     pub jobs: usize,
     /// zstd level for compressing NARs on the way out.
     pub zstd_level: i32,
-    /// Retries per path on 429/5xx, with exponential jittered backoff.
+    /// Retries per path on 5xx and dropped connections, with exponential
+    /// jittered backoff; 429s wait out `Retry-After` instead.
     pub max_retries: u32,
 }
 
@@ -309,14 +311,26 @@ impl Pusher {
             .iter()
             .map(|p| hash_of_store_path(&p.path))
             .collect();
-        let response = self
-            .http
-            .post(format!("{}/api/v1/missing-paths", self.endpoint))
-            .bearer_auth(&self.token)
-            .json(&hashes)
-            .send()
-            .await
-            .context("negotiating missing paths")?;
+        let send = |token: &str| {
+            self.http
+                .post(format!("{}/api/v1/missing-paths", self.endpoint))
+                .bearer_auth(token)
+                .json(&hashes)
+                .send()
+        };
+        let token = self.tokens.get().await?;
+        let mut response = send(&token).await.context("negotiating missing paths")?;
+        // Expired or revoked since it was minted: replace it once and ask
+        // again. A second 401 is a real refusal, reported below.
+        if response.status() == StatusCode::UNAUTHORIZED
+            && let Some(token) = self
+                .tokens
+                .renew(&token)
+                .await
+                .context("the Pusher refused the token, and renewing it failed")?
+        {
+            response = send(&token).await.context("negotiating missing paths")?;
+        }
 
         // `error_for_status` drops the body, which is where the server explains
         // itself — a bare "401 Unauthorized" says nothing a log can act on.
@@ -370,23 +384,36 @@ impl Pusher {
     }
 
     async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
-        let mut delay = Duration::from_millis(250);
-        for attempt in 0..=self.max_retries {
-            match self.attempt(info, report).await {
+        let mut backoff = Backoff::new(self.max_retries);
+        let mut renewed = false;
+        loop {
+            let token = self.tokens.get().await?;
+            let error = match self.attempt(info, report, &token).await {
                 Ok(status) => return Ok(status),
-                Err(e) if attempt < self.max_retries && is_retryable(&e) => {
-                    // Jitter so a fleet of pushers doesn't retry in lockstep.
-                    let jitter = Duration::from_millis(fastrand_millis(delay));
-                    tokio::time::sleep(delay + jitter).await;
-                    delay *= 2;
-                }
-                Err(e) => return Err(e),
+                Err(e) => e,
+            };
+            // The token expired or was revoked mid-run: replace it once and go
+            // again straight away. A second 401 is a real refusal.
+            if !renewed
+                && error.is::<Unauthorized>()
+                && self
+                    .tokens
+                    .renew(&token)
+                    .await
+                    .context("the Pusher refused the token, and renewing it failed")?
+                    .is_some()
+            {
+                renewed = true;
+                continue;
+            }
+            match backoff.next(&error) {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => return Err(error),
             }
         }
-        unreachable!("loop returns on the final attempt")
     }
 
-    async fn attempt(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
+    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<&'static str> {
         let preamble = Preamble {
             store_path: info.path.clone(),
             nar_hash: info.nar_hash.clone(),
@@ -412,7 +439,7 @@ impl Pusher {
                 self.endpoint,
                 hash_of_store_path(&info.path)
             ))
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
             .body(Body::wrap_stream(body))
             .send()
             .await
@@ -420,7 +447,11 @@ impl Pusher {
 
         let status = response.status();
         if let Some(after) = retry_after(status, &response) {
-            bail!("server is shedding load (429), retry after {after:?}");
+            return Err(Shed(after).into());
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Unauthorized(body.trim().to_owned()).into());
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -439,6 +470,84 @@ impl Pusher {
             "exists" | "in-progress" => "deduped",
             _ => "pushed",
         })
+    }
+}
+
+/// The Pusher refused the token. Typed so [`Pusher::push_one`] can tell it
+/// apart from other rejections and renew the token instead of failing.
+#[derive(Debug)]
+struct Unauthorized(String);
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "upload rejected with {}: {}",
+            StatusCode::UNAUTHORIZED,
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Unauthorized {}
+
+/// The server shed the upload (429) and said when to come back. Typed so
+/// [`Backoff`] waits out `Retry-After` instead of parsing the message.
+#[derive(Debug)]
+struct Shed(Duration);
+
+impl std::fmt::Display for Shed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server is shedding load (429), retry after {:?}", self.0)
+    }
+}
+
+impl std::error::Error for Shed {}
+
+/// How long one path keeps waiting out 429s before it fails: long enough to
+/// queue behind several multi-minute uploads, short enough that a server that
+/// never frees a slot fails the run instead of hanging it.
+const SHED_DEADLINE: Duration = Duration::from_secs(15 * 60);
+
+/// One path's retry schedule (spec 01). A 429 is the server's queue, not a
+/// fault: it waits out `Retry-After` for as long as [`SHED_DEADLINE`] allows
+/// and never spends the error budget. Other retryable failures get
+/// `max_retries` doubling waits from 250 ms; a shed resets that budget, so it
+/// counts consecutive faults — a shed whose reply is lost to the connection
+/// race (spec 01) must not add up over a quarter hour of queueing. Every wait
+/// is jittered so a fleet of pushers doesn't retry in lockstep.
+struct Backoff {
+    started: Instant,
+    retries: u32,
+    max_retries: u32,
+    delay: Duration,
+}
+
+impl Backoff {
+    fn new(max_retries: u32) -> Self {
+        Self {
+            started: Instant::now(),
+            retries: 0,
+            max_retries,
+            delay: Duration::from_millis(250),
+        }
+    }
+
+    /// How long to wait before trying again after `error`; `None` to give up.
+    fn next(&mut self, error: &anyhow::Error) -> Option<Duration> {
+        if let Some(Shed(after)) = error.downcast_ref::<Shed>() {
+            self.retries = 0;
+            self.delay = Duration::from_millis(250);
+            let wait = *after + Duration::from_millis(fastrand_millis(*after));
+            return (self.started.elapsed() + wait <= SHED_DEADLINE).then_some(wait);
+        }
+        if self.retries >= self.max_retries || !is_retryable(error) {
+            return None;
+        }
+        let wait = self.delay + Duration::from_millis(fastrand_millis(self.delay));
+        self.retries += 1;
+        self.delay *= 2;
+        Some(wait)
     }
 }
 
@@ -495,22 +604,30 @@ fn compressed_nar(
 
 fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Duration> {
     (status == StatusCode::TOO_MANY_REQUESTS).then(|| {
-        response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(1))
+        shed_for(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+        )
     })
 }
 
-/// 429 and 5xx are retryable; other 4xx are the client's fault (spec 01).
+/// A 429's `Retry-After`, in seconds; absent or unparseable (an HTTP date)
+/// means 1 s. Clamped to at least 1 s, so a `0` cannot spin, and at most
+/// [`SHED_DEADLINE`], so an absurd value cannot overflow the wait arithmetic.
+fn shed_for(retry_after: Option<&str>) -> Duration {
+    retry_after
+        .and_then(|v| v.trim().parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(1))
+        .clamp(Duration::from_secs(1), SHED_DEADLINE)
+}
+
+/// 5xx and dropped or timed-out connections are retryable; 4xx are the
+/// client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
 fn is_retryable(error: &anyhow::Error) -> bool {
-    let text = error.to_string();
-    text.contains("429")
-        || text.contains("shedding load")
-        || text.contains(" 50")
+    error.to_string().contains(" 50")
         || error
             .downcast_ref::<reqwest::Error>()
             .is_some_and(|e| e.is_timeout() || e.is_connect() || connection_dropped(e))
@@ -547,13 +664,15 @@ pub fn connection_dropped(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Jitter without a rand dependency: nanosecond noise, capped at the delay.
+/// Jitter without a rand dependency: sub-second clock noise, capped at the
+/// delay. Microseconds, not nanoseconds: macOS clocks tick in whole
+/// microseconds, so nanoseconds modulo a whole second would always be 0.
 fn fastrand_millis(delay: Duration) -> u64 {
-    let nanos = std::time::SystemTime::now()
+    let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
+        .map(|d| d.subsec_micros() as u64)
         .unwrap_or(0);
-    nanos % delay.as_millis().max(1) as u64
+    micros % delay.as_millis().max(1) as u64
 }
 
 #[cfg(test)]
@@ -643,14 +762,72 @@ mod tests {
         );
     }
 
+    fn shed(secs: u64) -> anyhow::Error {
+        Shed(Duration::from_secs(secs)).into()
+    }
+
+    fn rejected(status: u16) -> anyhow::Error {
+        let status = StatusCode::from_u16(status).unwrap();
+        anyhow::anyhow!("upload rejected with {status}: nope")
+    }
+
+    /// Six CI legs against sixteen upload slots is the normal load: a path
+    /// can be shed for minutes, and none of that may count against the
+    /// budget for real failures.
+    #[tokio::test(start_paused = true)]
+    async fn shedding_waits_out_retry_after_and_never_spends_the_error_budget() {
+        let mut backoff = Backoff::new(2);
+        for _ in 0..100 {
+            let wait = backoff.next(&shed(3)).expect("well inside the deadline");
+            assert!(
+                (Duration::from_secs(3)..Duration::from_secs(6)).contains(&wait),
+                "{wait:?}"
+            );
+            tokio::time::advance(wait).await;
+        }
+        assert!(backoff.next(&rejected(503)).is_some());
+        assert!(backoff.next(&rejected(503)).is_some());
+        // A shed in between resets the budget: it counts consecutive faults,
+        // not every reply lost to the connection race over a long queue.
+        assert!(backoff.next(&shed(1)).is_some());
+        assert!(backoff.next(&rejected(503)).is_some());
+        assert!(backoff.next(&rejected(503)).is_some());
+        assert!(backoff.next(&rejected(503)).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shedding_gives_up_at_the_deadline() {
+        let mut backoff = Backoff::new(5);
+        tokio::time::advance(SHED_DEADLINE - Duration::from_secs(10)).await;
+        assert!(backoff.next(&shed(1)).is_some());
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(backoff.next(&shed(1)).is_none());
+    }
+
+    /// The header is the server's (or a proxy's) to set: a `0` must not spin
+    /// and an absurd value must not overflow the wait, which would panic.
     #[test]
-    fn only_load_shedding_and_server_errors_are_retried() {
-        assert!(is_retryable(&anyhow::anyhow!(
-            "server is shedding load (429)"
-        )));
-        assert!(is_retryable(&anyhow::anyhow!("upload rejected with 503")));
-        assert!(!is_retryable(&anyhow::anyhow!("upload rejected with 400")));
-        assert!(!is_retryable(&anyhow::anyhow!("upload rejected with 401")));
+    fn retry_after_is_held_between_a_second_and_the_deadline() {
+        let second = Duration::from_secs(1);
+        assert_eq!(shed_for(Some("7")), Duration::from_secs(7));
+        assert_eq!(shed_for(Some("0")), second);
+        assert_eq!(shed_for(None), second);
+        assert_eq!(shed_for(Some("Wed, 21 Oct 2015 07:28:00 GMT")), second);
+        let absurd = shed_for(Some("18446744073709551615"));
+        assert_eq!(absurd, SHED_DEADLINE);
+        let mut backoff = Backoff::new(0);
+        assert!(backoff.next(&Shed(absurd).into()).is_none());
+    }
+
+    #[test]
+    fn server_errors_back_off_doubling_and_client_errors_fail_at_once() {
+        let mut backoff = Backoff::new(5);
+        let first = backoff.next(&rejected(503)).unwrap();
+        let second = backoff.next(&rejected(502)).unwrap();
+        assert!((Duration::from_millis(250)..Duration::from_millis(500)).contains(&first));
+        assert!((Duration::from_millis(500)..Duration::from_millis(1000)).contains(&second));
+        assert!(backoff.next(&rejected(400)).is_none());
+        assert!(backoff.next(&rejected(401)).is_none());
     }
 
     /// Stand-in for reqwest's wrapping: the io::Error sits at the bottom of a

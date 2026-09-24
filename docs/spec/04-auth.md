@@ -11,7 +11,7 @@ JWKS. There is no token-exchange service and no garret-issued token.
 
 | Caller | Flow |
 |---|---|
-| Human at a CLI | OIDC **device flow** against Pocket ID (passkey approval in browser). Refresh token (30-day rolling window, rotating) stored in XDG config, mode 0600. |
+| Human at a CLI | OIDC **device flow** against Pocket ID (passkey approval in browser). Refresh token (30-day rolling window, rotating) stored in XDG config: the directory created mode 0700, the file mode 0600 from creation — written to a new sibling and renamed over the old one, so no reader ever sees it unrestricted or half-written, and a symlink at the path is replaced, not followed. |
 | Store watcher daemon | **client_credentials** with a per-machine confidential client in Pocket ID (`sub = client-<uuid>`). Secret in a root-owned file wired by the NixOS module. |
 | GitHub Actions | **Re-mint per request**: the client fetches a fresh runner OIDC token whenever the cached one is >4 min old (the 5-minute TTL never bites; validation is at request start, so long streaming PUTs are unaffected). |
 
