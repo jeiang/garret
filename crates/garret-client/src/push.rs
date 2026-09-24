@@ -201,9 +201,11 @@ impl Report {
     /// bar's total is denominated in.
     ///
     /// A retried path is re-read and so counted twice, nudging the bar past its
-    /// total on a rare failure. That is cosmetic, and correcting it would mean
-    /// threading a per-attempt counter through the body stream to decrement on
-    /// error; the bar clamps its display, so it is left alone.
+    /// total — routinely while an `in-progress` path is polled, since each poll
+    /// streams part of the body before the early reply. That is cosmetic, and
+    /// correcting it would mean threading a per-attempt counter through the
+    /// body stream to decrement on error; the bar clamps its display, so it is
+    /// left alone.
     fn wrap<R: AsyncRead + Unpin>(&self, reader: R) -> ProgressBarIter<R> {
         match &self.bar {
             Some(bar) => bar.clone().wrap_async_read(reader),
@@ -516,11 +518,15 @@ impl Pusher {
     }
 }
 
-/// Orders `paths` so each comes after the paths in the batch it references,
-/// so a run cut short leaves complete closures behind rather than roots whose
-/// references never arrived. Self-references and references outside the batch
-/// impose nothing; a cycle (nix forbids them) keeps its original order at the
-/// end rather than dropping a path.
+/// Orders `paths` so each comes after the paths in the batch it references.
+/// The worker pool only *starts* uploads in this order: with `jobs > 1` a
+/// referrer can still finish before its references, and a reference that
+/// fails does not hold its referrers back, so an interrupted or failed run can
+/// leave a referrer without its references until the next push's Negotiation
+/// finds them. At `jobs = 1` an interrupted run leaves only whole closures.
+/// Self-references and references outside the batch impose nothing; a cycle
+/// (nix forbids them) keeps its original order at the end rather than dropping
+/// a path.
 fn references_first(paths: Vec<PathInfo>) -> Vec<PathInfo> {
     let index: HashMap<&str, usize> = paths
         .iter()
@@ -1059,8 +1065,8 @@ mod tests {
         }
     }
 
-    /// A run cut short must leave whole closures behind, so every path goes
-    /// out after the paths in the batch it references.
+    /// Every path starts after the paths in the batch it references, so a
+    /// sequential run cut short leaves whole closures behind.
     #[test]
     fn references_are_pushed_before_their_referrers() {
         let batch = vec![

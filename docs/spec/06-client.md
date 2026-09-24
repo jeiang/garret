@@ -119,14 +119,20 @@ replies lost to spec 01's connection-drop race must not add up over a long
 wait. Other `4xx`
 fail at once.
 
-**Closures are pushed whole.** Missing paths go out references first (a
-topological order over the batch; the worker pool still runs `jobs` at once),
-so a run cut short leaves complete closures behind rather than roots whose
-references never arrived. After a run with no failures that uploaded
-anything, `push` negotiates the whole closure once more: a path found present
-the first time can be gone by the end (evicted, deleted). Whatever is missing
-is reported (`re-check: N path(s) …`, or a `rechecked` event) and pushed, its
-results folded into the same summary. There is one re-check, not a loop.
+**Closures go out references first, then are re-checked.** Missing paths
+start in a topological order over the batch. That is an order of *starts*:
+the worker pool runs `jobs` uploads at once, so with `jobs > 1` a referrer can
+finish before its references, and a reference that fails does not hold its
+referrers back. An interrupted or failed run can therefore leave a referrer
+without its references until the next push's Negotiation finds them missing;
+at `jobs = 1` an interrupted run leaves only whole closures. After a run with
+no failures that had anything to upload, `push` negotiates the whole closure
+once more: a path found present the first time can be gone by the end
+(evicted, deleted).
+Whatever is missing is reported (`re-check: N path(s) …`, or a `rechecked`
+event) and pushed, its results folded into the same summary. There is one
+re-check, not a loop. If the re-check's Negotiation itself fails, `done` is
+still reported and the run then exits non-zero.
 
 **Timeouts** turn hangs into errors. Connecting gives up after
 30 s, a Negotiation after 2 minutes, and a request to the token provider
@@ -203,12 +209,19 @@ data.
 {"event":"path","path":"/nix/store/…","status":"pushed","nar_size":81920}
 {"event":"path","path":"/nix/store/…","status":"deduped","nar_size":4096}
 {"event":"path","path":"/nix/store/…","status":"failed","error":"upload rejected with 503: …"}
-{"event":"rechecked","missing":1,"nar_bytes":81920}
 {"event":"done","pushed":40,"deduped":6,"failed":1,"nar_bytes":4021374976}
 ```
 
+A run with no failures may end with a re-check before `done`:
+
+```
+{"event":"rechecked","missing":1,"nar_bytes":81920}
+{"event":"path","path":"/nix/store/…","status":"pushed","nar_size":81920}
+{"event":"done","pushed":47,"deduped":0,"failed":0,"nar_bytes":4021456896}
+```
+
 `rechecked` appears only when the closing re-check found paths missing; their
-`path` events follow it and `done` counts them.
+`path` events follow it and `done` counts them, bytes included.
 
 `negotiated` gives a consumer the denominator up front and `done` makes a
 truncated stream detectable. `upstream`-filtered paths are reported first, then
