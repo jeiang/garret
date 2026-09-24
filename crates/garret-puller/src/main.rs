@@ -152,7 +152,12 @@ where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let task = tokio::task::spawn_blocking(move || read(&conn.lock().unwrap()));
+    // A read that panicked poisons the lock, but it held no transaction and
+    // its statements are finalized on unwind, so the connection is fine.
+    // Refusing it would turn one bad row into a permanent 404 server.
+    let task = tokio::task::spawn_blocking(move || {
+        read(&conn.lock().unwrap_or_else(PoisonError::into_inner))
+    });
     match tokio::time::timeout(budget, task).await {
         Ok(joined) => {
             Some(joined.unwrap_or_else(|e| Err(anyhow::anyhow!("db read task failed: {e}"))))
@@ -675,12 +680,35 @@ mod tests {
         assert!(queued.is_none());
     }
 
+    /// One bad row that panics a read must cost that request, not the
+    /// Puller: the process stays up, so nothing would restart it.
     #[tokio::test]
-    async fn a_panicking_read_surfaces_as_an_error_not_a_crash() {
-        let got = db_read(conn(), Duration::from_secs(5), |_| -> anyhow::Result<()> {
+    async fn a_panicked_read_does_not_break_later_reads() {
+        let conn = conn();
+        let panicked = db_read(
+            conn.clone(),
+            Duration::from_secs(5),
+            |_| -> anyhow::Result<()> { panic!("boom") },
+        )
+        .await;
+        assert!(panicked.unwrap().is_err());
+        let next = db_read(conn, Duration::from_secs(5), |_| Ok(42)).await;
+        assert_eq!(next.unwrap().unwrap(), 42);
+    }
+
+    /// Browse's async lock cannot poison at all; this guards that design
+    /// choice, and the 500 a panicking browse request must still answer.
+    #[tokio::test]
+    async fn a_panicking_browse_request_is_a_500_and_the_next_one_is_served() {
+        let conn = Arc::new(tokio::sync::Mutex::new(
+            rusqlite::Connection::open_in_memory().unwrap(),
+        ));
+        let panicked = browse(conn.clone(), "tree", |_| -> anyhow::Result<Option<()>> {
             panic!("boom")
         })
         .await;
-        assert!(got.unwrap().is_err());
+        assert_eq!(panicked.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let next = browse(conn, "tree", |_| Ok(Some(42))).await;
+        assert_eq!(next.status(), StatusCode::OK);
     }
 }
