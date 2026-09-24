@@ -12,6 +12,7 @@ use bytes::Bytes;
 mod admin;
 mod fsck;
 mod gc;
+mod verify;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -37,6 +38,7 @@ use garret_server::{
 };
 use serde_json::json;
 use tokio::sync::Semaphore;
+use verify::VerifiedNar;
 
 pub(crate) struct AppState {
     pub conn: Arc<Mutex<rusqlite::Connection>>,
@@ -475,14 +477,22 @@ async fn store_upload(
     // Whatever followed the preamble in that chunk is the start of the NAR.
     let leftover = Bytes::from(head);
     let nar = futures::stream::once(async move { Ok::<_, axum::Error>(leftover) }).chain(stream);
+    // Checked on the way through against the claimed NarHash/NarSize, so
+    // the key signs only what nix will verify on download (ADR-0010).
+    let mut nar = VerifiedNar::new(Box::pin(nar), &object.nar_hash, object.nar_size)
+        .context("starting the zstd decoder")?;
 
-    let (digest, file_size) = state
+    let stored = state
         .storage
-        .put_streaming(&storage::key_for(hash), Box::pin(nar), &state.limits)
-        .await?;
+        .put_streaming(&storage::key_for(hash), &mut nar, &state.limits)
+        .await;
+    if let Some(reason) = nar.refused {
+        return Err(Error(StatusCode::BAD_REQUEST, reason));
+    }
+    let (digest, file_size) = stored?;
 
-    // Server-computed over exactly the bytes stored — the only integrity
-    // check in the system now that the Puller redirects (ADR-0005).
+    // Server-computed over exactly the bytes stored — what nix checks the
+    // redirected download against (ADR-0005).
     object.file_hash = format!("sha256:{}", nix_base32::encode(&digest));
     object.file_size = file_size;
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
@@ -854,6 +864,38 @@ mod tests {
             .await
             .expect_err(case);
             assert_eq!(err.0, StatusCode::BAD_REQUEST, "{case}: {}", err.1);
+        }
+    }
+
+    /// The NAR is checked against its claim before the store commits: the
+    /// storage is unreachable, so a 400 (not a 500) shows the mismatch
+    /// stopped the push before anything was stored or signed.
+    #[tokio::test]
+    async fn a_nar_that_does_not_match_its_claim_is_refused_before_it_is_stored() {
+        use sha2::{Digest, Sha256};
+        let nar = b"nix-archive-1 and then some".repeat(100);
+        let hash_of =
+            |bytes: &[u8]| format!("sha256:{}", nix_base32::encode(&Sha256::digest(bytes)));
+        let size = nar.len() as i64;
+        let claims = [
+            ("wrong NarHash", hash_of(b"another NAR"), size, "NarHash is"),
+            ("wrong NarSize", hash_of(&nar), size + 1, "NarSize is"),
+        ];
+        for (case, nar_hash, nar_size, why) in claims {
+            let mut p = preamble();
+            (p.nar_hash, p.nar_size) = (nar_hash, nar_size);
+            let mut body = p.to_framed().unwrap();
+            body.extend(zstd::encode_all(nar.as_slice(), 3).unwrap());
+            let err = upload(
+                State(test_state(open_db()).await),
+                Path(H.into()),
+                axum::Extension(Subject("test#user".into())),
+                Body::from(body),
+            )
+            .await
+            .expect_err(case);
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{case}: {}", err.1);
+            assert!(err.1.contains(why), "{case}: {}", err.1);
         }
     }
 

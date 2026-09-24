@@ -67,9 +67,9 @@ impl Entry {
 impl Entry {
     /// The body as a lazy chunk iterator, for entries too large to hold in
     /// memory (the streaming scenario's 2 GiB blob). Always incompressible
-    /// random bytes: the server never decompresses — it streams whatever
-    /// follows the preamble to S3 — so wire bytes are what the scenario
-    /// measures, and compressible filler would only measure the client's CPU.
+    /// random bytes, sent in raw (stored) zstd blocks: wire bytes are what
+    /// the scenario measures, and compressing would only measure the
+    /// client's CPU.
     pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = Vec<u8>> + use<> {
         let mut rng = Rng::new(u64::from_str_radix(&self.hash[..16], 32).unwrap_or(1));
         let mut remaining = self.size;

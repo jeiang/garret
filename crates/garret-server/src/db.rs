@@ -16,7 +16,8 @@ pub struct Object {
     pub store_path: String,
     /// Basename after the hash (`hello-1.0`); indexed for browse search.
     pub name: String,
-    /// Hash of the uncompressed NAR, `sha256:<nix-base32>` — client-claimed.
+    /// Hash of the uncompressed NAR, `sha256:<nix-base32>` — client-claimed,
+    /// and verified against the uploaded NAR before the row is written.
     pub nar_hash: String,
     /// Size of the uncompressed NAR in bytes.
     pub nar_size: i64,

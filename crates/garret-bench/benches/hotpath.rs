@@ -1,6 +1,7 @@
 //! Micro-benchmarks for the per-byte costs on the push hot path
 //! (spec 09-benchmarks): client-side zstd at the corpus's compressibility
-//! mix, the server's SHA-256 over the stored stream, and preamble framing.
+//! mix, the server's SHA-256 over the stored stream, its NarHash check
+//! (zstd decode + SHA-256 of the NAR), and preamble framing.
 //!
 //! These run in-process with no server, so they are the "maximum speed this
 //! CPU can reach" probes — the first numbers to compare when the
@@ -51,8 +52,8 @@ fn compression(c: &mut Criterion) {
     group.finish();
 }
 
-/// The Pusher's only per-byte CPU cost: SHA-256 over exactly the bytes stored
-/// (storage.rs `put_streaming`).
+/// The Pusher's SHA-256 over exactly the bytes stored (storage.rs
+/// `put_streaming`).
 fn hashing(c: &mut Criterion) {
     let input = body(0);
     let mut group = c.benchmark_group("sha256");
@@ -61,6 +62,26 @@ fn hashing(c: &mut Criterion) {
         b.iter(|| {
             let mut hasher = Sha256::new();
             hasher.update(black_box(input.as_slice()));
+            hasher.finalize()
+        })
+    });
+    group.finish();
+}
+
+/// The Pusher's other per-byte cost: decompressing the stored stream and
+/// hashing the NAR to check the claimed NarHash (ADR-0010). Throughput is
+/// per uncompressed byte, at the client's default level.
+fn verifying(c: &mut Criterion) {
+    let nar = body(70);
+    let compressed = zstd::encode_all(nar.as_slice(), 3).unwrap();
+    let mut group = c.benchmark_group("nar_verify");
+    group.throughput(Throughput::Bytes(BODY_SIZE as u64));
+    group.bench_function("zstd_decode+sha256/compressibility70", |b| {
+        b.iter(|| {
+            let mut hasher = Sha256::new();
+            let mut decoder =
+                zstd::stream::read::Decoder::new(black_box(compressed.as_slice())).unwrap();
+            std::io::copy(&mut decoder, &mut hasher).unwrap();
             hasher.finalize()
         })
     });
@@ -90,5 +111,5 @@ fn framing(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, compression, hashing, framing);
+criterion_group!(benches, compression, hashing, verifying, framing);
 criterion_main!(benches);

@@ -140,6 +140,41 @@ code=$(curl -s -o /dev/null -w '%{http_code}' "$pusher_url/metrics")
 echo "  public /metrics -> $code"
 [ "$code" != "200" ] || { echo "metrics leaked onto the public listener"; exit 1; }
 
+say "a NAR that does not match its claimed NarHash is refused (ADR-0010)"
+# A real NAR claimed under another path's NarHash — what a forged push looks
+# like. Multipart-sized, so the refusal must abort the parts already sent.
+head -c 12000000 /dev/urandom > "$root/forged.bin"
+forged=$(nix store add-path "$root/forged.bin" --name garret-e2e-forged)
+forged_hash=$(basename "$forged" | cut -c1-32)
+nix path-info --json --json-format 1 "$big" "$forged" > "$root/forged-info.json"
+python3 - "$big" "$forged" "$root/forged-info.json" > "$root/forged.body" <<'PY'
+import json, struct, sys
+big, forged, info = sys.argv[1], sys.argv[2], json.load(open(sys.argv[3]))
+if isinstance(info, list):  # older nix: an array of objects with "path"
+    info = {entry["path"]: entry for entry in info}
+preamble = json.dumps({
+    "store_path": forged,
+    "nar_hash": info[big]["narHash"],
+    "nar_size": info[forged]["narSize"],
+    "references": [], "deriver": None, "ca": None,
+}).encode()
+sys.stdout.buffer.write(struct.pack("<I", len(preamble)) + preamble)
+PY
+nix-store --dump "$forged" | zstd -q -c >> "$root/forged.body"
+code=$(curl -s -o "$root/forged.out" -w '%{http_code}' -X PUT \
+  -H "Authorization: Bearer $GARRET_TOKEN" --data-binary @"$root/forged.body" \
+  "$pusher_url/api/v1/nar/$forged_hash")
+echo "  forged push -> $code $(cat "$root/forged.out")"
+[ "$code" = "400" ] || { echo "expected 400 for a forged NarHash, got $code"; exit 1; }
+aborted=$(metric "$pusher_metrics_port" garret_s3_multipart_aborted_total)
+[ "${aborted:-0}" = "1" ] || { echo "the refused multipart was not aborted"; exit 1; }
+if curl -sf "$puller_url/$forged_hash.narinfo" >/dev/null 2>&1; then
+  echo "a refused NAR was signed and served"; exit 1
+fi
+# Nothing lingers from the refusal: the honest push of the same path lands.
+garret push "$forged" | grep -q "done: 1 pushed, 0 deduped, 0 failed"
+echo "  refused, its multipart aborted, and the honest push still lands"
+
 say "narinfo"
 curl -sf "$puller_url/$hash.narinfo" | tee "$root/narinfo"
 grep -q "^Sig: garret-e2e-1:" "$root/narinfo"

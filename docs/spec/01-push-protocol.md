@@ -26,7 +26,7 @@ Body layout (streamed, never buffered whole):
 1. A 4-byte little-endian length prefix.
 2. A JSON metadata preamble of that length: `storePath`, `narHash`,
    `narSize`, `references` (**full store paths**), `deriver?`, `ca?`.
-3. The zstd-compressed NAR stream (single frame) to EOF.
+3. The zstd-compressed NAR stream (one or more complete frames) to EOF.
 
 The length-prefixed preamble avoids header-size limits for long reference
 lists while keeping the request a single streamed body.
@@ -59,12 +59,25 @@ stored.
 
 ### Compression and verification
 
-- The **client** compresses (zstd, default level 3, configurable).
+- The **client** compresses (zstd, default level 3, configurable up to
+  19; higher levels need a window over 8 MiB, which the server refuses).
 - The server hashes the compressed bytes as it relays them to S3 — this
-  becomes the stored `FileHash`/`FileSize` — and **trusts the client's
-  claimed `narHash`/`narSize`** (every pusher is OIDC-authenticated on
-  single-tenant infra; [ADR-0002](../adr/0002-whole-nar-storage.md)).
-  A background deep-verify pass is an optional future addition, not v1.
+  becomes the stored `FileHash`/`FileSize` — and **verifies the claimed
+  `narHash`/`narSize`** on the same pass: it decompresses the stream as
+  it goes by, never buffering the NAR, and hashes the result
+  ([ADR-0010](../adr/0010-pusher-verifies-nar-hash.md)). The NAR must
+  be complete zstd frames whose content matches both claims exactly. A
+  mismatch, a truncated or corrupt stream, or a window over 8 MiB is
+  `400`. The check finishes at end of stream, before the store commits
+  (the single `PutObject` is never sent, or the multipart is aborted),
+  so nothing is inserted or signed.
+- What this proves is that the bytes are the NAR the preamble
+  describes, not that they are the real build output: a push token can
+  still sign any self-consistent NAR for an input-addressed path, so
+  token scope ([04-auth.md](04-auth.md)) stays the primary control.
+- A re-push that claims a different `narHash` for a present path is not
+  detected: `exists` is answered before the preamble is read (see
+  Idempotency), by design.
 
 ### Idempotency
 
@@ -99,7 +112,10 @@ bytes. Past either cap the server sheds fast with `429` + `Retry-After`;
 clients wait out `Retry-After` (jittered) and try again, for as long as a
 deadline allows rather than a retry count — a 429 is a place in the queue,
 not a failure. The queue lives in the clients;
-server memory is provably bounded by configuration.
+server memory is provably bounded by configuration. Each upload also
+holds one zstd decoder for the NarHash check: its window (at most
+8 MiB; 2 MiB at the default level) plus a 128 KiB output buffer, so
+the concurrent-upload cap bounds that too.
 
 **A stalled body is abandoned.** An admitted upload holds an upload
 slot, its in-flight claim and, mid-NAR, a part slot, so a sender that

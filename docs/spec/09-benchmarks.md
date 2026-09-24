@@ -77,12 +77,13 @@ hardware, which is a decision for after the first production runs.
 2. **Large-body streaming** (`garret-bench stream`) — single-stream
    1 MiB / 100 MiB / 2 GiB pushes; the regression gate for HTTP/2
    flow-control tuning. Bodies are generated chunk by chunk and
-   streamed, never held whole, and are **not** zstd-compressed on the
-   way out: the server never decompresses — everything after the
-   preamble streams to S3 as-is — so compressing random filler would
-   only measure the bench client's CPU. Reported as median wall time
-   and payload MiB/s per size; PASS = zero failures. (Pulls no longer
-   stream through us — see below.)
+   streamed, never held whole, and are sent as raw (stored) zstd blocks:
+   a valid frame the server decompresses and checks against the NarHash
+   ([ADR-0010](../adr/0010-pusher-verifies-nar-hash.md)), but not
+   compressed, since compressing random filler would only measure the
+   bench client's CPU. The NarHash is computed in a pass before the
+   timed push. Reported as median wall time and payload MiB/s per size;
+   PASS = zero failures. (Pulls no longer stream through us — see below.)
 3. **Pull side** (`garret-bench pull`) — concurrent cold narinfo + NAR
    requests up to the redirect (never following it): flat Puller memory
    and redirect latency under load. Since the Puller redirects rather
@@ -110,8 +111,9 @@ hardware, which is a decision for after the first production runs.
 `just microbench` (criterion, in `crates/garret-bench/benches/`) probes
 the per-byte hot-path costs in-process, with no server: zstd at the
 corpus's compressibility classes and level ladder (the client's cost),
-SHA-256 over stored bytes (the Pusher's only per-byte CPU cost), and
-preamble framing. These are the "maximum speed this CPU can reach"
+the Pusher's two per-byte costs — SHA-256 over stored bytes and the
+NarHash check (zstd decode + SHA-256 of the NAR) — and preamble
+framing. These are the "maximum speed this CPU can reach"
 numbers — the first thing to compare when a memory/cpu-limited sandbox
 underperforms the load scenarios.
 
