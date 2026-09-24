@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -22,6 +22,7 @@ use garret_server::{
     db, metrics as garret_metrics, narinfo, now,
     storage::{self, Storage},
 };
+use parking_lot::Mutex;
 use serde::Deserialize;
 
 struct AppState {
@@ -76,7 +77,7 @@ impl Bumps {
             metrics::counter!("garret_bump_debounced_total").increment(1);
             return;
         }
-        let mut pending = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pending = self.0.lock();
         if !pending.contains(hash) {
             pending.insert(hash.to_owned());
         }
@@ -88,7 +89,7 @@ impl Bumps {
     /// run it on the blocking pool, never under the pull-path lock.
     fn flush(&self, conn: &mut rusqlite::Connection, now: i64, debounce: i64) -> Result<usize> {
         let batch = {
-            let mut pending = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut pending = self.0.lock();
             metrics::gauge!("garret_bump_queue_depth").set(0.0);
             std::mem::take(&mut *pending)
         };
@@ -109,7 +110,7 @@ async fn flush_bumps(state: Arc<AppState>, conn: rusqlite::Connection) {
         tick.tick().await;
         let (state, conn) = (state.clone(), conn.clone());
         let flushed = tokio::task::spawn_blocking(move || {
-            let mut conn = conn.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut conn = conn.lock();
             state.bumps.flush(&mut conn, now(), state.bump_debounce)
         })
         .await;
@@ -164,12 +165,7 @@ where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    // A read that panicked poisons the lock, but it held no transaction and
-    // its statements are finalized on unwind, so the connection is fine.
-    // Refusing it would turn one bad row into a permanent 404 server.
-    let task = tokio::task::spawn_blocking(move || {
-        read(&conn.lock().unwrap_or_else(PoisonError::into_inner))
-    });
+    let task = tokio::task::spawn_blocking(move || read(&conn.lock()));
     match tokio::time::timeout(budget, task).await {
         Ok(joined) => {
             Some(joined.unwrap_or_else(|e| Err(anyhow::anyhow!("db read task failed: {e}"))))

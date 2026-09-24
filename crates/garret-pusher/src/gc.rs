@@ -3,7 +3,7 @@
 //! sweep can consult in-memory in-flight upload state.
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -15,6 +15,7 @@ use garret_server::{
     now,
     storage::{self, Storage},
 };
+use parking_lot::Mutex;
 use rusqlite::Connection;
 
 /// Candidates are re-queried after each batch: deleting a root frees its
@@ -64,7 +65,7 @@ impl Gc {
     /// successful run too: the timestamp says GC is alive, not that it evicted.
     pub async fn tick(&self) -> Result<Option<PassResult>> {
         let usage = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock();
             counted("pass", db::total_bytes(&conn))?
         };
         metrics::gauge!("garret_gc_usage_bytes").set(usage as f64);
@@ -93,14 +94,14 @@ impl Gc {
 
         // Correct any drift before deciding how much to delete.
         let mut usage = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock();
             db::reconcile_total_bytes(&conn)?
         };
 
         while usage > low {
             let at = now();
             let candidates = {
-                let conn = self.conn.lock().unwrap();
+                let conn = self.conn.lock();
                 db::evictable(&conn, BATCH, at)?
             };
             if candidates.is_empty() {
@@ -132,7 +133,7 @@ impl Gc {
                 // candidate negotiated or referenced since the snapshot stays;
                 // the next query no longer returns it.
                 let Some(freed) = ({
-                    let mut conn = self.conn.lock().unwrap();
+                    let mut conn = self.conn.lock();
                     db::evict_object(&mut conn, hash, at)?
                 }) else {
                     continue;
@@ -179,7 +180,7 @@ impl Gc {
     async fn sweep(&self) -> Result<usize> {
         let grace = Duration::from_secs(self.cfg.orphan_grace_secs);
         let known = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock();
             db::all_hashes(&conn)?
         };
         let blobs = self.storage.list_blobs().await?;
@@ -195,7 +196,7 @@ impl Gc {
         // A path claimed elsewhere is skipped, and one whose row landed since
         // `known` was read is no orphan.
         let (orphans, claims) = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.conn.lock();
             let mut orphans = Vec::new();
             let mut claims = Vec::new();
             for key in orphan_keys(&blobs, &known, &self.in_flight, grace) {
@@ -308,7 +309,7 @@ mod tests {
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let gate = Arc::new(Mutex::new(Some((held_tx, release_rx))));
         let app = axum::Router::new().fallback(move || {
-            let gate = gate.lock().unwrap().take();
+            let gate = gate.lock().take();
             async move {
                 if let Some((held, release)) = gate {
                     let _ = held.send(());
@@ -391,7 +392,7 @@ mod tests {
         );
 
         let pass = gc.run().await.unwrap();
-        assert!(db::exists(&gc.conn.lock().unwrap(), &d).unwrap());
+        assert!(db::exists(&gc.conn.lock(), &d).unwrap());
         assert_eq!(pass.evicted, 0);
         assert!(pass.candidates_exhausted, "over quota with no alarm");
     }
@@ -419,7 +420,7 @@ mod tests {
             async move { gc.run().await.unwrap() }
         });
         held.await.unwrap();
-        assert!(!db::exists(&gc.conn.lock().unwrap(), &r).unwrap());
+        assert!(!db::exists(&gc.conn.lock(), &r).unwrap());
         assert_eq!(
             in_flight.claim(&r, inflight::Kind::Upload).err(),
             Some(inflight::Kind::Delete),
@@ -461,7 +462,7 @@ mod tests {
                 if query.contains("uploads") {
                     return r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"#.to_owned();
                 }
-                let gate = gate.lock().unwrap().take();
+                let gate = gate.lock().take();
                 if let Some((held, release)) = gate {
                     let _ = held.send(());
                     let _ = release.await;
@@ -518,7 +519,7 @@ mod tests {
         let (storage, mut held, _release) = orphan_s3(&o, {
             let (conn, o) = (conn.clone(), o.clone());
             move || {
-                db::insert_object(&mut conn.lock().unwrap(), &object(&o, 1, &[]), 0).unwrap();
+                db::insert_object(&mut conn.lock(), &object(&o, 1, &[]), 0).unwrap();
             }
         })
         .await;
@@ -555,7 +556,7 @@ mod tests {
             !pass.candidates_exhausted,
             "a transient claim raised the alarm"
         );
-        assert!(db::exists(&gc.conn.lock().unwrap(), &r).unwrap());
+        assert!(db::exists(&gc.conn.lock(), &r).unwrap());
     }
 
     fn config(quota_bytes: u64) -> GcConfig {
@@ -617,7 +618,7 @@ mod tests {
         release.send(()).unwrap();
         let evicted = first.await.unwrap().evicted + second.await.unwrap().evicted;
 
-        let conn = gc.conn.lock().unwrap();
+        let conn = gc.conn.lock();
         assert!(
             db::exists(&conn, &y).unwrap(),
             "two passes evicted past the low watermark"

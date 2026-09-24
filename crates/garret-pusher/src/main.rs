@@ -3,11 +3,12 @@
 //! backpressure and metrics. No GC yet (M4).
 
 use std::{
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 
 mod admin;
 mod fsck;
@@ -355,7 +356,7 @@ async fn missing_paths(
     Json(hashes): Json<Vec<String>>,
 ) -> Result<Json<Vec<String>>, Error> {
     let missing = {
-        let mut conn = state.conn.lock().unwrap();
+        let mut conn = state.conn.lock();
         db::missing(&mut conn, &hashes, garret_server::now())?
     };
     metrics::histogram!("garret_negotiation_batch_size").record(hashes.len() as f64);
@@ -393,7 +394,7 @@ async fn upload(
 
     // Idempotency: answered before the body is read, so `Expect: 100-continue`
     // clients skip the transfer entirely (spec 01).
-    if db::exists(&state.conn.lock().unwrap(), &hash).map_err(Error::from)? {
+    if db::exists(&state.conn.lock(), &hash).map_err(Error::from)? {
         metrics::counter!("garret_upload_skipped_total", "reason" => "exists").increment(1);
         return Ok((StatusCode::OK, Json(json!({"status": "exists"}))).into_response());
     }
@@ -496,7 +497,7 @@ async fn store_upload(
     object.file_hash = format!("sha256:{}", nix_base32::encode(&digest));
     object.file_size = file_size;
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
-    db::insert_object(&mut state.conn.lock().unwrap(), &object, now())?;
+    db::insert_object(&mut state.conn.lock(), &object, now())?;
     Ok(file_size)
 }
 
@@ -907,7 +908,7 @@ mod tests {
         struct Log(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Log {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
+                self.0.lock().extend_from_slice(buf);
                 Ok(buf.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
@@ -948,7 +949,7 @@ mod tests {
             );
         }
 
-        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        let log = String::from_utf8(log.0.lock().clone()).unwrap();
         let line = log
             .lines()
             .find(|l| l.contains(&format!("error_id={id}")))
