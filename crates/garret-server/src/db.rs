@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE INDEX IF NOT EXISTS objects_name          ON objects(name);
 CREATE INDEX IF NOT EXISTS objects_last_accessed ON objects(last_accessed_at);
+CREATE INDEX IF NOT EXISTS objects_created       ON objects(created_at DESC, store_path_hash);
 
 CREATE TABLE IF NOT EXISTS object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
