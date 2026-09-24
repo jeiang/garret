@@ -78,8 +78,10 @@ Notes:
 
 - References are normalized (recursive CTEs for dependency trees;
   referrer lookups via the reverse index). References may point outside
-  the cache. **Self-references are excluded at insert time** (a
-  self-referencing path would never be evictable under closure-safe GC).
+  the cache. **Self-references are stored**: the signed fingerprint
+  covers them. A path is not its own dependency, though, so GC's
+  evictability check, the referrers endpoint and the browse tree all
+  ignore self-edges.
 - `reference` holds the **basename**, not the bare hash: narinfo prints
   reference names and the signed fingerprint needs full store paths, and
   neither can be reconstructed from a hash — least of all for references

@@ -101,8 +101,9 @@ pub fn list(
     })
 }
 
-/// Dependency tree: first occurrence expands, repeats truncate, references
-/// missing from the cache are shown but marked (spec 07).
+/// Dependency tree: first occurrence expands, repeats truncate,
+/// self-references are skipped, references missing from the cache are shown
+/// but marked (spec 07).
 pub fn tree(conn: &Connection, hash: &str, depth_limit: usize) -> Result<Option<TreeNode>> {
     let Some(name) = name_of(conn, hash)? else {
         return Ok(None);
@@ -135,9 +136,16 @@ fn children_of(
 
     let mut out = Vec::new();
     for reference in references {
-        let child_hash = crate::db::hash_of(&reference).to_owned();
-        // Self-references are excluded at insert, but a cycle through two
-        // paths would still loop forever without the seen set.
+        // Stored because the signature covers them, but a path is not its
+        // own dependency: showing it would add a truncated self-child to
+        // nearly every node, since most compiled packages refer to themselves.
+        let child_hash = crate::db::hash_of(&reference);
+        if child_hash == hash {
+            continue;
+        }
+        let child_hash = child_hash.to_owned();
+        // A cycle through two paths would still loop forever without the
+        // seen set.
         let truncated = !seen.insert(child_hash.clone());
         let missing = name_of(conn, &child_hash)?.is_none();
         out.push(TreeNode {
@@ -379,6 +387,26 @@ mod tests {
         assert!(shared_under_mid.truncated ^ shared_under_root.truncated);
 
         assert!(tree_of_unknown_hash(&conn));
+    }
+
+    #[test]
+    fn tree_skips_self_references() {
+        let mut conn = db();
+        let (root, dep) = (h('a'), h('b'));
+        let (root_ref, dep_ref) = (format!("{root}-root"), format!("{dep}-dep"));
+        db::insert_object(
+            &mut conn,
+            &object(&root, "root", &[&root_ref, &dep_ref]),
+            100,
+        )
+        .unwrap();
+        db::insert_object(&mut conn, &object(&dep, "dep", &[&dep_ref]), 100).unwrap();
+
+        let tree = tree(&conn, &root, 10).unwrap().unwrap();
+        let hashes: Vec<&str> = tree.children.iter().map(|c| c.hash.as_str()).collect();
+        assert_eq!(hashes, vec![dep.as_str()]);
+        assert!(!tree.children[0].truncated);
+        assert!(tree.children[0].children.is_empty());
     }
 
     fn tree_of_unknown_hash(conn: &Connection) -> bool {
