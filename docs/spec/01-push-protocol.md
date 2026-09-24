@@ -92,7 +92,9 @@ one saturates.
 
 Global semaphores cap (a) concurrent uploads and (b) total in-flight
 bytes. Past either cap the server sheds fast with `429` + `Retry-After`;
-clients retry with jittered backoff. The queue lives in the clients;
+clients wait out `Retry-After` (jittered) and try again, for as long as a
+deadline allows rather than a retry count — a 429 is a place in the queue,
+not a failure. The queue lives in the clients;
 server memory is provably bounded by configuration.
 
 ## Errors, retry, versioning
@@ -113,7 +115,7 @@ not waiting on `100-continue` and is still writing the body races the
 RST: usually it reads the reply first, but sometimes the write fails
 (broken pipe / connection reset) and the reply is lost. Clients must
 treat a connection-level error during an upload as retryable with the
-same bounded backoff as a `429` — negotiation makes every push
+same bounded backoff as a `5xx` — negotiation makes every push
 idempotent, so the retry either lands the NAR or cheaply learns
 `exists`. (Found at M5: the e2e bench flaked on exactly this race when
 re-pushing an already-present corpus.)
