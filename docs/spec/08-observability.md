@@ -26,8 +26,10 @@ Prefix `garret_`; service distinguished by scrape job.
 - **Pusher — uploads**: in-flight uploads and in-flight bytes gauges
   *versus their configured caps* (saturation visible before it hurts);
   upload size/duration histograms; accepted/failed/shed(429) counters;
-  negotiation batch-size and missing-ratio histograms; idempotent-skip
-  counters (exists / in-progress).
+  negotiation batch-size and missing-ratio histograms;
+  `garret_upload_skipped_total` by `reason` (`exists`, `in-progress`,
+  `quiescing`, and `deleting` for an upload turned away with `503`
+  because GC, `delete` or prune is removing the path, spec 05).
 - **Pusher — S3**: put/multipart-part counters, part duration, retries,
   aborted multiparts; blob deletes (`garret_s3_deletes_total`, only keys
   the response did not report as failed) and per-key delete failures

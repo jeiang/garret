@@ -158,7 +158,7 @@ fn apply_repair(
 /// Polls until no upload is in progress or `timeout` elapses.
 async fn wait_for_drain(in_flight: &InFlight, timeout: Duration, poll: Duration) -> bool {
     tokio::time::timeout(timeout, async {
-        while !in_flight.is_empty() {
+        while in_flight.uploads() > 0 {
             tokio::time::sleep(poll).await;
         }
     })
@@ -214,7 +214,9 @@ mod tests {
         let rows = vec![row("a", "thing", NOW - 2 * 86400, 5)];
         let blobs = vec![];
         let in_flight = InFlight::new();
-        let _claim = in_flight.claim("a").unwrap();
+        let _claim = in_flight
+            .claim("a", garret_server::inflight::Kind::Upload)
+            .unwrap();
         let (dangling, _) = classify_rows(&rows, &blobs, &in_flight, GRACE, NOW, false);
         assert!(dangling.is_empty(), "in-flight upload reported as dangling");
     }
@@ -320,7 +322,9 @@ mod tests {
     #[tokio::test]
     async fn a_drain_that_never_finishes_times_out() {
         let in_flight = InFlight::new();
-        let _claim = in_flight.claim("a").unwrap();
+        let _claim = in_flight
+            .claim("a", garret_server::inflight::Kind::Upload)
+            .unwrap();
         assert!(
             !wait_for_drain(
                 &in_flight,

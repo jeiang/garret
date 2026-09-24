@@ -73,3 +73,10 @@ present and uploads its referrers against that answer.
 Operator-requested removal of every closure last pushed before a cutoff,
 independent of quota. Like eviction, it never removes an object that a
 surviving object, a newer push, or a live pin still needs.
+
+## Deletion Claim
+
+The Pusher's in-memory hold on an object being removed — by eviction,
+prune, or an operator delete — from before its row is deleted until its
+blob is. An upload of that object meanwhile is told to retry, so it cannot
+write a blob the pending delete would take.

@@ -29,7 +29,7 @@ use garret_server::{
     auth::{Authenticator, Subject},
     config::PusherConfig,
     db::{self, Object},
-    inflight::InFlight,
+    inflight::{self, InFlight},
     metrics as garret_metrics,
     narinfo::{self, SigningKeyFile},
     nix_base32, now,
@@ -405,11 +405,28 @@ async fn upload(
             "too many concurrent uploads",
         ));
     };
-    // Second pusher for the same path: first writer wins, and the loser treats
-    // it as success rather than racing to overwrite an identical blob.
-    let Some(_claim) = state.in_flight.claim(&hash) else {
-        metrics::counter!("garret_upload_skipped_total", "reason" => "in-progress").increment(1);
-        return Ok((StatusCode::OK, Json(json!({"status": "in-progress"}))).into_response());
+    let _claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
+        Ok(claim) => claim,
+        // Second pusher for the same path: first writer wins, and the loser
+        // treats it as success rather than racing to overwrite an identical
+        // blob.
+        Err(inflight::Kind::Upload) => {
+            metrics::counter!("garret_upload_skipped_total", "reason" => "in-progress")
+                .increment(1);
+            return Ok((StatusCode::OK, Json(json!({"status": "in-progress"}))).into_response());
+        }
+        // GC, `delete` or prune has removed the row and not yet the blob: a
+        // blob uploaded now would go with it (spec 05). By the retry the path
+        // is simply missing.
+        Err(inflight::Kind::Delete) => {
+            metrics::counter!("garret_upload_skipped_total", "reason" => "deleting").increment(1);
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(header::RETRY_AFTER, "1")],
+                Json(json!({"error": "this path is being deleted; retry"})),
+            )
+                .into_response());
+        }
     };
 
     metrics::gauge!("garret_uploads_in_flight").increment(1.0);
@@ -601,7 +618,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn test_state(conn: rusqlite::Connection) -> Arc<AppState> {
+    pub(crate) async fn test_state(conn: rusqlite::Connection) -> Arc<AppState> {
         Arc::new(AppState {
             conn: Arc::new(Mutex::new(conn)),
             storage: unreachable_storage().await,
@@ -628,7 +645,7 @@ mod tests {
         })
     }
 
-    fn open_db() -> rusqlite::Connection {
+    pub(crate) fn open_db() -> rusqlite::Connection {
         let conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         conn
@@ -653,6 +670,30 @@ mod tests {
         .await
         .expect_err("quiescing must reject the push");
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// GC, `delete` and prune claim a path from its row delete until its
+    /// blob delete returns. An upload in that window would have its new blob
+    /// deleted under a row it then inserts, so it is turned away, retryably.
+    #[tokio::test]
+    async fn an_upload_meeting_a_deletion_is_told_to_retry() {
+        let state = test_state(open_db()).await;
+        let hash = "a".repeat(32);
+        let _deleting = state
+            .in_flight
+            .claim(&hash, inflight::Kind::Delete)
+            .unwrap();
+
+        let response = upload(
+            State(state),
+            Path(hash),
+            axum::Extension(Subject("test#user".into())),
+            Body::empty(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
     }
 
     /// With the flag clear, the handler proceeds past the quiescing check

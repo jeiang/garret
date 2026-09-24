@@ -21,7 +21,9 @@ SQLite, one file, WAL mode, shared by both services on the same host.
   - A failed flush drops its batch. Those rows are still stale, so their
     next hit queues them again.
 - **Upload-in-progress state is not in the DB.** It lives in the Pusher's
-  memory; the object row is inserted only after the S3 blob completes.
+  memory, alongside the deletion claims GC, `delete` and prune hold from
+  row delete to blob delete (spec 05); the object row is inserted only
+  after the S3 blob completes.
 
 **Invariant: row exists ⇒ blob exists.** Crashes leave no dangling DB
 state; orphaned blobs/multiparts are swept by GC. `garret-admin fsck`

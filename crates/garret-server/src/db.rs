@@ -151,7 +151,7 @@ pub const PUSHED_AT_DEBOUNCE: i64 = 3600;
 /// How long a Negotiation protects the paths it reported present. The client
 /// was told it need not upload them and relies on them until its push
 /// finishes; their debounced `pushed_at` is at most [`PUSHED_AT_DEBOUNCE`]
-/// behind that Negotiation. Neither GC ([`evictable`]) nor [`prune`] removes
+/// behind that Negotiation. Neither GC ([`evictable`]) nor prune ([`prunable`]) removes
 /// an object pushed more recently than this, which leaves a push up to 23
 /// hours long room to finish against a complete closure.
 pub const PUSH_GRACE: i64 = 86400;
@@ -571,13 +571,13 @@ pub fn bump_last_accessed<S: AsRef<str>>(
 
 /// Negotiation: the subset of `hashes` the cache does not hold. Every hash it
 /// does hold has its `pushed_at` refreshed (debounced): the client will now
-/// rely on that path instead of uploading it, so to [`prune`] it counts as
+/// rely on that path instead of uploading it, so to [`prunable`] it counts as
 /// pushed now.
 ///
 /// Reads first and takes the write lock only when a bump is due, so the
 /// usual, debounced Negotiation stays read-only; the IMMEDIATE transaction
 /// makes `busy_timeout` apply, where a deferred read-to-write upgrade would
-/// fail at once under contention. [`prune`] cannot interleave: both run on
+/// fail at once under contention. Prune cannot interleave: both run on
 /// the Pusher's one writer connection, behind its mutex.
 pub fn missing(conn: &mut Connection, hashes: &[String], now: i64) -> Result<Vec<String>> {
     let mut missing = Vec::new();
@@ -610,34 +610,32 @@ pub fn missing(conn: &mut Connection, hashes: &[String], now: i64) -> Result<Vec
     Ok(missing)
 }
 
-/// One object [`prune`] removed (or would remove): hash, name, blob size.
+/// One object [`prunable`] marks for deletion: hash, name, blob size.
 pub type Pruned = (String, String, i64);
 
-/// Rows [`prune`] deletes per write transaction, like GC's batches: the
-/// Puller's last-accessed writes interleave between them instead of waiting
-/// out one long transaction.
+/// Rows [`delete_pruned`] deletes per write transaction, like GC's batches:
+/// the Puller's last-accessed writes interleave between them instead of
+/// waiting out one long transaction.
 const PRUNE_BATCH: usize = 500;
 
-/// Removes every object last pushed before `before` that no surviving
-/// closure needs: mark from the roots that stay — objects pushed at or after
-/// the cutoff and live pins — through their references, then delete what the
-/// mark did not reach. Store paths form a DAG (self-edges aside), so this is
-/// exactly the set that repeated root-first deletion of old objects would
-/// reach. Anything unmarked is older than the cutoff by construction.
+/// Prune's mark: every object last pushed before `before` that no surviving
+/// closure needs. It marks from the roots that stay — objects pushed at or
+/// after the cutoff and live pins — through their references; what the mark
+/// does not reach is returned. Store paths form a DAG (self-edges aside), so
+/// this is exactly the set that repeated root-first deletion of old objects
+/// would reach. Anything unmarked is older than the cutoff by construction.
 ///
-/// The mark is a plain read, so a dry run takes no write lock. Everything it
-/// reads is written only by the Pusher, and the caller holds the Pusher's
-/// connection for the whole call, so no Negotiation can refresh a doomed
-/// path between mark and delete. Deletes run in short batches, referrers
-/// before their references, so the cache is closed after every commit. The
-/// caller deletes the blobs afterwards: row first, blob second (spec 05).
-pub fn prune(conn: &mut Connection, before: i64, now: i64, dry_run: bool) -> Result<Vec<Pruned>> {
+/// A plain read, so a dry run takes no write lock. Everything it reads is
+/// written only by the Pusher; the caller holds the Pusher's connection from
+/// here through [`delete_pruned`], so no Negotiation can refresh a doomed
+/// path in between.
+pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<Pruned>> {
     anyhow::ensure!(
         before <= now - PUSH_GRACE,
         "the cutoff must be at least {} hours ago, so a push in progress keeps its closure",
         PUSH_GRACE / 3600
     );
-    let doomed: Vec<Pruned> = conn
+    Ok(conn
         .prepare(
             "WITH RECURSIVE keep(hash) AS (
                  SELECT store_path_hash FROM objects WHERE pushed_at >= ?1
@@ -653,11 +651,14 @@ pub fn prune(conn: &mut Connection, before: i64, now: i64, dry_run: bool) -> Res
         .query_map(params![before, now], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
-        .collect::<rusqlite::Result<_>>()?;
-    if dry_run {
-        return Ok(doomed);
-    }
-    for batch in referrers_first(conn, &doomed)?.chunks(PRUNE_BATCH) {
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Prune's delete: the rows [`prunable`] marked, in short batches, referrers
+/// before their references, so the cache is closed after every commit. The
+/// caller deletes the blobs afterwards: row first, blob second (spec 05).
+pub fn delete_pruned(conn: &mut Connection, doomed: &[Pruned]) -> Result<()> {
+    for batch in referrers_first(conn, doomed)?.chunks(PRUNE_BATCH) {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut delete = tx.prepare("DELETE FROM objects WHERE store_path_hash = ?1")?;
@@ -672,7 +673,7 @@ pub fn prune(conn: &mut Connection, before: i64, now: i64, dry_run: bool) -> Res
         )?;
         tx.commit()?;
     }
-    Ok(doomed)
+    Ok(())
 }
 
 /// Indexes into `doomed`, every referrer before the objects it references
@@ -1041,7 +1042,7 @@ mod tests {
         missing(&mut conn, std::slice::from_ref(&c), now).unwrap();
 
         assert!(
-            prune(&mut conn, now - 1, now, true).is_err(),
+            prunable(&conn, now - 1, now).is_err(),
             "a cutoff inside the in-progress-push window was accepted"
         );
 
@@ -1049,14 +1050,14 @@ mod tests {
             (a.clone(), "thing".into(), 5),
             (b.clone(), "thing".into(), 5),
         ];
-        assert_eq!(prune(&mut conn, 5 * DAY, now, true).unwrap(), expected);
+        assert_eq!(prunable(&conn, 5 * DAY, now).unwrap(), expected);
         assert_eq!(
             total_bytes(&conn).unwrap(),
             35,
-            "a dry run deleted something"
+            "the mark (a dry run) deleted something"
         );
 
-        assert_eq!(prune(&mut conn, 5 * DAY, now, false).unwrap(), expected);
+        delete_pruned(&mut conn, &expected).unwrap();
         for h in [&a, &b] {
             assert!(!exists(&conn, h).unwrap(), "{h} survived the prune");
         }
