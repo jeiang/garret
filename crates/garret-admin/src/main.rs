@@ -44,8 +44,13 @@ enum Command {
     /// Remove objects by store-path hash, row and blob; or, with
     /// `--pushed-by`, everything one subject pushed (dry-run unless `--apply`)
     Delete {
-        /// Store-path hashes (the 32 characters before the first `-`)
-        #[arg(required_unless_present = "pushed_by", conflicts_with = "pushed_by")]
+        /// Store-path hashes (the 32 characters before the first `-`), or
+        /// the store paths themselves
+        #[arg(
+            required_unless_present = "pushed_by",
+            conflicts_with = "pushed_by",
+            value_parser = parse_store_hash
+        )]
         hashes: Vec<String>,
         /// Select every object this subject pushed (`<issuer>#<sub>`, as the
         /// browse API's `pushed_by` shows it) instead of naming hashes
@@ -63,7 +68,9 @@ enum Command {
     Pin {
         /// Pin name (re-pinning a name replaces it)
         name: String,
-        /// Store-path hash of the root (the 32 characters before the first `-`)
+        /// The root: its store-path hash (the 32 characters before the
+        /// first `-`), or the store path itself
+        #[arg(value_parser = parse_store_hash)]
         hash: String,
         /// Protect only this long (e.g. `36h`, `30d`); permanent by default
         #[arg(long)]
@@ -493,6 +500,22 @@ fn human(bytes: i64) -> String {
     }
 }
 
+/// A store-path hash, given bare or as a store path (`/nix/store/<hash>-<name>`
+/// or `<hash>-<name>`). Anything else is refused here, so a typo cannot come
+/// back from the Pusher as "not in the cache".
+fn parse_store_hash(text: &str) -> Result<String> {
+    let base = text
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(text);
+    let hash = base.split('-').next().unwrap_or(base);
+    if !garret_common::is_store_hash(hash) {
+        bail!("{text:?} is not a store path or a 32-character store-path hash");
+    }
+    Ok(hash.to_owned())
+}
+
 /// `<number><s|m|h|d>` → seconds. ponytail: four suffixes cover release
 /// retention; reach for a duration crate only if operators ask for more.
 fn parse_duration(text: &str) -> Result<i64> {
@@ -545,7 +568,30 @@ fn parse_cutoff(text: &str, now: i64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cutoff, parse_duration, write_secret};
+    use super::{parse_cutoff, parse_duration, parse_store_hash, write_secret};
+
+    #[test]
+    fn store_paths_and_bare_hashes_name_the_same_object() {
+        let hash = "9anpmlwx6772cpf1782ilhwbjr1x0y47";
+        for arg in [
+            hash.to_owned(),
+            format!("{hash}-garret-deploy-check.txt"),
+            format!("/nix/store/{hash}-garret-deploy-check.txt"),
+            format!("/nix/store/{hash}-dir/"),
+        ] {
+            assert_eq!(parse_store_hash(&arg).unwrap(), hash, "{arg:?}");
+        }
+        for bad in [
+            "",
+            "/nix/store/",
+            "9anpmlwx6772cpf1782ilhwbjr1x0y4",
+            "9anpmlwx6772cpf1782ilhwbjr1x0y47x",
+            "eanpmlwx6772cpf1782ilhwbjr1x0y47",
+            "/nix/store/9anpmlwx",
+        ] {
+            assert!(parse_store_hash(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
 
     #[test]
     fn durations_parse_or_fail_loudly() {

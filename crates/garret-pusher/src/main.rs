@@ -26,7 +26,7 @@ use axum::{
     routing::{get, post, put},
 };
 use futures::StreamExt;
-use garret_common::Preamble;
+use garret_common::{Preamble, is_store_hash};
 use garret_server::{
     auth::{self, Authenticator, Subject},
     config::PusherConfig,
@@ -385,7 +385,7 @@ async fn upload(
 
     // The hash becomes the DB key and the S3 key, so it is checked before
     // either sees it — and before a byte of the body is read.
-    if !nix_base32::is_store_hash(&hash) {
+    if !is_store_hash(&hash) {
         return Err(Error(
             StatusCode::BAD_REQUEST,
             format!("{hash:?} is not a store path hash"),
@@ -602,7 +602,7 @@ fn store_basename<'a>(path: &'a str, store_dir: &str) -> Option<&'a str> {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"+-._?=".contains(&b));
-    (nix_base32::is_store_hash(hash) && name_ok).then_some(base)
+    (is_store_hash(hash) && name_ok).then_some(base)
 }
 
 #[cfg(test)]

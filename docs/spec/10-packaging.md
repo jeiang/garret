@@ -46,6 +46,13 @@ Pusher runs).
 | `prune --before <YYYY-MM-DD\|age> [--apply]` | socket — delete closures last pushed before the cutoff, keeping what newer pushes and pins need (spec 05); dry-run unless `--apply` |
 | `backup <path>` | socket — online copy of the DB, mode 0600, never overwrites |
 
+Wherever a command takes a `<hash>`, it also accepts the store path
+(`/nix/store/<hash>-<name>` or `<hash>-<name>`) and uses its hash: the
+last path component must start with a 32-character store-path hash.
+Any other argument, such as a path inside a store object, is rejected
+before the request is sent, so a typo fails loudly instead of coming
+back as "not in the cache".
+
 ### Backup and restore
 
 `garret-admin backup <path>` has the Pusher run `VACUUM INTO` on a

@@ -41,6 +41,14 @@ pub fn hash_of_store_path(path: &str) -> &str {
     &base[..base.len().min(32)]
 }
 
+/// Whether `s` is a store path hash: exactly 32 characters of Nix's base32
+/// alphabet.
+pub fn is_store_hash(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&b))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
