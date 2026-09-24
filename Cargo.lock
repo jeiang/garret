@@ -1493,6 +1493,7 @@ dependencies = [
  "garret-common",
  "garret-server",
  "metrics",
+ "metrics-exporter-prometheus",
  "rusqlite",
  "serde",
  "serde_json",

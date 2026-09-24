@@ -207,8 +207,8 @@ pub struct Pusher {
     pub http: reqwest::Client,
     /// Pusher base URL.
     pub endpoint: String,
-    /// Bearer token sent with every request.
-    pub token: String,
+    /// Bearer tokens, asked for per request: a run can outlive any one token.
+    pub tokens: crate::auth::TokenSource,
     /// Maximum concurrent uploads.
     pub jobs: usize,
     /// zstd level for compressing NARs on the way out.
@@ -309,14 +309,26 @@ impl Pusher {
             .iter()
             .map(|p| hash_of_store_path(&p.path))
             .collect();
-        let response = self
-            .http
-            .post(format!("{}/api/v1/missing-paths", self.endpoint))
-            .bearer_auth(&self.token)
-            .json(&hashes)
-            .send()
-            .await
-            .context("negotiating missing paths")?;
+        let send = |token: &str| {
+            self.http
+                .post(format!("{}/api/v1/missing-paths", self.endpoint))
+                .bearer_auth(token)
+                .json(&hashes)
+                .send()
+        };
+        let token = self.tokens.get().await?;
+        let mut response = send(&token).await.context("negotiating missing paths")?;
+        // Expired or revoked since it was minted: replace it once and ask
+        // again. A second 401 is a real refusal, reported below.
+        if response.status() == StatusCode::UNAUTHORIZED
+            && let Some(token) = self
+                .tokens
+                .renew(&token)
+                .await
+                .context("the Pusher refused the token, and renewing it failed")?
+        {
+            response = send(&token).await.context("negotiating missing paths")?;
+        }
 
         // `error_for_status` drops the body, which is where the server explains
         // itself — a bare "401 Unauthorized" says nothing a log can act on.
@@ -371,22 +383,41 @@ impl Pusher {
 
     async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
         let mut delay = Duration::from_millis(250);
-        for attempt in 0..=self.max_retries {
-            match self.attempt(info, report).await {
+        let mut retries = 0;
+        let mut renewed = false;
+        loop {
+            let token = self.tokens.get().await?;
+            let error = match self.attempt(info, report, &token).await {
                 Ok(status) => return Ok(status),
-                Err(e) if attempt < self.max_retries && is_retryable(&e) => {
-                    // Jitter so a fleet of pushers doesn't retry in lockstep.
-                    let jitter = Duration::from_millis(fastrand_millis(delay));
-                    tokio::time::sleep(delay + jitter).await;
-                    delay *= 2;
-                }
-                Err(e) => return Err(e),
+                Err(e) => e,
+            };
+            // The token expired or was revoked mid-run: replace it once and go
+            // again straight away. A second 401 is a real refusal.
+            if !renewed
+                && error.is::<Unauthorized>()
+                && self
+                    .tokens
+                    .renew(&token)
+                    .await
+                    .context("the Pusher refused the token, and renewing it failed")?
+                    .is_some()
+            {
+                renewed = true;
+                continue;
             }
+            if retries < self.max_retries && is_retryable(&error) {
+                // Jitter so a fleet of pushers doesn't retry in lockstep.
+                let jitter = Duration::from_millis(fastrand_millis(delay));
+                tokio::time::sleep(delay + jitter).await;
+                delay *= 2;
+                retries += 1;
+                continue;
+            }
+            return Err(error);
         }
-        unreachable!("loop returns on the final attempt")
     }
 
-    async fn attempt(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
+    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<&'static str> {
         let preamble = Preamble {
             store_path: info.path.clone(),
             nar_hash: info.nar_hash.clone(),
@@ -412,7 +443,7 @@ impl Pusher {
                 self.endpoint,
                 hash_of_store_path(&info.path)
             ))
-            .bearer_auth(&self.token)
+            .bearer_auth(token)
             .body(Body::wrap_stream(body))
             .send()
             .await
@@ -421,6 +452,10 @@ impl Pusher {
         let status = response.status();
         if let Some(after) = retry_after(status, &response) {
             bail!("server is shedding load (429), retry after {after:?}");
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Unauthorized(body.trim().to_owned()).into());
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -441,6 +476,24 @@ impl Pusher {
         })
     }
 }
+
+/// The Pusher refused the token. Typed so [`Pusher::push_one`] can tell it
+/// apart from other rejections and renew the token instead of failing.
+#[derive(Debug)]
+struct Unauthorized(String);
+
+impl std::fmt::Display for Unauthorized {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "upload rejected with {}: {}",
+            StatusCode::UNAUTHORIZED,
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Unauthorized {}
 
 /// Streams `dump`'s stdout through zstd, then fails the stream if `dump` exited
 /// non-zero.

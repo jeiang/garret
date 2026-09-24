@@ -50,6 +50,7 @@ CREATE TABLE objects (
 );
 CREATE INDEX objects_name          ON objects(name);
 CREATE INDEX objects_last_accessed ON objects(last_accessed_at); -- LRU order
+CREATE INDEX objects_created       ON objects(created_at DESC, store_path_hash); -- browse listing order
 
 CREATE TABLE object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
@@ -93,7 +94,8 @@ Notes:
 - `total_bytes` is reconciled against `SUM(file_size)` at each GC pass.
 - `pushed_at` is set on insert and refreshed by every Negotiation that
   finds the object present, debounced to one write per hour. It is the
-  age `garret-admin prune` judges by (spec 05). Databases from before
+  age `garret-admin prune` judges by, and GC leaves anything pushed in
+  the last day alone (the push grace, spec 05). Databases from before
   the column existed are migrated with `pushed_at = created_at`.
 - A re-push rewrites the object's row in place (an upsert), never
   delete-then-insert: `pins` cascade on delete, so `INSERT OR REPLACE`
@@ -103,11 +105,21 @@ Notes:
 
 WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
 `busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
-`foreign_keys=ON`. Short write transactions only; the Pusher runs
-periodic checkpoint maintenance.
+`journal_size_limit=64MiB`; `foreign_keys=ON`. Short write transactions
+only.
 
 A write transaction that reads before it writes (insert and delete, for
 their `stats` delta) begins `IMMEDIATE`. Begun deferred, it would take a
 read lock first, and SQLite fails the later upgrade to the write lock
 with `SQLITE_BUSY` at once, without consulting `busy_timeout`, whenever
 another connection holds it — which the Puller's bumps do.
+
+Checkpointing is SQLite's own; there is no periodic checkpoint task.
+Auto-checkpoint (PASSIVE, every 1000 WAL pages, on commit on either
+connection) keeps the WAL at a few MiB even under continuous pull reads,
+because no read transaction is long-lived. It never shrinks the file,
+though, so `journal_size_limit` trims it back after one large
+transaction, and the Pusher truncates it at startup. A timed PASSIVE
+checkpoint would repeat auto-checkpoint; a timed TRUNCATE would stall
+writers behind readers, for up to `busy_timeout`, to reclaim what the
+size limit already reclaims.

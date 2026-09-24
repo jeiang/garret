@@ -1,7 +1,9 @@
 //! SQLite access. Schema per spec 02-database; the Pusher owns all writes.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params, params,
+};
 
 /// One cached store path: the unit of content in the cache, keyed by its
 /// store path hash. A row exists if and only if its blob does (spec 02).
@@ -60,6 +62,7 @@ CREATE TABLE IF NOT EXISTS objects (
 );
 CREATE INDEX IF NOT EXISTS objects_name          ON objects(name);
 CREATE INDEX IF NOT EXISTS objects_last_accessed ON objects(last_accessed_at);
+CREATE INDEX IF NOT EXISTS objects_created       ON objects(created_at DESC, store_path_hash);
 
 CREATE TABLE IF NOT EXISTS object_refs (
   referrer  TEXT NOT NULL REFERENCES objects ON DELETE CASCADE,
@@ -99,6 +102,10 @@ pub fn open(path: &str, create: bool) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, flags)
         .with_context(|| format!("opening database {path}"))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
+    // SQLite's auto-checkpoint (every 1000 pages, on commit) keeps the WAL
+    // short, but never shrinks the file: without a limit, one large
+    // transaction would leave the WAL at its size until the next restart.
+    conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024)?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     conn.pragma_update(None, "mmap_size", 512 * 1024 * 1024)?;
@@ -111,12 +118,13 @@ pub fn open(path: &str, create: bool) -> Result<Connection> {
 /// per job.
 pub const PUSHED_AT_DEBOUNCE: i64 = 3600;
 
-/// The newest cutoff [`prune`] accepts. A client that negotiated a path is
-/// told it need not upload it, and relies on it until its push finishes; the
-/// debounced `pushed_at` of such a path is at most [`PUSHED_AT_DEBOUNCE`]
-/// behind the Negotiation, so any cutoff older than this leaves a push up to
-/// 23 hours long room to finish against a complete closure.
-pub const PRUNE_MIN_AGE: i64 = 86400;
+/// How long a Negotiation protects the paths it reported present. The client
+/// was told it need not upload them and relies on them until its push
+/// finishes; their debounced `pushed_at` is at most [`PUSHED_AT_DEBOUNCE`]
+/// behind that Negotiation. Neither GC ([`evictable`]) nor [`prune`] removes
+/// an object pushed more recently than this, which leaves a push up to 23
+/// hours long room to finish against a complete closure.
+pub const PUSH_GRACE: i64 = 86400;
 
 /// Applies the schema (idempotent `IF NOT EXISTS`). Pusher-only, like every
 /// other write.
@@ -336,6 +344,30 @@ pub fn reconcile_total_bytes(conn: &Connection) -> Result<i64> {
     Ok(actual)
 }
 
+/// Whether object `o` may be evicted at `:now` (spec 05): nothing else in the
+/// cache refers to it, no live pin holds it, and it was not pushed or
+/// negotiated within `:grace`. Shared by [`evictable`] and [`evict_object`],
+/// so a candidate the delete refuses is one the next query no longer returns.
+///
+/// `r.referrer != o.store_path_hash` skips self-edges: an object referring to
+/// itself must not count as a referrer keeping itself alive, or nothing would
+/// ever be evictable (spec 02).
+macro_rules! evictable_where {
+    () => {
+        "NOT EXISTS (
+             SELECT 1 FROM object_refs r
+             WHERE r.reference_hash = o.store_path_hash
+               AND r.referrer != o.store_path_hash
+         )
+         AND NOT EXISTS (
+             SELECT 1 FROM pins p
+             WHERE p.store_path_hash = o.store_path_hash
+               AND (p.expires_at IS NULL OR p.expires_at > :now)
+         )
+         AND o.pushed_at < :now - :grace"
+    };
+}
+
 /// Objects no surviving object in the cache references, least-recently-accessed
 /// first. Everything returned is evictable *together*: removing one unreferenced
 /// object cannot make another referenced (spec 05).
@@ -345,28 +377,53 @@ pub fn reconcile_total_bytes(conn: &Connection) -> Result<i64> {
 /// closure member referenced and therefore out of this query — the whole
 /// closure is protected without any walk. An expired pin simply stops
 /// matching; no sweep runs (ticket 22).
+///
+/// So is anything pushed within [`PUSH_GRACE`]: a Negotiation that reported
+/// it present refreshed its `pushed_at`, and that push may not have uploaded
+/// the referrers that will keep it yet. To the reference check it looks like
+/// an unreferenced root.
 pub fn evictable(conn: &Connection, limit: usize, now: i64) -> Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare(
-        // `r.referrer != o.store_path_hash` skips self-edges: an object
-        // referring to itself must not count as a referrer keeping itself
-        // alive, or nothing would ever be evictable (spec 02).
-        "SELECT o.store_path_hash, o.file_size FROM objects o
-         WHERE NOT EXISTS (
-             SELECT 1 FROM object_refs r
-             WHERE r.reference_hash = o.store_path_hash
-               AND r.referrer != o.store_path_hash
-         )
-         AND NOT EXISTS (
-             SELECT 1 FROM pins p
-             WHERE p.store_path_hash = o.store_path_hash
-               AND (p.expires_at IS NULL OR p.expires_at > ?2)
-         )
-         ORDER BY o.last_accessed_at ASC, o.store_path_hash ASC
-         LIMIT ?1",
-    )?;
+    let mut stmt = conn.prepare(concat!(
+        "SELECT o.store_path_hash, o.file_size FROM objects o WHERE ",
+        evictable_where!(),
+        " ORDER BY o.last_accessed_at ASC, o.store_path_hash ASC LIMIT :limit"
+    ))?;
     Ok(stmt
-        .query_map(params![limit, now], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .query_map(
+            named_params! {":limit": limit, ":now": now, ":grace": PUSH_GRACE},
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+/// GC's delete: [`delete_object`], but only if the object is still evictable
+/// at `now`, re-checked inside the write transaction. The candidate list is a
+/// snapshot; since it was taken a Negotiation may have reported the object
+/// present, or an upload may have added a referrer. `None` means it stays.
+pub fn evict_object(conn: &mut Connection, hash: &str, now: i64) -> Result<Option<i64>> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let size: Option<i64> = tx
+        .prepare_cached(concat!(
+            "SELECT o.file_size FROM objects o WHERE o.store_path_hash = :hash AND ",
+            evictable_where!()
+        ))?
+        .query_row(
+            named_params! {":hash": hash, ":now": now, ":grace": PUSH_GRACE},
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(size) = size {
+        tx.execute(
+            "DELETE FROM objects WHERE store_path_hash = ?1",
+            params![hash],
+        )?;
+        tx.execute(
+            "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
+            params![size],
+        )?;
+        tx.commit()?;
+    }
+    Ok(size)
 }
 
 /// Creates or replaces a pin (idempotent, ncps semantics). Pinning a hash not
@@ -546,9 +603,9 @@ const PRUNE_BATCH: usize = 500;
 /// caller deletes the blobs afterwards: row first, blob second (spec 05).
 pub fn prune(conn: &mut Connection, before: i64, now: i64, dry_run: bool) -> Result<Vec<Pruned>> {
     anyhow::ensure!(
-        before <= now - PRUNE_MIN_AGE,
+        before <= now - PUSH_GRACE,
         "the cutoff must be at least {} hours ago, so a push in progress keeps its closure",
-        PRUNE_MIN_AGE / 3600
+        PUSH_GRACE / 3600
     );
     let doomed: Vec<Pruned> = conn
         .prepare(
@@ -654,6 +711,10 @@ mod tests {
         conn
     }
 
+    /// A time past the push grace of every object these tests insert (at
+    /// times up to 1000), so only references and pins decide evictability.
+    const LATER: i64 = PUSH_GRACE + 1000;
+
     #[test]
     fn hash_of_survives_a_multibyte_character_at_the_hash_boundary() {
         // Byte 32 falls inside `é`: slicing there used to panic the Puller's
@@ -714,7 +775,7 @@ mod tests {
         // ...but a self-edge must not count as a referrer keeping the object
         // alive, or nothing would ever be evictable (spec 02).
         assert!(
-            evictable(&conn, 10, 1000)
+            evictable(&conn, 10, LATER)
                 .unwrap()
                 .iter()
                 .any(|(h, _)| h == &a),
@@ -743,7 +804,7 @@ mod tests {
         insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
         insert_object(&mut conn, &object(&c, &[]), 200).unwrap();
 
-        let candidates = evictable(&conn, 10, 1000).unwrap();
+        let candidates = evictable(&conn, 10, LATER).unwrap();
         let hashes: Vec<&str> = candidates.iter().map(|(h, _)| h.as_str()).collect();
         // b is referenced, so it must not appear at any price.
         assert!(
@@ -756,7 +817,7 @@ mod tests {
         // Evicting the root frees its dependency for the next pass — this is
         // what makes root-first eviction reclaim whole closures.
         delete_object(&mut conn, &a).unwrap();
-        let after: Vec<String> = evictable(&conn, 10, 1000)
+        let after: Vec<String> = evictable(&conn, 10, LATER)
             .unwrap()
             .into_iter()
             .map(|(h, _)| h)
@@ -774,15 +835,15 @@ mod tests {
 
         pin(&conn, "release", &a, None, 500).unwrap();
         assert!(
-            evictable(&conn, 10, 1000).unwrap().is_empty(),
+            evictable(&conn, 10, LATER).unwrap().is_empty(),
             "pinned closure appeared as an eviction candidate"
         );
 
         // Idempotent re-pin with an expiry; once past it, protection lapses
         // with no sweep — the pin simply stops matching.
-        pin(&conn, "release", &a, Some(900), 500).unwrap();
-        assert!(evictable(&conn, 10, 800).unwrap().is_empty());
-        let after: Vec<String> = evictable(&conn, 10, 1000)
+        pin(&conn, "release", &a, Some(LATER - 100), 500).unwrap();
+        assert!(evictable(&conn, 10, LATER - 200).unwrap().is_empty());
+        let after: Vec<String> = evictable(&conn, 10, LATER)
             .unwrap()
             .into_iter()
             .map(|(h, _)| h)
@@ -794,6 +855,44 @@ mod tests {
             !unpin(&conn, "release").unwrap(),
             "double unpin reported ok"
         );
+    }
+
+    #[test]
+    fn a_path_negotiated_after_the_candidate_snapshot_is_not_evicted() {
+        // GC deletes from a snapshot of candidates. A Negotiation that reports
+        // one present in between tells its client not to upload it, and the
+        // client's referrers are not in the cache yet to protect it.
+        let mut conn = db();
+        let d = "d".repeat(32);
+        insert_object(&mut conn, &object(&d, &[]), 100).unwrap();
+        assert_eq!(evictable(&conn, 10, LATER).unwrap(), vec![(d.clone(), 5)]);
+
+        assert!(
+            missing(&mut conn, std::slice::from_ref(&d), LATER)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(evict_object(&mut conn, &d, LATER).unwrap(), None);
+        assert!(exists(&conn, &d).unwrap(), "evicted a path just negotiated");
+
+        // Protected for the push grace, then an ordinary candidate again.
+        let after = LATER + PUSH_GRACE;
+        assert!(evictable(&conn, 10, after - 1).unwrap().is_empty());
+        assert_eq!(evict_object(&mut conn, &d, after + 1).unwrap(), Some(5));
+        assert!(!exists(&conn, &d).unwrap());
+        assert_eq!(total_bytes(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_referrer_uploaded_after_the_candidate_snapshot_keeps_its_dependency() {
+        let mut conn = db();
+        let (d, x) = ("d".repeat(32), "x".repeat(32));
+        insert_object(&mut conn, &object(&d, &[]), 100).unwrap();
+        assert_eq!(evictable(&conn, 10, LATER).unwrap(), vec![(d.clone(), 5)]);
+
+        insert_object(&mut conn, &object(&x, &[&format!("{d}-dep")]), LATER).unwrap();
+        assert_eq!(evict_object(&mut conn, &d, LATER).unwrap(), None);
+        assert!(exists(&conn, &d).unwrap(), "evicted a referenced path");
     }
 
     #[test]
@@ -813,7 +912,7 @@ mod tests {
 
         insert_object(&mut conn, &object(&a, &[&dep]), 200).unwrap();
         assert!(
-            evictable(&conn, 10, 1000).unwrap().is_empty(),
+            evictable(&conn, 10, LATER).unwrap().is_empty(),
             "re-push dropped the pin: the pinned closure became evictable"
         );
         assert_eq!(

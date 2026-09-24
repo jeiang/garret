@@ -1,5 +1,6 @@
 //! Browse queries behind the Puller's `/api/v1` routes (spec 07-browse-api).
-//! Served entirely by ticket 07's indices: name, PK, and the reverse-ref index.
+//! Served entirely by indices: name, creation order, PK, and the reverse-ref
+//! index.
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -46,6 +47,15 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
 }
 
+/// The listing query. Its order is exactly the `objects_created` index, so a
+/// page walks the index and stops, instead of sorting every row per request.
+const LIST: &str = "SELECT store_path_hash, name, store_path, nar_size, file_size, created_at
+     FROM objects
+     WHERE (?1 IS NULL OR name LIKE ?1)
+       AND (created_at < ?2 OR (created_at = ?2 AND store_path_hash > ?3))
+     ORDER BY created_at DESC, store_path_hash ASC
+     LIMIT ?4";
+
 /// Keyset pagination, newest first. The cursor is `created_at:hash` so the
 /// pair is strictly ordered even when timestamps collide — offset pagination
 /// would skip or repeat rows as objects are pushed underneath it.
@@ -62,14 +72,7 @@ pub fn list(
     };
     let pattern = query.map(|q| format!("%{q}%"));
 
-    let mut stmt = conn.prepare(
-        "SELECT store_path_hash, name, store_path, nar_size, file_size, created_at
-         FROM objects
-         WHERE (?1 IS NULL OR name LIKE ?1)
-           AND (created_at < ?2 OR (created_at = ?2 AND store_path_hash > ?3))
-         ORDER BY created_at DESC, store_path_hash ASC
-         LIMIT ?4",
-    )?;
+    let mut stmt = conn.prepare(LIST)?;
     let mut objects: Vec<Summary> = stmt
         .query_map(
             params![pattern, after_time, after_hash, limit as i64 + 1],
@@ -265,8 +268,10 @@ mod tests {
     #[test]
     fn listing_pages_without_skipping_or_repeating() {
         let mut conn = db();
-        for (i, c) in ['a', 'b', 'c', 'd'].iter().enumerate() {
-            db::insert_object(&mut conn, &object(&h(*c), "thing", &[]), 100 + i as i64).unwrap();
+        // `b` and `c` share a timestamp, and the page boundary falls between
+        // them: the hash tiebreak must carry the walk across it.
+        for (c, at) in [('a', 100), ('b', 101), ('c', 101), ('d', 102)] {
+            db::insert_object(&mut conn, &object(&h(c), "thing", &[]), at).unwrap();
         }
 
         let first = list(&conn, None, 2, None).unwrap();
@@ -282,8 +287,26 @@ mod tests {
             .chain(second.objects.iter())
             .map(|o| o.hash.as_str())
             .collect();
-        assert_eq!(seen, vec![h('d'), h('c'), h('b'), h('a')]);
+        assert_eq!(seen, vec![h('d'), h('b'), h('c'), h('a')]);
         assert!(second.next_cursor.is_none(), "last page must end the walk");
+    }
+
+    /// The default listing pages newest-first over the whole cache on every
+    /// browse visit; sorting every row for each page is what made it slow.
+    #[test]
+    fn the_unfiltered_listing_walks_an_index_instead_of_sorting() {
+        let conn = db();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LIST}"))
+            .unwrap()
+            .query_map(params![None::<String>, i64::MAX, "", 51], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(
+            !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
     }
 
     #[test]
