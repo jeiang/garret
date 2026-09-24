@@ -124,7 +124,12 @@ async fn main() -> Result<()> {
         true => Some(config::load(cli.config.as_deref())?),
         false => None,
     };
-    let http = reqwest::Client::new();
+    // A server that never accepts becomes an error instead of a hang. A
+    // connection that stalls once open is `push`'s to catch: reqwest's read
+    // timeout cannot tell a slow upload from a stuck one.
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()?;
 
     match cli.command {
         Command::Completions { shell } => {
@@ -142,8 +147,8 @@ async fn main() -> Result<()> {
 
         Command::Doctor { path } => {
             // A diagnostic that hangs is a diagnostic that failed: every probe
-            // gets a hard timeout, unlike the push path where a slow server is
-            // the client's problem to wait out.
+            // gets a hard timeout, unlike the push path, which gives up only
+            // on a stalled connection, never on a slow one.
             let timed = reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()?;

@@ -122,6 +122,7 @@ pub async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints>
     );
     Ok(http
         .get(&url)
+        .timeout(TOKEN_TIMEOUT)
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -189,6 +190,7 @@ pub async fn device_login(
             vec![("client_id", client_id), ("scope", "openid offline_access")],
             resource,
         ))
+        .timeout(TOKEN_TIMEOUT)
         .send()
         .await?
         .error_for_status()
@@ -218,6 +220,7 @@ pub async fn device_login(
                 ],
                 resource,
             ))
+            .timeout(TOKEN_TIMEOUT)
             .send()
             .await?
             .json()
@@ -265,6 +268,7 @@ async fn refresh(
             ],
             resource,
         ))
+        .timeout(TOKEN_TIMEOUT)
         .send()
         .await?
         .error_for_status()
@@ -305,6 +309,7 @@ async fn github_token(
         .get(url)
         .query(&[("audience", audience)])
         .bearer_auth(request_token)
+        .timeout(TOKEN_TIMEOUT)
         .send()
         .await?
         .error_for_status()
@@ -334,6 +339,7 @@ pub async fn client_credentials(
             ],
             resource,
         ))
+        .timeout(TOKEN_TIMEOUT)
         .send()
         .await?
         .error_for_status()
@@ -369,6 +375,12 @@ pub async fn bearer_token(
 /// GitHub runner token (five minutes) that is spec 04-auth's "re-mint once
 /// the cached one is >4 min old".
 const EXPIRY_MARGIN_SECS: i64 = 60;
+
+/// Every request to a token provider gives up after this long. The shared
+/// client has only a connect timeout (uploads must not have a total one), and a
+/// provider that accepts the connection then stalls would otherwise hang a push
+/// or the watcher while it holds the [`TokenSource`] lock.
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where a [`TokenSource`] gets its next token.
 enum Mint {
