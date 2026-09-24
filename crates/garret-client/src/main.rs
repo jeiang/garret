@@ -422,6 +422,12 @@ async fn login(
             }
             config::write(&path, &rendered)?;
             eprintln!("wrote {}", path.display());
+            if !discovered.public_keys.is_empty() {
+                eprintln!(
+                    "`garret use` will make nix trust these signing keys: {}",
+                    discovered.public_keys.join(" ")
+                );
+            }
             config::load(explicit)?
         }
     };
@@ -517,6 +523,12 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
              up from the server.",
             cfg.endpoint
         );
+    }
+    // Checked again here, not only at login: the config may predate the check
+    // or be hand-edited, and this is the write that makes nix trust the values.
+    discovery::check_url("puller_endpoint", puller)?;
+    for key in &cfg.public_keys {
+        discovery::check_key(key)?;
     }
 
     if print {
