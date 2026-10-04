@@ -35,6 +35,20 @@ const KEY_TTL: Duration = Duration::from_secs(3600);
 const JWKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JWKS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// RS256-pinned validation for one issuer: its `audience` plus every
+/// `extra_audiences` entry is accepted.
+fn validation_for(cfg: &IssuerConfig) -> Validation {
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[&cfg.issuer]);
+    let audiences: Vec<&str> = std::iter::once(cfg.audience.as_str())
+        .chain(cfg.extra_audiences.iter().map(String::as_str))
+        .collect();
+    validation.set_audience(&audiences);
+    validation.leeway = LEEWAY_SECS;
+    validation.validate_nbf = true;
+    validation
+}
+
 #[derive(Debug, Deserialize)]
 struct Claims {
     iss: String,
@@ -189,11 +203,7 @@ impl Authenticator {
             }
         };
 
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.set_issuer(&[&issuer.cfg.issuer]);
-        validation.set_audience(&[&issuer.cfg.audience]);
-        validation.leeway = LEEWAY_SECS;
-        validation.validate_nbf = true;
+        let validation = validation_for(&issuer.cfg);
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
             .context("token failed validation")
             .map_err(|e| ("invalid", e))?
@@ -445,6 +455,7 @@ mod tests {
         IssuerConfig {
             issuer: "https://token.actions.githubusercontent.com".into(),
             audience: "garret".into(),
+            extra_audiences: vec![],
             client_id: None,
             jwks_url: None,
             github_owner_id: Some(owner.into()),
@@ -608,6 +619,7 @@ mod tests {
         let mut cfg = IssuerConfig {
             issuer: "https://id.example".into(),
             audience: "garret".into(),
+            extra_audiences: vec![],
             client_id: None,
             jwks_url: None,
             github_owner_id: None,
@@ -624,6 +636,41 @@ mod tests {
         assert!(authorize(&cfg, &claims(None, None, &["builders"])).is_ok());
         assert!(authorize(&cfg, &claims(None, None, &["others"])).is_err());
         assert!(authorize(&cfg, &claims(None, None, &[])).is_err());
+    }
+
+    /// Decodes an HS256 token under `validation_for`'s rules (only the
+    /// algorithm swapped, so no RSA key is needed).
+    fn decodes_with_aud(cfg: &IssuerConfig, aud: &str) -> bool {
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "iss": cfg.issuer,
+                "sub": "ci",
+                "aud": aud,
+                "exp": 4_102_444_800_u64,
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"k"),
+        )
+        .unwrap();
+        let mut validation = validation_for(cfg);
+        validation.algorithms = vec![Algorithm::HS256];
+        jsonwebtoken::decode::<Claims>(&token, &DecodingKey::from_secret(b"k"), &validation).is_ok()
+    }
+
+    #[test]
+    fn extra_audiences_are_accepted_alongside_the_primary() {
+        let mut cfg = dev_issuer("unused");
+        cfg.extra_audiences = vec!["ci-builder".into()];
+        assert!(decodes_with_aud(&cfg, "garret"));
+        assert!(decodes_with_aud(&cfg, "ci-builder"));
+    }
+
+    #[test]
+    fn an_unknown_audience_is_rejected_even_with_extra_audiences() {
+        let mut cfg = dev_issuer("unused");
+        assert!(!decodes_with_aud(&cfg, "ci-builder"));
+        cfg.extra_audiences = vec!["ci-builder".into()];
+        assert!(!decodes_with_aud(&cfg, "someone-else"));
     }
 
     #[test]
@@ -648,6 +695,7 @@ mod tests {
         IssuerConfig {
             issuer: DEV_ISSUER.into(),
             audience: "garret".into(),
+            extra_audiences: vec![],
             client_id: None,
             jwks_url: Some(jwks_url.into()),
             github_owner_id: None,

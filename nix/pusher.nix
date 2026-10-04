@@ -174,6 +174,7 @@ in
         options = {
           issuer = mkOption { type = types.str; description = "Issuer URL."; };
           audience = mkOption { type = types.str; description = "RFC 8707 audience identifying garret."; };
+          extra_audiences = mkOption { type = types.listOf types.str; default = [ ]; description = "Further accepted `aud` values (e.g. a machine client's own client id); discovery still advertises only `audience`."; };
           client_id = mkOption {
             type = types.nullOr types.str;
             default = null;

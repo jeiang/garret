@@ -78,7 +78,9 @@ router reordering cannot silently re-authenticate it. See
 
 Stacked per-issuer authorizers (jwt-authorizer-style): RS256 pinned,
 audience required for both issuers, `exp` required and `nbf` checked when
-present, ~60 s clock skew.
+present, ~60 s clock skew. An issuer may list `extra_audiences` (NixOS:
+`oidc.*.extra_audiences`), also accepted as `aud`, for machine clients whose
+tokens carry their own client id; discovery advertises only `audience`.
 
 Each issuer's JWKS is cached in memory and refetched when a token names an
 unknown kid (rotation) or the cached set is over an hour old, so a key the
