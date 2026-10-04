@@ -638,6 +638,7 @@ mod tests {
             auth: Authenticator::new(vec![IssuerConfig {
                 issuer: "https://issuer.example".into(),
                 audience: "aud".into(),
+                extra_audiences: vec![],
                 client_id: None,
                 jwks_url: None,
                 github_owner_id: None,

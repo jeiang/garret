@@ -56,6 +56,11 @@ pub struct IssuerConfig {
     pub issuer: String,
     /// Required `aud` claim (RFC 8707 audience).
     pub audience: String,
+    /// Further `aud` values accepted besides `audience`, which stays the only
+    /// one discovery advertises. For machine clients (Pocket ID
+    /// client_credentials) whose tokens carry their own client id as `aud`.
+    #[serde(default)]
+    pub extra_audiences: Vec<String>,
     /// The public client id `garret login` should use for the device flow.
     /// Lives here rather than in a top-level `[discovery]` section so it cannot
     /// drift from the issuer the Pusher actually validates against, and so it
