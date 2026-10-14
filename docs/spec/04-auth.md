@@ -25,8 +25,11 @@ JWKS. There is no token-exchange service and no garret-issued token.
   (never match renameable names). Owner-wide on its own: every workflow in
   every repository of that owner can mint a push token, so narrow it with
   the optional constraints below. Each is off when unset; once set, a token
-  missing the claim is refused (fail closed).
-  - `ref_patterns`: allowed `ref`s (trailing-`*` globs).
+  missing the claim is refused (fail closed). Startup is refused when the
+  GitHub issuer sets neither `github_owner_id` nor `repository_ids`, since
+  any GitHub repository could then mint a token for the audience.
+  - `ref_patterns`: allowed `ref`s (trailing-`*` globs). Applies with or
+    without `github_owner_id`.
   - `ref_protected`: the claim must be present and equal; `true` requires a
     protected ref.
   - `repository_ids`: allowed immutable numeric `repository_id`s.
@@ -38,7 +41,10 @@ JWKS. There is no token-exchange service and no garret-issued token.
     (`owner/repo/.github/workflows/file.yml@ref`, trailing-`*` globs). This
     names the file the job actually runs: for a reusable workflow it is the
     called file, so a third-party reusable workflow called from an allowed
-    repository — which inherits the caller's other claims — is refused.
+    repository — which inherits the caller's other claims — is refused. The
+    `owner/repo/` prefix must also equal the token's own `repository` claim,
+    so another repository's job calling an allowed repository's reusable
+    workflow is refused too.
     It spells repositories by name, so a rename can only refuse tokens
     (never grant one, given the id checks): update it alongside the rename.
 
@@ -77,8 +83,9 @@ router reordering cannot silently re-authenticate it. See
 ## Validation mechanics
 
 Stacked per-issuer authorizers (jwt-authorizer-style): RS256 pinned,
-audience required for both issuers, `exp` required and `nbf` checked when
-present, ~60 s clock skew. An issuer may list `extra_audiences` (NixOS:
+`aud`, `iss` and `exp` all required (a token omitting any is refused),
+`nbf` checked when present, ~60 s clock skew. An issuer may list
+`extra_audiences` (NixOS:
 `oidc.*.extra_audiences`), also accepted as `aud`, for machine clients whose
 tokens carry their own client id; discovery advertises only `audience`.
 
@@ -107,5 +114,9 @@ refresh flow previously bypassed revocation/group checks).
 
 ## Local development
 
-A dev-issuer config override points at a local static JWKS (test keys in
-the test tree). There is deliberately **no auth-disable flag**.
+A dev-issuer config override points `jwks_url` at a local static JWKS file
+(test keys in the test tree) or an `http://` URL on a loopback host
+(`127.0.0.1`, `::1`, `localhost`). A local file path is honoured only as the
+configured `jwks_url`, never as a `jwks_uri` returned by discovery. Every
+other JWKS and discovery URL must be `https`, and redirects are not
+followed. There is deliberately **no auth-disable flag**.
