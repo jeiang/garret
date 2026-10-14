@@ -10,12 +10,14 @@ let
     endpoint = cfg.endpoint;
     jobs = cfg.jobs;
     zstd_level = cfg.zstdLevel;
+    max_retries = cfg.maxRetries;
     oidc = {
       inherit (cfg.oidc) issuer audience;
       client_id = cfg.oidc.clientId;
+      client_secret_file = cfg.oidc.clientSecretFile;
     };
     watch = {
-      credentials_file = cfg.credentialsFile;
+      max_attempts = cfg.maxAttempts;
       nix_db = cfg.nixDb;
       cursor_path = cfg.cursorPath;
       poll_interval_secs = cfg.pollIntervalSeconds;
@@ -49,15 +51,14 @@ in
     oidc = {
       issuer = mkOption { type = types.str; description = "Pocket ID issuer URL."; };
       clientId = mkOption { type = types.str; description = "This machine's confidential client id."; };
+      clientSecretFile = mkOption {
+        type = types.str;
+        description = ''
+          Root-owned file (mode 0600) holding only the client secret of
+          `clientId`. A path, so the secret never enters the nix store.
+        '';
+      };
       audience = mkOption { type = types.str; description = "Audience identifying garret."; };
-    };
-
-    credentialsFile = mkOption {
-      type = types.str;
-      description = ''
-        Root-owned file holding `client_id:client_secret` for this machine's
-        confidential client. A path, so the secret never enters the nix store.
-      '';
     };
 
     nixDb = mkOption { type = types.str; default = "/nix/var/nix/db/db.sqlite"; description = "The local nix database."; };
@@ -65,6 +66,8 @@ in
     pollIntervalSeconds = mkOption { type = types.int; default = 30; description = "Seconds between polls of the nix database."; };
     jobs = mkOption { type = types.int; default = 8; description = "Concurrent uploads."; };
     zstdLevel = mkOption { type = types.int; default = 3; description = "Client-side zstd level."; };
+    maxRetries = mkOption { type = types.int; default = 5; description = "Upload attempts per path beyond the first, for 5xx answers and dropped connections."; };
+    maxAttempts = mkOption { type = types.int; default = 5; description = "Push attempts per path in one watcher process before it leaves the path on the failed list for a restart or drain."; };
 
     socketPath = mkOption {
       type = types.str;
@@ -129,7 +132,7 @@ in
         StateDirectory = "garret";
         # /run/garret, where the wake socket lives.
         RuntimeDirectory = "garret";
-        # Root: the credentials file is root's. Reading the nix database needs
+        # Root: the client secret file is root's. Reading the nix database needs
         # only read access (spec 06-client), which the CI user has too.
         User = "root";
         ReadWritePaths = [ (builtins.dirOf cfg.cursorPath) ];

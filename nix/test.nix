@@ -133,8 +133,8 @@ in
   nodes.builder = {
     imports = [ self.nixosModules.watcher ];
 
-    environment.etc."garret/watcher-credentials" = {
-      text = "builder:secret";
+    environment.etc."garret/watcher-secret" = {
+      text = "secret";
       mode = "0400";
     };
     systemd.services.garret-test-issuer = {
@@ -149,9 +149,9 @@ in
       oidc = {
         issuer = issuerUrl;
         clientId = "builder";
+        clientSecretFile = "/etc/garret/watcher-secret";
         audience = "garret";
       };
-      credentialsFile = "/etc/garret/watcher-credentials";
       # An hour: only the wake socket can get the push below done in time.
       pollIntervalSeconds = 3600;
     };

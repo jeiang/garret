@@ -12,12 +12,12 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret logout` | Deletes the stored refresh token; the config stays |
 | `garret whoami` | Subject, audience, expiry, and a live probe that the Pusher accepts the token |
 | `garret doctor [path]` | Layer-by-layer diagnosis (below); with a path, a Negotiation round answers "is this cached" |
-| `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter |
+| `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter; exits 1 if nix ignores that file |
 | `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers |
-| `garret watch-store [--full-sync] [--drain]` | Watcher daemon (below); `--drain` pushes what it has not yet and exits, for CI |
+| `garret watch-store [--full-sync] [--drain] [--cursor <path>] [--socket <path>]` | Watcher daemon (below); `--drain` pushes what it has not yet and exits, for CI; `--cursor`/`--socket` override `[watch] cursor_path`/`socket_path` |
 | `garret enqueue [paths…] [--socket]` | Wake a running `watch-store` to poll now; paths default to `$OUT_PATHS`, for use as nix's `post-build-hook`. Exits 0 unconditionally |
-| `garret list` | Search/filter cache contents (browse API) |
-| `garret tree <path>` | Dependency tree (browse API) |
+| `garret list [query] [--limit N]` | Search/filter cache contents (browse API); prints full 32-character hashes |
+| `garret tree <hash\|path>` | Dependency tree (browse API); accepts a 32-character store hash or a store path |
 | `garret pins` | List GC-exempt pins (browse API; set with `garret-admin pin`) |
 | `garret completions <shell>` | bash/zsh/fish completion script |
 
@@ -43,7 +43,9 @@ must know is the one thing they would have had to configure anyway.
 - A URL with no config bootstraps.
 - No URL with a config re-authenticates and leaves the config alone.
 - A URL *and* a config refuses without `--force`, printing both the current
-  contents and what would replace them. `--force` overwrites wholesale rather
+  contents and what would replace them — unless the rendered config is
+  identical to the current one, in which case there is nothing to replace and
+  it proceeds to re-authenticate. `--force` overwrites wholesale rather
   than merging: the only fields a human hand-edits interactively are `jobs` and
   `zstd_level`, and `[watch]` lives on daemon hosts whose config the NixOS
   module writes at an explicit `--config` path.
@@ -62,6 +64,34 @@ The written file is a hand-rendered subset with comments, not a serialization
 of the config struct — which would emit every default and the entire `[watch]`
 section into a laptop's config.
 
+## Authentication sources
+
+Every command that talks to a server gets its token from one `TokenSource`,
+first match wins:
+
+1. `GARRET_TOKEN`, used as given and never renewed.
+2. `[oidc] client_secret_file` — a file holding only the client secret (the
+   client id is `oidc.client_id`; both, and `oidc.issuer`, are required with
+   it). The `client_credentials` grant, re-minted on expiry. A warning goes to
+   stderr when the file is readable by group or others (mode & `0o077`).
+3. A GitHub Actions runner (`ACTIONS_ID_TOKEN_REQUEST_*`).
+4. The refresh token `garret login` stored (device flow).
+
+`oidc.issuer` is optional in the config: only `login` and
+`client_secret_file` need it, and each says so where it is used.
+`doctor` runs its `keys` check and the `[oidc]` drift comparison, and
+suggests `garret login --force`, only for a device-flow config (rule 4) — a
+machine config is never told to log in.
+
+A non-2xx answer from the issuer or the cache is reported with the response
+body (the issuer's `error`/`error_description`), not just the status. A
+refresh refused with 400/401 reads "stored login expired or revoked; run
+`garret login`". During the device flow, `slow_down` adds 5 s to the poll
+interval (RFC 8628 §3.5).
+
+Environment: `GARRET_TOKEN` (above) and `GARRET_ENDPOINT` (overrides
+`endpoint`) are listed in `garret --help`.
+
 ## Doctor
 
 Sources: [ticket 24](../../.scratch/spec/issues/24-doctor.md). Prior art:
@@ -76,9 +106,9 @@ non-zero if any check failed:
 | Check | What it probes |
 |---|---|
 | `discovery` | `GET /api/v1/discovery` on the Pusher — the server is reachable at all, and its document passes the checks `login` applies |
-| `config` | The local config against the discovery document — drift in `puller_endpoint` or `[oidc]` since `garret login` wrote it. Fields the server does not advertise are sparse, not drifted |
-| `keys` | Configured `public_keys` against discovery's — a configured key the server no longer signs with fails; *extra* server keys pass with a re-login nudge (rotation in progress) |
-| `auth` | Token acquisition plus the empty-Negotiation liveness probe `whoami` uses — the token is not merely present but accepted |
+| `config` | The local config against the discovery document — drift in `puller_endpoint`, and (device-flow configs only) `[oidc]`, since `garret login` wrote it. Fields the server does not advertise are sparse, not drifted |
+| `keys` | Device-flow configs only: configured `public_keys` against discovery's — a configured key the server no longer signs with fails; *extra* server keys pass with a re-login nudge (rotation in progress) |
+| `auth` | Token acquisition plus the empty-Negotiation liveness probe `whoami` uses (one shared helper) — the token is not merely present but accepted |
 | `pull` | The Puller's `/nix-cache-info`, then one narinfo probe. Hit and miss both pass: the question is whether the substituter protocol is served, not whether a given path is cached |
 | `path` | Only with a path argument: one Negotiation round for its hash. Not cached is a `fail`, so the exit code carries the answer for scripts |
 
@@ -240,8 +270,9 @@ sudo. Idempotence is a substring match on the URL, not a nix.conf parse.
 It then runs `nix config show substituters` and checks the URL comes back.
 Substituters in a *user's* nix.conf are silently ignored unless that user is in
 `trusted-users`; that one subprocess turns the classic silent failure into a
-message carrying the `nix.settings` snippet to use instead. `--print` emits
-both forms and writes nothing, for the declarative case.
+message carrying the `nix.settings` snippet to use instead — and `garret use`
+exits 1 after writing the snippet, so a script cannot mistake it for success.
+`--print` emits both forms and writes nothing, for the declarative case.
 
 `public_keys` is plural because the Pusher signs every object with every
 configured key, so a rotation has several live at once.
@@ -314,10 +345,10 @@ and set `post-build-hook = /path/to/that-script` in `nix.conf`.
 A CI job that fails late should still leave behind everything it built,
 so the next run substitutes it. The shape: the hook wakes a background
 `watch-store` as each build finishes, and an always-run last step stops it
-and drains. Authentication needs no secret: with no `credentials_file`,
+and drains. Authentication needs no secret: with no `oidc.client_secret_file`,
 `watch-store` takes its token from the environment, and on a GitHub
 Actions runner with `id-token: write` that is the runner's OIDC token,
-re-minted as it ages. For GitHub Actions:
+re-minted as it ages. `oidc.issuer` is not needed there. For GitHub Actions:
 
 ```yaml
 permissions:

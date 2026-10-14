@@ -4,7 +4,7 @@
 //! and naming the broken layer instead of letting a push fail three layers
 //! deeper with a message about the wrong one.
 
-use garret_common::hash_of_store_path;
+use garret_common::parse_store_hash;
 
 use crate::{auth, config, discovery};
 
@@ -80,6 +80,10 @@ impl Check {
 /// caller always gets the whole picture before deciding the exit code.
 pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
+    // One provider for the run; a machine config (secret file, GARRET_TOKEN,
+    // GitHub Actions) is told apart from a human's stored login by what it is.
+    let tokens = auth::TokenSource::for_config(http, cfg);
+    let device_flow = tokens.as_ref().is_ok_and(auth::TokenSource::is_device_flow);
 
     let discovered = match discovery::fetch(http, &cfg.endpoint).await {
         Ok(d) => {
@@ -97,33 +101,40 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
 
     match &discovered {
         Some(d) => {
-            let drifted = drift(cfg, d);
+            let drifted = drift(cfg, d, device_flow);
             checks.push(match drifted.is_empty() {
                 true => Check::pass("config", "config matches the server's discovery document"),
                 false => Check::fail(
                     "config",
                     format!(
-                        "config drift — re-run `garret login --force`: {}",
+                        "config drift — {}: {}",
+                        fix_hint(device_flow),
                         drifted.join("; ")
                     ),
                 ),
             });
-            let (status, detail) = keys_verdict(&cfg.public_keys, &d.public_keys);
-            checks.push(Check {
-                name: "keys",
-                status,
-                detail,
-            });
+            // Which keys nix trusts is a laptop's concern; a build machine
+            // pushes and never substitutes through `garret use`.
+            if device_flow {
+                let (status, detail) = keys_verdict(&cfg.public_keys, &d.public_keys);
+                checks.push(Check {
+                    name: "keys",
+                    status,
+                    detail,
+                });
+            }
         }
         None => {
             checks.push(Check::skip("config"));
-            checks.push(Check::skip("keys"));
+            if device_flow {
+                checks.push(Check::skip("keys"));
+            }
         }
     }
 
-    let token = auth_check(cfg, http, &mut checks).await;
+    let token = auth_check(cfg, http, tokens, &mut checks).await;
 
-    checks.push(pull_check(cfg, http, path).await);
+    checks.push(pull_check(cfg, http, path, device_flow).await);
 
     match (path, token) {
         (Some(path), Some(token)) => checks.push(path_check(cfg, http, &token, path).await),
@@ -134,32 +145,29 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
     checks
 }
 
-/// Token acquisition plus the liveness probe `whoami` uses: an empty
-/// Negotiation batch, valid and near-free, exercising exactly the
-/// authentication path `push` crosses. Returns the token — only when the
-/// Pusher accepted it — so the `path` check can reuse it.
+/// Token acquisition plus the liveness probe `whoami` uses
+/// ([`auth::probe_pusher`]). Returns the token — only when the Pusher
+/// accepted it — so the `path` check can reuse it.
 async fn auth_check(
     cfg: &config::Config,
     http: &reqwest::Client,
+    tokens: anyhow::Result<auth::TokenSource>,
     checks: &mut Vec<Check>,
 ) -> Option<String> {
-    let token =
-        match auth::bearer_token(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()).await {
-            Ok(token) => token,
-            Err(e) => {
-                checks.push(Check::fail("auth", format!("no token: {e:#}")));
-                return None;
-            }
-        };
+    let token = match tokens {
+        Ok(tokens) => tokens.get().await,
+        Err(e) => Err(e),
+    };
+    let token = match token {
+        Ok(token) => token,
+        Err(e) => {
+            checks.push(Check::fail("auth", format!("no token: {e:#}")));
+            return None;
+        }
+    };
 
-    let response = http
-        .post(format!("{}/api/v1/missing-paths", cfg.endpoint))
-        .bearer_auth(&token)
-        .json(&Vec::<String>::new())
-        .send()
-        .await;
-    match response {
-        Ok(r) if r.status().is_success() => {
+    match auth::probe_pusher(http, &cfg.endpoint, &token).await {
+        Ok(()) => {
             let subject = auth::peek_claims(&token)
                 .ok()
                 .and_then(|c| c.sub)
@@ -170,20 +178,8 @@ async fn auth_check(
             ));
             Some(token)
         }
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            checks.push(Check::fail(
-                "auth",
-                format!(
-                    "the Pusher rejected the token with {status}: {}",
-                    body.trim()
-                ),
-            ));
-            None
-        }
         Err(e) => {
-            checks.push(Check::fail("auth", format!("probing the Pusher: {e:#}")));
+            checks.push(Check::fail("auth", format!("{e:#}")));
             None
         }
     }
@@ -193,12 +189,16 @@ async fn auth_check(
 /// route must answer. Hit and miss both pass — whether a *specific* path is
 /// cached is the `path` check's question, asked of the Pusher; here only a
 /// dead connection or an error status is a broken pull layer.
-async fn pull_check(cfg: &config::Config, http: &reqwest::Client, path: Option<&str>) -> Check {
+async fn pull_check(
+    cfg: &config::Config,
+    http: &reqwest::Client,
+    path: Option<&str>,
+    device_flow: bool,
+) -> Check {
     let Some(puller) = cfg.puller_endpoint.as_deref() else {
         return Check::fail(
             "pull",
-            "no `puller_endpoint` in the config — re-run `garret login --force` to pick it up \
-             from the server",
+            format!("no `puller_endpoint` in the config — {}", fix_hint(device_flow)),
         );
     };
 
@@ -215,7 +215,7 @@ async fn pull_check(cfg: &config::Config, http: &reqwest::Client, path: Option<&
         );
     }
 
-    let probe = path.and_then(|p| probe_hash(p).ok()).unwrap_or(ABSENT_HASH);
+    let probe = path.and_then(parse_store_hash).unwrap_or(ABSENT_HASH);
     let narinfo_url = format!("{puller}/{probe}.narinfo");
     match http.get(&narinfo_url).send().await {
         Ok(r)
@@ -244,9 +244,11 @@ async fn path_check(
     token: &str,
     path: &str,
 ) -> Check {
-    let hash = match probe_hash(path) {
-        Ok(hash) => hash,
-        Err(why) => return Check::fail("path", why),
+    let Some(hash) = parse_store_hash(path) else {
+        return Check::fail(
+            "path",
+            format!("`{path}` does not look like a store path or 32-character hash"),
+        );
     };
 
     let response = match http
@@ -291,8 +293,10 @@ async fn path_check(
 /// The fields `garret login` writes that the server still advertises. Only
 /// advertised fields count — a server that omits its `puller_endpoint` is
 /// sparse, not drifted. `public_keys` is deliberately excluded: the
-/// signing-key match is its own check.
-fn drift(cfg: &config::Config, d: &discovery::Discovery) -> Vec<String> {
+/// signing-key match is its own check. The `oidc` fields are compared only
+/// for device-flow configs, the ones `garret login` writes; a machine
+/// config's issuer, audience and client id are its operator's to set.
+fn drift(cfg: &config::Config, d: &discovery::Discovery, device_flow: bool) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(advertised) = &d.puller_endpoint
         && cfg.puller_endpoint.as_deref() != Some(advertised.as_str())
@@ -302,11 +306,12 @@ fn drift(cfg: &config::Config, d: &discovery::Discovery) -> Vec<String> {
             cfg.puller_endpoint.as_deref().unwrap_or("unset")
         ));
     }
-    if let Some(oidc) = &d.oidc {
-        if cfg.oidc.issuer != oidc.issuer {
+    if device_flow && let Some(oidc) = &d.oidc {
+        if cfg.oidc.issuer.as_deref() != Some(oidc.issuer.as_str()) {
             out.push(format!(
                 "oidc.issuer is {}, server advertises {}",
-                cfg.oidc.issuer, oidc.issuer
+                cfg.oidc.issuer.as_deref().unwrap_or("unset"),
+                oidc.issuer
             ));
         }
         if cfg.oidc.audience != oidc.audience {
@@ -384,15 +389,13 @@ fn cache_info_ok(body: &str) -> bool {
     body.lines().any(|l| l.starts_with("StoreDir:"))
 }
 
-/// The 32-character store path hash of a path (or bare hash) argument, or an
-/// explanation of why the argument cannot name one.
-fn probe_hash(path: &str) -> Result<&str, String> {
-    let hash = hash_of_store_path(path);
-    match hash.len() == 32 && hash.chars().all(|c| c.is_ascii_alphanumeric()) {
-        true => Ok(hash),
-        false => Err(format!(
-            "`{path}` does not look like a store path or 32-character hash"
-        )),
+/// What to do about a config that no longer matches the server. Only a
+/// device-flow config came from `garret login`, so only it is told to re-run
+/// it: a machine config is managed by hand or by the NixOS module.
+fn fix_hint(device_flow: bool) -> &'static str {
+    match device_flow {
+        true => "re-run `garret login --force`",
+        false => "update the config to match the server",
     }
 }
 
@@ -405,8 +408,9 @@ mod tests {
         config::Config {
             endpoint: "https://push.example".into(),
             oidc: config::Oidc {
-                issuer: "https://id.example".into(),
+                issuer: Some("https://id.example".into()),
                 client_id: Some("garret-cli".into()),
+                client_secret_file: None,
                 audience: "garret".into(),
                 resource: None,
             },
@@ -434,7 +438,7 @@ mod tests {
 
     #[test]
     fn a_matching_config_has_no_drift() {
-        assert!(drift(&cfg(), &advertised()).is_empty());
+        assert!(drift(&cfg(), &advertised(), true).is_empty());
     }
 
     #[test]
@@ -448,7 +452,7 @@ mod tests {
             }),
             ..advertised()
         };
-        let drifted = drift(&cfg(), &d);
+        let drifted = drift(&cfg(), &d, true);
         assert_eq!(drifted.len(), 4, "{drifted:?}");
         assert!(drifted[0].contains("puller_endpoint"));
     }
@@ -461,7 +465,7 @@ mod tests {
             oidc: None,
             ..advertised()
         };
-        assert!(drift(&cfg(), &sparse).is_empty());
+        assert!(drift(&cfg(), &sparse, true).is_empty());
     }
 
     #[test]
@@ -502,16 +506,13 @@ mod tests {
     }
 
     #[test]
-    fn probe_hash_accepts_paths_and_bare_hashes() {
-        assert_eq!(
-            probe_hash("/nix/store/v2xb3fmd3qd34s7q7sngajj8rjl5k25j-payload"),
-            Ok("v2xb3fmd3qd34s7q7sngajj8rjl5k25j")
-        );
-        assert_eq!(
-            probe_hash("v2xb3fmd3qd34s7q7sngajj8rjl5k25j"),
-            Ok("v2xb3fmd3qd34s7q7sngajj8rjl5k25j")
-        );
-        assert!(probe_hash("hello").is_err());
-        assert!(probe_hash("/nix/store/short-name").is_err());
+    fn a_machine_config_is_not_told_to_log_in() {
+        let mut machine = cfg();
+        machine.oidc.issuer = None;
+        machine.oidc.client_secret_file = Some("/run/secrets/garret".into());
+        // The device-flow-only OIDC fields are not compared for machines.
+        assert!(drift(&machine, &advertised(), false).is_empty());
+        assert!(!fix_hint(false).contains("login"));
+        assert!(fix_hint(true).contains("garret login --force"));
     }
 }
