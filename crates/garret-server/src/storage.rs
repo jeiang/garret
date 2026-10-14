@@ -274,8 +274,9 @@ impl Storage {
     ///
     /// `first_part_hint` is the most bytes the body is expected to hold. The
     /// first buffer reserves only that much (capped at a part), so a small NAR
-    /// neither allocates nor holds a whole part slot. A body that outgrows
-    /// the hint tops the reservation up to a whole part before reading on.
+    /// neither allocates nor holds a whole part slot. A body shorter than a
+    /// part that outgrows the hint is refused: the buffer never exceeds the
+    /// bytes charged to the permit.
     pub async fn put_streaming<S, E>(
         &self,
         key: &str,
@@ -293,25 +294,33 @@ impl Storage {
 
         // First part decides the shape: if the whole body fits, one PutObject.
         let reserve = first_part_hint.clamp(1, limits.part_size);
-        let mut permit = limits.acquire(reserve).await?;
+        let permit = limits.acquire(reserve).await?;
         let mut first = BytesMut::with_capacity(reserve);
         fill_part(&mut first, &mut body, &mut carry, reserve, &mut hasher).await?;
         if first.len() == reserve && reserve < limits.part_size {
-            // The hint was exceeded (or hit exactly): reserve the rest of a
-            // part before buffering it.
-            let extra = limits.part_units - limits.units(reserve);
-            if extra > 0 {
-                permit.merge(limits.acquire_units(extra).await?);
+            // The hint is a hard cap for a body that is not a whole part: more
+            // data means the body exceeds what the caller will accept, so fail
+            // rather than wait for more memory while holding a partial permit.
+            let more = match carry.as_ref() {
+                Some(left) => !left.is_empty(),
+                None => loop {
+                    match next_chunk(&mut body).await? {
+                        None => break false,
+                        Some(Ok(chunk)) if chunk.is_empty() => continue,
+                        Some(Ok(_)) => break true,
+                        Some(Err(e)) => {
+                            return Err(anyhow::Error::new(ClientBodyError(format!(
+                                "reading the upload body: {e}"
+                            ))));
+                        }
+                    }
+                },
+            };
+            if more {
+                return Err(anyhow::Error::new(ClientBodyError(format!(
+                    "upload body exceeds the {reserve}-byte limit for its size"
+                ))));
             }
-            first.reserve(limits.part_size - first.len());
-            fill_part(
-                &mut first,
-                &mut body,
-                &mut carry,
-                limits.part_size,
-                &mut hasher,
-            )
-            .await?;
         }
         let first = first.freeze();
         total += first.len() as i64;
@@ -897,27 +906,26 @@ mod tests {
         assert_eq!(limits.part_slots.available_permits(), limits.total_units);
     }
 
-    /// A body that outgrows its hint tops the reservation up to a whole part
-    /// and still stores every byte once.
+    /// A body that outgrows its hint fails instead of growing past its
+    /// reservation, and returns its permit.
     #[tokio::test]
-    async fn a_body_past_its_hint_still_stores_whole() {
+    async fn a_body_past_its_hint_is_refused() {
         let storage = fake_s3().await;
         let limits = UploadLimits::new(1024, 2, 4096);
-        let body: Vec<u8> = (0..2500).map(|i| i as u8).collect();
+        let body: Vec<u8> = (0..500).map(|i| i as u8).collect();
         let chunks: Vec<_> = body
             .chunks(300)
             .map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c)))
             .collect();
-        let stored = storage
+        let result = storage
             .put_streaming(
                 &key_for("grown"),
                 futures::stream::iter(chunks),
                 &limits,
                 100,
             )
-            .await
-            .unwrap();
-        assert_eq!(stored, (Sha256::digest(&body).to_vec(), 2500));
+            .await;
+        assert!(result.is_err());
         assert_eq!(limits.part_slots.available_permits(), limits.total_units);
     }
 

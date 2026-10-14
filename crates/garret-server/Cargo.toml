@@ -14,7 +14,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync",
 axum = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "service", "tokio", "http1", "http2"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "server-graceful", "service", "tokio"] }
 garret-common.workspace = true
 anyhow = "1"
 # No legacy `rustls` feature on aws-sdk-s3: it selects the hyper 0.14 /

@@ -43,6 +43,12 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
         "revision" => option_env!("GARRET_REVISION").unwrap_or("unknown"),
     )
     .set(1.0);
+    // Captured here, not read from `/proc` (`/proc/stat` is hidden under
+    // `ProcSubset=pid`), so it is exported on every platform.
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    metrics::gauge!("process_start_time_seconds").set(started);
     Ok(handle)
 }
 
@@ -136,14 +142,6 @@ fn record_process_metrics() {
             let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok());
             if let (Some(utime), Some(stime)) = (ticks(11), ticks(12)) {
                 metrics::gauge!("process_cpu_seconds_total").set((utime + stime) / TICKS_PER_SEC);
-            }
-            let boot = fs::read_to_string("/proc/stat").ok().and_then(|s| {
-                s.lines()
-                    .find_map(|l| l.strip_prefix("btime "))
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-            });
-            if let (Some(start), Some(boot)) = (ticks(19), boot) {
-                metrics::gauge!("process_start_time_seconds").set(boot + start / TICKS_PER_SEC);
             }
         }
     }

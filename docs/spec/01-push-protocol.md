@@ -104,9 +104,12 @@ normal operation:
 Parallelism is expressed as concurrent PUTs from the client's
 configurable worker pool — no custom framing, no batch endpoint (revisit
 only if benchmarks show per-request overhead dominating small-NAR
-pushes). The server speaks HTTP/1.1; HTTP/2 flow-control tuning is not
-implemented. A connection must send complete request headers within
-**30 s** or it is dropped (the accept loop in `garret_server::runtime`);
+pushes). The server speaks **HTTP/1.1 only** (no HTTP/2, h2c included).
+A connection must send complete request headers within **30 s** of being
+accepted, and of each later keep-alive request, or it is dropped — a
+connection that sends nothing is closed too (the accept loop in
+`garret_server::runtime`). While draining on shutdown the listener is
+closed, so new connections are refused;
 bodies are bounded by the idle timeout below. The client may open
 additional connections if one saturates.
 

@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto::Builder;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
@@ -28,17 +28,30 @@ pub fn init_tracing() {
 }
 
 /// Serves `app` on `listener` until `shutdown` resolves, then waits for open
-/// connections to finish. HTTP/1 connections must send their headers within
-/// [`HEADER_READ_TIMEOUT`].
+/// connections to finish. HTTP/1.1 only: every connection must send complete
+/// request headers within [`HEADER_READ_TIMEOUT`] of being accepted (and of
+/// each keep-alive request), so a silent client is dropped. The listener is
+/// closed as soon as `shutdown` fires, so drain refuses new connections.
 pub async fn serve<F>(listener: TcpListener, app: Router, shutdown: F) -> std::io::Result<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let mut builder = Builder::new(TokioExecutor::new());
+    serve_with_header_timeout(listener, app, shutdown, HEADER_READ_TIMEOUT).await
+}
+
+async fn serve_with_header_timeout<F>(
+    listener: TcpListener,
+    app: Router,
+    shutdown: F,
+    header_timeout: Duration,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut builder = http1::Builder::new();
     builder
-        .http1()
         .timer(TokioTimer::new())
-        .header_read_timeout(HEADER_READ_TIMEOUT);
+        .header_read_timeout(header_timeout);
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -55,16 +68,14 @@ where
             () = &mut shutdown => break,
         };
         let service = TowerToHyperService::new(app.clone());
-        let conn = builder
-            .serve_connection_with_upgrades(TokioIo::new(stream), service)
-            .into_owned();
-        let conn = graceful.watch(conn);
+        let conn = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::debug!("connection ended with an error: {e}");
             }
         });
     }
+    drop(listener);
     graceful.shutdown().await;
     Ok(())
 }
@@ -107,4 +118,35 @@ fn send_notify(path: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn send_notify(_: &std::ffi::OsStr, _: &[u8]) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn silent_connection_is_closed_after_header_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(super::serve_with_header_timeout(
+            listener,
+            axum::Router::new(),
+            async move {
+                let _ = stopped.await;
+            },
+            Duration::from_millis(200),
+        ));
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("server did not drop the silent connection");
+        // Closed (EOF) or reset; either way no hang.
+        assert!(matches!(read, Ok(0) | Err(_)) || read.unwrap() > 0);
+        let _ = stop.send(());
+        server.await.unwrap().unwrap();
+    }
 }

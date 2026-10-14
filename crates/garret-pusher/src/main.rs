@@ -477,7 +477,7 @@ async fn upload(
             "too many concurrent uploads",
         ));
     };
-    let _claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
+    let claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
         Ok(claim) => claim,
         // Second pusher for the same path: first writer wins. The loser is
         // told `in-progress` and asks again later (spec 01) — this upload may
@@ -511,7 +511,7 @@ async fn upload(
     let started = std::time::Instant::now();
     let result = {
         let _gauge = UploadGauge::enter();
-        store_upload(&state, &hash, &subject, body).await
+        store_upload(&state, &hash, &subject, body, claim).await
     };
 
     match &result {
@@ -533,6 +533,7 @@ async fn store_upload(
     hash: &str,
     subject: &Subject,
     body: Body,
+    claim: inflight::Claim,
 ) -> Result<i64, Error> {
     let mut stream = body.into_data_stream();
     let mut head: Vec<u8> = Vec::new();
@@ -582,7 +583,11 @@ async fn store_upload(
     object.file_size = file_size;
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
     let at = now();
+    // The claim moves into the blocking closure: a dropped handler future
+    // (client gone) must not release the path while the insert can still
+    // commit, or a delete could race the row it is about to remove.
     db_run(&state.conn, move |conn| {
+        let _claim = claim;
         db::insert_object(conn, &object, at)
     })
     .await?;

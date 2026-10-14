@@ -58,7 +58,10 @@ Prefix `garret_`; service distinguished by scrape job.
   (`process_cpu_seconds_total`, `process_resident_memory_bytes`,
   `process_open_fds`, `process_max_fds`, `process_start_time_seconds`),
   read from `/proc` on each scrape (Linux only, no background task; the
-  CPU series is exposed as a gauge of cumulative seconds);
+  CPU series is exposed as a gauge of cumulative seconds), except
+  `process_start_time_seconds`, which is the wall-clock time recorded when
+  the metrics recorder is installed at startup (so it needs no `/proc/stat`
+  and works under `ProcSubset=pid`, on every platform);
   `garret_build_info` with `service`, `version` and `revision` (the
   commit the binary was built from, `unknown` outside the Nix build).
 - **Pusher — uploads**: in-flight uploads and in-flight bytes gauges

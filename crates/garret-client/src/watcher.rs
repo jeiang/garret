@@ -20,6 +20,10 @@ use garret_common::hash_of_store_path;
 
 use crate::push::{PathInfo, Pusher, retain_missing};
 
+/// Paths per poll, drain chunk, and retry chunk: one `nix path-info` and one
+/// Negotiation each, so argv and request bodies stay bounded.
+const BATCH_SIZE: usize = 500;
+
 /// The daemon's assembled settings; [`run`](Watcher::run) is its whole life.
 pub struct Watcher {
     /// Path to the Nix database (normally `/nix/var/nix/db/db.sqlite`).
@@ -288,7 +292,7 @@ impl Watcher {
         let mut attempts: HashMap<String, u32> = HashMap::new();
 
         loop {
-            let batch = paths_after(&conn, cursor, 500)?;
+            let batch = paths_after(&conn, cursor, BATCH_SIZE)?;
             let Some(newest) = batch.last().map(|entry| entry.id) else {
                 self.retry_failed(pusher, &mut failed, &mut attempts)
                     .await?;
@@ -313,7 +317,7 @@ impl Watcher {
     }
 
     /// One more try for each failed path with attempts left in this process,
-    /// as one batch.
+    /// in batches of `BATCH_SIZE`.
     async fn retry_failed(
         &self,
         pusher: &Pusher,
@@ -328,25 +332,29 @@ impl Watcher {
         if due.is_empty() {
             return Ok(());
         }
-        let still: HashSet<String> = self.push_batch(pusher, &due).await.into_iter().collect();
-        for path in due {
-            if !still.contains(&path) {
-                tracing::info!(path, "pushed on retry");
-                attempts.remove(&path);
-                failed.remove(&path);
-                continue;
-            }
-            let count = attempts.entry(path.clone()).or_default();
-            *count += 1;
-            if *count >= self.max_attempts {
-                tracing::error!(
-                    path,
-                    attempts = *count,
-                    "giving up on this path until the watcher restarts or \
-                     `garret watch-store --drain` runs"
-                );
-            } else {
-                tracing::warn!(path, attempts = *count, "retry failed");
+        // In batches the size of a poll, so a long failed list never becomes
+        // one huge argv or an oversized Negotiation body.
+        for chunk in due.chunks(BATCH_SIZE) {
+            let still: HashSet<String> = self.push_batch(pusher, chunk).await.into_iter().collect();
+            for path in chunk {
+                if !still.contains(path) {
+                    tracing::info!(path, "pushed on retry");
+                    attempts.remove(path);
+                    failed.remove(path);
+                    continue;
+                }
+                let count = attempts.entry(path.clone()).or_default();
+                *count += 1;
+                if *count >= self.max_attempts {
+                    tracing::error!(
+                        path,
+                        attempts = *count,
+                        "giving up on this path until the watcher restarts or \
+                         `garret watch-store --drain` runs"
+                    );
+                } else {
+                    tracing::warn!(path, attempts = *count, "retry failed");
+                }
             }
         }
         write_failed(&failed_path(&self.cursor_path), failed)
@@ -374,7 +382,7 @@ impl Watcher {
         let mut failed = read_failed(&failed_file);
         let mut todo: Vec<String> = failed.iter().cloned().collect();
         while cursor < target {
-            let mut batch = paths_after(&conn, cursor, 500)?;
+            let mut batch = paths_after(&conn, cursor, BATCH_SIZE)?;
             // Paths validated after the drain began are the daemon's (or the
             // next drain's), not this one's.
             batch.retain(|entry| entry.id <= target);
@@ -392,7 +400,7 @@ impl Watcher {
 
         // Oldest first, in batches the size of a poll: one `nix path-info`
         // and one Negotiation each, and an argv that stays small.
-        for chunk in todo.chunks(500) {
+        for chunk in todo.chunks(BATCH_SIZE) {
             let still_failed = self.push_batch(pusher, chunk).await;
             for path in chunk {
                 if still_failed.contains(path) {

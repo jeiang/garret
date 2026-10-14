@@ -1445,6 +1445,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "garret-common",
+ "hyper",
  "hyper-util",
  "jsonwebtoken",
  "metrics",

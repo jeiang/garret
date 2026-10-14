@@ -43,13 +43,13 @@ let
       max_parts_in_flight = cfg.limits.maxPartsInFlight;
     };
     oidc = cfg.oidc;
+  } // lib.optionalAttrs (cfg.quotaBytes != null) {
     gc = {
-      orphan_grace_secs = cfg.orphanGraceSeconds;
-    } // lib.optionalAttrs (cfg.quotaBytes != null) {
       quota_bytes = cfg.quotaBytes;
       high_watermark = cfg.watermarks.high;
       low_watermark = cfg.watermarks.low;
       interval_secs = cfg.gcIntervalSeconds;
+      orphan_grace_secs = cfg.orphanGraceSeconds;
     };
   };
 
@@ -168,7 +168,7 @@ in
     orphanGraceSeconds = mkOption {
       type = types.int;
       default = 86400;
-      description = "How long an unreferenced Blob is kept before GC may delete it.";
+      description = "How long an unreferenced Blob is kept before GC may delete it. Applies only when quotaBytes is set: GC, including the orphan sweep, runs only with a quota.";
     };
 
     limits = {

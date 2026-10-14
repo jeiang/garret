@@ -216,7 +216,7 @@ in
         # The Pusher opens the database, then fails on a key it cannot read;
         # its clean close must leave the -wal and -shm the Puller cannot make.
         cache.succeed("chown root /etc/garret/signing-key")
-        cache.succeed("systemctl start garret-pusher")
+        cache.execute("systemctl start --no-block garret-pusher")
         cache.wait_until_succeeds("systemctl is-failed garret-pusher")
         cache.succeed("systemctl start garret-puller")
         cache.wait_until_succeeds("curl -fsS http://127.0.0.1:8081/ready", timeout=60)
