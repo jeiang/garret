@@ -1,7 +1,7 @@
 //! TOML config, one file per service. Secrets are paths or env, never inline
 //! in the nix store (spec 10-packaging).
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// The `[s3]` section: where blobs live (MEGA S4 in production, Garage
@@ -103,13 +103,14 @@ pub struct IssuerConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
-    /// Uploads admitted at once; the rest wait. Default 32.
+    /// Uploads admitted at once; the rest wait. Default 16.
     #[serde(default = "max_concurrent_uploads")]
     pub max_concurrent_uploads: usize,
-    /// Global cap on buffered upload bytes across all uploads. Default 2 GiB.
+    /// Global cap on buffered upload bytes across all uploads. Default 256 MiB.
     #[serde(default = "max_in_flight_bytes")]
     pub max_in_flight_bytes: u64,
-    /// S3 part size, and the single-`PutObject` threshold. Default 64 MiB.
+    /// S3 part size, and the single-`PutObject` threshold. Default 16 MiB;
+    /// at least 5 MiB (the S3 minimum).
     #[serde(default = "part_size")]
     pub part_size: usize,
     /// Concurrent part uploads per NAR. Default 4.
@@ -129,15 +130,15 @@ impl Default for Limits {
 }
 
 fn max_concurrent_uploads() -> usize {
-    32
+    16
 }
 
 fn max_in_flight_bytes() -> u64 {
-    2 * 1024 * 1024 * 1024
+    256 * 1024 * 1024
 }
 
 fn part_size() -> usize {
-    64 * 1024 * 1024
+    16 * 1024 * 1024
 }
 
 fn max_parts_in_flight() -> usize {
@@ -238,6 +239,58 @@ pub struct PusherConfig {
     pub metrics_listen: String,
 }
 
+impl PusherConfig {
+    /// Rejects values that would wedge or silently disable the service
+    /// (a part size S3 refuses, a zero permit count, a watermark that never
+    /// triggers), naming the key so the operator can fix it at startup.
+    pub fn validate(&self) -> Result<()> {
+        const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+        let l = &self.limits;
+        if l.part_size < MIN_PART_SIZE {
+            bail!(
+                "limits.part_size must be at least 5 MiB (S3 minimum part size), got {}",
+                l.part_size
+            );
+        }
+        if l.max_in_flight_bytes < l.part_size as u64 {
+            bail!(
+                "limits.max_in_flight_bytes ({}) must be at least limits.part_size ({})",
+                l.max_in_flight_bytes,
+                l.part_size
+            );
+        }
+        if l.max_concurrent_uploads == 0 {
+            bail!("limits.max_concurrent_uploads must be at least 1");
+        }
+        if l.max_parts_in_flight == 0 {
+            bail!("limits.max_parts_in_flight must be at least 1");
+        }
+        if self.s3.operation_timeout_secs == 0 {
+            bail!("s3.operation_timeout_secs must be at least 1");
+        }
+        if let Some(gc) = &self.gc {
+            if gc.interval_secs == 0 {
+                bail!("gc.interval_secs must be at least 1");
+            }
+            let in_range = |w: f64| w > 0.0 && w <= 1.0;
+            if !in_range(gc.high_watermark) {
+                bail!("gc.high_watermark must be in (0, 1], got {}", gc.high_watermark);
+            }
+            if !in_range(gc.low_watermark) {
+                bail!("gc.low_watermark must be in (0, 1], got {}", gc.low_watermark);
+            }
+            if gc.low_watermark >= gc.high_watermark {
+                bail!(
+                    "gc.low_watermark ({}) must be below gc.high_watermark ({})",
+                    gc.low_watermark,
+                    gc.high_watermark
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The Puller's config file (the public substituter frontend; read-only).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -331,6 +384,78 @@ mod tests {
         assert!(cfg.low() < cfg.high());
     }
 }
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+
+    fn cfg() -> PusherConfig {
+        toml::from_str(
+            r#"
+            db_path = "/tmp/x.db"
+            signing_key_files = ["/tmp/k"]
+            [s3]
+            bucket = "b"
+            [[oidc]]
+            issuer = "https://i"
+            audience = "a"
+            [gc]
+            quota_bytes = 1000
+        "#,
+        )
+        .unwrap()
+    }
+
+    fn rejects(edit: impl FnOnce(&mut PusherConfig), key: &str) {
+        let mut c = cfg();
+        edit(&mut c);
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e:#}").contains(key), "{e:#}");
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        cfg().validate().unwrap();
+    }
+
+    #[test]
+    fn limits_boundaries() {
+        const MIB: usize = 1024 * 1024;
+        let mut c = cfg();
+        c.limits.part_size = 5 * MIB;
+        c.limits.max_in_flight_bytes = (5 * MIB) as u64;
+        c.validate().unwrap();
+
+        rejects(|c| c.limits.part_size = 5 * MIB - 1, "part_size");
+        rejects(
+            |c| c.limits.max_in_flight_bytes = c.limits.part_size as u64 - 1,
+            "max_in_flight_bytes",
+        );
+        rejects(|c| c.limits.max_concurrent_uploads = 0, "max_concurrent_uploads");
+        rejects(|c| c.limits.max_parts_in_flight = 0, "max_parts_in_flight");
+    }
+
+    #[test]
+    fn gc_and_s3_boundaries() {
+        rejects(|c| c.gc.as_mut().unwrap().interval_secs = 0, "interval_secs");
+        rejects(|c| c.s3.operation_timeout_secs = 0, "operation_timeout_secs");
+        rejects(|c| c.gc.as_mut().unwrap().high_watermark = 0.0, "high_watermark");
+        rejects(|c| c.gc.as_mut().unwrap().high_watermark = 1.01, "high_watermark");
+        rejects(|c| c.gc.as_mut().unwrap().low_watermark = 0.0, "low_watermark");
+        rejects(|c| c.gc.as_mut().unwrap().low_watermark = f64::NAN, "low_watermark");
+        rejects(
+            |c| c.gc.as_mut().unwrap().low_watermark = c.gc.as_ref().unwrap().high_watermark,
+            "low_watermark",
+        );
+        let mut c = cfg();
+        c.gc.as_mut().unwrap().high_watermark = 1.0;
+        c.validate().unwrap();
+        // No [gc] section means no GC rules apply.
+        c.gc = None;
+        c.validate().unwrap();
+    }
+}
+
 
 #[cfg(test)]
 mod strictness_tests {

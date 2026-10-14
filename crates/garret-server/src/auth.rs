@@ -34,6 +34,8 @@ const KEY_TTL: Duration = Duration::from_secs(3600);
 /// Bound how long a slow or hung issuer can hold a fetch attempt.
 const JWKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JWKS_TIMEOUT: Duration = Duration::from_secs(10);
+/// The GitHub Actions OIDC issuer, which any repository can mint tokens from.
+const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 /// RS256-pinned validation for one issuer: its `audience` plus every
 /// `extra_audiences` entry is accepted.
@@ -45,6 +47,9 @@ fn validation_for(cfg: &IssuerConfig) -> Validation {
         .collect();
     validation.set_audience(&audiences);
     validation.leeway = LEEWAY_SECS;
+    // `aud` and `iss` are only checked when present unless required, so a
+    // token omitting them would otherwise skip the check.
+    validation.set_required_spec_claims(&["exp", "aud", "iss"]);
     validation.validate_nbf = true;
     validation
 }
@@ -73,6 +78,10 @@ struct Claims {
     /// reusable workflow).
     #[serde(default)]
     job_workflow_ref: Option<String>,
+    /// GitHub Actions: `owner/repo` the job runs in (the caller, for a
+    /// reusable workflow).
+    #[serde(default)]
+    repository: Option<String>,
 }
 
 /// One JWKS fetch attempt, shared by every caller waiting on it. It runs as
@@ -117,6 +126,17 @@ impl Authenticator {
         if issuers.is_empty() {
             bail!("no OIDC issuers configured — garret has no auth-disable mode (spec 04)");
         }
+        for cfg in &issuers {
+            if cfg.issuer == GITHUB_ISSUER
+                && cfg.github_owner_id.is_none()
+                && cfg.repository_ids.is_empty()
+            {
+                bail!(
+                    "issuer {GITHUB_ISSUER} needs github_owner_id or repository_ids: \
+                     any GitHub repository can mint a token for this audience"
+                );
+            }
+        }
         Ok(Self {
             issuers: issuers
                 .into_iter()
@@ -131,6 +151,7 @@ impl Authenticator {
             http: reqwest::Client::builder()
                 .connect_timeout(JWKS_CONNECT_TIMEOUT)
                 .timeout(JWKS_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
         })
     }
@@ -238,9 +259,9 @@ async fn fetch_keys(
     cfg: &IssuerConfig,
 ) -> Result<HashMap<String, DecodingKey>> {
     let url = jwks_url(http, cfg).await?;
-    // A local path is the sanctioned dev-issuer override (spec 04): test
-    // keys on disk, never an auth-disable flag.
-    let body = if url.starts_with("http") {
+    let is_remote = url.starts_with("http://") || url.starts_with("https://");
+    let body = if is_remote {
+        check_remote_url(&url)?;
         http.get(&url)
             .send()
             .await
@@ -248,8 +269,13 @@ async fn fetch_keys(
             .with_context(|| format!("fetching JWKS from {url}"))?
             .text()
             .await?
-    } else {
+    } else if cfg.jwks_url.is_some() {
+        // A local path is the sanctioned dev-issuer override (spec 04), and
+        // only as the configured `jwks_url`: a discovery document must never
+        // point us at a file.
         std::fs::read_to_string(&url).with_context(|| format!("reading JWKS file {url}"))?
+    } else {
+        bail!("discovery returned a non-http jwks_uri");
     };
 
     let set: JwkSet = serde_json::from_str(&body).context("malformed JWKS")?;
@@ -275,6 +301,7 @@ async fn jwks_url(http: &reqwest::Client, cfg: &IssuerConfig) -> Result<String> 
         "{}/.well-known/openid-configuration",
         cfg.issuer.trim_end_matches('/')
     );
+    check_remote_url(&url)?;
     Ok(http
         .get(&url)
         .send()
@@ -339,6 +366,17 @@ impl Issuer {
     }
 }
 
+/// Remote JWKS and discovery URLs must be https; plain http is for a local
+/// dev issuer on a loopback host only.
+fn check_remote_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
+    match (parsed.scheme(), parsed.host_str()) {
+        ("https", Some(_)) => Ok(()),
+        ("http", Some("localhost" | "127.0.0.1" | "[::1]")) => Ok(()),
+        _ => bail!("{url} must be https (http only for loopback hosts)"),
+    }
+}
+
 fn unverified_issuer(token: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct OnlyIss {
@@ -372,13 +410,13 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
         if owner != expected {
             bail!("repository owner is not authorized");
         }
-        if !cfg.ref_patterns.is_empty() {
-            let git_ref = claims.git_ref.as_deref().unwrap_or_default();
-            if !cfg.ref_patterns.iter().any(|p| ref_matches(p, git_ref)) {
-                bail!("ref {git_ref} is not authorized");
-            }
-        }
     }
+    allowlisted(
+        &cfg.ref_patterns,
+        claims.git_ref.as_deref(),
+        "ref",
+        ref_matches,
+    )?;
     if let Some(expected) = cfg.ref_protected {
         let actual = claims
             .ref_protected
@@ -407,6 +445,22 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
         "job_workflow_ref",
         ref_matches,
     )?;
+    // A reusable workflow called from another repository carries the callee's
+    // job_workflow_ref but the caller's repository, so the ref alone doesn't
+    // prove whose run this is.
+    if let (false, Some(jwr)) = (cfg.job_workflow_refs.is_empty(), &claims.job_workflow_ref) {
+        let repository = claims
+            .repository
+            .as_deref()
+            .ok_or_else(|| anyhow!("token has no repository"))?;
+        if jwr
+            .strip_prefix(repository)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_none()
+        {
+            bail!("job_workflow_ref is not from the token's repository");
+        }
+    }
     if !cfg.allowed_groups.is_empty()
         && !claims.groups.iter().any(|g| cfg.allowed_groups.contains(g))
     {
@@ -479,6 +533,7 @@ mod tests {
             repository_id: None,
             event_name: None,
             job_workflow_ref: None,
+            repository: None,
         }
     }
 
@@ -555,6 +610,96 @@ mod tests {
     }
 
     #[test]
+    fn job_workflow_ref_must_come_from_the_tokens_own_repository() {
+        let mut cfg = github("1234", &[]);
+        cfg.job_workflow_refs =
+            vec!["jeiang/garret/.github/workflows/ci.yml@refs/heads/main".into()];
+        let with = |repository: Option<&str>, jwr: &str| {
+            let mut c = claims(Some("1234"), None, &[]);
+            c.repository = repository.map(str::to_owned);
+            c.job_workflow_ref = Some(jwr.to_owned());
+            authorize(&cfg, &c)
+        };
+        let ci = "jeiang/garret/.github/workflows/ci.yml@refs/heads/main";
+        assert!(with(Some("jeiang/garret"), ci).is_ok());
+        // Another repo's job calling garret's reusable workflow carries
+        // garret's job_workflow_ref but its own repository.
+        assert!(with(Some("ripper/evil"), ci).is_err());
+        assert!(with(None, ci).is_err());
+    }
+
+    #[test]
+    fn ref_patterns_gate_without_an_owner_id() {
+        let mut cfg = github("1234", &["refs/heads/main"]);
+        cfg.github_owner_id = None;
+        cfg.repository_ids = vec!["42".into()];
+        let with_ref = |r: Option<&str>| {
+            let mut c = claims(None, r, &[]);
+            c.repository_id = Some("42".into());
+            authorize(&cfg, &c)
+        };
+        assert!(with_ref(Some("refs/heads/main")).is_ok());
+        assert!(with_ref(Some("refs/heads/wip")).is_err());
+        assert!(with_ref(None).is_err());
+    }
+
+    #[test]
+    fn an_unscoped_github_issuer_is_refused_at_startup() {
+        let mut cfg = github("1234", &[]);
+        cfg.github_owner_id = None;
+        let e = Authenticator::new(vec![cfg.clone()]).err().unwrap();
+        assert!(format!("{e:#}").contains("token.actions.githubusercontent.com"));
+        cfg.repository_ids = vec!["42".into()];
+        assert!(Authenticator::new(vec![cfg]).is_ok());
+        assert!(Authenticator::new(vec![github("1234", &[])]).is_ok());
+    }
+
+    #[test]
+    fn remote_jwks_urls_must_be_https_or_loopback() {
+        assert!(check_remote_url("https://id.example/jwks").is_ok());
+        assert!(check_remote_url("http://127.0.0.1:8080/jwks").is_ok());
+        assert!(check_remote_url("http://localhost/jwks").is_ok());
+        assert!(check_remote_url("http://[::1]/jwks").is_ok());
+        assert!(check_remote_url("http://id.example/jwks").is_err());
+        assert!(check_remote_url("http://127.0.0.1.evil.example/jwks").is_err());
+        assert!(check_remote_url("ftp://id.example/jwks").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_discovered_jwks_uri_is_never_read_as_a_file() {
+        let app = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(|| async { r#"{"jwks_uri":"/etc/hostname"}"# }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cfg = dev_issuer("unused");
+        cfg.issuer = issuer;
+        cfg.jwks_url = None;
+        let http = reqwest::Client::new();
+        let e = fetch_keys(&http, &cfg).await.err().unwrap();
+        assert!(format!("{e:#}").contains("non-http jwks_uri"), "{e:#}");
+    }
+
+    #[test]
+    fn a_token_without_aud_is_rejected() {
+        let cfg = dev_issuer("unused");
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &serde_json::json!({"iss": cfg.issuer, "sub": "ci", "exp": 4_102_444_800_u64}),
+            &jsonwebtoken::EncodingKey::from_secret(b"k"),
+        )
+        .unwrap();
+        let mut validation = validation_for(&cfg);
+        validation.algorithms = vec![Algorithm::HS256];
+        assert!(
+            jsonwebtoken::decode::<Claims>(&token, &DecodingKey::from_secret(b"k"), &validation)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn job_workflow_refs_gate_when_configured() {
         let mut cfg = github("1234", &[]);
         cfg.job_workflow_refs = vec![
@@ -563,6 +708,7 @@ mod tests {
         ];
         let with_ref = |r: Option<&str>| {
             let mut c = claims(Some("1234"), None, &[]);
+            c.repository = r.map(|r| r.split('/').take(2).collect::<Vec<_>>().join("/"));
             c.job_workflow_ref = r.map(str::to_owned);
             authorize(&cfg, &c)
         };
