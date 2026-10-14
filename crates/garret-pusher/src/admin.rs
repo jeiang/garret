@@ -20,16 +20,26 @@ use tokio::{
 
 use crate::{AppState, fsck, gc::Gc};
 
-pub async fn serve(path: String, state: Arc<AppState>, gc: Option<Arc<Gc>>) -> Result<()> {
+/// Binds the admin socket (0600), replacing a stale one, so a bind failure
+/// fails startup instead of a background task.
+pub fn bind(path: &str) -> Result<UnixListener> {
     // A socket left behind by a crashed process would block the bind.
-    let _ = std::fs::remove_file(&path);
-    if let Some(parent) = std::path::Path::new(&path).parent() {
+    let _ = std::fs::remove_file(path);
+    if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    let listener = UnixListener::bind(&path).with_context(|| format!("binding {path}"))?;
-    restrict(&path)?;
+    let listener = UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
+    restrict(path)?;
     tracing::info!("admin socket listening on {path}");
+    Ok(listener)
+}
 
+/// Accept loop over a socket from [`bind`].
+pub async fn serve(
+    listener: UnixListener,
+    state: Arc<AppState>,
+    gc: Option<Arc<Gc>>,
+) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let (state, gc) = (state.clone(), gc.clone());
