@@ -126,6 +126,19 @@ impl std::fmt::Display for ClientBodyError {
 
 impl std::error::Error for ClientBodyError {}
 
+/// The body is larger than the caller allows for its claimed size: a client
+/// error that retrying cannot fix, unlike [`ClientBodyError`].
+#[derive(Debug)]
+pub struct BodyOverLimit(pub String);
+
+impl std::fmt::Display for BodyOverLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BodyOverLimit {}
+
 /// The body's next chunk, or a [`ClientBodyError`] once it has sent nothing
 /// for [`BODY_IDLE_TIMEOUT`].
 pub async fn next_chunk<S: Stream + Unpin>(body: &mut S) -> Result<Option<S::Item>> {
@@ -317,7 +330,7 @@ impl Storage {
                 },
             };
             if more {
-                return Err(anyhow::Error::new(ClientBodyError(format!(
+                return Err(anyhow::Error::new(BodyOverLimit(format!(
                     "upload body exceeds the {reserve}-byte limit for its size"
                 ))));
             }

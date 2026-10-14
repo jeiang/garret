@@ -319,6 +319,9 @@ impl IntoResponse for Error {
 /// fresh id and the caller gets only the id to quote back.
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
+        if let Some(over) = e.downcast_ref::<storage::BodyOverLimit>() {
+            return Error(StatusCode::BAD_REQUEST, over.to_string());
+        }
         let id = format!("{:016x}", fastrand::u64(..));
         // A sender that stalled or dropped mid-body failed; the server did
         // not. Same id and 500, but a warning rather than an error.

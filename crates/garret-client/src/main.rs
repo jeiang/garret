@@ -156,6 +156,9 @@ async fn main() -> Result<()> {
     // timeout cannot tell a slow upload from a stuck one.
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        // The servers close connections idle for 30 s; retire pooled ones
+        // first so an upload is never sent on a connection mid-close.
+        .pool_idle_timeout(Duration::from_secs(20))
         .build()?;
 
     match cli.command {
