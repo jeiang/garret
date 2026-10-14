@@ -84,7 +84,10 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
     // Actions) is told apart from a human's stored login by the config on
     // disk — `GARRET_TOKEN` in the environment alone says nothing about it.
     let tokens = auth::TokenSource::for_config(http, cfg);
-    let device_flow = is_device_flow(cfg, std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some());
+    let device_flow = is_device_flow(
+        cfg,
+        std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some(),
+    );
 
     let discovered = match discovery::fetch(http, &cfg.endpoint).await {
         Ok(d) => {
@@ -551,7 +554,10 @@ mod tests {
     fn keys_are_checked_unless_a_machine_config_has_none() {
         let mut c = cfg();
         assert!(keys_checked(&c, true));
-        assert!(keys_checked(&c, false), "a machine config with keys is checked");
+        assert!(
+            keys_checked(&c, false),
+            "a machine config with keys is checked"
+        );
         c.public_keys.clear();
         assert!(keys_checked(&c, true));
         assert!(!keys_checked(&c, false));
