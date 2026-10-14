@@ -321,27 +321,24 @@ pub fn get_object_and_last_accessed(
                     sigs, pushed_by, last_accessed_at
              FROM objects WHERE store_path_hash = ?1",
         )?
-        .query_row(
-            params![hash],
-            |row| {
-                let obj = Object {
-                    store_path_hash: hash.to_owned(),
-                    store_path: row.get(0)?,
-                    name: row.get(1)?,
-                    nar_hash: row.get(2)?,
-                    nar_size: row.get(3)?,
-                    file_hash: row.get(4)?,
-                    file_size: row.get(5)?,
-                    deriver: row.get(6)?,
-                    ca: row.get(7)?,
-                    references: Vec::new(),
-                    sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
-                        .unwrap_or_default(),
-                    pushed_by: row.get(9)?,
-                };
-                Ok((obj, row.get(10)?))
-            },
-        )
+        .query_row(params![hash], |row| {
+            let obj = Object {
+                store_path_hash: hash.to_owned(),
+                store_path: row.get(0)?,
+                name: row.get(1)?,
+                nar_hash: row.get(2)?,
+                nar_size: row.get(3)?,
+                file_hash: row.get(4)?,
+                file_size: row.get(5)?,
+                deriver: row.get(6)?,
+                ca: row.get(7)?,
+                references: Vec::new(),
+                sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
+                    .unwrap_or_default(),
+                pushed_by: row.get(9)?,
+            };
+            Ok((obj, row.get(10)?))
+        })
         .optional()?;
 
     if let Some((obj, _)) = obj.as_mut() {
@@ -591,7 +588,9 @@ pub fn bump_last_accessed<S: AsRef<str>>(
 /// under the Puller's deep-readiness probe. `None` on an empty cache.
 pub fn most_recently_accessed(conn: &Connection) -> Result<Option<String>> {
     Ok(conn
-        .prepare_cached("SELECT store_path_hash FROM objects ORDER BY last_accessed_at DESC LIMIT 1")?
+        .prepare_cached(
+            "SELECT store_path_hash FROM objects ORDER BY last_accessed_at DESC LIMIT 1",
+        )?
         .query_row([], |row| row.get(0))
         .optional()?)
 }

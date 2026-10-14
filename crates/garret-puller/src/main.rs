@@ -430,11 +430,7 @@ async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
     };
     match cached_probe(&state.read_probe, READ_PROBE_TTL, probe).await {
         Ok(()) => (StatusCode::OK, "ready").into_response(),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "S3 read path failing",
-        )
-            .into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "S3 read path failing").into_response(),
     }
 }
 
@@ -569,8 +565,7 @@ async fn require_browse_oidc(
             } else {
                 "token_rejected"
             };
-            metrics::counter!("garret_browse_auth_failures_total", "reason" => reason)
-                .increment(1);
+            metrics::counter!("garret_browse_auth_failures_total", "reason" => reason).increment(1);
             (
                 StatusCode::UNAUTHORIZED,
                 [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],

@@ -825,7 +825,10 @@ mod tests {
             describe_body(r#"{"error":"invalid_grant","error_description":"token revoked"}"#),
             "invalid_grant: token revoked"
         );
-        assert_eq!(describe_body(r#"{"error":"invalid_client"}"#), "invalid_client");
+        assert_eq!(
+            describe_body(r#"{"error":"invalid_client"}"#),
+            "invalid_client"
+        );
         assert_eq!(describe_body("  plain failure \n"), "plain failure");
         assert!(describe_body(&"x".repeat(1000)).chars().count() <= 301);
     }

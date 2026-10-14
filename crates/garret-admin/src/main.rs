@@ -246,7 +246,11 @@ async fn main() -> Result<()> {
                     for basename in &objects {
                         println!("{verb} {basename}");
                     }
-                    println!("{verb} {} object(s), {}", objects.len(), human_bytes(bytes_freed));
+                    println!(
+                        "{verb} {} object(s), {}",
+                        objects.len(),
+                        human_bytes(bytes_freed)
+                    );
                 }
                 other => print_unexpected(other),
             }
@@ -375,7 +379,11 @@ async fn main() -> Result<()> {
                     for basename in &pruned {
                         println!("{verb} {basename}");
                     }
-                    println!("{verb} {} object(s), {}", pruned.len(), human_bytes(bytes_freed));
+                    println!(
+                        "{verb} {} object(s), {}",
+                        pruned.len(),
+                        human_bytes(bytes_freed)
+                    );
                 }
                 other => print_unexpected(other),
             }
@@ -389,7 +397,9 @@ async fn main() -> Result<()> {
                 .context("backup path is not UTF-8")?
                 .to_owned();
             match request(&cli.socket, Request::Backup { path: path.clone() }).await? {
-                Response::Backup { bytes } => println!("wrote {path} ({})", human_bytes(bytes as i64)),
+                Response::Backup { bytes } => {
+                    println!("wrote {path} ({})", human_bytes(bytes as i64))
+                }
                 other => print_unexpected(other),
             }
         }

@@ -85,7 +85,7 @@ pub async fn track_http(request: Request, next: Next) -> Response {
     let status = status_class(response.status().as_u16());
     metrics::counter!(
         "garret_http_requests_total",
-        "route" => route.clone(), "method" => method.clone(), "status" => status,
+        "route" => route.clone(), "method" => method, "status" => status,
     )
     .increment(1);
     metrics::histogram!(
@@ -135,8 +135,7 @@ fn record_process_metrics() {
             let f: Vec<&str> = rest.split_whitespace().collect();
             let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok());
             if let (Some(utime), Some(stime)) = (ticks(11), ticks(12)) {
-                metrics::gauge!("process_cpu_seconds_total")
-                    .set((utime + stime) / TICKS_PER_SEC);
+                metrics::gauge!("process_cpu_seconds_total").set((utime + stime) / TICKS_PER_SEC);
             }
             let boot = fs::read_to_string("/proc/stat").ok().and_then(|s| {
                 s.lines()

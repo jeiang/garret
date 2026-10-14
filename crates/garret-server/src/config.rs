@@ -274,10 +274,16 @@ impl PusherConfig {
             }
             let in_range = |w: f64| w > 0.0 && w <= 1.0;
             if !in_range(gc.high_watermark) {
-                bail!("gc.high_watermark must be in (0, 1], got {}", gc.high_watermark);
+                bail!(
+                    "gc.high_watermark must be in (0, 1], got {}",
+                    gc.high_watermark
+                );
             }
             if !in_range(gc.low_watermark) {
-                bail!("gc.low_watermark must be in (0, 1], got {}", gc.low_watermark);
+                bail!(
+                    "gc.low_watermark must be in (0, 1], got {}",
+                    gc.low_watermark
+                );
             }
             if gc.low_watermark >= gc.high_watermark {
                 bail!(
@@ -431,18 +437,39 @@ mod validate_tests {
             |c| c.limits.max_in_flight_bytes = c.limits.part_size as u64 - 1,
             "max_in_flight_bytes",
         );
-        rejects(|c| c.limits.max_concurrent_uploads = 0, "max_concurrent_uploads");
+        rejects(
+            |c| c.limits.max_concurrent_uploads = 0,
+            "max_concurrent_uploads",
+        );
         rejects(|c| c.limits.max_parts_in_flight = 0, "max_parts_in_flight");
     }
 
     #[test]
     fn gc_and_s3_boundaries() {
-        rejects(|c| c.gc.as_mut().unwrap().interval_secs = 0, "interval_secs");
-        rejects(|c| c.s3.operation_timeout_secs = 0, "operation_timeout_secs");
-        rejects(|c| c.gc.as_mut().unwrap().high_watermark = 0.0, "high_watermark");
-        rejects(|c| c.gc.as_mut().unwrap().high_watermark = 1.01, "high_watermark");
-        rejects(|c| c.gc.as_mut().unwrap().low_watermark = 0.0, "low_watermark");
-        rejects(|c| c.gc.as_mut().unwrap().low_watermark = f64::NAN, "low_watermark");
+        rejects(
+            |c| c.gc.as_mut().unwrap().interval_secs = 0,
+            "interval_secs",
+        );
+        rejects(
+            |c| c.s3.operation_timeout_secs = 0,
+            "operation_timeout_secs",
+        );
+        rejects(
+            |c| c.gc.as_mut().unwrap().high_watermark = 0.0,
+            "high_watermark",
+        );
+        rejects(
+            |c| c.gc.as_mut().unwrap().high_watermark = 1.01,
+            "high_watermark",
+        );
+        rejects(
+            |c| c.gc.as_mut().unwrap().low_watermark = 0.0,
+            "low_watermark",
+        );
+        rejects(
+            |c| c.gc.as_mut().unwrap().low_watermark = f64::NAN,
+            "low_watermark",
+        );
         rejects(
             |c| c.gc.as_mut().unwrap().low_watermark = c.gc.as_ref().unwrap().high_watermark,
             "low_watermark",
@@ -455,7 +482,6 @@ mod validate_tests {
         c.validate().unwrap();
     }
 }
-
 
 #[cfg(test)]
 mod strictness_tests {

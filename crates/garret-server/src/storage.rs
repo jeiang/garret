@@ -304,7 +304,14 @@ impl Storage {
                 permit.merge(limits.acquire_units(extra).await?);
             }
             first.reserve(limits.part_size - first.len());
-            fill_part(&mut first, &mut body, &mut carry, limits.part_size, &mut hasher).await?;
+            fill_part(
+                &mut first,
+                &mut body,
+                &mut carry,
+                limits.part_size,
+                &mut hasher,
+            )
+            .await?;
         }
         let first = first.freeze();
         total += first.len() as i64;
@@ -672,7 +679,10 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(hasher.finalize().as_slice(), Sha256::digest(&whole).as_slice());
+            assert_eq!(
+                hasher.finalize().as_slice(),
+                Sha256::digest(&whole).as_slice()
+            );
             sizes
         })
     }
@@ -868,10 +878,7 @@ mod tests {
         let storage = fake_s3().await;
         let limits = UploadLimits::new(1024 * 1024, 4, 1024 * 1024);
         // Another upload holds all but two units of the one-part budget.
-        let held = limits
-            .acquire_units(limits.total_units - 2)
-            .await
-            .unwrap();
+        let held = limits.acquire_units(limits.total_units - 2).await.unwrap();
         let body = vec![7u8; 1000];
         let stored = tokio::time::timeout(
             Duration::from_secs(5),
@@ -902,7 +909,12 @@ mod tests {
             .map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c)))
             .collect();
         let stored = storage
-            .put_streaming(&key_for("grown"), futures::stream::iter(chunks), &limits, 100)
+            .put_streaming(
+                &key_for("grown"),
+                futures::stream::iter(chunks),
+                &limits,
+                100,
+            )
             .await
             .unwrap();
         assert_eq!(stored, (Sha256::digest(&body).to_vec(), 2500));

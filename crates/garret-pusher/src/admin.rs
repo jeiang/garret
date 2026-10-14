@@ -186,7 +186,7 @@ async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<Re
         keys.push(garret_server::storage::key_for(hash));
     }
 
-    if !keys.is_empty() {
+    if !dry_run && !keys.is_empty() {
         state.storage.delete_objects(&keys).await?;
     }
     Ok(Response::Delete {
@@ -600,10 +600,20 @@ mod tests {
         let conn = state.conn.lock();
         assert_eq!(db::get_object(&conn, &good).unwrap().unwrap().sigs.len(), 2);
         assert_eq!(
-            db::get_object(&conn, &tampered).unwrap().unwrap().sigs.len(),
+            db::get_object(&conn, &tampered)
+                .unwrap()
+                .unwrap()
+                .sigs
+                .len(),
             1
         );
-        assert!(db::get_object(&conn, &unsigned).unwrap().unwrap().sigs.is_empty());
+        assert!(
+            db::get_object(&conn, &unsigned)
+                .unwrap()
+                .unwrap()
+                .sigs
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -617,7 +627,9 @@ mod tests {
             deleted,
             bytes_freed,
             missing: gone,
-        } = delete(&state, &[a.clone(), missing.clone()], true).await.unwrap()
+        } = delete(&state, &[a.clone(), missing.clone()], true)
+            .await
+            .unwrap()
         else {
             panic!("not a delete response");
         };

@@ -198,7 +198,10 @@ async fn pull_check(
     let Some(puller) = cfg.puller_endpoint.as_deref() else {
         return Check::fail(
             "pull",
-            format!("no `puller_endpoint` in the config — {}", fix_hint(device_flow)),
+            format!(
+                "no `puller_endpoint` in the config — {}",
+                fix_hint(device_flow)
+            ),
         );
     };
 

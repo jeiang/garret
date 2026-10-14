@@ -582,7 +582,10 @@ async fn store_upload(
     object.file_size = file_size;
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
     let at = now();
-    db_run(&state.conn, move |conn| db::insert_object(conn, &object, at)).await?;
+    db_run(&state.conn, move |conn| {
+        db::insert_object(conn, &object, at)
+    })
+    .await?;
     Ok(file_size)
 }
 

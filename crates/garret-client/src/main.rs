@@ -7,6 +7,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use garret_client::{auth, browse, config, discovery, doctor, nixconf, push, watcher};
 use garret_common::human_bytes;
 use indicatif::MultiProgress;
+use serde_json::json;
 
 #[derive(Parser)]
 #[command(
@@ -279,7 +280,9 @@ async fn main() -> Result<()> {
             pusher.tokens.get().await?;
             let watcher = watcher::Watcher {
                 nix_db: cfg.watch.nix_db.clone(),
-                cursor_path: cursor.unwrap_or_else(|| cfg.watch.cursor_path.clone()).into(),
+                cursor_path: cursor
+                    .unwrap_or_else(|| cfg.watch.cursor_path.clone())
+                    .into(),
                 poll_interval: Duration::from_secs(cfg.watch.poll_interval_secs),
                 filters: watcher::Filters {
                     // `[watch]` may override the client-wide upstream list.
@@ -292,7 +295,9 @@ async fn main() -> Result<()> {
                     own_keys: cfg.public_keys.clone(),
                 },
                 max_attempts: cfg.watch.max_attempts,
-                socket_path: socket.unwrap_or_else(|| cfg.watch.socket_path.clone()).into(),
+                socket_path: socket
+                    .unwrap_or_else(|| cfg.watch.socket_path.clone())
+                    .into(),
             };
             if !drain {
                 watcher.run(&pusher, full_sync).await?;
