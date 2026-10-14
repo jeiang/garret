@@ -35,12 +35,12 @@ Pusher runs).
 |---|---|
 | `key generate` | offline — writes nix-format keypair file, created mode 0600; never overwrites |
 | `key show` | offline — prints public key for nix.conf |
-| `resign` | socket — backfill signatures after adding a key |
+| `resign` | socket — backfill signatures after adding a key; a row is re-signed only if one of its existing signatures verifies under a configured key, otherwise it is refused and counted (`refused`), so tampered metadata is never given a valid signature |
 | `gc run` | socket — trigger a GC pass |
 | `status` | socket — object count, usage vs quota, in-flight uploads |
 | `fsck [--repair] [--verify-sizes] [--quiesce] [--json]` | socket — audit row⇔blob consistency, optionally repair |
-| `delete <hash>...` | socket — remove objects, row then blob, whatever still references them |
-| `delete --pushed-by <subject> [--since <YYYY-MM-DD\|age>] [--apply]` | socket — incident response: every object that subject (`<issuer>#<sub>`, as browse shows `pushed_by`) first pushed, at or after the cutoff; lists them, and deletes through the same path as `delete` only with `--apply` |
+| `delete <hash>... [--apply]` | socket — remove objects, row then blob, whatever still references them; dry-run (lists what would go) unless `--apply` |
+| `delete --pushed-by <subject> [--since <YYYY-MM-DD\|age>] [--apply]` | socket — incident response: every object that subject (`<issuer>#<sub>`, as browse shows `pushed_by`) first pushed, at or after the cutoff; lists them, and deletes through the same path as `delete` only with `--apply` (dry-run by default, like `delete`) |
 | `pin <name> <hash> [--expires <duration>]` | socket — GC-exempt root, closure-protecting (spec 05) |
 | `unpin <name>` | socket — remove a pin; unknown name is an error |
 | `prune --before <YYYY-MM-DD\|age> [--apply]` | socket — delete closures last pushed before the cutoff, keeping what newer pushes and pins need (spec 05); dry-run unless `--apply` |

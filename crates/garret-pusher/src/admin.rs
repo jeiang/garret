@@ -79,8 +79,8 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
                 message: "no [gc] section is configured".into(),
             }),
         },
-        Request::Resign => resign(state).map(|resigned| Response::Resign { resigned }),
-        Request::Delete { hashes } => delete(state, &hashes).await,
+        Request::Resign => resign(state),
+        Request::Delete { hashes, dry_run } => delete(state, &hashes, dry_run).await,
         Request::Pin {
             name,
             hash,
@@ -136,14 +136,20 @@ fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
 /// Deliberately unconditional -- it does not check whether anything still
 /// references the object. GC decides by reachability; this is the operator
 /// saying "remove it regardless", which is the whole reason it exists.
-async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
+async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<Response> {
     let mut seen = HashSet::new();
     let hashes: Vec<&str> = hashes
         .iter()
         .map(String::as_str)
         .filter(|hash| seen.insert(*hash))
         .collect();
-    let _claims = claim_deletions(&state.in_flight, &hashes)?;
+    // A dry run deletes nothing, so it claims nothing and cannot collide with
+    // an upload or a GC pass.
+    let _claims = if dry_run {
+        Vec::new()
+    } else {
+        claim_deletions(&state.in_flight, &hashes)?
+    };
     let mut deleted = 0;
     let mut bytes_freed = 0;
     let mut missing = Vec::new();
@@ -158,7 +164,10 @@ async fn delete(state: &AppState, hashes: &[String]) -> Result<Response> {
             missing.push(hash.to_owned());
             continue;
         }
-        let freed = {
+        let freed = if dry_run {
+            let conn = state.conn.lock();
+            db::get_object(&conn, hash)?.map_or(0, |object| object.file_size)
+        } else {
             let mut conn = state.conn.lock();
             db::delete_object(&mut conn, hash)?
         };
@@ -198,7 +207,7 @@ async fn delete_pushed_by(
             bytes_freed,
             missing,
             ..
-        } = delete(state, &hashes).await?
+        } = delete(state, &hashes, false).await?
         else {
             bail!("delete answered with something other than Response::Delete");
         };
@@ -302,21 +311,32 @@ fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> 
 
 /// Backfills signatures after a key is added, so both the old and new key
 /// appear on every object during an overlap rotation (spec 10-packaging).
-fn resign(state: &AppState) -> Result<usize> {
+///
+/// A row is re-signed only if one of its existing signatures verifies under a
+/// configured key: re-signing blindly would turn tampered metadata (a database
+/// write by anything that can reach the file) into a valid signature. Rows that
+/// fail are counted as refused and left untouched.
+fn resign(state: &AppState) -> Result<Response> {
     let mut conn = state.conn.lock();
     let hashes = db::all_hashes(&conn)?;
     let mut resigned = 0;
+    let mut refused = 0;
     for hash in hashes {
         let Some(object) = db::get_object(&conn, &hash)? else {
             continue;
         };
+        if !narinfo::verify(&object, &state.store_dir, &state.keys) {
+            tracing::warn!(hash, "refusing to re-sign: no existing signature verifies");
+            refused += 1;
+            continue;
+        }
         let sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
         if sigs != object.sigs {
             db::update_sigs(&mut conn, &hash, &sigs)?;
             resigned += 1;
         }
     }
-    Ok(resigned)
+    Ok(Response::Resign { resigned, refused })
 }
 
 /// The online backup: a consistent copy of the whole database, taken while
@@ -500,7 +520,7 @@ mod tests {
         let state = test_state(conn).await;
         let _gc = state.in_flight.claim(&b, Kind::Delete).unwrap();
 
-        let err = delete(&state, &[a.clone(), a.clone(), b.clone()])
+        let err = delete(&state, &[a.clone(), a.clone(), b.clone()], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains(&b), "{err:#}");
@@ -522,6 +542,76 @@ mod tests {
         };
         assert_eq!(pruned, vec![format!("{a}-thing")]);
         assert!(prune(&state, before, false).await.is_err());
+        assert!(db::exists(&state.conn.lock(), &a).unwrap());
+    }
+
+    /// A signing key from base64 of a 64-byte keypair; `parse` uses only the
+    /// first 32 bytes (the seed), so any 64 bytes do.
+    fn signing_key(name: &str, b64: &str) -> narinfo::SigningKeyFile {
+        narinfo::SigningKeyFile::parse(&format!("{name}:{b64}")).unwrap()
+    }
+
+    // 64 bytes of 0x00 and of 0x01.
+    fn key_one() -> narinfo::SigningKeyFile {
+        signing_key("test-1", &format!("{}==", "A".repeat(86)))
+    }
+
+    fn key_two() -> narinfo::SigningKeyFile {
+        signing_key("test-2", &format!("{}AQ==", "AQEB".repeat(21)))
+    }
+
+    /// A row whose metadata was altered after signing must not be re-signed:
+    /// that would mint a valid signature over the alteration.
+    #[tokio::test]
+    async fn resign_refuses_rows_that_do_not_verify() {
+        let (good, tampered, unsigned) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        let key = key_one();
+        let mut conn = open_db();
+        for h in [&good, &tampered, &unsigned] {
+            let mut obj = object(h);
+            if h != &unsigned {
+                obj.sigs = narinfo::sign(&obj, "/nix/store", std::slice::from_ref(&key)).unwrap();
+            }
+            db::insert_object(&mut conn, &obj, 100).unwrap();
+        }
+        conn.execute(
+            "UPDATE objects SET nar_hash = 'sha256:evil' WHERE store_path_hash = ?1",
+            [&tampered],
+        )
+        .unwrap();
+        // A second key joins: the good row must pick up its signature too.
+        let mut state = test_state(conn).await;
+        Arc::get_mut(&mut state).unwrap().keys = vec![key, key_two()];
+
+        let Response::Resign { resigned, refused } = resign(&state).unwrap() else {
+            panic!("not a resign response");
+        };
+        assert_eq!((resigned, refused), (1, 2));
+        let conn = state.conn.lock();
+        assert_eq!(db::get_object(&conn, &good).unwrap().unwrap().sigs.len(), 2);
+        assert_eq!(
+            db::get_object(&conn, &tampered).unwrap().unwrap().sigs.len(),
+            1
+        );
+        assert!(db::get_object(&conn, &unsigned).unwrap().unwrap().sigs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_delete_reports_without_deleting() {
+        let (a, missing) = ("a".repeat(32), "z".repeat(32));
+        let mut conn = open_db();
+        db::insert_object(&mut conn, &object(&a), 100).unwrap();
+        let state = test_state(conn).await;
+
+        let Response::Delete {
+            deleted,
+            bytes_freed,
+            missing: gone,
+        } = delete(&state, &[a.clone(), missing.clone()], true).await.unwrap()
+        else {
+            panic!("not a delete response");
+        };
+        assert_eq!((deleted, bytes_freed, gone), (1, 5, vec![missing]));
         assert!(db::exists(&state.conn.lock(), &a).unwrap());
     }
 }

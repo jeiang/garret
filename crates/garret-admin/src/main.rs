@@ -9,7 +9,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
-use garret_common::admin::{Request, Response};
+use garret_common::{
+    admin::{Request, Response},
+    human_bytes,
+};
 use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -60,8 +63,8 @@ enum Command {
         /// (`2026-06-01`) or an age (`36h`)
         #[arg(long, requires = "pushed_by", conflicts_with = "hashes")]
         since: Option<String>,
-        /// Delete; without this, `--pushed-by` only lists what would go
-        #[arg(long, requires = "pushed_by", conflicts_with = "hashes")]
+        /// Delete; without this, only list what would go
+        #[arg(long)]
         apply: bool,
     },
     /// Pin an object's closure as a GC-exempt root (spec 05)
@@ -169,11 +172,11 @@ async fn main() -> Result<()> {
                 match quota_bytes {
                     Some(quota) => println!(
                         "usage:             {} of {} ({:.1}%)",
-                        human(total_bytes),
-                        human(quota as i64),
+                        human_bytes(total_bytes),
+                        human_bytes(quota as i64),
                         100.0 * total_bytes as f64 / quota as f64
                     ),
-                    None => println!("usage:             {} (no quota)", human(total_bytes)),
+                    None => println!("usage:             {} (no quota)", human_bytes(total_bytes)),
                 }
                 println!("uploads in flight: {uploads_in_flight}");
             }
@@ -190,7 +193,7 @@ async fn main() -> Result<()> {
             } => {
                 println!(
                     "evicted {evicted} object(s), freeing {}",
-                    human(bytes_freed)
+                    human_bytes(bytes_freed)
                 );
                 if candidates_exhausted {
                     println!(
@@ -203,7 +206,15 @@ async fn main() -> Result<()> {
         },
 
         Command::Resign => match request(&cli.socket, Request::Resign).await? {
-            Response::Resign { resigned } => println!("re-signed {resigned} object(s)"),
+            Response::Resign { resigned, refused } => {
+                println!("re-signed {resigned} object(s)");
+                if refused > 0 {
+                    println!(
+                        "refused {refused} object(s): no existing signature verifies under a \
+                         configured key (tampered or signed only by a key no longer configured)"
+                    );
+                }
+            }
             other => print_unexpected(other),
         },
 
@@ -235,20 +246,22 @@ async fn main() -> Result<()> {
                     for basename in &objects {
                         println!("{verb} {basename}");
                     }
-                    println!("{verb} {} object(s), {}", objects.len(), human(bytes_freed));
+                    println!("{verb} {} object(s), {}", objects.len(), human_bytes(bytes_freed));
                 }
                 other => print_unexpected(other),
             }
         }
 
-        Command::Delete { hashes, .. } => {
-            match request(&cli.socket, Request::Delete { hashes }).await? {
+        Command::Delete { hashes, apply, .. } => {
+            let dry_run = !apply;
+            match request(&cli.socket, Request::Delete { hashes, dry_run }).await? {
                 Response::Delete {
                     deleted,
                     bytes_freed,
                     missing,
                 } => {
-                    println!("deleted {deleted} object(s), {bytes_freed} byte(s) freed");
+                    let verb = if dry_run { "would delete" } else { "deleted" };
+                    println!("{verb} {deleted} object(s), {}", human_bytes(bytes_freed));
                     // Reported, not swallowed: a mistyped hash would otherwise
                     // look exactly like a successful delete.
                     if !missing.is_empty() {
@@ -362,7 +375,7 @@ async fn main() -> Result<()> {
                     for basename in &pruned {
                         println!("{verb} {basename}");
                     }
-                    println!("{verb} {} object(s), {}", pruned.len(), human(bytes_freed));
+                    println!("{verb} {} object(s), {}", pruned.len(), human_bytes(bytes_freed));
                 }
                 other => print_unexpected(other),
             }
@@ -376,7 +389,7 @@ async fn main() -> Result<()> {
                 .context("backup path is not UTF-8")?
                 .to_owned();
             match request(&cli.socket, Request::Backup { path: path.clone() }).await? {
-                Response::Backup { bytes } => println!("wrote {path} ({})", human(bytes as i64)),
+                Response::Backup { bytes } => println!("wrote {path} ({})", human_bytes(bytes as i64)),
                 other => print_unexpected(other),
             }
         }
@@ -485,35 +498,13 @@ fn write_secret(path: &std::path::Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-fn human(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
-}
-
-/// A store-path hash, given bare or as a store path (`/nix/store/<hash>-<name>`
-/// or `<hash>-<name>`). Anything else is refused here, so a typo cannot come
-/// back from the Pusher as "not in the cache".
+/// clap value parser over [`garret_common::parse_store_hash`]: a typo cannot
+/// come back from the Pusher as "not in the cache".
 fn parse_store_hash(text: &str) -> Result<String> {
-    let base = text
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or(text);
-    let hash = base.split('-').next().unwrap_or(base);
-    if !garret_common::is_store_hash(hash) {
-        bail!("{text:?} is not a store path or a 32-character store-path hash");
+    match garret_common::parse_store_hash(text) {
+        Some(hash) => Ok(hash.to_owned()),
+        None => bail!("{text:?} is not a store path or a 32-character store-path hash"),
     }
-    Ok(hash.to_owned())
 }
 
 /// `<number><s|m|h|d>` → seconds. ponytail: four suffixes cover release
@@ -568,30 +559,7 @@ fn parse_cutoff(text: &str, now: i64) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_cutoff, parse_duration, parse_store_hash, write_secret};
-
-    #[test]
-    fn store_paths_and_bare_hashes_name_the_same_object() {
-        let hash = "9anpmlwx6772cpf1782ilhwbjr1x0y47";
-        for arg in [
-            hash.to_owned(),
-            format!("{hash}-garret-deploy-check.txt"),
-            format!("/nix/store/{hash}-garret-deploy-check.txt"),
-            format!("/nix/store/{hash}-dir/"),
-        ] {
-            assert_eq!(parse_store_hash(&arg).unwrap(), hash, "{arg:?}");
-        }
-        for bad in [
-            "",
-            "/nix/store/",
-            "9anpmlwx6772cpf1782ilhwbjr1x0y4",
-            "9anpmlwx6772cpf1782ilhwbjr1x0y47x",
-            "eanpmlwx6772cpf1782ilhwbjr1x0y47",
-            "/nix/store/9anpmlwx",
-        ] {
-            assert!(parse_store_hash(bad).is_err(), "{bad:?} should be rejected");
-        }
-    }
+    use super::{parse_cutoff, parse_duration, write_secret};
 
     #[test]
     fn durations_parse_or_fail_loudly() {

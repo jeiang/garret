@@ -3,7 +3,8 @@
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+use std::fmt::Write as _;
 
 use crate::db::Object;
 
@@ -41,6 +42,28 @@ impl SigningKeyFile {
         )
     }
 
+    /// Whether `sig` (`<name>:<base64>`) is this key's signature over
+    /// `fingerprint`. A different key name, malformed base64 or a bad
+    /// signature all answer false.
+    fn verifies(&self, sig: &str, fingerprint: &str) -> bool {
+        let Some((name, b64)) = sig.split_once(':') else {
+            return false;
+        };
+        if name != self.name {
+            return false;
+        }
+        let Ok(bytes) = B64.decode(b64) else {
+            return false;
+        };
+        let Ok(sig) = Signature::from_slice(&bytes) else {
+            return false;
+        };
+        self.key
+            .verifying_key()
+            .verify(fingerprint.as_bytes(), &sig)
+            .is_ok()
+    }
+
     fn sign(&self, fingerprint: &str) -> String {
         format!(
             "{}:{}",
@@ -70,11 +93,7 @@ pub fn normalize_hash(hash: &str) -> Result<String> {
 
 fn normalize_digest(digest: &str) -> Result<String> {
     // 52 base32 characters is an already-canonical sha256.
-    if digest.len() == 52
-        && digest
-            .bytes()
-            .all(|b| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&b))
-    {
+    if digest.len() == 52 && garret_common::is_nix_base32(digest) {
         return Ok(digest.to_owned());
     }
     let bytes = B64
@@ -110,25 +129,47 @@ pub fn sign(obj: &Object, store_dir: &str, keys: &[SigningKeyFile]) -> Result<Ve
     Ok(keys.iter().map(|k| k.sign(&fp)).collect())
 }
 
+/// Whether at least one of the object's stored signatures verifies against
+/// its fingerprint under one of `keys` (their public halves). Used before
+/// re-signing: signing a row whose metadata was altered would turn the
+/// alteration into a valid signature.
+pub fn verify(obj: &Object, store_dir: &str, keys: &[SigningKeyFile]) -> bool {
+    let fp = fingerprint(obj, store_dir);
+    obj.sigs
+        .iter()
+        .any(|sig| keys.iter().any(|k| k.verifies(sig, &fp)))
+}
+
 /// Renders the narinfo body served by the Puller.
 pub fn render(obj: &Object) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("StorePath: {}\n", obj.store_path));
-    out.push_str(&format!("URL: nar/{}.nar.zst\n", obj.store_path_hash));
+    let mut out = String::with_capacity(
+        256 + obj.references.iter().map(|r| r.len() + 1).sum::<usize>()
+            + obj.sigs.iter().map(|s| s.len() + 6).sum::<usize>(),
+    );
+    // Writing to a String cannot fail.
+    let _ = writeln!(out, "StorePath: {}", obj.store_path);
+    let _ = writeln!(out, "URL: nar/{}.nar.zst", obj.store_path_hash);
     out.push_str("Compression: zstd\n");
-    out.push_str(&format!("FileHash: {}\n", obj.file_hash));
-    out.push_str(&format!("FileSize: {}\n", obj.file_size));
-    out.push_str(&format!("NarHash: {}\n", obj.nar_hash));
-    out.push_str(&format!("NarSize: {}\n", obj.nar_size));
-    out.push_str(&format!("References: {}\n", obj.references.join(" ")));
+    let _ = writeln!(out, "FileHash: {}", obj.file_hash);
+    let _ = writeln!(out, "FileSize: {}", obj.file_size);
+    let _ = writeln!(out, "NarHash: {}", obj.nar_hash);
+    let _ = writeln!(out, "NarSize: {}", obj.nar_size);
+    out.push_str("References: ");
+    for (i, r) in obj.references.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(r);
+    }
+    out.push('\n');
     if let Some(d) = &obj.deriver {
-        out.push_str(&format!("Deriver: {d}\n"));
+        let _ = writeln!(out, "Deriver: {d}");
     }
     if let Some(ca) = &obj.ca {
-        out.push_str(&format!("CA: {ca}\n"));
+        let _ = writeln!(out, "CA: {ca}");
     }
     for sig in &obj.sigs {
-        out.push_str(&format!("Sig: {sig}\n"));
+        let _ = writeln!(out, "Sig: {sig}");
     }
     out
 }
@@ -216,6 +257,32 @@ mod tests {
         assert!(normalize_hash("sha256-not-base64!!").is_err());
         // Right encoding, wrong length: must not silently produce a short hash.
         assert!(normalize_hash("sha256-YWJj").is_err());
+    }
+
+    fn test_key() -> SigningKeyFile {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let keypair: Vec<u8> = key
+            .to_bytes()
+            .iter()
+            .chain(key.verifying_key().to_bytes().iter())
+            .copied()
+            .collect();
+        SigningKeyFile::parse(&format!("test-1:{}", B64.encode(&keypair))).unwrap()
+    }
+
+    #[test]
+    fn verify_accepts_own_signature_and_rejects_tampering() {
+        let keys = [test_key()];
+        let mut obj = object();
+        obj.sigs = sign(&obj, "/nix/store", &keys).unwrap();
+        assert!(verify(&obj, "/nix/store", &keys));
+
+        obj.nar_hash = "sha256:1q6zw3dd7l2vnwk06rlnzwl8g1582sbagj6hccngspc7yvhrip52".into();
+        assert!(!verify(&obj, "/nix/store", &keys));
+
+        obj.sigs.clear();
+        assert!(!verify(&obj, "/nix/store", &keys));
+        assert!(!verify(&obj, "/nix/store", &[]));
     }
 
     #[test]
