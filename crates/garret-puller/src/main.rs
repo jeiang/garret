@@ -200,7 +200,7 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    garret_server::runtime::init_tracing();
     let path = std::env::args()
         .nth(1)
         .context("usage: garret-puller <config.toml>")?;
