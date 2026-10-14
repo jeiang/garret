@@ -25,6 +25,10 @@ labels, so each environment keeps its own file.
 | `nixos-x86_64-1cpu` | artemis, pinned to 1 CPU | 615 | 54 / 344 / 411 | 105 / 328 / 453 | 13.4k | 1.48 / 5.89 | 218 MiB | yes |
 | `nixos-x86_64-1cpu-896m` | artemis, 1 CPU + 896 MiB | 609 | 53 / 258 / 419 | 103 / 288 / 346 | 13.3k | 1.46 / 6.29 | 206 MiB | yes |
 
+The Pusher runs the default limits (256 MiB in-flight cap, 16 MiB parts, 4 parts
+in flight) except `max_concurrent_uploads`, raised from the default 16 to 32 so
+the 20 pushers are not shed.
+
 The RSS criterion (peak pusher RSS < 2x the 256 MiB in-flight cap, i.e.
 512 MiB) held in every configuration, with zero failed requests and zero
 shed retries throughout. A second pass of the artemis matrix and of the
