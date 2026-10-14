@@ -80,10 +80,11 @@ impl Check {
 /// caller always gets the whole picture before deciding the exit code.
 pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
-    // One provider for the run; a machine config (secret file, GARRET_TOKEN,
-    // GitHub Actions) is told apart from a human's stored login by what it is.
+    // One provider for the run. A machine config (secret file, GitHub
+    // Actions) is told apart from a human's stored login by the config on
+    // disk — `GARRET_TOKEN` in the environment alone says nothing about it.
     let tokens = auth::TokenSource::for_config(http, cfg);
-    let device_flow = tokens.as_ref().is_ok_and(auth::TokenSource::is_device_flow);
+    let device_flow = is_device_flow(cfg, std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some());
 
     let discovered = match discovery::fetch(http, &cfg.endpoint).await {
         Ok(d) => {
@@ -113,9 +114,10 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
                     ),
                 ),
             });
-            // Which keys nix trusts is a laptop's concern; a build machine
-            // pushes and never substitutes through `garret use`.
-            if device_flow {
+            // A machine config with no `public_keys` is a build host that
+            // pushes and never substitutes through `garret use`; anything
+            // that does carry keys has them checked.
+            if keys_checked(cfg, device_flow) {
                 let (status, detail) = keys_verdict(&cfg.public_keys, &d.public_keys);
                 checks.push(Check {
                     name: "keys",
@@ -126,7 +128,7 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
         }
         None => {
             checks.push(Check::skip("config"));
-            if device_flow {
+            if keys_checked(cfg, device_flow) {
                 checks.push(Check::skip("keys"));
             }
         }
@@ -392,6 +394,21 @@ fn cache_info_ok(body: &str) -> bool {
     body.lines().any(|l| l.starts_with("StoreDir:"))
 }
 
+/// Whether this config is a human's `garret login` config, as opposed to a
+/// machine's (a client secret file, or a GitHub Actions runner). Decided by
+/// the config and runner, never by `GARRET_TOKEN`, which a login config can
+/// be run under too.
+fn is_device_flow(cfg: &config::Config, github_actions: bool) -> bool {
+    cfg.oidc.client_secret_file.is_none() && !github_actions
+}
+
+/// The `keys` check runs for any config that has keys to verify, and for a
+/// device-flow config even without (that is itself a failure). Only a machine
+/// config with no keys — a build host that never substitutes — skips it.
+fn keys_checked(cfg: &config::Config, device_flow: bool) -> bool {
+    device_flow || !cfg.public_keys.is_empty()
+}
+
 /// What to do about a config that no longer matches the server. Only a
 /// device-flow config came from `garret login`, so only it is told to re-run
 /// it: a machine config is managed by hand or by the NixOS module.
@@ -517,5 +534,26 @@ mod tests {
         assert!(drift(&machine, &advertised(), false).is_empty());
         assert!(!fix_hint(false).contains("login"));
         assert!(fix_hint(true).contains("garret login --force"));
+    }
+
+    /// The classification reads the config, not the environment: a config
+    /// `garret login` wrote stays a login config under `GARRET_TOKEN`.
+    #[test]
+    fn a_config_is_a_machine_config_only_by_secret_file_or_github_actions() {
+        assert!(is_device_flow(&cfg(), false));
+        assert!(!is_device_flow(&cfg(), true));
+        let mut machine = cfg();
+        machine.oidc.client_secret_file = Some("/run/secrets/garret".into());
+        assert!(!is_device_flow(&machine, false));
+    }
+
+    #[test]
+    fn keys_are_checked_unless_a_machine_config_has_none() {
+        let mut c = cfg();
+        assert!(keys_checked(&c, true));
+        assert!(keys_checked(&c, false), "a machine config with keys is checked");
+        c.public_keys.clear();
+        assert!(keys_checked(&c, true));
+        assert!(!keys_checked(&c, false));
     }
 }

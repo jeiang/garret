@@ -562,12 +562,6 @@ impl TokenSource {
         Ok(Self::new(http, mint))
     }
 
-    /// Whether a human logged in with the device flow is behind this source —
-    /// the only case where `garret login` is the fix for an auth problem.
-    pub fn is_device_flow(&self) -> bool {
-        matches!(self.mint, Mint::Stored { .. })
-    }
-
     /// The token to send now, minted first if none is held or it has aged out.
     pub async fn get(&self) -> Result<String> {
         let mut held = self.held.lock().await;
@@ -800,10 +794,10 @@ mod tests {
             &select(&plain, None, true).unwrap().mint,
             Mint::Github { .. }
         ));
-        let stored = select(&plain, None, false).unwrap();
-        assert!(matches!(stored.mint, Mint::Stored { .. }));
-        assert!(stored.is_device_flow());
-        assert!(!select(&with_file, None, false).unwrap().is_device_flow());
+        assert!(matches!(
+            &select(&plain, None, false).unwrap().mint,
+            Mint::Stored { .. }
+        ));
         std::fs::remove_dir_all(&dir).ok();
     }
 
