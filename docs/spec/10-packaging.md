@@ -110,24 +110,46 @@ pusher and puller modules over Garage, and a builder whose watcher pushes a
 path the Puller then serves back, all under the sandbox below; it also checks
 the service-user boundary).
 
-Module option sketch (all under `services.garret.*`):
+Module options (all under `services.garret.*`; defaults in parentheses):
 
-- **pusher**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.{endpointUrl,
-  bucket, region, credentialsFile}`, `quota`, `watermarks.{high,low}`,
-  `limits.{maxConcurrentUploads, maxInFlightBytes}`, `oidc.{pocketId.{issuer,
-  audience}, github.{ownerId, refPatterns, refProtected, repositoryIds,
-  eventNames, jobWorkflowRefs}}`, `signingKeyFiles` (list — active +
-  retiring), `adminSocketPath`, `gcInterval`.
-- **puller**: `enable`, `port`, `metricsPort`, `dbPath`, `s3.*` (same),
-  `presignTtl` (default 1 h), `browse.oidc.{issuer, audience}`,
-  `bumpDebounce`, `dbReadBudgetMs` / `presignBudgetMs` (pull-path
-  degrade-to-miss budgets, spec 03; default 250 ms).
-- **watcher** (client machines): `enable`, `endpoint`,
-  `credentialsFile` (client id/secret), `filters.{excludePatterns,
-  upstreamKeys}`, `jobs`, `zstdLevel`, `fullSync`, `socketPath` (wake
-  socket, spec 06). Enabling the watcher also sets
+- **pusher**: `enable`, `package`, `listen` (`127.0.0.1:8080`),
+  `metricsListen` (`127.0.0.1:9091`), `dbPath`, `storeDir`,
+  `s3.{bucket, endpointUrl, region, pathStyle (true), operationTimeoutSeconds
+  (60), credentialsFile}`, `signingKeyFiles` (list — active + retiring),
+  `pullerEndpoint`, `quotaBytes` (null: no quota), `watermarks.{high (0.95),
+  low (0.85)}`, `gcIntervalSeconds` (300), `orphanGraceSeconds` (86400),
+  `limits.{maxConcurrentUploads (16), maxInFlightBytes (256 MiB), partSize
+  (16 MiB), maxPartsInFlight (4)}`, `oidc` (list of issuer submodules:
+  `issuer`, `audience`, `extra_audiences`, `client_id`, `jwks_url`,
+  `github_owner_id`, `ref_patterns`, `ref_protected`, `repository_ids`,
+  `event_names`, `job_workflow_refs`, `allowed_groups`), `adminSocketPath`
+  (`/run/garret/admin.sock`).
+- **puller**: `enable`, `package`, `listen` (`127.0.0.1:8081` — front it with
+  TLS), `metricsListen` (`127.0.0.1:9092`), `dbPath`, `storeDir`, `s3.*`
+  (same), `presignTtlSeconds` (3600), `bumpDebounceSeconds` (86400),
+  `dbWaitTimeoutSeconds` (300), `dbReadBudgetMs` / `presignBudgetMs`
+  (pull-path degrade-to-miss budgets, spec 03; 250 ms), `browseOidc.{issuer,
+  audience, jwks_url, allowed_groups}` (null: no browse API).
+- **watcher** (client machines): `enable`, `package`, `endpoint`,
+  `oidc.{issuer, clientId, audience, clientSecretFile}`, `nixDb`,
+  `cursorPath`, `pollIntervalSeconds` (30), `jobs` (8), `zstdLevel` (3),
+  `maxRetries` (5), `maxAttempts` (5), `fullSync`, `socketPath` (wake
+  socket, spec 06), `filters.{excludePatterns, upstreamKeys}`.
+  `oidc.clientSecretFile` replaces the old `credentialsFile`: it is a
+  root-owned file holding only the machine client's secret (the client id is
+  `oidc.clientId`). Enabling the watcher also sets
   `nix.settings.post-build-hook` to a wrapper running `garret enqueue`,
   so builds wake the watcher the moment they finish.
+
+The Pusher and Puller units are `Type=notify`: the binaries send `READY=1`
+once every listener is bound, so units ordered `After=` them (and the Puller
+after the Pusher) start only once the sockets accept connections. systemd's
+default `NotifyAccess` (the main process) suffices.
+
+**Sizing `MemoryMax`.** Set the Pusher's at no less than
+`2 × maxInFlightBytes + maxConcurrentUploads × 8 MiB` (zstd decoder window)
+`+ ~1 MiB × maxConcurrentUploads` (preamble), plus headroom for the process
+itself; the defaults need about 700 MiB.
 
 The pusher module also carries `pullerEndpoint` and a per-issuer `client_id`,
 both advertised by `/api/v1/discovery` so `garret login <pusher-url>` can write
@@ -181,7 +203,10 @@ cursor directory, plus `StateDirectory`/`RuntimeDirectory`),
 cgroup protections, no new namespaces, realtime or SUID/SGID files,
 `MemoryDenyWriteExecute`, native syscalls only, filtered to
 `@system-service` minus `@privileged` (a denied call fails with `EPERM`),
-address families limited to unix and IP, and `UMask=0077`. Files meant for
+address families limited to unix and IP, and `UMask=0077`. The Pusher and
+Puller units additionally set `ProtectProc=invisible`, `ProcSubset=pid`,
+`PrivateIPC` and `RemoveIPC` (the watcher does not: it runs `nix`, and keeps
+the default `/proc`). Files meant for
 another user get their mode set explicitly: the database files (0660) and
 the wake socket (0666).
 

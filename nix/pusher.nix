@@ -34,6 +34,7 @@ let
       inherit (cfg.s3) bucket region;
       endpoint_url = cfg.s3.endpointUrl;
       path_style = cfg.s3.pathStyle;
+      operation_timeout_secs = cfg.s3.operationTimeoutSeconds;
     };
     limits = {
       max_concurrent_uploads = cfg.limits.maxConcurrentUploads;
@@ -42,8 +43,9 @@ let
       max_parts_in_flight = cfg.limits.maxPartsInFlight;
     };
     oidc = cfg.oidc;
-  } // lib.optionalAttrs (cfg.quotaBytes != null) {
     gc = {
+      orphan_grace_secs = cfg.orphanGraceSeconds;
+    } // lib.optionalAttrs (cfg.quotaBytes != null) {
       quota_bytes = cfg.quotaBytes;
       high_watermark = cfg.watermarks.high;
       low_watermark = cfg.watermarks.low;
@@ -118,6 +120,7 @@ in
       };
       region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
       pathStyle = mkOption { type = types.bool; default = true; description = "Path-style addressing."; };
+      operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Per-operation S3 timeout."; };
       credentialsFile = mkOption {
         type = types.path;
         description = ''
@@ -162,10 +165,16 @@ in
 
     gcIntervalSeconds = mkOption { type = types.int; default = 300; description = "Seconds between GC ticks."; };
 
+    orphanGraceSeconds = mkOption {
+      type = types.int;
+      default = 86400;
+      description = "How long an unreferenced Blob is kept before GC may delete it.";
+    };
+
     limits = {
-      maxConcurrentUploads = mkOption { type = types.int; default = 32; description = "Past this, uploads are shed with 429."; };
-      maxInFlightBytes = mkOption { type = types.int; default = 2147483648; description = "Cap on buffered upload bytes."; };
-      partSize = mkOption { type = types.int; default = 67108864; description = "Multipart part size; also the single-PutObject threshold."; };
+      maxConcurrentUploads = mkOption { type = types.int; default = 16; description = "Past this, uploads are shed with 429."; };
+      maxInFlightBytes = mkOption { type = types.int; default = 268435456; description = "Cap on buffered upload bytes."; };
+      partSize = mkOption { type = types.int; default = 16777216; description = "Multipart part size; also the single-PutObject threshold."; };
       maxPartsInFlight = mkOption { type = types.int; default = 4; description = "Concurrent parts per upload."; };
     };
 
@@ -229,6 +238,14 @@ in
         ExecStart = "${cfg.package}/bin/garret-pusher ${configFile}";
         EnvironmentFile = cfg.s3.credentialsFile;
         Restart = "on-failure";
+        # Server daemons only (the watcher shares the rest of the sandbox):
+        # hide other processes and SysV IPC.
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        PrivateIPC = true;
+        RemoveIPC = true;
+        # The binary signals READY=1 once every listener is bound.
+        Type = "notify";
         StateDirectory = "garret";
         # Group `garret` (the Puller) may reach the database, never create
         # files beside it.

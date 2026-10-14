@@ -15,6 +15,8 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
+        # Read by `option_env!("GARRET_REVISION")` for the reported build revision.
+        env.GARRET_REVISION = self.shortRev or self.dirtyShortRev or "unknown";
         # rusqlite is vendored (its `bundled` feature), so no system sqlite.
         nativeBuildInputs = [ pkgs.installShellFiles ];
         # Generating completions means *running* the binary we just built, which

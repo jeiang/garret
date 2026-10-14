@@ -19,11 +19,10 @@ start_garage 5G
 make_signing_key
 mint_dev_tokens
 
+# Default limits, except max_concurrent_uploads: the default (16) is below the
+# 20 seeding pushers, which would be shed with 429 instead of just seeding.
 write_configs "[limits]
-part_size = 16777216
-max_parts_in_flight = 4
-max_concurrent_uploads = 32
-max_in_flight_bytes = 268435456"
+max_concurrent_uploads = 32"
 build_binaries release garret-pusher garret-puller garret-bench
 start_services
 

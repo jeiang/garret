@@ -31,6 +31,7 @@ let
       inherit (cfg.s3) bucket region;
       endpoint_url = cfg.s3.endpointUrl;
       path_style = cfg.s3.pathStyle;
+      operation_timeout_secs = cfg.s3.operationTimeoutSeconds;
     };
   } // lib.optionalAttrs (cfg.browseOidc != null) { browse_oidc = cfg.browseOidc; };
 
@@ -46,7 +47,7 @@ in
       description = "The garret-puller package to run.";
     };
 
-    listen = mkOption { type = types.str; default = "0.0.0.0:8081"; description = "Public substituter listener."; };
+    listen = mkOption { type = types.str; default = "127.0.0.1:8081"; description = "Public substituter listener. Front it with TLS."; };
     metricsListen = mkOption { type = types.str; default = "127.0.0.1:9092"; description = "Internal metrics listener."; };
     dbPath = mkOption { type = types.str; default = "/var/lib/garret/garret.db"; description = "The Pusher's database."; };
     storeDir = mkOption { type = types.str; default = "/nix/store"; description = "Reported in nix-cache-info."; };
@@ -86,6 +87,7 @@ in
       endpointUrl = mkOption { type = types.nullOr types.str; default = null; description = "S3 endpoint."; };
       region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
       pathStyle = mkOption { type = types.bool; default = true; description = "Path-style addressing."; };
+      operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Per-operation S3 timeout."; };
       credentialsFile = mkOption {
         type = types.path;
         description = ''
@@ -128,6 +130,14 @@ in
         ExecStart = "${cfg.package}/bin/garret-puller ${configFile}";
         EnvironmentFile = cfg.s3.credentialsFile;
         Restart = "on-failure";
+        # Server daemons only (the watcher shares the rest of the sandbox):
+        # hide other processes and SysV IPC.
+        ProtectProc = "invisible";
+        ProcSubset = "pid";
+        PrivateIPC = true;
+        RemoveIPC = true;
+        # The binary signals READY=1 once every listener is bound.
+        Type = "notify";
         # Its own user, in group `garret` only to share the database
         # (ADR-0009): the signing keys and the admin socket are owner-only, so
         # the public-facing process can reach neither. No StateDirectory: the
