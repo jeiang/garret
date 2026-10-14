@@ -1,8 +1,6 @@
 //! Nix's base32 encoding, as narinfo hashes spell it. Store path hashes use
 //! the same alphabet; `garret_common::is_store_hash` checks those.
 
-const ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
-
 /// Encode bytes least-significant-group first, as `nix hash convert --to nix32` does.
 pub fn encode(bytes: &[u8]) -> String {
     if bytes.is_empty() {
@@ -20,7 +18,7 @@ pub fn encode(bytes: &[u8]) -> String {
                 (0, _) | (_, None) => 0,
                 (_, Some(next)) => next << (8 - j),
             };
-            ALPHABET[usize::from((lo | hi) & 0x1f)] as char
+            garret_common::NIX_BASE32_ALPHABET[usize::from((lo | hi) & 0x1f)] as char
         })
         .collect()
 }

@@ -28,3 +28,8 @@ modes are reasoned about is stable and nameable. Consequences: the Puller
 can still rewrite rows, which only moving the bumps behind the Pusher would
 close, and a database replaced or restored in place must lose its `-wal`
 and `-shm` too, or the next open replays the stale WAL over it.
+A writable database also means anything that can write the file can alter
+row metadata, so `garret-admin resign` re-signs a row only when one of its
+existing signatures verifies under a configured key; rows that fail (or carry
+no signatures) are refused and counted rather than laundered into a valid
+signature.
