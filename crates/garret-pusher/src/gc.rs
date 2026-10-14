@@ -64,10 +64,10 @@ impl Gc {
     /// high watermark (spec 05). A check that finds nothing to evict is a
     /// successful run too: the timestamp says GC is alive, not that it evicted.
     pub async fn tick(&self) -> Result<Option<PassResult>> {
-        let usage = {
-            let conn = self.conn.lock();
-            counted("pass", db::total_bytes(&conn))?
-        };
+        let usage = counted(
+            "pass",
+            crate::db_run(&self.conn, |conn| db::total_bytes(conn)).await,
+        )?;
         metrics::gauge!("garret_gc_usage_bytes").set(usage as f64);
         metrics::gauge!("garret_gc_quota_bytes").set(self.cfg.quota_bytes as f64);
 
@@ -93,17 +93,12 @@ impl Gc {
         let low = self.cfg.low();
 
         // Correct any drift before deciding how much to delete.
-        let mut usage = {
-            let conn = self.conn.lock();
-            db::reconcile_total_bytes(&conn)?
-        };
+        let mut usage = crate::db_run(&self.conn, |conn| db::reconcile_total_bytes(conn)).await?;
 
         while usage > low {
             let at = now();
-            let candidates = {
-                let conn = self.conn.lock();
-                db::evictable(&conn, BATCH, at)?
-            };
+            let candidates =
+                crate::db_run(&self.conn, move |conn| db::evictable(conn, BATCH, at)).await?;
             if candidates.is_empty() {
                 result.candidates_exhausted = true;
                 metrics::counter!("garret_gc_candidates_exhausted_total").increment(1);
@@ -132,10 +127,11 @@ impl Gc {
                 // for the sweep, never a row without a blob (spec 05). A
                 // candidate negotiated or referenced since the snapshot stays;
                 // the next query no longer returns it.
-                let Some(freed) = ({
-                    let mut conn = self.conn.lock();
-                    db::evict_object(&mut conn, hash, at)?
-                }) else {
+                let owned = hash.clone();
+                let Some(freed) =
+                    crate::db_run(&self.conn, move |conn| db::evict_object(conn, &owned, at))
+                        .await?
+                else {
                     continue;
                 };
                 usage -= freed;
@@ -179,10 +175,7 @@ impl Gc {
 
     async fn sweep(&self) -> Result<usize> {
         let grace = Duration::from_secs(self.cfg.orphan_grace_secs);
-        let known = {
-            let conn = self.conn.lock();
-            db::all_hashes(&conn)?
-        };
+        let known = crate::db_run(&self.conn, |conn| db::all_hashes(conn)).await?;
         let blobs = self.storage.list_blobs().await?;
         // Before the orphans are claimed: the abort skips in-flight paths.
         let aborted = self
@@ -196,21 +189,24 @@ impl Gc {
         // A path claimed elsewhere is skipped, and one whose row landed since
         // `known` was read is no orphan.
         let (orphans, claims) = {
-            let conn = self.conn.lock();
-            let mut orphans = Vec::new();
-            let mut claims = Vec::new();
-            for key in orphan_keys(&blobs, &known, &self.in_flight, grace) {
-                let hash = storage::hash_for(&key).unwrap_or_default();
-                let Ok(claim) = self.in_flight.claim(hash, inflight::Kind::Delete) else {
-                    continue;
-                };
-                if db::exists(&conn, hash)? {
-                    continue;
+            let in_flight = self.in_flight.clone();
+            crate::db_run(&self.conn, move |conn| {
+                let mut orphans = Vec::new();
+                let mut claims = Vec::new();
+                for key in orphan_keys(&blobs, &known, &in_flight, grace) {
+                    let hash = storage::hash_for(&key).unwrap_or_default();
+                    let Ok(claim) = in_flight.claim(hash, inflight::Kind::Delete) else {
+                        continue;
+                    };
+                    if db::exists(conn, hash)? {
+                        continue;
+                    }
+                    orphans.push(key);
+                    claims.push(claim);
                 }
-                orphans.push(key);
-                claims.push(claim);
-            }
-            (orphans, claims)
+                Ok((orphans, claims))
+            })
+            .await?
         };
         let count = orphans.len();
         self.storage.delete_objects(&orphans).await?;

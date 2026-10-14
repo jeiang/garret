@@ -17,7 +17,9 @@ nothing is inserted or signed. The wrapper sits around the body stream
 in the Pusher; storage is untouched. The decoder window is capped at
 8 MiB, what level 19 uses, so each upload's extra memory is bounded
 (2 MiB at the client's default level 3). Clients configured for the
-`--ultra` levels 20–22 are refused.
+`--ultra` levels 20–22 are refused. The compressed body is capped at
+zstd's worst-case size for the claimed NarSize plus 64 KiB, so skippable
+frames or padding that decode to nothing cannot be stored for free.
 
 Cost, measured on an Apple M3 Pro:
 - A real 379 MiB NAR (llvm 21 `lib`, 97.8 MiB at zstd-3) decompresses
