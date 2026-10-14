@@ -53,8 +53,14 @@ it is not there. It is the only command that runs without a config, because it
 is the one that writes it.
 
 Also: `garret whoami`, `garret logout`, `garret push --dry-run`, `--json` on
-`push` (NDJSON), `list`, `tree` and `whoami`, and `garret completions <shell>`
-(installed automatically by the Nix package). Full reference:
+`push` (NDJSON), `list`, `tree` (takes a store hash or path) and `whoami`, and
+`garret completions <shell>` (installed automatically by the Nix package).
+`garret use` exits 1 if nix ignores your user `nix.conf`.
+
+Machines without a human (build hosts, CI) skip `login`: set
+`[oidc] client_secret_file` to a file holding only the client secret (with
+`client_id` and `issuer` alongside), or set `GARRET_TOKEN`; a GitHub Actions
+runner needs neither. `GARRET_ENDPOINT` overrides `endpoint`. Full reference:
 [docs/spec/06-client.md](docs/spec/06-client.md).
 
 ## Push as built in CI
