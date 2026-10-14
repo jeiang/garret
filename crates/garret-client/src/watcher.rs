@@ -7,17 +7,18 @@
 //! cases needing their own code.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
-use futures::{StreamExt, stream};
 use rusqlite::{Connection, OpenFlags, params};
 use tokio::net::UnixDatagram;
 
-use crate::push::{PathInfo, Pusher};
+use garret_common::hash_of_store_path;
+
+use crate::push::{PathInfo, Pusher, retain_missing};
 
 /// The daemon's assembled settings; [`run`](Watcher::run) is its whole life.
 pub struct Watcher {
@@ -44,6 +45,9 @@ pub struct Filters {
     pub upstream_keys: Vec<String>,
     /// Substring matches, so an operator can exclude a whole family of paths.
     pub exclude_patterns: Vec<String>,
+    /// The cache's own `public_keys` (`name:base64`); a path signed by one of
+    /// these names came from the cache, so pushing it back is pointless.
+    pub own_keys: Vec<String>,
 }
 
 /// One newly-valid store path, as the Nix database describes it.
@@ -70,6 +74,16 @@ impl Filters {
         }
         if crate::push::signed_upstream(&path.sigs, &self.upstream_keys) {
             return Some("upstream");
+        }
+        // Our own signature means this path came from the cache (or was
+        // already pushed to it): CI needs no upstream_keys entry for that.
+        if path.sigs.iter().any(|sig| {
+            let signer = sig.split(':').next().unwrap_or_default();
+            self.own_keys
+                .iter()
+                .any(|key| key.split(':').next().unwrap_or_default() == signer)
+        }) {
+            return Some("own");
         }
         None
     }
@@ -275,34 +289,31 @@ impl Watcher {
 
         loop {
             let batch = paths_after(&conn, cursor, 500)?;
-            if batch.is_empty() {
+            let Some(newest) = batch.last().map(|entry| entry.id) else {
                 self.retry_failed(pusher, &mut failed, &mut attempts)
                     .await?;
                 wait_for_wake(wake.as_ref(), self.poll_interval).await;
                 continue;
-            }
+            };
 
-            for entry in batch {
-                cursor = entry.id;
-                if let Some(reason) = self.filters.should_skip(&entry) {
-                    tracing::debug!(path = entry.path, reason, "skipping");
-                } else if let Err(e) = self.push_path(pusher, &entry.path).await {
-                    tracing::warn!(
-                        path = entry.path,
-                        "push failed; on the failed list, retried when idle: {e:#}"
-                    );
-                    attempts.insert(entry.path.clone(), 1);
-                    failed.insert(entry.path);
-                    write_failed(&failed_file, &failed)?;
-                }
-                // Advance regardless of outcome — an old cursor is a backlog,
-                // but a stuck cursor is an outage.
-                write_cursor(&self.cursor_path, cursor)?;
+            // One Negotiation and one `nix path-info` for the whole poll.
+            for path in self.push_batch(pusher, &self.select(&batch)).await {
+                tracing::warn!(path, "on the failed list, retried when idle");
+                attempts.insert(path.clone(), 1);
+                failed.insert(path);
             }
+            write_failed(&failed_file, &failed)?;
+            // Advance regardless of outcome — an old cursor is a backlog,
+            // but a stuck cursor is an outage. Written once the whole batch
+            // is handled, so a crash mid-batch re-pushes it (Negotiation makes
+            // that a no-op for what already landed).
+            cursor = newest;
+            write_cursor(&self.cursor_path, cursor)?;
         }
     }
 
-    /// One more try for each failed path with attempts left in this process.
+    /// One more try for each failed path with attempts left in this process,
+    /// as one batch.
     async fn retry_failed(
         &self,
         pusher: &Pusher,
@@ -317,27 +328,25 @@ impl Watcher {
         if due.is_empty() {
             return Ok(());
         }
+        let still: HashSet<String> = self.push_batch(pusher, &due).await.into_iter().collect();
         for path in due {
-            match self.push_path(pusher, &path).await {
-                Ok(()) => {
-                    tracing::info!(path, "pushed on retry");
-                    attempts.remove(&path);
-                    failed.remove(&path);
-                }
-                Err(e) => {
-                    let count = attempts.entry(path.clone()).or_default();
-                    *count += 1;
-                    if *count >= self.max_attempts {
-                        tracing::error!(
-                            path,
-                            attempts = *count,
-                            "giving up on this path until the watcher restarts or \
-                             `garret watch-store --drain` runs: {e:#}"
-                        );
-                    } else {
-                        tracing::warn!(path, attempts = *count, "retry failed: {e:#}");
-                    }
-                }
+            if !still.contains(&path) {
+                tracing::info!(path, "pushed on retry");
+                attempts.remove(&path);
+                failed.remove(&path);
+                continue;
+            }
+            let count = attempts.entry(path.clone()).or_default();
+            *count += 1;
+            if *count >= self.max_attempts {
+                tracing::error!(
+                    path,
+                    attempts = *count,
+                    "giving up on this path until the watcher restarts or \
+                     `garret watch-store --drain` runs"
+                );
+            } else {
+                tracing::warn!(path, attempts = *count, "retry failed");
             }
         }
         write_failed(&failed_path(&self.cursor_path), failed)
@@ -364,40 +373,33 @@ impl Watcher {
         let failed_file = failed_path(&self.cursor_path);
         let mut failed = read_failed(&failed_file);
         let mut todo: Vec<String> = failed.iter().cloned().collect();
-        'walk: while cursor < target {
-            let batch = paths_after(&conn, cursor, 500)?;
-            if batch.is_empty() {
+        while cursor < target {
+            let mut batch = paths_after(&conn, cursor, 500)?;
+            // Paths validated after the drain began are the daemon's (or the
+            // next drain's), not this one's.
+            batch.retain(|entry| entry.id <= target);
+            let Some(newest) = batch.last().map(|entry| entry.id) else {
                 break;
-            }
-            for entry in batch {
-                if entry.id > target {
-                    break 'walk;
-                }
-                cursor = entry.id;
-                if self.filters.should_skip(&entry).is_none() && !failed.contains(&entry.path) {
-                    todo.push(entry.path);
-                }
-            }
+            };
+            cursor = newest;
+            todo.extend(
+                self.select(&batch)
+                    .into_iter()
+                    .filter(|path| !failed.contains(path)),
+            );
         }
         tracing::info!(cursor, paths = todo.len(), "draining");
 
-        // Oldest first, so dependencies tend to land before their referrers.
-        let results: Vec<(String, Result<()>)> = stream::iter(todo)
-            .map(|path| async move {
-                let result = self.push_path(pusher, &path).await;
-                (path, result)
-            })
-            .buffered(pusher.jobs.max(1))
-            .collect()
-            .await;
-        for (path, result) in results {
-            match result {
-                Ok(()) => {
-                    failed.remove(&path);
-                }
-                Err(e) => {
-                    tracing::error!(path, "push failed: {e:#}");
-                    failed.insert(path);
+        // Oldest first, in batches the size of a poll: one `nix path-info`
+        // and one Negotiation each, and an argv that stays small.
+        for chunk in todo.chunks(500) {
+            let still_failed = self.push_batch(pusher, chunk).await;
+            for path in chunk {
+                if still_failed.contains(path) {
+                    tracing::error!(path, "push failed");
+                    failed.insert(path.clone());
+                } else {
+                    failed.remove(path);
                 }
             }
         }
@@ -406,38 +408,104 @@ impl Watcher {
         Ok(failed.into_iter().collect())
     }
 
-    async fn push_path(&self, pusher: &Pusher, path: &str) -> Result<()> {
-        let closure = match crate::push::closure(std::slice::from_ref(&path.to_owned())).await {
-            Ok(closure) => closure,
-            // Nix-GC'd between validation and push: nothing to do, not an error.
-            Err(_) if !std::path::Path::new(path).exists() => {
-                tracing::debug!(path, "path vanished before push; skipping");
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-        // Bare paths: dependencies register before roots, so closures
-        // self-assemble and the server never needs a closed closure (spec 06).
-        let missing: Vec<PathInfo> = pusher
-            .missing(&closure)
-            .await?
-            .into_iter()
-            .filter(|p| p.path == path)
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        // The daemon reports per path into the journal and draws no bar. A
-        // failure must surface as an error here: it is what puts the path on
-        // the failed list.
-        let summary = pusher
-            .push_all(missing, &crate::push::Report::plain())
-            .await;
-        if summary.failed > 0 {
-            bail!("{} path(s) failed to push", summary.failed);
-        }
-        Ok(())
+    /// The store paths of `batch` worth pushing, in order; the rest are
+    /// skipped with their reason logged.
+    fn select(&self, batch: &[ValidPath]) -> Vec<String> {
+        batch
+            .iter()
+            .filter(|entry| match self.filters.should_skip(entry) {
+                Some(reason) => {
+                    tracing::debug!(path = entry.path, reason, "skipping");
+                    false
+                }
+                None => true,
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
     }
+
+    /// Pushes a batch of paths with one `nix path-info` and one Negotiation,
+    /// returning the paths that failed (never an error: a failure puts paths
+    /// on the failed list, it does not stop the watcher).
+    ///
+    /// The Negotiation names the batch and its *direct* references, not whole
+    /// closures. Dependencies need no upload from this batch (they are
+    /// pushed as their own newly-valid paths), but a present one must still
+    /// be named, because naming it is what refreshes its `pushed_at`: until
+    /// this batch lands nothing in the cache refers to it, and without the
+    /// refresh GC could see it as an unreferenced old root (spec 05
+    /// `PUSH_GRACE`). Anything deeper is kept by its referrer's `object_refs`
+    /// edges, so closure-wide Negotiations bought nothing but load.
+    async fn push_batch(&self, pusher: &Pusher, paths: &[String]) -> Vec<String> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let (infos, mut failed) = describe(paths).await;
+        if infos.is_empty() {
+            return failed;
+        }
+        let hashes = negotiation_hashes(&infos);
+        let missing = match pusher.negotiate(&hashes).await {
+            Ok(missing) => missing,
+            Err(e) => {
+                tracing::warn!(paths = infos.len(), "negotiation failed: {e:#}");
+                failed.extend(infos.into_iter().map(|info| info.path));
+                return failed;
+            }
+        };
+        let to_push = retain_missing(&infos, &missing);
+        tracing::debug!(
+            batch = infos.len(),
+            negotiated = hashes.len(),
+            missing = to_push.len(),
+            "negotiated"
+        );
+        if !to_push.is_empty() {
+            // The daemon reports per path into the journal and draws no bar.
+            let (_, pushed_failed) = pusher
+                .push_tracked(to_push, &crate::push::Report::plain())
+                .await;
+            failed.extend(pushed_failed);
+        }
+        failed
+    }
+}
+
+/// `nix path-info` for a batch, non-recursive. A path that errors poisons the
+/// whole call, so on failure each path is described alone: one that nix-GC'd
+/// since validation is dropped (not an error), and one that still fails comes
+/// back in the second list.
+async fn describe(paths: &[String]) -> (Vec<PathInfo>, Vec<String>) {
+    if let Ok(infos) = crate::push::path_info(paths, false).await {
+        return (infos, Vec::new());
+    }
+    let mut infos = Vec::new();
+    let mut failed = Vec::new();
+    for path in paths {
+        match crate::push::path_info(std::slice::from_ref(path), false).await {
+            Ok(mut one) => infos.append(&mut one),
+            Err(_) if !Path::new(path).exists() => {
+                tracing::debug!(path, "path vanished before push; skipping");
+            }
+            Err(e) => {
+                tracing::warn!(path, "nix path-info failed: {e:#}");
+                failed.push(path.clone());
+            }
+        }
+    }
+    (infos, failed)
+}
+
+/// The hashes one Negotiation covers: each batch path and each direct
+/// reference, once, in first-seen order.
+fn negotiation_hashes(infos: &[PathInfo]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    infos
+        .iter()
+        .flat_map(|info| std::iter::once(&info.path).chain(&info.references))
+        .map(|path| hash_of_store_path(path))
+        .filter(|hash| seen.insert(*hash))
+        .collect()
 }
 
 #[cfg(test)]
@@ -456,6 +524,7 @@ mod tests {
     fn drvs_and_upstream_signed_paths_are_skipped() {
         let filters = Filters {
             upstream_keys: vec!["cache.nixos.org-1".into()],
+            own_keys: vec![],
             exclude_patterns: vec!["-secret".into()],
         };
         assert_eq!(
@@ -476,6 +545,7 @@ mod tests {
     fn source_and_locally_signed_paths_are_kept() {
         let filters = Filters {
             upstream_keys: vec!["cache.nixos.org-1".into()],
+            own_keys: vec![],
             exclude_patterns: vec![],
         };
         // `-source` and fixed-output paths are exactly what we want to cache.
@@ -559,5 +629,89 @@ mod tests {
         assert!(!file.exists());
         write_failed(&file, &BTreeSet::new()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_caches_own_keys_are_skipped_by_name() {
+        let filters = Filters {
+            upstream_keys: vec!["cache.nixos.org-1".into()],
+            own_keys: vec!["garret-1:AAAA".into(), "garret-2:BBBB".into()],
+            exclude_patterns: vec![],
+        };
+        // Signed by any of the cache's keys, whatever the signature bytes.
+        assert_eq!(
+            filters.should_skip(&path("/nix/store/aaa-thing", &["garret-2:other-sig"])),
+            Some("own")
+        );
+        // A lookalike name is not the cache's key.
+        assert_eq!(
+            filters.should_skip(&path("/nix/store/aaa-thing", &["garret-12:sig"])),
+            None
+        );
+    }
+
+    fn info(path: &str, references: &[&str]) -> PathInfo {
+        PathInfo {
+            path: path.into(),
+            nar_hash: "sha256:h".into(),
+            nar_size: 1,
+            references: references.iter().map(|r| (*r).to_owned()).collect(),
+            deriver: None,
+            ca: None,
+            signatures: vec![],
+        }
+    }
+
+    /// One Negotiation per batch covers the batch and its direct references,
+    /// each hash once — not a closure per path.
+    #[test]
+    fn a_batch_negotiates_its_paths_and_direct_references_once_each() {
+        let (a, b, lib, dep) = (
+            format!("/nix/store/{}-a", "a".repeat(32)),
+            format!("/nix/store/{}-b", "b".repeat(32)),
+            format!("/nix/store/{}-lib", "l".repeat(32)),
+            format!("/nix/store/{}-dep", "d".repeat(32)),
+        );
+        let infos = vec![
+            info(&a, &[&a, &lib, &b]),
+            info(&b, &[&lib, &dep]),
+            info(&lib, &[]),
+        ];
+        let hashes = negotiation_hashes(&infos);
+        assert_eq!(
+            hashes,
+            [
+                "a".repeat(32),
+                "l".repeat(32),
+                "b".repeat(32),
+                "d".repeat(32)
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_skips_filtered_paths_and_keeps_order() {
+        let watcher = Watcher {
+            nix_db: String::new(),
+            cursor_path: PathBuf::new(),
+            poll_interval: Duration::ZERO,
+            filters: Filters {
+                upstream_keys: vec!["cache.nixos.org-1".into()],
+                own_keys: vec![],
+                exclude_patterns: vec![],
+            },
+            max_attempts: 1,
+            socket_path: PathBuf::new(),
+        };
+        let batch = [
+            path("/nix/store/aaa-one", &[]),
+            path("/nix/store/bbb-two.drv", &[]),
+            path("/nix/store/ccc-three", &["cache.nixos.org-1:sig"]),
+            path("/nix/store/ddd-four", &[]),
+        ];
+        assert_eq!(
+            watcher.select(&batch),
+            ["/nix/store/aaa-one", "/nix/store/ddd-four"]
+        );
     }
 }

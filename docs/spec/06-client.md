@@ -229,7 +229,9 @@ uploads as they finish. `--dry-run --json` reuses the identical schema, with
 `status:"would-push"` for what would upload (upstream paths keep their real
 `upstream` status — the filter runs identically either way) and a zeroed
 `done`, so a consumer needs one parser. The human summary line mentions the
-upstream count only when it is non-zero.
+upstream count only when it is non-zero; human output prints no per-path
+`upstream` lines (`--json` and `--dry-run` do), and its `done:` line ends
+with the total NAR bytes and elapsed time.
 
 ## Pointing nix at the cache
 
@@ -271,16 +273,30 @@ configured key, so a rotation has several live at once.
 - **Scope**: pushes bare paths as they become valid — dependencies
   register before roots, so closures self-assemble. The server never
   requires closed closures.
+- **Batching**: each poll (and each drain chunk of 500) is handled as one
+  batch: the paths that pass the filters go through a single non-recursive
+  `nix path-info --json`, then a single Negotiation naming the batch plus
+  its *direct* references, and only the batch's own missing paths upload
+  (`jobs` concurrent, references first). Naming present direct references
+  is deliberate: the Negotiation refreshes their `pushed_at`, which keeps
+  them inside `PUSH_GRACE` (spec 05) while the referrer lands; anything
+  deeper stays referenced by the objects already in the cache. A
+  per-path whole-closure Negotiation made request size, and server cost,
+  grow with every build.
 - **Filtering**: skip `.drv` paths and paths already signed by configured
   upstream keys — the same key list as push's upstream filter (top-level
   `upstream_keys`, default `cache.nixos.org-1`; `[watch] upstream_keys`
-  overrides it per daemon), read from the DB's sigs rather than
-  `nix path-info`. Keep `-source` and fixed-output paths. Configurable
-  exclude patterns.
+  overrides it per daemon) — or by any of the cache's own `public_keys`
+  (key name before `:`), so CI need not list garret's key as upstream.
+  Signatures are read from the DB's sigs rather than `nix path-info`. Keep
+  `-source` and fixed-output paths. Configurable exclude patterns.
 - **Failure handling**: the cursor always advances — one poison path
   never wedges the pipeline — so a path whose push fails (after push's own
   retries) goes on the **failed list**, `<cursor_path>.failed`, one store
-  path per line. The daemon retries the list whenever a poll finds nothing
+  path per line. The cursor is written once per batch, after the batch's
+  failures are on the list. If `nix path-info` rejects a batch, its paths
+  are described one by one, so a single bad path cannot fail the rest; a
+  failed Negotiation puts the whole batch on the list. The daemon retries the list whenever a poll finds nothing
   new, up to `max_attempts` (default 5) per path, then logs loudly and
   leaves the path on the list for a restart (which starts every path's
   count afresh) or a drain. Paths nix-GC'd before push are dropped
@@ -289,7 +305,8 @@ configured key, so a rotation has several live at once.
 - **Bootstrap**: cursor starts at `MAX(id)` (only new paths push) and is
   written at startup; `--full-sync` opts into walking history from id 0.
 - **Drain** (`--drain`): push every path validated after the cursor as of
-  invocation, plus the failed list, then exit — non-zero, naming the
+  invocation, plus the failed list, in batches of 500 (one `nix path-info`
+  and one Negotiation each, like a poll), then exit — non-zero, naming the
   paths, if any failed; those stay on the list. The cursor ends at the
   newest path seen. Run it after stopping the daemon, which shares the
   cursor. With no cursor it refuses rather than guessing where to start
