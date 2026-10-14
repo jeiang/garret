@@ -20,6 +20,15 @@ SQLite, one file, WAL mode, shared by both services on the same host.
     1 s busy timeout. A flush never touches the pull-path connection.
   - A failed flush drops its batch. Those rows are still stale, so their
     next hit queues them again.
+- Pull-path reads (narinfo, exists, usage counter) and the Negotiation,
+  eviction and bump statements are prepared once per connection and
+  cached, not re-parsed per request. Each statement family's latency is
+  recorded in `garret_db_query_duration_seconds` (spec
+  [08](08-observability.md)).
+- A pull-path read carries its budget as a deadline into the blocking
+  pool: one that waited for the connection lock past its budget returns
+  without touching the database, so timed-out requests do not queue up
+  behind a wedged holder.
 - **Upload-in-progress state is not in the DB.** It lives in the Pusher's
   memory, alongside the deletion claims GC, `delete` and prune hold from
   row delete to blob delete (spec 05); the object row is inserted only

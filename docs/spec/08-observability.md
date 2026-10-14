@@ -17,8 +17,10 @@ The Puller's public listener answers two readiness probes:
 - `/ready/deep`: `/ready`, plus one real read through the path a
   substituter follows. It presigns the blob of the most recently
   accessed object exactly as the NAR route does and fetches its first
-  byte (`Range: bytes=0-0`). On failure it answers 503 naming the
-  failing step, e.g. `presigned GET answered 403`.
+  byte (`Range: bytes=0-0`). On failure it answers 503 with the fixed
+  body `S3 read path failing`: the public route never echoes upstream
+  detail. The WARN log keeps it (the failing step, and the S3 error code
+  and `x-amz-request-id` when S4 sent them; never the presigned URL).
   - Presigning is signature-only (spec
     [03](03-storage.md)), so revoked or rotated S3 credentials or an S4
     outage fail neither `/ready` nor the NAR redirect. Only a fetch
@@ -36,7 +38,10 @@ The Puller's public listener answers two readiness probes:
 
 ## Cardinality rules
 
-Bounded labels only: route, status class, issuer, phase, outcome.
+Bounded labels only: route, method, status class, issuer, phase, outcome.
+The `method` label is one of `GET`, `HEAD`, `POST`, `PUT`, `DELETE` or
+`OTHER`: any other method a client sends collapses to `OTHER`, so request
+headers cannot mint series.
 **Never per-object labels** (store path hashes as label values would
 explode series); per-object insight is the logs' job. Histogram buckets:
 bytes 64 KiB…8 GiB log-scale; latency 1 ms…60 s.
@@ -45,9 +50,17 @@ bytes 64 KiB…8 GiB log-scale; latency 1 ms…60 s.
 
 Prefix `garret_`; service distinguished by scrape job.
 
-- **Common**: HTTP requests/duration by route + status class; in-flight
-  gauge; SQLite busy/lock-wait histogram; DB query duration by statement
-  family; process/runtime defaults; build info.
+- **Common**: HTTP requests/duration by route + method + status class;
+  in-flight gauge; SQLite busy/lock-wait histogram;
+  `garret_db_query_duration_seconds` by `query` (statement family:
+  `missing`, `insert_object`, `get_object`, `exists`, `bump_flush`,
+  `evictable`, `evict_object`); standard `process_*` metrics
+  (`process_cpu_seconds_total`, `process_resident_memory_bytes`,
+  `process_open_fds`, `process_max_fds`, `process_start_time_seconds`),
+  read from `/proc` on each scrape (Linux only, no background task; the
+  CPU series is exposed as a gauge of cumulative seconds);
+  `garret_build_info` with `service`, `version` and `revision` (the
+  commit the binary was built from, `unknown` outside the Nix build).
 - **Pusher — uploads**: in-flight uploads and in-flight bytes gauges
   *versus their configured caps* (saturation visible before it hurts);
   upload size/duration histograms; accepted/failed/shed(429) counters;
@@ -83,8 +96,11 @@ Prefix `garret_`; service distinguished by scrape job.
   gauge by `kind` (`dangling`, `orphan`, `size_mismatch`), set to the
   latest run's count per kind; `garret_fsck_rows_repaired_total` counter
   by `reason` (`dangling`, `size_mismatch`).
-- **Puller**: narinfo hit/miss counters; NAR redirects issued, by
-  hit/miss; presign duration histogram; `garret_degraded_total` by
+- **Puller**: narinfo hit/miss counters; `garret_nar_requests_total` by
+  `outcome` (`hit`: a redirect was issued; `miss`: anything else,
+  degraded requests included, like narinfo — it replaces the former
+  `garret_nar_redirects_total`); presign duration histogram;
+  `garret_degraded_total` by
   `reason` (`db_timeout`, `db_error`, `presign_timeout`,
   `presign_error`) — pull-path requests degraded to a 404 miss when a
   budget tripped or a read failed (spec
@@ -94,7 +110,8 @@ Prefix `garret_`; service distinguished by scrape job.
   `garret_bump_queue_depth` gauge, `garret_bump_debounced_total`
   (hits on a fresh row, no write) and `garret_bump_failures_total`
   (failed flushes, batch dropped); browse requests by endpoint;
-  browse auth failures; `garret_s3_read_probes_total` by `outcome`
+  browse auth failures (`garret_browse_auth_failures_total` by `reason`:
+  `missing_bearer`, `token_rejected`); `garret_s3_read_probes_total` by `outcome`
   (deep readiness, [above](#readiness)). The Puller no longer sees NAR bytes
   ([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md)), so
   bytes-served, serve-duration, first-byte and Range counters are gone —
@@ -102,10 +119,12 @@ Prefix `garret_`; service distinguished by scrape job.
 
 ## Logs
 
-`tracing` crate: human-readable by default, JSON via config
-(journald-friendly); per-request spans with request ids. No
-OTLP/distributed tracing in v1. The client is metrics-free: progress
-output, logs, and the watcher's failed list.
+`tracing` crate, human-readable, on stdout. Verbosity follows `RUST_LOG`
+(default `info`). Output is plain, with no ANSI colour codes, whenever stdout is
+not a terminal, so journald and files stay clean; there is no JSON
+logging. Per-request spans with request ids. No OTLP/distributed tracing
+in v1. The client is metrics-free: progress output, logs, and the
+watcher's failed list.
 
 A rejected token's reason is logged escaped and cut at 256 characters: it
 can carry attacker-controlled token text (the `kid`, header fields echoed

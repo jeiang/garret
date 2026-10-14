@@ -21,6 +21,11 @@ the listing's exact order, so a page never sorts the table), PK, and
 reverse-ref. Exact response shapes are an implementation detail — keep
 them stable once shipped.
 
+The tree derives each child's hash from its reference basename with the
+shared `hash_of_store_path`; a malformed reference (too short, or
+multibyte text at the hash boundary) yields a hash that matches nothing
+rather than a panic while the browse connection is held.
+
 ## Isolation from the pull path
 
 A big closure tree or a full-scan search must never delay a narinfo
