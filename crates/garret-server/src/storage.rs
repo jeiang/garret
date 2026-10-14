@@ -31,40 +31,64 @@ pub struct Storage {
     bucket: String,
 }
 
-/// Bounds every upload's memory: `part_size` bytes per in-flight part, with
-/// the total across all concurrent uploads capped by a shared semaphore.
+/// Bounds every upload's memory. The shared semaphore counts bytes in
+/// fixed-size units, and a buffer holds the units covering its capacity, so
+/// the sum of all upload buffers never exceeds `max_in_flight_bytes` while a
+/// small NAR costs a few units instead of a whole part (spec 03).
 pub struct UploadLimits {
     /// Bytes per part; also the single-`PutObject` threshold (spec 03).
     pub part_size: usize,
     /// Concurrent part uploads per NAR.
     pub max_parts_in_flight: usize,
-    /// One permit per part-sized buffer, shared process-wide.
+    /// One permit per `unit` bytes of buffer, shared process-wide.
     pub part_slots: Arc<Semaphore>,
+    /// Bytes one permit stands for: `part_size / 256`, at most 64 KiB.
+    unit: usize,
+    /// Permits making up one part.
+    part_units: usize,
+    /// Permits in the whole budget.
+    total_units: usize,
 }
 
 impl UploadLimits {
-    /// `max_in_flight_bytes` becomes a whole number of part-sized slots, so
-    /// the byte cap is enforced by counting buffers instead of bytes.
+    /// `max_in_flight_bytes` becomes a whole number of units, never fewer
+    /// than one part's worth so a cap below one part cannot deadlock every
+    /// upload.
     pub fn new(part_size: usize, max_parts_in_flight: usize, max_in_flight_bytes: u64) -> Self {
-        let slots = (max_in_flight_bytes / part_size as u64).max(1) as usize;
+        let unit = (part_size / 256).clamp(1, 64 * 1024);
+        let part_units = part_size.div_ceil(unit);
+        let total_units = ((max_in_flight_bytes / unit as u64) as usize).max(part_units);
         Self {
             part_size,
             max_parts_in_flight,
-            part_slots: Arc::new(Semaphore::new(slots)),
+            part_slots: Arc::new(Semaphore::new(total_units)),
+            unit,
+            part_units,
+            total_units,
         }
     }
 
-    /// How many part-sized buffers may exist at once, process-wide.
+    /// How many part-sized buffers fit in the budget at once, process-wide.
     pub fn total_slots(&self) -> usize {
-        self.part_slots.available_permits()
+        self.total_units / self.part_units
     }
 
-    async fn acquire(&self) -> Result<OwnedSemaphorePermit> {
+    /// Permits covering `bytes` of buffer: at least one, at most a part.
+    fn units(&self, bytes: usize) -> usize {
+        bytes.div_ceil(self.unit).clamp(1, self.part_units)
+    }
+
+    async fn acquire_units(&self, units: usize) -> Result<OwnedSemaphorePermit> {
         self.part_slots
             .clone()
-            .acquire_owned()
+            .acquire_many_owned(units as u32)
             .await
             .map_err(|_| anyhow!("upload capacity semaphore closed"))
+    }
+
+    /// Reserves room for a buffer of up to `bytes` (capped at one part).
+    async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
+        self.acquire_units(self.units(bytes)).await
     }
 }
 
@@ -88,53 +112,90 @@ pub fn hash_for(key: &str) -> Option<&str> {
 /// other push. Idle, not total: a slow sender that keeps moving is fine.
 pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The body's next chunk, or an error once it has sent nothing for
-/// [`BODY_IDLE_TIMEOUT`].
+/// The client's request body stalled or broke mid-upload: a failure on the
+/// sender's side, not the server's. Handlers downcast to it to log such
+/// failures as warnings rather than server errors.
+#[derive(Debug)]
+pub struct ClientBodyError(pub String);
+
+impl std::fmt::Display for ClientBodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ClientBodyError {}
+
+/// The body's next chunk, or a [`ClientBodyError`] once it has sent nothing
+/// for [`BODY_IDLE_TIMEOUT`].
 pub async fn next_chunk<S: Stream + Unpin>(body: &mut S) -> Result<Option<S::Item>> {
     tokio::time::timeout(BODY_IDLE_TIMEOUT, body.next())
         .await
         .map_err(|_| {
-            anyhow!(
+            anyhow::Error::new(ClientBodyError(format!(
                 "upload body stalled: nothing received for {}s",
                 BODY_IDLE_TIMEOUT.as_secs()
-            )
+            )))
         })
 }
 
-/// Pulls exactly `part_size` bytes (fewer only at end of stream), keeping any
-/// overshoot in `carry` for the next part. The part is handed on as-is, never
-/// copied again: a part slot must account for the part's only buffer.
-async fn read_part<S, E>(body: &mut S, carry: &mut Option<Bytes>, part_size: usize) -> Result<Bytes>
+/// Appends body bytes to `part` until it holds `cap` bytes or the body ends,
+/// keeping any overshoot in `carry` for the next part. Each byte is hashed
+/// as it is appended, while still cache-hot. `part` must have been allocated
+/// with room for `cap` against a permit: a part slot accounts for the
+/// part's only buffer.
+async fn fill_part<S, E>(
+    part: &mut BytesMut,
+    body: &mut S,
+    carry: &mut Option<Bytes>,
+    cap: usize,
+    hasher: &mut Sha256,
+) -> Result<()>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    while part.len() < cap {
+        let chunk = match carry.take() {
+            Some(left) => left,
+            None => {
+                let Some(chunk) = next_chunk(body).await? else {
+                    break;
+                };
+                chunk.map_err(|e| {
+                    anyhow::Error::new(ClientBodyError(format!("reading request body: {e}")))
+                })?
+            }
+        };
+        // A chunk can span several parts, so it is split: a part over
+        // part_size would abort the upload.
+        let room = cap - part.len();
+        if chunk.len() > room {
+            hasher.update(&chunk[..room]);
+            part.extend_from_slice(&chunk[..room]);
+            *carry = Some(chunk.slice(room..));
+            break;
+        }
+        hasher.update(&chunk);
+        part.extend_from_slice(&chunk);
+    }
+    Ok(())
+}
+
+/// Pulls exactly `part_size` bytes (fewer only at end of stream) into one
+/// buffer, hashing them on the way.
+async fn read_part<S, E>(
+    body: &mut S,
+    carry: &mut Option<Bytes>,
+    part_size: usize,
+    hasher: &mut Sha256,
+) -> Result<Bytes>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
     let mut part = BytesMut::with_capacity(part_size);
-    if let Some(mut left) = carry.take() {
-        // The carry can exceed a whole part when one chunk spans several, so
-        // it is split too — a part over part_size would abort the upload.
-        if left.len() >= part_size {
-            let whole = left.split_to(part_size);
-            if !left.is_empty() {
-                *carry = Some(left);
-            }
-            return Ok(whole);
-        }
-        part.extend_from_slice(&left);
-    }
-    while part.len() < part_size {
-        let Some(chunk) = next_chunk(body).await? else {
-            break;
-        };
-        let chunk = chunk.map_err(|e| anyhow!("reading request body: {e}"))?;
-        let room = part_size - part.len();
-        if chunk.len() > room {
-            part.extend_from_slice(&chunk[..room]);
-            *carry = Some(chunk.slice(room..));
-            break;
-        }
-        part.extend_from_slice(&chunk);
-    }
+    fill_part(&mut part, body, carry, part_size, hasher).await?;
     Ok(part.freeze())
 }
 
@@ -170,9 +231,10 @@ impl Storage {
         }
         // S4 and Garage both accept path-style; it avoids DNS games for dotted buckets.
         builder = builder.force_path_style(cfg.path_style);
-        // Overall deadline per call, not per attempt: a timed-out attempt
-        // would be retried, and re-uploading a part is forbidden on S4
-        // (spec 03) — fail once and let the caller abort the multipart.
+        // Overall deadline per call, not per attempt. UploadPart is also never
+        // retried by the SDK (see `upload_part`): re-uploading a part is
+        // forbidden on S4 (spec 03), so fail once and let the caller abort
+        // the multipart.
         builder = builder.timeout_config(
             aws_sdk_s3::config::timeout::TimeoutConfig::builder()
                 .operation_timeout(std::time::Duration::from_secs(cfg.operation_timeout_secs))
@@ -209,11 +271,17 @@ impl Storage {
     /// each read, so the reader can never race ahead of S3 and server memory
     /// stays bounded by configuration rather than by client behaviour. Parts
     /// upload on their own tasks while the next one is read.
+    ///
+    /// `first_part_hint` is the most bytes the body is expected to hold. The
+    /// first buffer reserves only that much (capped at a part), so a small NAR
+    /// neither allocates nor holds a whole part slot. A body that outgrows
+    /// the hint tops the reservation up to a whole part before reading on.
     pub async fn put_streaming<S, E>(
         &self,
         key: &str,
         mut body: S,
         limits: &UploadLimits,
+        first_part_hint: usize,
     ) -> Result<(Vec<u8>, i64)>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -224,9 +292,21 @@ impl Storage {
         let mut carry: Option<Bytes> = None;
 
         // First part decides the shape: if the whole body fits, one PutObject.
-        let permit = limits.acquire().await?;
-        let first = read_part(&mut body, &mut carry, limits.part_size).await?;
-        hasher.update(&first);
+        let reserve = first_part_hint.clamp(1, limits.part_size);
+        let mut permit = limits.acquire(reserve).await?;
+        let mut first = BytesMut::with_capacity(reserve);
+        fill_part(&mut first, &mut body, &mut carry, reserve, &mut hasher).await?;
+        if first.len() == reserve && reserve < limits.part_size {
+            // The hint was exceeded (or hit exactly): reserve the rest of a
+            // part before buffering it.
+            let extra = limits.part_units - limits.units(reserve);
+            if extra > 0 {
+                permit.merge(limits.acquire_units(extra).await?);
+            }
+            first.reserve(limits.part_size - first.len());
+            fill_part(&mut first, &mut body, &mut carry, limits.part_size, &mut hasher).await?;
+        }
+        let first = first.freeze();
         total += first.len() as i64;
         if first.len() < limits.part_size {
             self.put(key, first).await?;
@@ -315,13 +395,12 @@ impl Storage {
             while in_flight.len() >= limits.max_parts_in_flight {
                 completed.push(collect(in_flight).await?);
             }
-            let permit = limits.acquire().await?;
-            let part = read_part(body, carry, limits.part_size).await?;
+            let permit = limits.acquire(limits.part_size).await?;
+            let part = read_part(body, carry, limits.part_size, hasher).await?;
             if part.is_empty() {
                 drop(permit);
                 break;
             }
-            hasher.update(&part);
             *total += part.len() as i64;
             let is_final = part.len() < limits.part_size;
 
@@ -380,10 +459,14 @@ impl Storage {
                 .upload_id(&upload_id)
                 .part_number(part_number)
                 .body(ByteStream::from(body))
+                .customize()
+                // S4 forbids re-uploading a part, so the SDK must not retry
+                // one: the caller aborts the whole multipart (spec 03-storage).
+                .config_override(aws_sdk_s3::config::Config::builder().retry_config(
+                    aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+                ))
                 .send()
                 .await
-                // S4 forbids re-uploading a part, so there is no retry here: the
-                // caller aborts the whole multipart (spec 03-storage).
                 .with_context(|| format!("uploading part {part_number} of {key}"))?;
             drop(permit);
 
@@ -559,7 +642,9 @@ mod tests {
     /// Feeds `chunks` through `read_part` and returns the part sizes produced.
     /// S4 requires parts 1..N-1 to be identical in size, so this is the check
     /// that matters most: only the final part may be short.
+    /// Also checks that the hasher saw every byte exactly once.
     fn parts_of(chunks: Vec<&'static [u8]>, part_size: usize) -> Vec<usize> {
+        let whole: Vec<u8> = chunks.concat();
         // Tokio, not a bare executor: reads carry the body idle timeout.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -573,8 +658,11 @@ mod tests {
             );
             let mut carry = None;
             let mut sizes = Vec::new();
+            let mut hasher = Sha256::new();
             loop {
-                let part = read_part(&mut body, &mut carry, part_size).await.unwrap();
+                let part = read_part(&mut body, &mut carry, part_size, &mut hasher)
+                    .await
+                    .unwrap();
                 if part.is_empty() {
                     break;
                 }
@@ -584,6 +672,7 @@ mod tests {
                     break;
                 }
             }
+            assert_eq!(hasher.finalize().as_slice(), Sha256::digest(&whole).as_slice());
             sizes
         })
     }
@@ -626,6 +715,21 @@ mod tests {
         assert_eq!(tiny.total_slots(), 1);
     }
 
+    /// A small upload reserves a few units, not a whole part, and the
+    /// reservation never exceeds a part or falls to zero.
+    #[test]
+    fn a_small_reservation_costs_a_fraction_of_a_part() {
+        let limits = UploadLimits::new(16 * 1024 * 1024, 4, 256 * 1024 * 1024);
+        assert_eq!(limits.total_slots(), 16);
+        let whole = limits.part_slots.available_permits();
+        assert_eq!(limits.units(16 * 1024 * 1024), limits.part_units);
+        assert_eq!(limits.units(usize::MAX / 2), limits.part_units);
+        assert_eq!(limits.units(0), 1);
+        // 1 KiB NAR: one 64 KiB unit of 256 in a part.
+        assert_eq!(limits.units(1024), 1);
+        assert_eq!(whole, limits.total_units);
+    }
+
     /// A sender that goes quiet mid-part must fail the read rather than hold
     /// its slots forever. Paused clock: the idle bound passes at once, and a
     /// read that ignores it trips the outer bound instead of hanging.
@@ -633,9 +737,11 @@ mod tests {
     async fn a_stalled_body_fails_the_read() {
         let mut body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
             .chain(futures::stream::pending());
-        let read =
-            tokio::time::timeout(BODY_IDLE_TIMEOUT * 2, read_part(&mut body, &mut None, 1024))
-                .await;
+        let read = tokio::time::timeout(
+            BODY_IDLE_TIMEOUT * 2,
+            read_part(&mut body, &mut None, 1024, &mut Sha256::new()),
+        )
+        .await;
         assert!(read.expect("a stalled body hung the read").is_err());
     }
 
@@ -647,7 +753,9 @@ mod tests {
             tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
-        let part = read_part(&mut body, &mut None, 1024).await.unwrap();
+        let part = read_part(&mut body, &mut None, 1024, &mut Sha256::new())
+            .await
+            .unwrap();
         assert_eq!(part.len(), 8);
     }
     /// Just enough S3 on a loopback port. Every call succeeds, except that
@@ -735,7 +843,7 @@ mod tests {
                 .chunks(300)
                 .map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c)))
                 .collect();
-            storage.put_streaming(key, futures::stream::iter(chunks), &limits)
+            storage.put_streaming(key, futures::stream::iter(chunks), &limits, 1024)
         });
 
         let stored = tokio::time::timeout(
@@ -750,6 +858,55 @@ mod tests {
         for (hash, len) in stored {
             assert_eq!((hash, len), (digest.clone(), body.len() as i64));
         }
+    }
+
+    /// A small body reserves only its hint: with the budget holding barely
+    /// more than one part and most of it already taken, it still uploads at
+    /// once. Under whole-part accounting it would wait on the other holder.
+    #[tokio::test]
+    async fn a_small_upload_does_not_need_a_whole_part_slot() {
+        let storage = fake_s3().await;
+        let limits = UploadLimits::new(1024 * 1024, 4, 1024 * 1024);
+        // Another upload holds all but two units of the one-part budget.
+        let held = limits
+            .acquire_units(limits.total_units - 2)
+            .await
+            .unwrap();
+        let body = vec![7u8; 1000];
+        let stored = tokio::time::timeout(
+            Duration::from_secs(5),
+            storage.put_streaming(
+                &key_for("small"),
+                futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(body.clone()))]),
+                &limits,
+                2000,
+            ),
+        )
+        .await
+        .expect("a small upload waited for a whole part")
+        .unwrap();
+        assert_eq!(stored, (Sha256::digest(&body).to_vec(), 1000));
+        drop(held);
+        assert_eq!(limits.part_slots.available_permits(), limits.total_units);
+    }
+
+    /// A body that outgrows its hint tops the reservation up to a whole part
+    /// and still stores every byte once.
+    #[tokio::test]
+    async fn a_body_past_its_hint_still_stores_whole() {
+        let storage = fake_s3().await;
+        let limits = UploadLimits::new(1024, 2, 4096);
+        let body: Vec<u8> = (0..2500).map(|i| i as u8).collect();
+        let chunks: Vec<_> = body
+            .chunks(300)
+            .map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c)))
+            .collect();
+        let stored = storage
+            .put_streaming(&key_for("grown"), futures::stream::iter(chunks), &limits, 100)
+            .await
+            .unwrap();
+        assert_eq!(stored, (Sha256::digest(&body).to_vec(), 2500));
+        assert_eq!(limits.part_slots.available_permits(), limits.total_units);
     }
 
     /// `DeleteObjects` answers 200 even when some keys fail, listing them in
