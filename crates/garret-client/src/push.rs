@@ -2,7 +2,7 @@
 //! (spec 01-push-protocol, 06-client).
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     process::Stdio,
     sync::{
         Arc,
@@ -38,6 +38,8 @@ pub struct Report {
     json: bool,
     mp: MultiProgress,
     bar: Option<ProgressBar>,
+    /// When the run began, for the human `done:` line.
+    started: Instant,
 }
 
 impl Report {
@@ -45,9 +47,10 @@ impl Report {
     /// `missing`, because that is the first moment the byte total is known.
     ///
     /// `upstream` is the paths the upstream filter dropped *before* the
-    /// Negotiation. They are reported here, each with status `upstream`, so
-    /// `closure` minus `upstream` is what was negotiated and the counts stay
-    /// honest.
+    /// Negotiation. Under `--json` each is reported here with status
+    /// `upstream`; the human output only counts them, since a closure routinely
+    /// holds thousands. Either way `closure` minus `upstream` is what was
+    /// negotiated and the counts stay honest.
     pub fn start(
         json: bool,
         mp: &MultiProgress,
@@ -60,6 +63,7 @@ impl Report {
             json,
             mp: mp.clone(),
             bar: None,
+            started: Instant::now(),
         };
         if json {
             report.event(json!({
@@ -79,9 +83,6 @@ impl Report {
             upstream.len(),
             missing.len(),
         ));
-        for info in upstream {
-            report.path(info, "upstream", None);
-        }
         if missing.is_empty() {
             return report;
         }
@@ -120,6 +121,7 @@ impl Report {
             json: false,
             mp: MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden()),
             bar: None,
+            started: Instant::now(),
         }
     }
 
@@ -191,8 +193,12 @@ impl Report {
             }));
         } else {
             self.out(&format!(
-                "done: {} pushed, {} deduped, {} failed",
-                summary.pushed, summary.deduped, summary.failed
+                "done: {} pushed, {} deduped, {} failed ({} in {:.1}s)",
+                summary.pushed,
+                summary.deduped,
+                summary.failed,
+                garret_common::human_bytes(summary.nar_bytes.min(i64::MAX as u64) as i64),
+                self.started.elapsed().as_secs_f64()
             ));
         }
     }
@@ -310,8 +316,19 @@ pub fn partition_upstream(
 
 /// Whole closure of the given installables, roots included.
 pub async fn closure(paths: &[String]) -> Result<Vec<PathInfo>> {
-    let output = Command::new("nix")
-        .args(["path-info", "--recursive", "--json", "--json-format", "1"])
+    path_info(paths, true).await
+}
+
+/// `nix path-info --json` over `paths`: with `recursive`, their whole closure;
+/// without, just the paths themselves (their direct references are named in
+/// each entry's `references`).
+pub async fn path_info(paths: &[String], recursive: bool) -> Result<Vec<PathInfo>> {
+    let mut command = Command::new("nix");
+    command.args(["path-info", "--json", "--json-format", "1"]);
+    if recursive {
+        command.arg("--recursive");
+    }
+    let output = command
         .args(paths)
         .output()
         .await
@@ -345,13 +362,29 @@ fn parse_path_info(stdout: &[u8]) -> Result<Vec<PathInfo>> {
     }
 }
 
+/// The entries of `infos` whose hash is in `missing`, in order. A set lookup
+/// per entry: Negotiations over thousands of paths must not go quadratic.
+pub fn retain_missing(infos: &[PathInfo], missing: &HashSet<String>) -> Vec<PathInfo> {
+    infos
+        .iter()
+        .filter(|p| missing.contains(hash_of_store_path(&p.path)))
+        .cloned()
+        .collect()
+}
+
 impl Pusher {
-    /// The one pre-upload round-trip (spec 01): ask for the whole batch at once.
+    /// The one pre-upload round-trip (spec 01): the subset of `closure` the
+    /// cache does not hold.
     pub async fn missing(&self, closure: &[PathInfo]) -> Result<Vec<PathInfo>> {
         let hashes: Vec<&str> = closure
             .iter()
             .map(|p| hash_of_store_path(&p.path))
             .collect();
+        Ok(retain_missing(closure, &self.negotiate(&hashes).await?))
+    }
+
+    /// One Negotiation over `hashes`: the subset the cache does not hold.
+    pub async fn negotiate(&self, hashes: &[&str]) -> Result<HashSet<String>> {
         let send = |token: &str| {
             self.http
                 .post(format!("{}/api/v1/missing-paths", self.endpoint))
@@ -383,16 +416,12 @@ impl Pusher {
             let body = response.text().await.unwrap_or_default();
             bail!("negotiation rejected with {status}: {}", body.trim());
         }
-        let missing: Vec<String> = response
+        let missing: HashSet<String> = response
             .json()
             .await
             .context("parsing the negotiation response")?;
 
-        Ok(closure
-            .iter()
-            .filter(|p| missing.iter().any(|h| h == hash_of_store_path(&p.path)))
-            .cloned()
-            .collect())
+        Ok(missing)
     }
 
     /// Uploads every path with at most `jobs` in flight, references first.
@@ -401,17 +430,27 @@ impl Pusher {
     /// and the caller decides the exit code from `Summary::failed`. That way a
     /// `--json` consumer always receives the terminating `done` event.
     pub async fn push_all(&self, paths: Vec<PathInfo>, report: &Report) -> Summary {
+        self.push_tracked(paths, report).await.0
+    }
+
+    /// [`push_all`](Self::push_all), also naming the paths that failed — what
+    /// the Watcher puts on its failed list.
+    pub async fn push_tracked(
+        &self,
+        paths: Vec<PathInfo>,
+        report: &Report,
+    ) -> (Summary, Vec<String>) {
         let nar_bytes: u64 = paths.iter().map(|p| p.nar_size.max(0) as u64).sum();
-        let statuses = stream::iter(references_first(paths))
+        let outcomes = stream::iter(references_first(paths))
             .map(|info| async move {
                 match self.push_one(&info, report).await {
                     Ok(status) => {
                         report.path(&info, status, None);
-                        status
+                        (info.path, status)
                     }
                     Err(e) => {
                         report.path(&info, "failed", Some(&format!("{e:#}")));
-                        "failed"
+                        (info.path, "failed")
                     }
                 }
             })
@@ -419,12 +458,19 @@ impl Pusher {
             .collect::<Vec<_>>()
             .await;
 
-        Summary {
-            pushed: statuses.iter().filter(|s| **s == "pushed").count(),
-            deduped: statuses.iter().filter(|s| **s == "deduped").count(),
-            failed: statuses.iter().filter(|s| **s == "failed").count(),
+        let count = |wanted: &str| outcomes.iter().filter(|(_, s)| *s == wanted).count();
+        let summary = Summary {
+            pushed: count("pushed"),
+            deduped: count("deduped"),
+            failed: count("failed"),
             nar_bytes,
-        }
+        };
+        let failed = outcomes
+            .into_iter()
+            .filter(|(_, s)| *s == "failed")
+            .map(|(path, _)| path)
+            .collect();
+        (summary, failed)
     }
 
     async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
@@ -799,7 +845,7 @@ fn compressed_nar(
     // Counted here, before the encoder, so the ticks are in the same units as
     // the bar's total.
     let encoder = ZstdEncoder::with_quality(
-        BufReader::new(report.wrap(stdout)),
+        BufReader::with_capacity(256 * 1024, report.wrap(stdout)),
         Level::Precise(zstd_level),
     );
     let exit = stream::once(async move {
@@ -814,7 +860,9 @@ fn compressed_nar(
         )))
     })
     .filter_map(|end: std::io::Result<Option<bytes::Bytes>>| async move { end.transpose() });
-    Ok(ReaderStream::new(encoder).chain(exit))
+    // 256 KiB reads and chunks: the 8 KiB defaults cost a syscall and a body
+    // frame per 8 KiB of a multi-hundred-MB NAR.
+    Ok(ReaderStream::with_capacity(encoder, 256 * 1024).chain(exit))
 }
 
 fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Duration> {
@@ -1228,5 +1276,28 @@ mod tests {
             .collect()
             .await;
         assert!(items.iter().all(Result::is_ok));
+    }
+
+    /// The Negotiation answers with hashes; only the batch's own entries that
+    /// come back are pushed, in batch order.
+    #[test]
+    fn only_entries_named_missing_are_kept_in_order() {
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        let c = "c".repeat(32);
+        let infos = vec![
+            info(&format!("/nix/store/{a}-one"), &[]),
+            info(&format!("/nix/store/{b}-two"), &[]),
+            info(&format!("/nix/store/{c}-three"), &[]),
+        ];
+        let missing: HashSet<String> = [c.clone(), a.clone(), "d".repeat(32)].into();
+        let kept = retain_missing(&infos, &missing);
+        assert_eq!(
+            kept.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(),
+            [
+                format!("/nix/store/{a}-one"),
+                format!("/nix/store/{c}-three")
+            ]
+        );
     }
 }
