@@ -40,27 +40,30 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
         "garret_build_info",
         "service" => service.to_owned(),
         "version" => env!("CARGO_PKG_VERSION"),
+        "revision" => option_env!("GARRET_REVISION").unwrap_or("unknown"),
     )
     .set(1.0);
     Ok(handle)
 }
 
-/// Serves `/metrics` and `/healthz` on its own listener, forever.
-pub async fn serve(handle: PrometheusHandle, listen: &str) -> Result<()> {
+/// Serves `/metrics` and `/healthz` on the pre-bound `listener`, forever.
+/// Binding is the caller's job, so a bad address or a taken port fails
+/// startup rather than a detached task.
+pub async fn serve(handle: PrometheusHandle, listener: tokio::net::TcpListener) -> Result<()> {
     let app = Router::new()
         .route(
             "/metrics",
             get(move || {
                 let handle = handle.clone();
-                async move { handle.render() }
+                async move {
+                    record_process_metrics();
+                    handle.render()
+                }
             }),
         )
         .route("/healthz", get(|| async { "ok" }));
 
-    let addr: std::net::SocketAddr = listen.parse().context("invalid metrics listen address")?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("metrics listening on {addr}");
-    axum::serve(listener, app).await?;
+    crate::runtime::serve(listener, app, std::future::pending()).await?;
     Ok(())
 }
 
@@ -72,7 +75,7 @@ pub async fn track_http(request: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map(|p| p.as_str().to_owned())
         .unwrap_or_else(|| "unmatched".into());
-    let method = request.method().to_string();
+    let method = method_label(request.method());
 
     metrics::gauge!("garret_http_requests_in_flight").increment(1.0);
     let started = Instant::now();
@@ -104,6 +107,71 @@ fn status_class(status: u16) -> &'static str {
     }
 }
 
+/// Bounded method label: anything but the standard five collapses to `OTHER`,
+/// so a client sending arbitrary extension methods cannot mint series.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        _ => "OTHER",
+    }
+}
+
+/// Refreshes the standard `process_*` metrics from `/proc` (Linux only; a
+/// no-op elsewhere). Called on every `/metrics` render, so there is no
+/// background task. Anything unreadable is skipped, never an error.
+#[cfg(target_os = "linux")]
+fn record_process_metrics() {
+    // USER_HZ is 100 on every Linux target this runs on.
+    const TICKS_PER_SEC: f64 = 100.0;
+    use std::fs;
+
+    if let Ok(stat) = fs::read_to_string("/proc/self/stat") {
+        // Fields after the parenthesised comm, which may itself contain spaces.
+        if let Some((_, rest)) = stat.rsplit_once(')') {
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok());
+            if let (Some(utime), Some(stime)) = (ticks(11), ticks(12)) {
+                metrics::gauge!("process_cpu_seconds_total")
+                    .set((utime + stime) / TICKS_PER_SEC);
+            }
+            let boot = fs::read_to_string("/proc/stat").ok().and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("btime "))
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            });
+            if let (Some(start), Some(boot)) = (ticks(19), boot) {
+                metrics::gauge!("process_start_time_seconds").set(boot + start / TICKS_PER_SEC);
+            }
+        }
+    }
+    let status_kb = fs::read_to_string("/proc/self/status").ok().and_then(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
+    });
+    if let Some(kb) = status_kb {
+        metrics::gauge!("process_resident_memory_bytes").set(kb * 1024.0);
+    }
+    if let Ok(dir) = fs::read_dir("/proc/self/fd") {
+        metrics::gauge!("process_open_fds").set(dir.count() as f64);
+    }
+    let max_fds = fs::read_to_string("/proc/self/limits").ok().and_then(|s| {
+        s.lines()
+            .find_map(|l| l.strip_prefix("Max open files"))
+            .and_then(|v| v.split_whitespace().next()?.parse::<f64>().ok())
+    });
+    if let Some(max) = max_fds {
+        metrics::gauge!("process_max_fds").set(max);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn record_process_metrics() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +192,15 @@ mod tests {
         let latency = latency_buckets();
         assert_eq!(latency.first(), Some(&0.001));
         assert_eq!(latency.last(), Some(&60.0));
+    }
+
+    #[test]
+    fn extension_methods_collapse_to_other() {
+        use axum::http::Method;
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::DELETE), "DELETE");
+        let custom = Method::from_bytes(b"BREW").unwrap();
+        assert_eq!(method_label(&custom), "OTHER");
+        assert_eq!(method_label(&Method::PATCH), "OTHER");
     }
 }

@@ -139,7 +139,7 @@ fn children_of(
         // Stored because the signature covers them, but a path is not its
         // own dependency: showing it would add a truncated self-child to
         // nearly every node, since most compiled packages refer to themselves.
-        let child_hash = crate::db::hash_of(&reference);
+        let child_hash = garret_common::hash_of_store_path(&reference);
         if child_hash == hash {
             continue;
         }
