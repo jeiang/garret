@@ -106,7 +106,7 @@ pub fn stream_entry(seed: u64, size: usize, rep: usize, salt: u64) -> Entry {
     }
 }
 
-const NIX_BASE32: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
+use garret_common::NIX_BASE32_ALPHABET as NIX_BASE32;
 
 /// `count` entries plus, when `with_giant` is set, one multi-GB blob — the fat
 /// tail is the interesting part of the real distribution, not the median.

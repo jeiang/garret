@@ -41,7 +41,8 @@ constraints is recorded as a possible future scenario, not built.)
 ## Scenarios and pass/fail
 
 1. **Headline — 20 concurrent pushers** (`garret-bench push`) × the
-   corpus against default caps. PASS =
+   corpus against the default caps (`bench-local` raises only
+   `max_concurrent_uploads` from 16 to 32, so 20 pushers are not shed). PASS =
    - zero failed pushes (429-retries are fine);
    - Pusher RSS < **2× its configured in-flight byte cap** throughout,
      returning to baseline after (cap-relative: provable and

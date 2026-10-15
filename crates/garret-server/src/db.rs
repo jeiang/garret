@@ -37,11 +37,27 @@ pub struct Object {
     pub pushed_by: Option<String>,
 }
 
-/// `<hash>-<name>` → hash. Store path basenames are hash-prefixed by
-/// construction; anything else (a row from before the Pusher validated its
-/// input) yields a hash that matches nothing rather than a panic mid-browse.
-pub fn hash_of(basename: &str) -> &str {
-    basename.get(..32).unwrap_or(basename)
+/// Records `garret_db_query_duration_seconds{query=...}` when dropped, so
+/// every return path of a statement family is timed, errors included.
+struct QueryTimer {
+    query: &'static str,
+    started: std::time::Instant,
+}
+
+impl QueryTimer {
+    fn start(query: &'static str) -> Self {
+        Self {
+            query,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for QueryTimer {
+    fn drop(&mut self) {
+        metrics::histogram!("garret_db_query_duration_seconds", "query" => self.query)
+            .record(self.started.elapsed());
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -147,11 +163,11 @@ fn persist_wal(conn: &Connection) -> Result<()> {
 /// How stale `pushed_at` must be before Negotiation rewrites it: a closure
 /// pushed from several CI jobs in one run costs one write per path, not one
 /// per job.
-pub const PUSHED_AT_DEBOUNCE: i64 = 3600;
+const PUSHED_AT_DEBOUNCE: i64 = 3600;
 
 /// How long a Negotiation protects the paths it reported present. The client
 /// was told it need not upload them and relies on them until its push
-/// finishes; their debounced `pushed_at` is at most [`PUSHED_AT_DEBOUNCE`]
+/// finishes; their debounced `pushed_at` is at most `PUSHED_AT_DEBOUNCE`
 /// behind that Negotiation. Neither GC ([`evictable`]) nor prune ([`prunable`]) removes
 /// an object pushed more recently than this, which leaves a push up to 23
 /// hours long room to finish against a complete closure.
@@ -220,14 +236,12 @@ pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result
 /// write lock with SQLITE_BUSY at once, without waiting out `busy_timeout`,
 /// whenever another connection (the Puller's bumps) holds the write lock.
 pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()> {
+    let _timer = QueryTimer::start("insert_object");
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // A re-push of an object we already hold must not count its bytes twice.
     let previous: i64 = tx
-        .query_row(
-            "SELECT file_size FROM objects WHERE store_path_hash = ?1",
-            params![obj.store_path_hash],
-            |row| row.get(0),
-        )
+        .prepare_cached("SELECT file_size FROM objects WHERE store_path_hash = ?1")?
+        .query_row(params![obj.store_path_hash], |row| row.get(0))
         .optional()?
         .unwrap_or(0);
     // An upsert, not INSERT OR REPLACE: REPLACE deletes the old row first,
@@ -266,7 +280,7 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
     )?;
     {
         let mut stmt =
-            tx.prepare("INSERT INTO object_refs (referrer, reference) VALUES (?1, ?2)")?;
+            tx.prepare_cached("INSERT INTO object_refs (referrer, reference) VALUES (?1, ?2)")?;
         for r in &obj.references {
             // Self-references are stored, not dropped: the signature covers the
             // full reference list the pusher was handed, so a narinfo rendered
@@ -300,37 +314,38 @@ pub fn get_object_and_last_accessed(
     conn: &Connection,
     hash: &str,
 ) -> Result<Option<(Object, i64)>> {
+    let _timer = QueryTimer::start("get_object");
     let mut obj = conn
-        .query_row(
+        .prepare_cached(
             "SELECT store_path, name, nar_hash, nar_size, file_hash, file_size, deriver, ca,
                     sigs, pushed_by, last_accessed_at
              FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |row| {
-                let obj = Object {
-                    store_path_hash: hash.to_owned(),
-                    store_path: row.get(0)?,
-                    name: row.get(1)?,
-                    nar_hash: row.get(2)?,
-                    nar_size: row.get(3)?,
-                    file_hash: row.get(4)?,
-                    file_size: row.get(5)?,
-                    deriver: row.get(6)?,
-                    ca: row.get(7)?,
-                    references: Vec::new(),
-                    sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
-                        .unwrap_or_default(),
-                    pushed_by: row.get(9)?,
-                };
-                Ok((obj, row.get(10)?))
-            },
-        )
+        )?
+        .query_row(params![hash], |row| {
+            let obj = Object {
+                store_path_hash: hash.to_owned(),
+                store_path: row.get(0)?,
+                name: row.get(1)?,
+                nar_hash: row.get(2)?,
+                nar_size: row.get(3)?,
+                file_hash: row.get(4)?,
+                file_size: row.get(5)?,
+                deriver: row.get(6)?,
+                ca: row.get(7)?,
+                references: Vec::new(),
+                sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
+                    .unwrap_or_default(),
+                pushed_by: row.get(9)?,
+            };
+            Ok((obj, row.get(10)?))
+        })
         .optional()?;
 
     if let Some((obj, _)) = obj.as_mut() {
         // Sorted: narinfo References order is part of what the signature covers.
-        let mut stmt = conn
-            .prepare("SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference",
+        )?;
         obj.references = stmt
             .query_map(params![hash], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -341,12 +356,10 @@ pub fn get_object_and_last_accessed(
 /// Whether the cache holds this store path hash — and, by the row ⇒ blob
 /// invariant, its blob.
 pub fn exists(conn: &Connection, hash: &str) -> Result<bool> {
+    let _timer = QueryTimer::start("exists");
     Ok(conn
-        .query_row(
-            "SELECT 1 FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |_| Ok(()),
-        )
+        .prepare_cached("SELECT 1 FROM objects WHERE store_path_hash = ?1")?
+        .query_row(params![hash], |_| Ok(()))
         .optional()?
         .is_some())
 }
@@ -354,11 +367,9 @@ pub fn exists(conn: &Connection, hash: &str) -> Result<bool> {
 /// Current cache usage from the maintained `stats` counter — a cheap read,
 /// which is what lets every GC tick check quota without summing rows.
 pub fn total_bytes(conn: &Connection) -> Result<i64> {
-    Ok(
-        conn.query_row("SELECT total_bytes FROM stats WHERE id = 1", [], |r| {
-            r.get(0)
-        })?,
-    )
+    Ok(conn
+        .prepare_cached("SELECT total_bytes FROM stats WHERE id = 1")?
+        .query_row([], |r| r.get(0))?)
 }
 
 /// Re-derives the maintained counter from the rows themselves (spec 05: done
@@ -414,7 +425,8 @@ macro_rules! evictable_where {
 /// the referrers that will keep it yet. To the reference check it looks like
 /// an unreferenced root.
 pub fn evictable(conn: &Connection, limit: usize, now: i64) -> Result<Vec<(String, i64)>> {
-    let mut stmt = conn.prepare(concat!(
+    let _timer = QueryTimer::start("evictable");
+    let mut stmt = conn.prepare_cached(concat!(
         "SELECT o.store_path_hash, o.file_size FROM objects o WHERE ",
         evictable_where!(),
         " ORDER BY o.last_accessed_at ASC, o.store_path_hash ASC LIMIT :limit"
@@ -432,6 +444,7 @@ pub fn evictable(conn: &Connection, limit: usize, now: i64) -> Result<Vec<(Strin
 /// snapshot; since it was taken a Negotiation may have reported the object
 /// present, or an upload may have added a referrer. `None` means it stays.
 pub fn evict_object(conn: &mut Connection, hash: &str, now: i64) -> Result<Option<i64>> {
+    let _timer = QueryTimer::start("evict_object");
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let size: Option<i64> = tx
         .prepare_cached(concat!(
@@ -556,9 +569,10 @@ pub fn bump_last_accessed<S: AsRef<str>>(
     now: i64,
     stale_after: i64,
 ) -> Result<()> {
+    let _timer = QueryTimer::start("bump_flush");
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare_cached(
             "UPDATE objects SET last_accessed_at = ?2
              WHERE store_path_hash = ?1 AND last_accessed_at < ?2 - ?3",
         )?;
@@ -574,11 +588,10 @@ pub fn bump_last_accessed<S: AsRef<str>>(
 /// under the Puller's deep-readiness probe. `None` on an empty cache.
 pub fn most_recently_accessed(conn: &Connection) -> Result<Option<String>> {
     Ok(conn
-        .query_row(
+        .prepare_cached(
             "SELECT store_path_hash FROM objects ORDER BY last_accessed_at DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
+        )?
+        .query_row([], |row| row.get(0))
         .optional()?)
 }
 
@@ -593,6 +606,7 @@ pub fn most_recently_accessed(conn: &Connection) -> Result<Option<String>> {
 /// fail at once under contention. Prune cannot interleave: both run on
 /// the Pusher's one writer connection, behind its mutex.
 pub fn missing(conn: &mut Connection, hashes: &[String], now: i64) -> Result<Vec<String>> {
+    let _timer = QueryTimer::start("missing");
     let mut missing = Vec::new();
     let mut stale = Vec::new();
     {
@@ -758,15 +772,6 @@ mod tests {
     /// A time past the push grace of every object these tests insert (at
     /// times up to 1000), so only references and pins decide evictability.
     const LATER: i64 = PUSH_GRACE + 1000;
-
-    #[test]
-    fn hash_of_survives_a_multibyte_character_at_the_hash_boundary() {
-        // Byte 32 falls inside `é`: slicing there used to panic the Puller's
-        // browse tree while it held the connection mutex.
-        let base = format!("{}é-x", "a".repeat(31));
-        assert!(!garret_common::is_store_hash(hash_of(&base)));
-        assert_eq!(hash_of(&format!("{}-x", "a".repeat(32))), "a".repeat(32));
-    }
 
     #[test]
     fn round_trips_an_object_with_sorted_references() {

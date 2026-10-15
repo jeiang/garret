@@ -165,7 +165,16 @@ where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let task = tokio::task::spawn_blocking(move || read(&conn.lock()));
+    // A read queued behind a wedged lock holder must not run once its
+    // request has already been answered: check the deadline under the lock.
+    let deadline = Instant::now() + budget;
+    let task = tokio::task::spawn_blocking(move || {
+        let conn = conn.lock();
+        if Instant::now() > deadline {
+            anyhow::bail!("db read abandoned: budget elapsed while queued");
+        }
+        read(&conn)
+    });
     match tokio::time::timeout(budget, task).await {
         Ok(joined) => {
             Some(joined.unwrap_or_else(|e| Err(anyhow::anyhow!("db read task failed: {e}"))))
@@ -200,7 +209,7 @@ where
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    garret_server::runtime::init_tracing();
     let path = std::env::args()
         .nth(1)
         .context("usage: garret-puller <config.toml>")?;
@@ -254,9 +263,14 @@ async fn main() -> Result<()> {
     });
 
     let metrics_handle = garret_metrics::install("puller")?;
-    let metrics_listen = cfg.metrics_listen.clone();
+    let metrics_addr: std::net::SocketAddr = cfg
+        .metrics_listen
+        .parse()
+        .context("invalid metrics listen address")?;
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    tracing::info!("metrics listening on {metrics_addr}");
     tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, &metrics_listen).await {
+        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener).await {
             tracing::error!("metrics listener failed: {e:#}");
         }
     });
@@ -312,7 +326,8 @@ async fn main() -> Result<()> {
     let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("puller listening on {addr}");
-    axum::serve(listener, app).await?;
+    garret_server::runtime::notify_ready();
+    garret_server::runtime::serve(listener, app, std::future::pending()).await?;
     Ok(())
 }
 
@@ -415,11 +430,7 @@ async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
     };
     match cached_probe(&state.read_probe, READ_PROBE_TTL, probe).await {
         Ok(()) => (StatusCode::OK, "ready").into_response(),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("S3 read path failing: {e}"),
-        )
-            .into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "S3 read path failing").into_response(),
     }
 }
 
@@ -451,11 +462,45 @@ async fn probe_read(
         .map_err(|e| format!("fetching: {}", e.without_url()))?;
     match response.status() {
         status if status.is_success() => Ok(()),
-        status => Err(format!("presigned GET answered {}", status.as_u16())),
+        status => {
+            // Upstream S3 error code / request id help diagnosis; the URL
+            // itself (a live signature) is never included.
+            let request_id = response
+                .headers()
+                .get("x-amz-request-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.chars().take(64).collect::<String>());
+            let body = response.text().await.unwrap_or_default();
+            let code = body
+                .split_once("<Code>")
+                .and_then(|(_, rest)| rest.split_once("</Code>"))
+                .map(|(code, _)| code.chars().take(64).collect::<String>());
+            let mut detail = format!("presigned GET answered {}", status.as_u16());
+            if let Some(code) = code {
+                detail.push_str(&format!(", S3 error code {code}"));
+            }
+            if let Some(id) = request_id {
+                detail.push_str(&format!(", x-amz-request-id {id}"));
+            }
+            Err(detail)
+        }
     }
 }
 
-async fn nar_route(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
+/// Counts NAR requests by outcome: a hit is a redirect issued, anything else
+/// (unknown blob, degraded read, presign failure) is a miss.
+async fn nar_route(state: State<Arc<AppState>>, file: Path<String>) -> Response {
+    let response = nar_redirect(state, file).await;
+    let outcome = if response.status() == StatusCode::TEMPORARY_REDIRECT {
+        "hit"
+    } else {
+        "miss"
+    };
+    metrics::counter!("garret_nar_requests_total", "outcome" => outcome).increment(1);
+    response
+}
+
+async fn nar_redirect(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
     let Some(hash) = file.strip_suffix(".nar.zst") else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -489,7 +534,6 @@ async fn nar_route(State(state): State<Arc<AppState>>, Path(file): Path<String>)
     .await
     {
         Ok(Ok(url)) => {
-            metrics::counter!("garret_nar_redirects_total").increment(1);
             metrics::histogram!("garret_presign_duration_seconds").record(started.elapsed());
             Redirect::temporary(&url).into_response()
         }
@@ -515,8 +559,13 @@ async fn require_browse_oidc(
         .and_then(|v| v.strip_prefix("Bearer "));
     match token {
         Some(token) if auth.authenticate(token).await.is_ok() => next.run(request).await,
-        _ => {
-            metrics::counter!("garret_browse_auth_failures_total").increment(1);
+        other => {
+            let reason = if other.is_none() {
+                "missing_bearer"
+            } else {
+                "token_rejected"
+            };
+            metrics::counter!("garret_browse_auth_failures_total", "reason" => reason).increment(1);
             (
                 StatusCode::UNAUTHORIZED,
                 [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],

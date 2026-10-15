@@ -5,11 +5,18 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use garret_client::{auth, browse, config, discovery, doctor, nixconf, push, watcher};
+use garret_common::human_bytes;
 use indicatif::MultiProgress;
 use serde_json::json;
 
 #[derive(Parser)]
-#[command(name = "garret", about = "Push store paths to a garret binary cache")]
+#[command(
+    name = "garret",
+    about = "Push store paths to a garret binary cache",
+    after_help = "Environment:\n  \
+                  GARRET_TOKEN     Bearer token to use instead of any login or client secret\n  \
+                  GARRET_ENDPOINT  Pusher URL, overriding `endpoint` in the config"
+)]
 struct Cli {
     /// Config file (defaults to $XDG_CONFIG_HOME/garret/config.toml)
     #[arg(long, global = true)]
@@ -48,6 +55,7 @@ enum Command {
     },
     /// Push store paths and their closure
     Push {
+        /// Store paths to push, with their closure
         paths: Vec<String>,
         /// Concurrent uploads
         #[arg(long, short)]
@@ -69,6 +77,12 @@ enum Command {
         /// stopping the watch-store that pushed during the build.
         #[arg(long)]
         drain: bool,
+        /// Persist the Watcher Cursor here instead of `[watch] cursor_path`
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Listen for wake datagrams here instead of `[watch] socket_path`
+        #[arg(long)]
+        socket: Option<String>,
     },
     /// Wake a running watch-store so it polls now (the post-build-hook stub).
     /// Exits 0 unconditionally: a hook must never block or fail the build.
@@ -81,16 +95,24 @@ enum Command {
     },
     /// Search the cache contents
     List {
+        /// Substring to match against store path names; omit to list everything
         query: Option<String>,
+        /// Maximum number of Objects to print
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
     /// Print an object's dependency tree
-    Tree { hash: String },
+    Tree {
+        /// Store hash (32 characters) or store path of the Object
+        hash: String,
+    },
     /// List GC-exempt pins (set with `garret-admin pin`)
     Pins,
     /// Emit a shell completion script
-    Completions { shell: clap_complete::Shell },
+    Completions {
+        /// Shell to generate the script for
+        shell: clap_complete::Shell,
+    },
 }
 
 impl Command {
@@ -134,6 +156,9 @@ async fn main() -> Result<()> {
     // timeout cannot tell a slow upload from a stuck one.
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        // The servers close connections idle for 30 s; retire pooled ones
+        // first so an upload is never sent on a connection mid-close.
+        .pool_idle_timeout(Duration::from_secs(20))
         .build()?;
 
     match cli.command {
@@ -203,7 +228,7 @@ async fn main() -> Result<()> {
                 anyhow::bail!("nothing to push");
             }
             let cfg = cfg.unwrap();
-            let pusher = pusher(&cfg, &http, jobs);
+            let pusher = pusher(&cfg, &http, jobs)?;
             let closure = push::closure(&paths).await?;
             let closure_len = closure.len();
             // Paths an upstream cache already signs never enter the
@@ -245,40 +270,22 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::WatchStore { full_sync, drain } => {
+        Command::WatchStore {
+            full_sync,
+            drain,
+            cursor,
+            socket,
+        } => {
             let cfg = cfg.unwrap();
-            // A daemon authenticates as itself, not as whoever last logged in.
-            let tokens = match &cfg.watch.credentials_file {
-                Some(path) => {
-                    let (id, secret) = auth::read_client_credentials(path)?;
-                    auth::TokenSource::client_credentials(
-                        &http,
-                        &cfg.oidc.issuer,
-                        &id,
-                        &secret,
-                        cfg.oidc.resource.as_deref(),
-                    )
-                }
-                None => auth::TokenSource::from_env(
-                    &http,
-                    &cfg.oidc.audience,
-                    cfg.oidc.resource.as_deref(),
-                ),
-            };
+            let pusher = pusher(&cfg, &http, None)?;
             // Minted once up front so a daemon that cannot authenticate exits
             // saying so, rather than failing every path it sees.
-            tokens.get().await?;
-            let pusher = push::Pusher {
-                tokens,
-                http: http.clone(),
-                endpoint: cfg.endpoint.clone(),
-                jobs: cfg.jobs,
-                zstd_level: cfg.zstd_level,
-                max_retries: cfg.max_retries,
-            };
+            pusher.tokens.get().await?;
             let watcher = watcher::Watcher {
                 nix_db: cfg.watch.nix_db.clone(),
-                cursor_path: cfg.watch.cursor_path.clone().into(),
+                cursor_path: cursor
+                    .unwrap_or_else(|| cfg.watch.cursor_path.clone())
+                    .into(),
                 poll_interval: Duration::from_secs(cfg.watch.poll_interval_secs),
                 filters: watcher::Filters {
                     // `[watch]` may override the client-wide upstream list.
@@ -288,9 +295,12 @@ async fn main() -> Result<()> {
                         .clone()
                         .unwrap_or_else(|| cfg.upstream_keys.clone()),
                     exclude_patterns: cfg.watch.exclude_patterns.clone(),
+                    own_keys: cfg.public_keys.clone(),
                 },
                 max_attempts: cfg.watch.max_attempts,
-                socket_path: cfg.watch.socket_path.clone().into(),
+                socket_path: socket
+                    .unwrap_or_else(|| cfg.watch.socket_path.clone())
+                    .into(),
             };
             if !drain {
                 watcher.run(&pusher, full_sync).await?;
@@ -322,9 +332,9 @@ async fn main() -> Result<()> {
             for object in &page.objects {
                 println!(
                     "{}  {:<40} {:>12} on disk",
-                    &object.hash[..8.min(object.hash.len())],
+                    object.hash,
                     object.name,
-                    human(object.file_size),
+                    human_bytes(object.file_size),
                 );
             }
             if page.next_cursor.is_some() {
@@ -333,9 +343,12 @@ async fn main() -> Result<()> {
         }
 
         Command::Tree { hash } => {
+            let hash = garret_common::parse_store_hash(&hash).with_context(|| {
+                format!("`{hash}` is not a 32-character store hash or a store path")
+            })?;
             let cfg = cfg.unwrap();
             let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::tree(&http, &puller, &token, &hash).await?;
+            let raw = browse::tree(&http, &puller, &token, hash).await?;
             if cli.json {
                 println!("{raw}");
                 return Ok(());
@@ -447,20 +460,25 @@ async fn login(
         (Some(url), _) => {
             let discovered = discovery::fetch(http, url).await?;
             let rendered = config::render(url.trim_end_matches('/'), &discovered)?;
-            if exists {
-                let current = std::fs::read_to_string(&path).unwrap_or_default();
-                if !force {
-                    anyhow::bail!(
-                        "{} already exists. Re-run with --force to replace it with:\n\n{}\n\
-                         (hand-edited `jobs`/`zstd_level` would be lost; current contents:\n\n{})",
-                        path.display(),
-                        rendered.trim_end(),
-                        current.trim_end(),
-                    );
+            let current = exists.then(|| std::fs::read_to_string(&path).unwrap_or_default());
+            match current {
+                // Re-running against the server that wrote this config: nothing
+                // to replace, so nothing to refuse.
+                Some(current) if current == rendered => {
+                    eprintln!("{} is already up to date", path.display());
+                }
+                Some(current) if !force => anyhow::bail!(
+                    "{} already exists. Re-run with --force to replace it with:\n\n{}\n\
+                     (hand-edited `jobs`/`zstd_level` would be lost; current contents:\n\n{})",
+                    path.display(),
+                    rendered.trim_end(),
+                    current.trim_end(),
+                ),
+                _ => {
+                    config::write(&path, &rendered)?;
+                    eprintln!("wrote {}", path.display());
                 }
             }
-            config::write(&path, &rendered)?;
-            eprintln!("wrote {}", path.display());
             if !discovered.public_keys.is_empty() {
                 eprintln!(
                     "`garret use` will make nix trust these signing keys: {}",
@@ -476,13 +494,12 @@ async fn login(
         .client_id
         .as_deref()
         .context("`oidc.client_id` is required for `garret login`")?;
-    auth::device_login(
-        http,
-        &cfg.oidc.issuer,
-        client_id,
-        cfg.oidc.resource.as_deref(),
-    )
-    .await?;
+    let issuer = cfg
+        .oidc
+        .issuer
+        .as_deref()
+        .context("`oidc.issuer` is required to log in")?;
+    auth::device_login(http, issuer, client_id, cfg.oidc.resource.as_deref()).await?;
     println!(
         "Logged in; refresh token stored at {}",
         auth::token_path()?.display()
@@ -490,29 +507,15 @@ async fn login(
     Ok(())
 }
 
-/// Proves the token is not merely present but accepted: an empty
-/// `missing-paths` batch is a valid, near-free request that exercises exactly
-/// the authentication path `push` uses.
+/// Proves the token is not merely present but accepted — the same probe
+/// `doctor` runs ([`auth::probe_pusher`]), which exercises exactly the
+/// authentication path `push` uses.
 async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> Result<()> {
-    let token = auth::bearer_token(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()).await?;
+    let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
     let claims = auth::peek_claims(&token).unwrap_or_default();
+    auth::probe_pusher(http, &cfg.endpoint, &token).await?;
 
-    let response = http
-        .post(format!("{}/api/v1/missing-paths", cfg.endpoint))
-        .bearer_auth(&token)
-        .json(&Vec::<String>::new())
-        .send()
-        .await
-        .context("probing the Pusher")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "the Pusher rejected this token with {status}: {}",
-            body.trim()
-        );
-    }
-
+    let issuer = cfg.oidc.issuer.as_deref();
     let expires_at = claims.exp.map(|exp| {
         let remaining = exp - now();
         format!("{exp} ({})", human_duration(remaining))
@@ -524,7 +527,7 @@ async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> 
             json!({
                 "endpoint": cfg.endpoint,
                 "puller_endpoint": cfg.puller_endpoint,
-                "issuer": cfg.oidc.issuer,
+                "issuer": issuer,
                 "audience": cfg.oidc.audience,
                 "subject": claims.sub,
                 "expires_at": claims.exp,
@@ -537,7 +540,7 @@ async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> 
         "puller     {}",
         cfg.puller_endpoint.as_deref().unwrap_or("(unset)")
     );
-    println!("issuer     {}", cfg.oidc.issuer);
+    println!("issuer     {}", issuer.unwrap_or("(unset)"));
     println!("audience   {}", cfg.oidc.audience);
     println!(
         "subject    {}",
@@ -584,11 +587,13 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
         nixconf::Outcome::Added(path) => println!("added {puller} to {}", path.display()),
     }
 
-    // The silent failure this command exists to prevent.
+    // The silent failure this command exists to prevent: the snippet is
+    // written, but nix will not read it, so the cache is not in use. A script
+    // running `garret use` must see that as a failure.
     if nixconf::honoured(puller) == Some(false) {
-        eprintln!(
-            "\nwarning: nix does not list {puller} as a substituter, so it is ignoring \
-             your user nix.conf.\nThat happens when your user is not in `trusted-users`. \
+        anyhow::bail!(
+            "nix does not list {puller} as a substituter, so it is ignoring your user \
+             nix.conf.\nThat happens when your user is not in `trusted-users`. \
              On NixOS, add instead:\n\n{}",
             nixconf::nixos_snippet(puller, &cfg.public_keys)
         );
@@ -639,19 +644,23 @@ fn dry_run_report(
     for info in missing {
         println!("  would-push {}", info.path);
     }
-    println!("{} to upload (uncompressed)", human(nar_bytes as i64));
+    println!("{} to upload (uncompressed)", human_bytes(nar_bytes as i64));
     Ok(())
 }
 
-fn pusher(cfg: &config::Config, http: &reqwest::Client, jobs: Option<usize>) -> push::Pusher {
-    push::Pusher {
-        tokens: auth::TokenSource::from_env(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()),
+fn pusher(
+    cfg: &config::Config,
+    http: &reqwest::Client,
+    jobs: Option<usize>,
+) -> Result<push::Pusher> {
+    Ok(push::Pusher {
+        tokens: auth::TokenSource::for_config(http, cfg)?,
         http: http.clone(),
         endpoint: cfg.endpoint.clone(),
         jobs: jobs.unwrap_or(cfg.jobs),
         zstd_level: cfg.zstd_level,
         max_retries: cfg.max_retries,
-    }
+    })
 }
 
 async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(String, String)> {
@@ -659,10 +668,8 @@ async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(
         .puller_endpoint
         .clone()
         .context("set `puller_endpoint` in the config: list/tree query the Puller")?;
-    Ok((
-        puller,
-        auth::bearer_token(http, &cfg.oidc.audience, cfg.oidc.resource.as_deref()).await?,
-    ))
+    let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
+    Ok((puller, token))
 }
 
 fn now() -> i64 {
@@ -682,22 +689,6 @@ fn human_duration(seconds: i64) -> String {
         s if s < 5400 => format!("in {}m", s / 60),
         s if s < 172800 => format!("in {}h", s / 3600),
         s => format!("in {}d", s / 86400),
-    }
-}
-
-/// Byte sizes for humans; the API keeps the exact number.
-fn human(bytes: i64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
     }
 }
 

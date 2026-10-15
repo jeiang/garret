@@ -24,17 +24,33 @@ be 32 nix-base32 characters before it becomes a key
 
 Defaults, all configurable:
 
-- Single `PutObject` when the whole body fits in one part (**64 MiB**).
-- Above: multipart with **64 MiB parts**, at most **4 parts in flight**,
-  and the concurrency permit acquired **before** reading each part — the
-  reader must never race ahead of S3. Worst-case buffering is 4×64 MiB
-  per NAR; the protocol's global in-flight byte cap bounds the aggregate.
+- Single `PutObject` when the whole body fits in one part (**16 MiB**).
+- Above: multipart with **16 MiB parts**, at most **4 parts in flight**,
+  and the buffer capacity acquired **before** reading each part — the
+  reader must never race ahead of S3. Worst-case buffering is 4×16 MiB
+  per NAR; the global in-flight byte cap (default **256 MiB**, with
+  **16** concurrent uploads) bounds the aggregate.
+- **Slots are charged by bytes, not by part.** The global budget is a
+  semaphore counting buffer capacity in units of `part_size / 256` (at
+  most 64 KiB); a buffer holds the units covering its capacity, so the
+  sum of all upload buffers never exceeds `max_in_flight_bytes` (a cap
+  below one part is raised to one part). The first buffer reserves only
+  what the body can reach — the Pusher passes zstd's worst-case
+  compressed size for the claimed NarSize plus 64 KiB, which is also
+  the most it accepts ([ADR-0010](../adr/0010-pusher-verifies-nar-hash.md))
+  — and grows to a whole part only if the body outgrows that. A 1 KiB
+  NAR therefore holds one unit, not a part, and small uploads are
+  limited by `max_concurrent_uploads`, not by slot count. Parts 2..N
+  reserve a whole part. `garret_part_slots_limit` still reports the
+  budget in whole-part equivalents.
 - Each part uploads on its own task while the next is read, so client
   ingress and S3 egress overlap and a finished part frees its permit
   whether or not its reader is waiting. A permit is held only by a part
   being read or uploaded, never by a waiter, so uploads sharing the global
   cap cannot wedge each other; a cap of fewer part slots than parts in
   flight just serializes the parts.
+- Bytes are hashed (FileHash) chunk by chunk as they are appended to the
+  buffer, not in one pass over a finished part.
 - On any upload error, stop the parts still uploading, then abort the
   multipart immediately so parts free.
 - A body that sends nothing for **60 s** is an upload error like any
@@ -52,16 +68,20 @@ Defaults, all configurable:
 - Every S3 call carries an **overall operation deadline** —
   `[s3] operation_timeout_secs`, default **60** — covering connect,
   transfer, and any SDK-internal retries (ticket 27). Overall rather
-  than per-attempt on purpose: a timed-out attempt would be retried,
-  and part re-upload is forbidden below. A stalled upstream therefore
-  costs one timeout and a loud failed push instead of holding an upload
-  permit and its in-flight bytes forever.
+  than per-attempt on purpose. A stalled upstream therefore costs one
+  timeout and a loud failed push instead of holding an upload permit and
+  its in-flight bytes forever.
+- **`UploadPart` is never retried by the SDK** (max attempts 1, set per
+  operation): part re-upload is forbidden below, so a failed part aborts
+  the multipart at once rather than after retries have burned the
+  deadline. Other calls (`ListObjectsV2`, `DeleteObjects`, `PutObject`,
+  presigning) keep the SDK's default retries.
 
 The single-`PutObject` threshold is the part size, not a separate 100 MiB
 knob as originally written (corrected at M3). `PutObject` needs the body
 length up front, so the threshold is exactly how much must be buffered
 before the shape of the upload is known — setting it above the part size
-would buffer 100 MiB per upload and break the 4×64 MiB bound this section
+would buffer far more per upload and break the memory bound this section
 promises. One knob, and the promise holds.
 
 S4 constraints the defaults must keep satisfying: parts 1..N-1 must be

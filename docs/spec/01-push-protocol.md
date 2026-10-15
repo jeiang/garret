@@ -85,7 +85,9 @@ Pushes are fully idempotent; watcher/CI overlap and timeout-retries are
 normal operation:
 
 - Client sends `Expect: 100-continue`; the server checks the DB before
-  requesting the body.
+  requesting the body, and checks again once it holds the path's
+  in-flight claim (an upload that finished a moment earlier may have
+  landed the row).
 - Already present → `200 {"status":"exists"}` with no body transfer.
 - In flight elsewhere → `200 {"status":"in-progress"}`. The second
   pusher does **not** count this as pushed — the first upload may yet
@@ -102,32 +104,45 @@ normal operation:
 Parallelism is expressed as concurrent PUTs from the client's
 configurable worker pool — no custom framing, no batch endpoint (revisit
 only if benchmarks show per-request overhead dominating small-NAR
-pushes). HTTP/2 with explicitly tuned flow control: adaptive window
-enabled; `max_send_buf_size` sized to bound per-stream server memory.
-HTTP/1.1 works unmodified. The client may open additional connections if
-one saturates.
+pushes). The server speaks **HTTP/1.1 only** (no HTTP/2, h2c included).
+A connection must send complete request headers within **30 s** of being
+accepted, and of each later keep-alive request, or it is dropped — a
+connection that sends nothing is closed too (the accept loop in
+`garret_server::runtime`). While draining on shutdown the listener is
+closed, so new connections are refused;
+bodies are bounded by the idle timeout below. The client may open
+additional connections if one saturates.
 
 ## Backpressure
 
-Global semaphores cap (a) concurrent uploads and (b) total in-flight
-bytes. Past either cap the server sheds fast with `429` + `Retry-After`;
-clients wait out `Retry-After` (jittered) and try again, for as long as a
-deadline allows rather than a retry count — a 429 is a place in the queue,
-not a failure. The queue lives in the clients;
-server memory is provably bounded by configuration. Each upload also
-holds one zstd decoder for the NarHash check: its window (at most
-8 MiB; 2 MiB at the default level) plus a 128 KiB output buffer, so
-the concurrent-upload cap bounds that too.
+Global limits cap (a) concurrent uploads and (b) total in-flight
+buffer bytes. Past the **upload cap** the server sheds fast with `429` +
+`Retry-After`; clients wait out `Retry-After` (jittered) and try again,
+for as long as a deadline allows rather than a retry count — a 429 is a
+place in the queue, not a failure. The **byte cap** does not shed: an
+admitted upload's part read queues on the shared budget until buffer
+capacity frees, so it applies backpressure to the sender's body rather
+than a `429`. Server memory is provably bounded by configuration: the
+buffers by the byte cap (charged by bytes actually reserved, see
+[03-storage.md](03-storage.md)), and the preamble by a **1 MiB** limit on
+its declared length (larger is `400`; it is buffered whole until
+complete). Each upload also holds one zstd decoder for the NarHash
+check: its window (at most 8 MiB; 2 MiB at the default level) plus a
+128 KiB output buffer, so the concurrent-upload cap bounds that too.
 
 **A stalled body is abandoned.** An admitted upload holds an upload
-slot, its in-flight claim and, mid-NAR, a part slot, so a sender that
+slot, its in-flight claim and, mid-NAR, buffer capacity, so a sender that
 stops sending would hold them forever. If the body delivers nothing for
 **60 s** (a fixed bound), the server gives up: any multipart upload is
 aborted and the reply is a `500`, retryable like any `5xx`. The bound is
 on silence, not total time — only time spent waiting for the next chunk
-counts, so a slow sender that keeps moving is never cut off. There is
+counts, so a slow sender that keeps moving is never cut off. A stalled or
+broken client body is the sender's failure, so the Pusher logs it as a
+warning (still with the `error_id`), not an error. There is
 deliberately no per-NAR size cap: every pusher is authenticated, and the
-GC quota bounds what the cache holds.
+GC quota bounds what the cache holds. The compressed body itself is capped
+at zstd's worst-case size for the claimed `narSize` plus 64 KiB; past
+that it is `400`.
 
 ## Errors, retry, versioning
 

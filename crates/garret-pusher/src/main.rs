@@ -1,6 +1,4 @@
 //! Pusher: accepts NARs over the garret push protocol (spec 01-push-protocol).
-//! M3 slice — negotiation, streamed multipart upload, signing, OIDC,
-//! backpressure and metrics. No GC yet (M4).
 
 use std::{
     sync::{Arc, atomic::AtomicBool},
@@ -58,22 +56,36 @@ pub(crate) struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    garret_server::runtime::init_tracing();
     let path = std::env::args()
         .nth(1)
         .context("usage: garret-pusher <config.toml>")?;
     let cfg: PusherConfig = garret_server::config::load(&path)?;
+    cfg.validate()?;
 
     // Before any metric call: the recorder must exist first or the value is lost.
     let metrics_handle = garret_metrics::install("pusher")?;
-    let metrics_listen = cfg.metrics_listen.clone();
+
+    // Every listener is bound before anything serves, so a taken port or an
+    // unusable socket path fails startup instead of leaving a half-up Pusher.
+    let metrics_addr: std::net::SocketAddr = cfg
+        .metrics_listen
+        .parse()
+        .context("invalid metrics listen address")?;
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
+        .await
+        .with_context(|| format!("binding metrics listener {metrics_addr}"))?;
     tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, &metrics_listen).await {
+        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener).await {
             tracing::error!("metrics listener failed: {e:#}");
         }
     });
 
     let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    let admin_listener = cfg.admin_socket.as_deref().map(admin::bind).transpose()?;
     // Authenticator::new refuses an empty issuer list, so this cannot start
     // unauthenticated (spec 04: no auth-disable flag).
     let auth = Authenticator::new(cfg.oidc.clone())?;
@@ -114,10 +126,10 @@ async fn main() -> Result<()> {
         ))
     });
 
-    if let Some(admin_socket) = cfg.admin_socket.clone() {
+    if let Some(admin_listener) = admin_listener {
         let (state, collector) = (state.clone(), collector.clone());
         tokio::spawn(async move {
-            if let Err(e) = admin::serve(admin_socket, state, collector).await {
+            if let Err(e) = admin::serve(admin_listener, state, collector).await {
                 tracing::error!("admin socket failed: {e:#}");
             }
         });
@@ -205,8 +217,9 @@ async fn main() -> Result<()> {
         .layer(middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("pusher listening on {addr}");
+    // Every listener is bound and every background task spawned.
+    garret_server::runtime::notify_ready();
     serve_until_stopped(listener, app, storage).await
 }
 
@@ -225,7 +238,7 @@ async fn serve_until_stopped(
     storage: Storage,
 ) -> Result<()> {
     let (stop, stopped) = tokio::sync::oneshot::channel();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+    let server = garret_server::runtime::serve(listener, app, async move {
         stop_signal().await;
         tracing::info!("stopping: draining in-flight uploads for up to {DRAIN:?}");
         let _ = stop.send(());
@@ -238,7 +251,7 @@ async fn serve_until_stopped(
         }
     };
     tokio::select! {
-        served = std::future::IntoFuture::into_future(server) => return Ok(served?),
+        served = server => return Ok(served?),
         () = deadline => {}
     }
     // The Pusher is the bucket's only writer and is exiting, so every open
@@ -306,12 +319,71 @@ impl IntoResponse for Error {
 /// fresh id and the caller gets only the id to quote back.
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
+        if let Some(over) = e.downcast_ref::<storage::BodyOverLimit>() {
+            return Error(StatusCode::BAD_REQUEST, over.to_string());
+        }
         let id = format!("{:016x}", fastrand::u64(..));
-        tracing::error!(error_id = %id, "{e:#}");
+        // A sender that stalled or dropped mid-body failed; the server did
+        // not. Same id and 500, but a warning rather than an error.
+        if e.downcast_ref::<storage::ClientBodyError>().is_some() {
+            tracing::warn!(error_id = %id, kind = "client_body", "client body failed: {e:#}");
+        } else {
+            tracing::error!(error_id = %id, "{e:#}");
+        }
         Error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("internal error (id {id})"),
         )
+    }
+}
+
+/// Largest preamble accepted (spec 01). Real ones are a few KiB of JSON; the
+/// body is buffered whole until the preamble is complete.
+const MAX_PREAMBLE: usize = 1024 * 1024;
+
+/// Runs a blocking database call on the blocking pool, holding the
+/// connection lock only inside it. SQLite can wait seconds on another
+/// writer's lock; that must park a blocking thread, not a Tokio worker.
+pub(crate) async fn db_run<T, F>(conn: &Arc<Mutex<rusqlite::Connection>>, f: F) -> Result<T>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let conn = conn.clone();
+    tokio::task::spawn_blocking(move || f(&mut conn.lock()))
+        .await
+        .context("database task failed")?
+}
+
+/// Whether the object's row exists, i.e. the push is already complete.
+async fn already_stored(state: &AppState, hash: &str) -> Result<bool, Error> {
+    let hash = hash.to_owned();
+    let stored = db_run(&state.conn, move |conn| db::exists(conn, &hash)).await?;
+    if stored {
+        metrics::counter!("garret_upload_skipped_total", "reason" => "exists").increment(1);
+    }
+    Ok(stored)
+}
+
+fn exists_response() -> Response {
+    (StatusCode::OK, Json(json!({"status": "exists"}))).into_response()
+}
+
+/// Counts an upload in `garret_uploads_in_flight` for as long as it lives, so
+/// a handler future dropped mid-upload (client disconnect, shutdown) still
+/// gives its count back.
+struct UploadGauge;
+
+impl UploadGauge {
+    fn enter() -> Self {
+        metrics::gauge!("garret_uploads_in_flight").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for UploadGauge {
+    fn drop(&mut self) {
+        metrics::gauge!("garret_uploads_in_flight").decrement(1.0);
     }
 }
 
@@ -355,14 +427,15 @@ async fn missing_paths(
     State(state): State<Arc<AppState>>,
     Json(hashes): Json<Vec<String>>,
 ) -> Result<Json<Vec<String>>, Error> {
-    let missing = {
-        let mut conn = state.conn.lock();
-        db::missing(&mut conn, &hashes, garret_server::now())?
-    };
-    metrics::histogram!("garret_negotiation_batch_size").record(hashes.len() as f64);
-    if !hashes.is_empty() {
+    let batch = hashes.len();
+    let missing = db_run(&state.conn, move |conn| {
+        db::missing(conn, &hashes, garret_server::now())
+    })
+    .await?;
+    metrics::histogram!("garret_negotiation_batch_size").record(batch as f64);
+    if batch > 0 {
         metrics::histogram!("garret_negotiation_missing_ratio")
-            .record(missing.len() as f64 / hashes.len() as f64);
+            .record(missing.len() as f64 / batch as f64);
     }
     Ok(Json(missing))
 }
@@ -394,9 +467,8 @@ async fn upload(
 
     // Idempotency: answered before the body is read, so `Expect: 100-continue`
     // clients skip the transfer entirely (spec 01).
-    if db::exists(&state.conn.lock(), &hash).map_err(Error::from)? {
-        metrics::counter!("garret_upload_skipped_total", "reason" => "exists").increment(1);
-        return Ok((StatusCode::OK, Json(json!({"status": "exists"}))).into_response());
+    if already_stored(&state, &hash).await? {
+        return Ok(exists_response());
     }
 
     // Shed before reading a byte: the queue belongs in the clients, and past
@@ -408,7 +480,7 @@ async fn upload(
             "too many concurrent uploads",
         ));
     };
-    let _claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
+    let claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
         Ok(claim) => claim,
         // Second pusher for the same path: first writer wins. The loser is
         // told `in-progress` and asks again later (spec 01) — this upload may
@@ -432,10 +504,18 @@ async fn upload(
         }
     };
 
-    metrics::gauge!("garret_uploads_in_flight").increment(1.0);
+    // The row may have landed between the first check and the claim: an
+    // upload that finished just before this one released its claim. The
+    // blob is already stored; do not overwrite it (spec 01).
+    if already_stored(&state, &hash).await? {
+        return Ok(exists_response());
+    }
+
     let started = std::time::Instant::now();
-    let result = store_upload(&state, &hash, &subject, body).await;
-    metrics::gauge!("garret_uploads_in_flight").decrement(1.0);
+    let result = {
+        let _gauge = UploadGauge::enter();
+        store_upload(&state, &hash, &subject, body, claim).await
+    };
 
     match &result {
         Ok(size) => {
@@ -456,6 +536,7 @@ async fn store_upload(
     hash: &str,
     subject: &Subject,
     body: Body,
+    claim: inflight::Claim,
 ) -> Result<i64, Error> {
     let mut stream = body.into_data_stream();
     let mut head: Vec<u8> = Vec::new();
@@ -483,9 +564,16 @@ async fn store_upload(
     let mut nar = VerifiedNar::new(Box::pin(nar), &object.nar_hash, object.nar_size)
         .context("starting the zstd decoder")?;
 
+    // The first buffer reserves only what an honest compressed body can
+    // reach, so a small NAR does not hold a whole part slot (spec 03).
     let stored = state
         .storage
-        .put_streaming(&storage::key_for(hash), &mut nar, &state.limits)
+        .put_streaming(
+            &storage::key_for(hash),
+            &mut nar,
+            &state.limits,
+            verify::max_compressed_len(object.nar_size),
+        )
         .await;
     if let Some(reason) = nar.refused {
         return Err(Error(StatusCode::BAD_REQUEST, reason));
@@ -497,7 +585,15 @@ async fn store_upload(
     object.file_hash = format!("sha256:{}", nix_base32::encode(&digest));
     object.file_size = file_size;
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
-    db::insert_object(&mut state.conn.lock(), &object, now())?;
+    let at = now();
+    // The claim moves into the blocking closure: a dropped handler future
+    // (client gone) must not release the path while the insert can still
+    // commit, or a delete could race the row it is about to remove.
+    db_run(&state.conn, move |conn| {
+        let _claim = claim;
+        db::insert_object(conn, &object, at)
+    })
+    .await?;
     Ok(file_size)
 }
 
@@ -508,7 +604,7 @@ fn take_preamble(buf: &mut Vec<u8>) -> Result<Option<Preamble>, Error> {
         return Ok(None);
     }
     let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-    if len > 8 * 1024 * 1024 {
+    if len > MAX_PREAMBLE {
         return Err(Error(
             StatusCode::BAD_REQUEST,
             "preamble length is implausible".into(),
@@ -959,5 +1055,40 @@ mod tests {
             line.contains("inserting object: sqlite: disk I/O error at /var/lib/garret/db"),
             "{line}"
         );
+    }
+
+    /// A stalled or interrupted body is the sender's failure: still a 500
+    /// with an id, but logged as a warning, not an error.
+    #[test]
+    fn a_client_body_failure_is_a_warning_with_the_same_response() {
+        #[derive(Clone, Default)]
+        struct Log(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let log = Log::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let log = log.clone();
+                move || log.clone()
+            })
+            .finish();
+        let err = tracing::subscriber::with_default(subscriber, || {
+            Error::from(anyhow::Error::new(storage::ClientBodyError(
+                "upload body stalled".into(),
+            )))
+        });
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.starts_with("internal error (id "), "{}", err.1);
+        let log = String::from_utf8(log.0.lock().clone()).unwrap();
+        assert!(log.contains("WARN") && log.contains("error_id="), "{log}");
+        assert!(!log.contains("ERROR"), "{log}");
     }
 }

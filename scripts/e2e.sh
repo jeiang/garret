@@ -544,7 +544,11 @@ echo "  refuses to overwrite an existing key"
 leaf_hash=$(basename "$leaf" | cut -c1-32)
 curl -sf "$puller_url/$leaf_hash.narinfo" >/dev/null \
   || { echo "leaf should be present before delete"; exit 1; }
-admin delete "$leaf_hash" | tee "$root/delete.out"
+admin delete "$leaf_hash" | tee "$root/delete-dry.out"
+grep -q "would delete 1 object" "$root/delete-dry.out"
+curl -sf "$puller_url/$leaf_hash.narinfo" >/dev/null \
+  || { echo "a delete dry run removed the leaf"; exit 1; }
+admin delete "$leaf_hash" --apply | tee "$root/delete.out"
 grep -q "deleted 1 object" "$root/delete.out"
 if curl -sf "$puller_url/$leaf_hash.narinfo" >/dev/null 2>&1; then
   echo "narinfo still served after delete"; exit 1
@@ -553,7 +557,7 @@ echo "  deleted object is gone from the Puller"
 
 # A hash that was never there must be reported, not silently counted as a
 # successful delete -- otherwise a typo looks like success.
-admin delete 00000000000000000000000000000000 | tee "$root/delete-missing.out"
+admin delete 00000000000000000000000000000000 --apply | tee "$root/delete-missing.out"
 grep -q "deleted 0 object" "$root/delete-missing.out"
 grep -q "not in the cache: 00000000000000000000000000000000" "$root/delete-missing.out"
 echo "  unknown hash is reported rather than swallowed"
@@ -675,7 +679,7 @@ wait_until '[ "$(count "$in_progress")" -gt "$skipped" ]' \
   || { echo "the push never met the in-progress claim"; cat "$root/push-inflight.out"; exit 1; }
 kill -0 $push_pid 2>/dev/null \
   || { echo "the push ended while another upload held its path"; cat "$root/push-inflight.out"; exit 1; }
-admin delete "$inflight_dep_hash" >/dev/null
+admin delete "$inflight_dep_hash" --apply >/dev/null
 kill $hold_pid
 wait $push_pid || { echo "the push failed"; cat "$root/push-inflight.out"; exit 1; }
 cat "$root/push-inflight.out"

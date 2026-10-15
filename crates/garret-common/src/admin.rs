@@ -24,6 +24,8 @@ pub enum Request {
     Delete {
         /// 32-character store-path hashes of the objects to remove.
         hashes: Vec<String>,
+        /// Report what would go without deleting anything.
+        dry_run: bool,
     },
     /// Pin an object as a GC-exempt root (ticket 22): its whole closure is
     /// protected from eviction while the pin is live. Idempotent — pinning an
@@ -114,12 +116,16 @@ pub enum Response {
     Resign {
         /// Objects whose narinfo signatures were rewritten.
         resigned: usize,
+        /// Objects left untouched because none of their existing signatures
+        /// verified under a configured key (or they had none): re-signing
+        /// would otherwise launder tampered metadata into a valid signature.
+        refused: usize,
     },
     /// Reply to [`Request::Delete`].
     Delete {
-        /// Objects actually removed.
+        /// Objects removed (or, on a dry run, that would be removed).
         deleted: usize,
-        /// Compressed bytes reclaimed.
+        /// Compressed bytes reclaimed (or reclaimable, on a dry run).
         bytes_freed: i64,
         /// Hashes that were not in the cache; deleting them is a no-op, but
         /// silently reporting success would hide a typo.
@@ -214,6 +220,7 @@ mod tests {
             Request::Resign,
             Request::Delete {
                 hashes: vec!["a".repeat(32)],
+                dry_run: true,
             },
             Request::Fsck {
                 repair: true,

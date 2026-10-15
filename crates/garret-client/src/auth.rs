@@ -155,10 +155,67 @@ struct TokenResponse {
     refresh_token: Option<String>,
     #[serde(default)]
     error: Option<String>,
+    /// The issuer's human-readable reason accompanying `error` (RFC 6749 §5.2).
+    #[serde(default)]
+    error_description: Option<String>,
 }
 
 fn missing_token() -> anyhow::Error {
     anyhow!("token response contained no access_token")
+}
+
+/// The part of an error body worth showing: an OAuth `error` (and its
+/// description) when the body is that JSON, otherwise the body itself, cut
+/// short so a proxy's HTML error page cannot flood the terminal.
+fn describe_body(body: &str) -> String {
+    #[derive(Deserialize)]
+    struct OauthError {
+        error: String,
+        error_description: Option<String>,
+    }
+    if let Ok(e) = serde_json::from_str::<OauthError>(body) {
+        return match e.error_description {
+            Some(d) => format!("{}: {d}", e.error),
+            None => e.error,
+        };
+    }
+    let body = body.trim();
+    match body.char_indices().nth(300) {
+        Some((end, _)) => format!("{}…", &body[..end]),
+        None => body.to_owned(),
+    }
+}
+
+/// Passes a 2xx response through; turns anything else into an error that
+/// carries the response body, which is where servers and issuers say *why*
+/// (`error_for_status` discards it).
+pub async fn ensure_success(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let detail = describe_body(&body);
+    match detail.is_empty() {
+        true => bail!("{what}: {status}"),
+        false => bail!("{what}: {status}: {detail}"),
+    }
+}
+
+/// The liveness probe `whoami` and `doctor` share: an empty Negotiation batch
+/// is a valid, near-free request that crosses exactly the authentication path
+/// `push` uses, so success proves the Pusher accepts `token`.
+pub async fn probe_pusher(http: &reqwest::Client, endpoint: &str, token: &str) -> Result<()> {
+    let response = http
+        .post(format!("{endpoint}/api/v1/missing-paths"))
+        .bearer_auth(token)
+        .json(&Vec::<String>::new())
+        .send()
+        .await
+        .context("probing the Pusher")?;
+    ensure_success(response, "the Pusher rejected this token")
+        .await
+        .map(drop)
 }
 
 /// Appends the RFC 8707 `resource` parameter only when one is configured.
@@ -184,7 +241,7 @@ pub async fn device_login(
     resource: Option<&str>,
 ) -> Result<String> {
     let endpoints = discover(http, issuer).await?;
-    let grant: DeviceGrant = http
+    let response = http
         .post(&endpoints.device_authorization_endpoint)
         .form(&with_resource(
             vec![("client_id", client_id), ("scope", "openid offline_access")],
@@ -192,9 +249,9 @@ pub async fn device_login(
         ))
         .timeout(TOKEN_TIMEOUT)
         .send()
+        .await?;
+    let grant: DeviceGrant = ensure_success(response, "requesting a device code")
         .await?
-        .error_for_status()
-        .context("requesting a device code")?
         .json()
         .await?;
 
@@ -208,8 +265,9 @@ pub async fn device_login(
     );
     println!("Waiting for approval…");
 
+    let mut interval = grant.interval;
     loop {
-        tokio::time::sleep(Duration::from_secs(grant.interval)).await;
+        tokio::time::sleep(Duration::from_secs(interval)).await;
         let response: TokenResponse = http
             .post(&endpoints.token_endpoint)
             .form(&with_resource(
@@ -227,9 +285,16 @@ pub async fn device_login(
             .await?;
 
         match response.error.as_deref() {
-            // Both are "keep waiting"; anything else is terminal.
-            Some("authorization_pending") | Some("slow_down") => continue,
-            Some(other) => bail!("device authorization failed: {other}"),
+            Some("authorization_pending") => continue,
+            // RFC 8628 §3.5: polling too fast; every later poll waits 5 s more.
+            Some("slow_down") => {
+                interval += 5;
+                continue;
+            }
+            Some(other) => match response.error_description.as_deref() {
+                Some(why) => bail!("device authorization failed: {other}: {why}"),
+                None => bail!("device authorization failed: {other}"),
+            },
             // No error and no token is not success -- keep polling rather than
             // reporting a login that did not happen.
             None if response.access_token.is_none() => continue,
@@ -258,7 +323,7 @@ async fn refresh(
     resource: Option<&str>,
 ) -> Result<String> {
     let endpoints = discover(http, &stored.issuer).await?;
-    let response: TokenResponse = http
+    let response = http
         .post(&endpoints.token_endpoint)
         .form(&with_resource(
             vec![
@@ -270,9 +335,15 @@ async fn refresh(
         ))
         .timeout(TOKEN_TIMEOUT)
         .send()
+        .await?;
+    // The issuer answers 400 `invalid_grant` (or 401) for a refresh token that
+    // expired, was revoked or was already rotated: only a new login fixes it.
+    if matches!(response.status().as_u16(), 400 | 401) {
+        let detail = describe_body(&response.text().await.unwrap_or_default());
+        bail!("stored login expired or revoked; run `garret login` ({detail})");
+    }
+    let response: TokenResponse = ensure_success(response, "refreshing the stored token")
         .await?
-        .error_for_status()
-        .context("refreshing the stored token")?
         .json()
         .await?;
 
@@ -319,7 +390,7 @@ async fn github_token(
     Ok(token.value)
 }
 
-/// Watcher daemons: a per-machine confidential client, secret in a root-owned
+/// Machine clients: a confidential client whose secret lives in a root-owned
 /// file wired by the NixOS module (spec 04-auth).
 pub async fn client_credentials(
     http: &reqwest::Client,
@@ -329,7 +400,7 @@ pub async fn client_credentials(
     resource: Option<&str>,
 ) -> Result<String> {
     let endpoints = discover(http, issuer).await?;
-    let response: TokenResponse = http
+    let response = http
         .post(&endpoints.token_endpoint)
         .form(&with_resource(
             vec![
@@ -341,34 +412,35 @@ pub async fn client_credentials(
         ))
         .timeout(TOKEN_TIMEOUT)
         .send()
+        .await?;
+    let response: TokenResponse = ensure_success(response, "requesting a client_credentials token")
         .await?
-        .error_for_status()
-        .context("requesting a client_credentials token")?
         .json()
         .await?;
     response.access_token.ok_or_else(missing_token)
 }
 
-/// Reads `id:secret` from a mode-0600 file rather than taking it on argv,
-/// where every process on the box could read it.
-pub fn read_client_credentials(path: &str) -> Result<(String, String)> {
+/// Reads the client secret from `path` — a file holding only the secret,
+/// never argv, where every process on the box could read it. A file other
+/// users can read is still used, but loudly: it is a credential.
+fn read_client_secret(path: &std::path::Path) -> Result<String> {
+    use std::os::unix::fs::PermissionsExt;
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading client credentials {path}"))?;
-    let (id, secret) = text
-        .trim()
-        .split_once(':')
-        .context("credentials file must contain `client_id:client_secret`")?;
-    Ok((id.to_owned(), secret.to_owned()))
-}
-
-/// One token from whatever this environment provides — for commands that make
-/// a single request. Anything longer-lived holds a [`TokenSource`].
-pub async fn bearer_token(
-    http: &reqwest::Client,
-    audience: &str,
-    resource: Option<&str>,
-) -> Result<String> {
-    TokenSource::from_env(http, audience, resource).get().await
+        .with_context(|| format!("reading `oidc.client_secret_file` {}", path.display()))?;
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.permissions().mode() & 0o077 != 0
+    {
+        eprintln!(
+            "warning: {} is accessible to other users (mode {:o}); run `chmod 600` on it",
+            path.display(),
+            meta.permissions().mode() & 0o777
+        );
+    }
+    let secret = text.trim();
+    if secret.is_empty() {
+        bail!("`oidc.client_secret_file` {} is empty", path.display());
+    }
+    Ok(secret.to_owned())
 }
 
 /// Tokens are re-minted this long before their declared lifetime ends. For a
@@ -439,48 +511,55 @@ impl TokenSource {
         }
     }
 
-    /// Whatever this environment provides, in order: `GARRET_TOKEN`, a GitHub
-    /// Actions runner, then the stored refresh token (failing on first use
-    /// with "run `garret login`" when none of the three applies).
-    pub fn from_env(http: &reqwest::Client, audience: &str, resource: Option<&str>) -> Self {
-        let mint = if let Ok(token) = std::env::var("GARRET_TOKEN") {
-            Mint::Given(token)
-        } else if let (Ok(url), Ok(request_token)) = (
+    /// The token provider for this config and environment, first match wins:
+    /// `GARRET_TOKEN`; `oidc.client_secret_file` (client_credentials grant);
+    /// a GitHub Actions runner; the refresh token `garret login` stored (which
+    /// fails on first use with "run `garret login`" when there is none).
+    pub fn for_config(http: &reqwest::Client, cfg: &crate::config::Config) -> Result<Self> {
+        let github = match (
             std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL"),
             std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
         ) {
+            (Ok(url), Ok(request_token)) => Some((url, request_token)),
+            _ => None,
+        };
+        Self::select(http, cfg, std::env::var("GARRET_TOKEN").ok(), github)
+    }
+
+    /// [`for_config`](Self::for_config) with the environment passed in, so the
+    /// precedence can be tested without touching process-global state.
+    fn select(
+        http: &reqwest::Client,
+        cfg: &crate::config::Config,
+        given: Option<String>,
+        github: Option<(String, String)>,
+    ) -> Result<Self> {
+        let oidc = &cfg.oidc;
+        let mint = if let Some(token) = given {
+            Mint::Given(token)
+        } else if let Some(path) = &oidc.client_secret_file {
+            Mint::ClientCredentials {
+                issuer: oidc.issuer.clone().context(
+                    "`oidc.issuer` is required to use client credentials (`oidc.client_secret_file`)",
+                )?,
+                client_id: oidc.client_id.clone().context(
+                    "`oidc.client_id` is required with `oidc.client_secret_file`",
+                )?,
+                client_secret: read_client_secret(path)?,
+                resource: oidc.resource.clone(),
+            }
+        } else if let Some((url, request_token)) = github {
             Mint::Github {
                 url,
                 request_token,
-                audience: audience.to_owned(),
+                audience: oidc.audience.clone(),
             }
         } else {
             Mint::Stored {
-                resource: resource.map(str::to_owned),
+                resource: oidc.resource.clone(),
             }
         };
-        Self::new(http, mint)
-    }
-
-    /// Watcher daemons authenticate as themselves: a per-machine confidential
-    /// client, secret in a root-owned file wired by the NixOS module (spec
-    /// 04-auth).
-    pub fn client_credentials(
-        http: &reqwest::Client,
-        issuer: &str,
-        client_id: &str,
-        client_secret: &str,
-        resource: Option<&str>,
-    ) -> Self {
-        Self::new(
-            http,
-            Mint::ClientCredentials {
-                issuer: issuer.to_owned(),
-                client_id: client_id.to_owned(),
-                client_secret: client_secret.to_owned(),
-                resource: resource.map(str::to_owned),
-            },
-        )
+        Ok(Self::new(http, mint))
     }
 
     /// The token to send now, minted first if none is held or it has aged out.
@@ -663,5 +742,88 @@ mod tests {
             tokens.renew(&jwt(2, None)).await.unwrap(),
             Some(jwt(3, None))
         );
+    }
+
+    fn cfg(oidc: &str) -> crate::config::Config {
+        toml::from_str(&format!(
+            "endpoint = \"https://push.example\"\n[oidc]\naudience = \"garret\"\n{oidc}"
+        ))
+        .unwrap()
+    }
+
+    fn select(
+        cfg: &crate::config::Config,
+        given: Option<&str>,
+        github: bool,
+    ) -> Result<TokenSource> {
+        TokenSource::select(
+            &reqwest::Client::new(),
+            cfg,
+            given.map(str::to_owned),
+            github.then(|| ("https://actions.example".to_owned(), "rt".to_owned())),
+        )
+    }
+
+    /// `GARRET_TOKEN` > `client_secret_file` > GitHub Actions > stored login.
+    #[test]
+    fn the_token_provider_follows_the_documented_precedence() {
+        let dir = std::env::temp_dir().join(format!("garret-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "s3cret\n").unwrap();
+        let with_file = cfg(&format!(
+            "issuer = \"https://id.example\"\nclient_id = \"builder\"\nclient_secret_file = {:?}\n",
+            secret.display().to_string()
+        ));
+        let plain = cfg("issuer = \"https://id.example\"\nclient_id = \"cli\"\n");
+
+        // Everything configured: the explicit token still wins, and the secret
+        // file is not even read.
+        let missing = cfg("client_id = \"b\"\nclient_secret_file = \"/nonexistent/secret\"\n");
+        assert!(matches!(
+            &select(&missing, Some("t"), true).unwrap().mint,
+            Mint::Given(t) if t == "t"
+        ));
+        // The secret file beats a GitHub runner, and is trimmed.
+        assert!(matches!(
+            &select(&with_file, None, true).unwrap().mint,
+            Mint::ClientCredentials { client_secret, client_id, .. }
+                if client_secret == "s3cret" && client_id == "builder"
+        ));
+        assert!(matches!(
+            &select(&plain, None, true).unwrap().mint,
+            Mint::Github { .. }
+        ));
+        assert!(matches!(
+            &select(&plain, None, false).unwrap().mint,
+            Mint::Stored { .. }
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A secret file needs an issuer to ask and a client id to be: both are
+    /// reported where the config is used, not at parse time.
+    #[test]
+    fn a_secret_file_without_issuer_or_client_id_is_an_error_at_use() {
+        let no_issuer = cfg("client_id = \"b\"\nclient_secret_file = \"/x\"\n");
+        let err = select(&no_issuer, None, false).err().unwrap();
+        assert!(format!("{err:#}").contains("`oidc.issuer` is required"));
+        let no_id = cfg("issuer = \"https://id.example\"\nclient_secret_file = \"/x\"\n");
+        let err = select(&no_id, None, false).err().unwrap();
+        assert!(format!("{err:#}").contains("`oidc.client_id` is required"));
+    }
+
+    #[test]
+    fn error_bodies_show_the_issuers_reason() {
+        assert_eq!(
+            describe_body(r#"{"error":"invalid_grant","error_description":"token revoked"}"#),
+            "invalid_grant: token revoked"
+        );
+        assert_eq!(
+            describe_body(r#"{"error":"invalid_client"}"#),
+            "invalid_client"
+        );
+        assert_eq!(describe_body("  plain failure \n"), "plain failure");
+        assert!(describe_body(&"x".repeat(1000)).chars().count() <= 301);
     }
 }

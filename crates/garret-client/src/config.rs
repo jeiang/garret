@@ -47,8 +47,6 @@ pub struct Config {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Watch {
-    /// `client_id:client_secret` for this machine's confidential client.
-    pub credentials_file: Option<String>,
     /// The Nix database the watcher polls for newly validated paths.
     #[serde(default = "nix_db")]
     pub nix_db: String,
@@ -109,11 +107,19 @@ fn socket_path() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Oidc {
-    /// Issuer base URL; OIDC discovery hangs off it.
-    pub issuer: String,
-    /// Only the device flow needs one; GitHub Actions and client_credentials
-    /// callers identify themselves other ways.
+    /// Issuer base URL; OIDC discovery hangs off it. Needed only to log in
+    /// and to use `client_secret_file`: a `GARRET_TOKEN` or GitHub Actions
+    /// config has no use for one, and refreshing a stored login uses the
+    /// issuer recorded in the token file.
+    pub issuer: Option<String>,
+    /// Only the device flow and `client_secret_file` need one; GitHub Actions
+    /// callers identify themselves another way.
     pub client_id: Option<String>,
+    /// A file holding only this machine's client secret (`client_id` names the
+    /// client). Set, the client authenticates with the client_credentials
+    /// grant instead of a human's stored login — for daemons and CI.
+    #[serde(default)]
+    pub client_secret_file: Option<std::path::PathBuf>,
     /// The `aud` claim garret validates the resulting token against.
     pub audience: String,
     /// RFC 8707 resource indicator, sent only when set. Off by default
@@ -315,5 +321,20 @@ mod tests {
             ..discovery()
         };
         assert!(render("https://push.example", &no_oidc).is_err());
+    }
+
+    #[test]
+    fn a_machine_config_needs_no_issuer_and_may_name_a_secret_file() {
+        let cfg: Config = toml::from_str(
+            "endpoint = \"https://push.example\"\n\
+             [oidc]\naudience = \"garret\"\nclient_id = \"builder\"\n\
+             client_secret_file = \"/run/secrets/garret\"\n",
+        )
+        .unwrap();
+        assert!(cfg.oidc.issuer.is_none());
+        assert_eq!(
+            cfg.oidc.client_secret_file.as_deref(),
+            Some(std::path::Path::new("/run/secrets/garret"))
+        );
     }
 }

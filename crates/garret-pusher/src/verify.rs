@@ -20,6 +20,19 @@ use zstd::stream::raw::{DParameter, Decoder, InBuffer, Operation, OutBuffer};
 /// this keeps that memory bounded (spec 01).
 const WINDOW_LOG_MAX: u32 = 23;
 
+/// Slack over zstd's worst-case compressed size for the claimed NarSize:
+/// room for a few skippable or empty frames, never for a bulk padding stream
+/// (ADR-0010).
+const COMPRESSED_SLACK: usize = 64 * 1024;
+
+/// The most compressed bytes an honest push of a `claimed_size`-byte NAR can
+/// send: zstd's worst case plus [`COMPRESSED_SLACK`]. Beyond it the body is
+/// refused, and it is the first-part size hint for upload buffering.
+pub fn max_compressed_len(claimed_size: i64) -> usize {
+    let size = usize::try_from(claimed_size.max(0)).unwrap_or(usize::MAX);
+    zstd::zstd_safe::compress_bound(size).saturating_add(COMPRESSED_SLACK)
+}
+
 /// Decompressed bytes produced per decoder call: zstd's recommended
 /// streaming output size.
 const SCRATCH: usize = 128 * 1024;
@@ -36,6 +49,9 @@ pub struct VerifiedNar<S> {
     scratch: Box<[u8]>,
     hasher: Sha256,
     nar_size: i64,
+    /// Compressed bytes received so far, capped at `max_compressed`.
+    compressed: usize,
+    max_compressed: usize,
     /// The last decoder call ended exactly at a frame boundary.
     frame_done: bool,
     /// End of stream was reached or the NAR refused: never poll again.
@@ -57,6 +73,8 @@ impl<S> VerifiedNar<S> {
             scratch: vec![0; SCRATCH].into_boxed_slice(),
             hasher: Sha256::new(),
             nar_size: 0,
+            compressed: 0,
+            max_compressed: max_compressed_len(claimed_size),
             frame_done: false,
             finished: false,
             claimed_hash: claimed_hash.to_owned(),
@@ -66,6 +84,15 @@ impl<S> VerifiedNar<S> {
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<(), String> {
+        // Counted before decoding: zero-output input (skippable frames) would
+        // otherwise pass the NarSize check while still being stored.
+        self.compressed = self.compressed.saturating_add(chunk.len());
+        if self.compressed > self.max_compressed {
+            return Err(format!(
+                "compressed body exceeds {} bytes, the zstd bound for the claimed NarSize {}",
+                self.max_compressed, self.claimed_size
+            ));
+        }
         let mut src = InBuffer::around(chunk);
         loop {
             let mut dst = OutBuffer::around(&mut self.scratch[..]);
@@ -253,6 +280,26 @@ mod tests {
             "not a valid zstd stream",
         );
         assert_refused(run(b"", &hash, size).await.1, "mid-frame");
+    }
+
+    /// Skippable frames decode to nothing, so only the compressed-byte bound
+    /// stops a body padded with them.
+    #[tokio::test]
+    async fn a_body_padded_beyond_the_compression_bound_is_refused() {
+        let (_, compressed, hash, size) = nar();
+        assert!(compressed.len() <= max_compressed_len(size));
+        let mut padded = compressed.clone();
+        // One skippable frame (magic 0x184D2A50) larger than the bound's slack over the NAR.
+        padded.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        padded.extend_from_slice(&(2u32 * 1024 * 1024).to_le_bytes());
+        padded.extend(std::iter::repeat_n(0u8, 2 * 1024 * 1024));
+        let (_, refused) = run(&padded, &hash, size).await;
+        assert_refused(refused, "zstd bound");
+        // A tiny NAR gets only the slack on top of its own bound.
+        assert_eq!(
+            max_compressed_len(0),
+            zstd::zstd_safe::compress_bound(0) + COMPRESSED_SLACK
+        );
     }
 
     #[tokio::test]

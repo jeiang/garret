@@ -264,12 +264,9 @@ async fn main() -> Result<()> {
         (true, Some(token)) => token.clone(),
         (true, None) => {
             let cfg = garret_client::config::load(cli.config.as_deref())?;
-            garret_client::auth::bearer_token(
-                &http,
-                &cfg.oidc.audience,
-                cfg.oidc.resource.as_deref(),
-            )
-            .await?
+            garret_client::auth::TokenSource::for_config(&http, &cfg)?
+                .get()
+                .await?
         }
     };
 

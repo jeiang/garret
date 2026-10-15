@@ -4,6 +4,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::auth::ensure_success;
+
 /// One Object in a `garret list` page, as the browse API summarizes it.
 #[derive(Debug, Deserialize)]
 pub struct Summary {
@@ -59,11 +61,9 @@ pub async fn list(
     if let Some(q) = query {
         request = request.query(&[("q", q)]);
     }
-    request
-        .send()
+    let response = request.send().await?;
+    ensure_success(response, "listing objects")
         .await?
-        .error_for_status()
-        .context("listing objects")?
         .json()
         .await
         .context("parsing the object list")
@@ -76,12 +76,13 @@ pub async fn tree(
     token: &str,
     hash: &str,
 ) -> Result<serde_json::Value> {
-    http.get(format!("{puller}/api/v1/objects/{hash}/tree"))
+    let response = http
+        .get(format!("{puller}/api/v1/objects/{hash}/tree"))
         .bearer_auth(token)
         .send()
+        .await?;
+    ensure_success(response, "fetching the dependency tree")
         .await?
-        .error_for_status()
-        .context("fetching the dependency tree")?
         .json()
         .await
         .context("parsing the dependency tree")
@@ -102,12 +103,13 @@ pub struct Pin {
 
 /// Fetches the pin listing, verbatim — see [`list`] for why.
 pub async fn pins(http: &reqwest::Client, puller: &str, token: &str) -> Result<serde_json::Value> {
-    http.get(format!("{puller}/api/v1/pins"))
+    let response = http
+        .get(format!("{puller}/api/v1/pins"))
         .bearer_auth(token)
         .send()
+        .await?;
+    ensure_success(response, "listing pins")
         .await?
-        .error_for_status()
-        .context("listing pins")?
         .json()
         .await
         .context("parsing the pin list")
