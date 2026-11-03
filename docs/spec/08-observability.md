@@ -88,8 +88,14 @@ Prefix `garret_`; service distinguished by scrape job.
   `garret_upload_skipped_total` by `reason` (`exists`, `in-progress`,
   `quiescing`, and `deleting` for an upload turned away with `503`
   because GC, `delete` or prune is removing the path, spec 05).
-- **Pusher — S3**: put/multipart-part counters, part duration, retries,
-  aborted multiparts; blob deletes (`garret_s3_deletes_total`, only keys
+- **Pusher — S3**: put/multipart-part counters, part duration,
+  aborted multiparts; every S3 request's latency
+  (`garret_s3_request_duration_seconds` by `operation`: `put`,
+  `upload_part`, `create_mpu`, `complete_mpu`, `abort_mpu`, `delete`,
+  `list`) and failures (`garret_s3_errors_total` by `operation` and
+  `kind`: `timeout`, `dispatch`, `response`, `service`, `other`), kept
+  alongside `garret_s3_put_failures_total` and
+  `garret_s3_part_duration_seconds`; blob deletes (`garret_s3_deletes_total`, only keys
   the response did not report as failed) and per-key delete failures
   (`garret_s3_delete_failures_total`: keys a `DeleteObjects` 200 reported
   as not deleted — each an orphan until a later sweep succeeds).

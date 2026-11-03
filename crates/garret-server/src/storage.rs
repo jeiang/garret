@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use aws_sdk_s3::{
     Client,
     config::Credentials,
+    error::SdkError,
     presigning::PresigningConfig,
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
@@ -98,6 +99,33 @@ impl UploadLimits {
     /// Reserves room for a buffer of up to `bytes` (capped at one part).
     async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
         self.acquire_units(self.units(bytes)).await
+    }
+}
+
+/// Times one S3 request and, on failure, counts it by operation and error
+/// kind, so a timeout, a refused connection and a 5xx tell apart.
+async fn timed<T, E>(
+    op: &'static str,
+    fut: impl Future<Output = Result<T, SdkError<E>>>,
+) -> Result<T, SdkError<E>> {
+    let started = Instant::now();
+    let result = fut.await;
+    metrics::histogram!("garret_s3_request_duration_seconds", "operation" => op)
+        .record(started.elapsed());
+    if let Err(e) = &result {
+        metrics::counter!("garret_s3_errors_total", "operation" => op, "kind" => error_kind(e))
+            .increment(1);
+    }
+    result
+}
+
+fn error_kind<E>(e: &SdkError<E>) -> &'static str {
+    match e {
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(_) => "dispatch",
+        SdkError::ResponseError(_) => "response",
+        SdkError::ServiceError(_) => "service",
+        _ => "other",
     }
 }
 
@@ -272,15 +300,18 @@ impl Storage {
     /// part; larger uploads go through [`Storage::put_streaming`]).
     pub async fn put(&self, key: &str, body: Bytes) -> Result<()> {
         let bytes = body.len() as u64;
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
-            .with_context(|| format!("uploading {key}"))?;
+        timed(
+            "put",
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send(),
+        )
+        .await
+        .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
+        .with_context(|| format!("uploading {key}"))?;
         metrics::counter!("garret_s3_puts_total").increment(1);
         metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
         Ok(())
@@ -352,16 +383,18 @@ impl Storage {
             return Ok((hasher.finalize().to_vec(), total));
         }
 
-        let upload_id = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .with_context(|| format!("starting multipart upload for {key}"))?
-            .upload_id
-            .context("S3 returned no upload id")?;
+        let upload_id = timed(
+            "create_mpu",
+            self.client
+                .create_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .send(),
+        )
+        .await
+        .with_context(|| format!("starting multipart upload for {key}"))?
+        .upload_id
+        .context("S3 returned no upload id")?;
         metrics::counter!("garret_s3_multipart_started_total").increment(1);
 
         // Any failure past this point must abort, or the parts linger and bill.
@@ -386,14 +419,16 @@ impl Storage {
                 // abort would re-create what the abort freed.
                 parts.shutdown().await;
                 metrics::counter!("garret_s3_multipart_aborted_total").increment(1);
-                if let Err(abort) = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await
+                if let Err(abort) = timed(
+                    "abort_mpu",
+                    self.client
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .send(),
+                )
+                .await
                 {
                     tracing::error!("aborting multipart for {key} also failed: {abort}");
                 }
@@ -455,19 +490,22 @@ impl Storage {
 
         completed.sort_by_key(|p| p.part_number());
 
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .set_parts(Some(completed))
-                    .build(),
-            )
-            .send()
-            .await
-            .with_context(|| format!("completing multipart upload for {key}"))?;
+        timed(
+            "complete_mpu",
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed))
+                        .build(),
+                )
+                .send(),
+        )
+        .await
+        .with_context(|| format!("completing multipart upload for {key}"))?;
         metrics::counter!("garret_s3_multipart_completed_total").increment(1);
         Ok(())
     }
@@ -490,22 +528,25 @@ impl Storage {
         async move {
             let bytes = body.len() as u64;
             let started = Instant::now();
-            let output = client
-                .upload_part()
-                .bucket(&bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(body))
-                .customize()
-                // S4 forbids re-uploading a part, so the SDK must not retry
-                // one: the caller aborts the whole multipart (spec 03-storage).
-                .config_override(aws_sdk_s3::config::Config::builder().retry_config(
-                    aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
-                ))
-                .send()
-                .await
-                .with_context(|| format!("uploading part {part_number} of {key}"))?;
+            let output = timed(
+                "upload_part",
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(body))
+                    .customize()
+                    // S4 forbids re-uploading a part, so the SDK must not retry
+                    // one: the caller aborts the whole multipart (spec 03-storage).
+                    .config_override(aws_sdk_s3::config::Config::builder().retry_config(
+                        aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+                    ))
+                    .send(),
+            )
+            .await
+            .with_context(|| format!("uploading part {part_number} of {key}"))?;
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);
@@ -524,15 +565,17 @@ impl Storage {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let page = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix("nar/")
-                .set_continuation_token(token.take())
-                .send()
-                .await
-                .context("listing blobs")?;
+            let page = timed(
+                "list",
+                self.client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix("nar/")
+                    .set_continuation_token(token.take())
+                    .send(),
+            )
+            .await
+            .context("listing blobs")?;
 
             for object in page.contents() {
                 let Some(key) = object.key() else { continue };
@@ -571,14 +614,16 @@ impl Storage {
                 continue;
             }
             let requested = objects.len();
-            let output = self
-                .client
-                .delete_objects()
-                .bucket(&self.bucket)
-                .delete(Delete::builder().set_objects(Some(objects)).build()?)
-                .send()
-                .await
-                .context("deleting blobs")?;
+            let output = timed(
+                "delete",
+                self.client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(Delete::builder().set_objects(Some(objects)).build()?)
+                    .send(),
+            )
+            .await
+            .context("deleting blobs")?;
             let before = failed;
             for e in output.errors() {
                 if e.code() == Some("NoSuchKey") {
@@ -612,13 +657,15 @@ impl Storage {
         grace: Duration,
         in_flight: &crate::inflight::InFlight,
     ) -> Result<usize> {
-        let uploads = self
-            .client
-            .list_multipart_uploads()
-            .bucket(&self.bucket)
-            .send()
-            .await
-            .context("listing multipart uploads")?;
+        let uploads = timed(
+            "list",
+            self.client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .send(),
+        )
+        .await
+        .context("listing multipart uploads")?;
 
         let mut aborted = 0;
         for upload in uploads.uploads() {
@@ -637,14 +684,17 @@ impl Storage {
             if age < grace {
                 continue;
             }
-            self.client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await
-                .with_context(|| format!("aborting stale multipart for {key}"))?;
+            timed(
+                "abort_mpu",
+                self.client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send(),
+            )
+            .await
+            .with_context(|| format!("aborting stale multipart for {key}"))?;
             aborted += 1;
         }
         Ok(aborted)
@@ -667,6 +717,14 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_error_kinds_come_from_the_sdk_variant() {
+        let timeout = SdkError::<()>::timeout_error("slow");
+        let other = SdkError::<()>::construction_failure("bad");
+        assert_eq!(error_kind(&timeout), "timeout");
+        assert_eq!(error_kind(&other), "other");
+    }
 
     #[test]
     fn key_layout_is_flat_and_derivable() {
