@@ -249,7 +249,8 @@ in
           read-only dry run: it reports drift, never repairs. Its findings
           reach the `garret_fsck_findings` gauge, and the unit fails (exit 1)
           when it finds dangling rows or size mismatches. Needs
-          `adminSocketPath`.
+          `adminSocketPath` and `quotaBytes` (fsck reads the orphan grace
+          from the `[gc]` section and refuses without it).
 
           One run lists the whole bucket (one S3 `ListObjectsV2` request per
           1000 blobs, no per-object requests) and reads every Object row into
@@ -280,6 +281,10 @@ in
     {
       assertion = cfg.fsck.calendar == null || cfg.adminSocketPath != null;
       message = "services.garret.pusher.fsck.calendar needs adminSocketPath: fsck runs on the admin socket.";
+    }
+    {
+      assertion = cfg.fsck.calendar == null || cfg.quotaBytes != null;
+      message = "services.garret.pusher.fsck.calendar needs quotaBytes: fsck reads the orphan grace from the [gc] section and refuses without it.";
     }];
 
     systemd.services.garret-pusher = {

@@ -122,6 +122,8 @@ in
         inherit s3;
         signingKeyFiles = [ "/etc/garret/signing-key" ];
         oidc = [{ issuer = issuerUrl; audience = "garret"; jwks_url = "${oidc}/jwks.json"; }];
+        # fsck needs the [gc] section; far above test usage, so GC never evicts.
+        quotaBytes = 10737418240;
         fsck = { calendar = "weekly"; extraArgs = [ "--verify-sizes" ]; };
       };
       puller = {

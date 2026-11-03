@@ -137,7 +137,10 @@ Module options (all under `services.garret.*`; defaults in parentheses):
   The watcher adds `oidc.resource` (null: not sent). Enabling the pusher puts
   `garret-admin` on the system PATH.
 - `services.garret.pusher.fsck.calendar` (a systemd `OnCalendar` expression)
-  adds `garret-fsck.service` and `garret-fsck.timer`. The service is a
+  adds `garret-fsck.service` and `garret-fsck.timer`. It requires
+  `quotaBytes`, since fsck reads the orphan grace from the `[gc]` section
+  and refuses to run without it; module evaluation fails otherwise. The
+  service is a
   oneshot as `garret:garret`, after and requiring `garret-pusher.service`,
   in the common sandbox with only `AF_UNIX` sockets. It runs
   `garret-admin --socket <adminSocketPath> fsck <fsck.extraArgs>`: a
