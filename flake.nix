@@ -68,6 +68,13 @@
 
       checks = forAllSystems (pkgs: {
         build = garret pkgs;
+        # The shipped alert rules must parse, and the dashboard must be JSON.
+        monitoring = pkgs.runCommand "garret-monitoring-check"
+          { nativeBuildInputs = [ pkgs.prometheus.cli pkgs.jq ]; } ''
+          promtool check rules ${./contrib/monitoring/garret.rules.yml}
+          jq empty ${./contrib/monitoring/garret-dashboard.json}
+          touch $out
+        '';
       } // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
         # The modules on a booted host: service users, file modes, sockets.
         module = pkgs.testers.runNixOSTest (import ./nix/test.nix self);

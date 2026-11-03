@@ -152,6 +152,16 @@ Prefix `garret_`; service distinguished by scrape job.
   bytes-served, serve-duration, first-byte and Range counters are gone —
   served-byte volume is now S4's to report, not ours.
 
+## Shipped rules and dashboard
+
+`contrib/monitoring/` holds Prometheus-format recording and alert rules
+(`garret.rules.yml`, for Prometheus or vmalert) and a Grafana dashboard. The
+alerts cover scrape loss, failing deep readiness, refused tokens, upload
+failures and shedding, S3 errors, degraded pulls, stale or failing GC, quota
+near the high watermark and fsck findings. `nix flake check` runs `promtool
+check rules` and `jq empty` on them. The deep-readiness alert only fires when
+something probes `/ready/deep`.
+
 ## Logs
 
 `tracing` crate, human-readable, on stdout. Verbosity follows `RUST_LOG`

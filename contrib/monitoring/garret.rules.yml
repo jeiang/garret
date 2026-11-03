@@ -1,0 +1,88 @@
+# Prometheus-format rules for Garret, loadable by Prometheus or vmalert.
+# Metric names: docs/spec/08-observability.md. The scrape job distinguishes
+# the Pusher from the Puller, so rules group by `job` and `instance`.
+groups:
+  - name: garret-recording
+    rules:
+      - record: garret:http_p95_seconds
+        expr: histogram_quantile(0.95, sum by (job, route, le) (rate(garret_http_request_duration_seconds_bucket[5m])))
+      - record: garret:upload_failure_ratio:30m
+        expr: |
+          sum(increase(garret_uploads_failed_total[30m]))
+            /
+          (sum(increase(garret_uploads_failed_total[30m])) + sum(increase(garret_uploads_accepted_total[30m])))
+      # Mean number of upload slots held, comparable with garret_uploads_limit.
+      - record: garret:upload_concurrency:5m
+        expr: sum(rate(garret_upload_slot_milliseconds_total[5m])) / 1000
+      # Weighted: missing paths over negotiated paths, not a mean of ratios.
+      - record: garret:negotiation_missing_ratio:1h
+        expr: |
+          sum(increase(garret_negotiation_missing_paths_total[1h]))
+            /
+          sum(increase(garret_negotiation_batch_size_sum[1h]))
+      - record: garret:gc_usage_ratio
+        expr: garret_gc_usage_bytes / garret_gc_quota_bytes
+
+  - name: garret-alerts
+    rules:
+      - alert: GarretDown
+        expr: up{job=~"garret.*"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.job }} on {{ $labels.instance }} is not scraped"
+      # Probe-based: counts the Puller's cached /ready/deep S3 reads.
+      - alert: GarretDeepReadinessFailing
+        expr: sum by (job, instance) (increase(garret_s3_read_probes_total{outcome!="ok"}[10m])) >= 3
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.instance }}: the S3 read path failed {{ $value }} deep probes in 10m"
+      - alert: GarretAuthRefusals
+        expr: sum by (issuer, claim) (increase(garret_auth_unauthorized_total[1h])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "A valid token from {{ $labels.issuer }} was refused on claim {{ $labels.claim }}"
+      - alert: GarretUploadFailures
+        expr: |
+          sum by (reason) (increase(garret_uploads_failed_total[30m]))
+            / on() group_left ()
+          (sum(increase(garret_uploads_failed_total[30m])) + sum(increase(garret_uploads_accepted_total[30m]))) > 0.05
+        labels: {severity: warning}
+        annotations:
+          summary: "More than 5% of uploads failed in 30m (reason {{ $labels.reason }})"
+      - alert: GarretUploadsShed
+        expr: sum(increase(garret_uploads_shed_total[1h])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "The Pusher answered 429 to uploads; raise max_concurrent_uploads or slow the senders"
+      - alert: GarretS3Errors
+        expr: sum by (operation, kind) (increase(garret_s3_errors_total[15m])) > 5
+        labels: {severity: warning}
+        annotations:
+          summary: "S3 {{ $labels.operation }} errors of kind {{ $labels.kind }}: {{ $value }} in 15m"
+      - alert: GarretDegraded
+        expr: sum by (reason) (increase(garret_degraded_total[15m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "The Puller served misses because of {{ $labels.reason }}"
+      - alert: GarretGcStale
+        expr: time() - max(garret_gc_last_success_timestamp) > 3600
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful GC pass or tick for over an hour"
+      - alert: GarretGcFailures
+        expr: sum by (phase) (increase(garret_gc_failures_total[1h])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "GC {{ $labels.phase }} failed"
+      - alert: GarretQuotaNearHigh
+        expr: max(garret_gc_usage_bytes / garret_gc_high_watermark_bytes) > 0.9
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Usage is above 90% of the high watermark"
+      - alert: GarretFsckFindings
+        expr: max by (kind) (garret_fsck_findings) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "The latest fsck found {{ $labels.kind }} rows"
