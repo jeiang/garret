@@ -15,3 +15,7 @@ rusqlite = "0.37"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+garret-server = { workspace = true, features = ["test-support"] }
+tower = { version = "0.5", features = ["util"] }

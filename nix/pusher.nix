@@ -5,8 +5,8 @@ let
   cfg = config.services.garret.pusher;
   inherit (lib) mkEnableOption mkOption mkIf types;
 
-  # Secrets stay out of the store: the unit renders the config at start-up,
-  # substituting AWS credentials from an EnvironmentFile (agenix/sops-friendly).
+  # The config is generated at build time and holds no secrets: only the AWS
+  # credentials come from an EnvironmentFile (agenix/sops-friendly).
   #
   # `pkgs.formats.toml` has no representation for null, and every nullable
   # option here (`s3.region`, `s3.endpointUrl`, and each issuer's
@@ -35,12 +35,14 @@ let
       endpoint_url = cfg.s3.endpointUrl;
       path_style = cfg.s3.pathStyle;
       operation_timeout_secs = cfg.s3.operationTimeoutSeconds;
+      operation_attempt_timeout_secs = cfg.s3.operationAttemptTimeoutSeconds;
     };
     limits = {
       max_concurrent_uploads = cfg.limits.maxConcurrentUploads;
       max_in_flight_bytes = cfg.limits.maxInFlightBytes;
       part_size = cfg.limits.partSize;
       max_parts_in_flight = cfg.limits.maxPartsInFlight;
+      body_idle_timeout_secs = cfg.limits.bodyIdleTimeoutSeconds;
     };
     oidc = cfg.oidc;
   } // lib.optionalAttrs (cfg.quotaBytes != null) {
@@ -53,7 +55,7 @@ let
     };
   };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-pusher.toml" (stripNulls settings);
+  configFile = (pkgs.formats.toml { }).generate "garret-pusher.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
 
   # The Puller runs as its own user in group `garret` (ADR-0009) and must
   # write the database: last-accessed bumps, and every WAL reader writes the
@@ -80,6 +82,15 @@ in
       type = types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.garret-pusher;
       description = "The garret-pusher package to run.";
+    };
+
+    extraSettings = mkOption {
+      type = (pkgs.formats.toml { }).type;
+      default = { };
+      description = ''
+        Raw TOML settings merged over the generated config (recursively), for
+        keys that have no typed option here.
+      '';
     };
 
     listen = mkOption {
@@ -121,6 +132,11 @@ in
       region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
       pathStyle = mkOption { type = types.bool; default = true; description = "Path-style addressing."; };
       operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Per-operation S3 timeout."; };
+      operationAttemptTimeoutSeconds = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Per-attempt S3 timeout inside the overall one; must be below operationTimeoutSeconds and above the time to send partSize on the slowest uplink. Null: unset.";
+      };
       credentialsFile = mkOption {
         type = types.path;
         description = ''
@@ -153,29 +169,30 @@ in
     };
 
     quotaBytes = mkOption {
-      type = types.nullOr types.int;
+      type = types.nullOr types.ints.positive;
       default = null;
       description = "Storage budget. Null means no quota and no eviction.";
     };
 
     watermarks = {
-      high = mkOption { type = types.float; default = 0.95; description = "Eviction starts here."; };
-      low = mkOption { type = types.float; default = 0.85; description = "And runs until here."; };
+      high = mkOption { type = types.numbers.between 0.0 1.0; default = 0.95; description = "Eviction starts here."; };
+      low = mkOption { type = types.numbers.between 0.0 1.0; default = 0.85; description = "And runs until here."; };
     };
 
-    gcIntervalSeconds = mkOption { type = types.int; default = 300; description = "Seconds between GC ticks."; };
+    gcIntervalSeconds = mkOption { type = types.ints.positive; default = 300; description = "Seconds between GC ticks."; };
 
     orphanGraceSeconds = mkOption {
-      type = types.int;
+      type = types.ints.positive;
       default = 86400;
       description = "How long an unreferenced Blob is kept before GC may delete it. Applies only when quotaBytes is set: GC, including the orphan sweep, runs only with a quota.";
     };
 
     limits = {
-      maxConcurrentUploads = mkOption { type = types.int; default = 16; description = "Past this, uploads are shed with 429."; };
-      maxInFlightBytes = mkOption { type = types.int; default = 268435456; description = "Cap on buffered upload bytes."; };
-      partSize = mkOption { type = types.int; default = 16777216; description = "Multipart part size; also the single-PutObject threshold."; };
-      maxPartsInFlight = mkOption { type = types.int; default = 4; description = "Concurrent parts per upload."; };
+      maxConcurrentUploads = mkOption { type = types.ints.positive; default = 16; description = "Past this, uploads are shed with 429."; };
+      maxInFlightBytes = mkOption { type = types.ints.positive; default = 268435456; description = "Cap on buffered upload bytes."; };
+      partSize = mkOption { type = types.ints.positive; default = 16777216; description = "Multipart part size; also the single-PutObject threshold."; };
+      maxPartsInFlight = mkOption { type = types.ints.positive; default = 4; description = "Concurrent parts per upload."; };
+      bodyIdleTimeoutSeconds = mkOption { type = types.ints.positive; default = 60; description = "Seconds an upload body may send nothing before it is abandoned."; };
     };
 
     oidc = mkOption {
@@ -220,12 +237,54 @@ in
         socket.
       '';
     };
+
+    fsck = {
+      calendar = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "weekly";
+        description = ''
+          systemd `OnCalendar` expression for a scheduled `garret-admin fsck`.
+          Null (the default) defines no unit and no timer. The run is a
+          read-only dry run: it reports drift, never repairs. Its findings
+          reach the `garret_fsck_findings` gauge, and the unit fails (exit 1)
+          when it finds dangling rows or size mismatches. Needs
+          `adminSocketPath` and `quotaBytes` (fsck reads the orphan grace
+          from the `[gc]` section and refuses without it).
+
+          One run lists the whole bucket (one S3 `ListObjectsV2` request per
+          1000 blobs, no per-object requests) and reads every Object row into
+          memory, so size the schedule to the cache, not to the clock.
+        '';
+      };
+      extraArgs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "--verify-sizes" ];
+        description = ''
+          Extra arguments for `garret-admin fsck`. `--verify-sizes` costs
+          nothing more, because blob sizes come from the same listing. Do not
+          add `--repair`: repair needs a decision per run, see the restore
+          steps in the packaging spec.
+        '';
+      };
+    };
   };
 
   config = mkIf cfg.enable {
+    environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.garret-admin ];
+
     assertions = [{
       assertion = cfg.oidc != [ ];
       message = "services.garret.pusher.oidc must list at least one issuer.";
+    }
+    {
+      assertion = cfg.fsck.calendar == null || cfg.adminSocketPath != null;
+      message = "services.garret.pusher.fsck.calendar needs adminSocketPath: fsck runs on the admin socket.";
+    }
+    {
+      assertion = cfg.fsck.calendar == null || cfg.quotaBytes != null;
+      message = "services.garret.pusher.fsck.calendar needs quotaBytes: fsck reads the orphan grace from the [gc] section and refuses without it.";
     }];
 
     systemd.services.garret-pusher = {
@@ -259,6 +318,34 @@ in
         User = "garret";
         Group = "garret";
         ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
+      };
+    };
+
+    systemd.services.garret-fsck = mkIf (cfg.fsck.calendar != null) {
+      description = "garret fsck (read-only audit)";
+      after = [ "garret-pusher.service" ];
+      requires = [ "garret-pusher.service" ];
+      serviceConfig = import ./sandbox.nix // {
+        Type = "oneshot";
+        ExecStart = lib.escapeShellArgs ([
+          "${self.packages.${pkgs.stdenv.hostPlatform.system}.garret-admin}/bin/garret-admin"
+          "--socket"
+          cfg.adminSocketPath
+          "fsck"
+        ] ++ cfg.fsck.extraArgs);
+        User = "garret";
+        Group = "garret";
+        # Only the admin socket: the Pusher does the S3 and DB work.
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+      };
+    };
+
+    systemd.timers.garret-fsck = mkIf (cfg.fsck.calendar != null) {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = cfg.fsck.calendar;
+        Persistent = true;
+        RandomizedDelaySec = "15m";
       };
     };
 

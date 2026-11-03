@@ -115,21 +115,54 @@ Module options (all under `services.garret.*`; defaults in parentheses):
 - **pusher**: `enable`, `package`, `listen` (`127.0.0.1:8080`),
   `metricsListen` (`127.0.0.1:9091`), `dbPath`, `storeDir`,
   `s3.{bucket, endpointUrl, region, pathStyle (true), operationTimeoutSeconds
-  (60), credentialsFile}`, `signingKeyFiles` (list — active + retiring),
+  (60), operationAttemptTimeoutSeconds (null: unset), credentialsFile}`, `signingKeyFiles` (list — active + retiring),
   `pullerEndpoint`, `quotaBytes` (null: no quota), `watermarks.{high (0.95),
   low (0.85)}`, `gcIntervalSeconds` (300), `orphanGraceSeconds` (86400),
   `limits.{maxConcurrentUploads (16), maxInFlightBytes (256 MiB), partSize
-  (16 MiB), maxPartsInFlight (4)}`, `oidc` (list of issuer submodules:
+  (16 MiB), maxPartsInFlight (4), bodyIdleTimeoutSeconds (60)}`, `oidc` (list of issuer submodules:
   `issuer`, `audience`, `extra_audiences`, `client_id`, `jwks_url`,
   `github_owner_id`, `ref_patterns`, `ref_protected`, `repository_ids`,
   `event_names`, `job_workflow_refs`, `allowed_groups`), `adminSocketPath`
-  (`/run/garret/admin.sock`).
+  (`/run/garret/admin.sock`), `fsck.{calendar (null: no scheduled fsck),
+  extraArgs ([])}`.
 - **puller**: `enable`, `package`, `listen` (`127.0.0.1:8081` — front it with
   TLS), `metricsListen` (`127.0.0.1:9092`), `dbPath`, `storeDir`, `s3.*`
   (same), `presignTtlSeconds` (3600), `bumpDebounceSeconds` (86400),
   `dbWaitTimeoutSeconds` (300), `dbReadBudgetMs` / `presignBudgetMs`
   (pull-path degrade-to-miss budgets, spec 03; 250 ms), `browseOidc.{issuer,
   audience, jwks_url, allowed_groups}` (null: no browse API).
+- Every module also has `extraSettings` (`{}`): raw TOML merged recursively
+  over the generated config, for keys without a typed option (for example
+  `browse_oidc.extra_audiences` and `browse_oidc.client_id` on the Puller).
+  The watcher adds `oidc.resource` (null: not sent). Enabling the pusher puts
+  `garret-admin` on the system PATH.
+- `services.garret.pusher.fsck.calendar` (a systemd `OnCalendar` expression)
+  adds `garret-fsck.service` and `garret-fsck.timer`. It requires
+  `quotaBytes`, since fsck reads the orphan grace from the `[gc]` section
+  and refuses to run without it; module evaluation fails otherwise. The
+  service is a
+  oneshot as `garret:garret`, after and requiring `garret-pusher.service`,
+  in the common sandbox with only `AF_UNIX` sockets. It runs
+  `garret-admin --socket <adminSocketPath> fsck <fsck.extraArgs>`: a
+  read-only dry run, never `--repair` and never `--quiesce`, so it cannot
+  delete a row or reject a push. The timer is `Persistent=true` with
+  `RandomizedDelaySec=15m`. The unit exits 1, and so shows as failed, when
+  the run finds dangling rows or size mismatches (orphan Blobs alone do not
+  fail it); the findings also set the `garret_fsck_findings` gauge (spec
+  08). The cost of a run is one S3 `ListObjectsV2` request per 1000 Blobs
+  and no per-object request (`--verify-sizes` reuses the listed sizes),
+  plus one read of every Object row. Repair stays a manual step. The option
+  needs `adminSocketPath`; an assertion rejects `calendar` without it.
+- Option types reject the values the binaries reject, at evaluation time:
+  the Pusher quota, intervals and `limits.*` are positive integers,
+  watermarks lie in 0 to 1, `presignTtlSeconds` is 1 to 604800 (the SigV4
+  maximum), the Puller budgets and `dbWaitTimeoutSeconds` are positive,
+  `bumpDebounceSeconds` is not negative, and the watcher `jobs`,
+  `pollIntervalSeconds` and `maxAttempts` are positive. The binaries check
+  the same ranges at startup for hand-written configs (`quota_bytes = 0`
+  would evict the whole cache). The Puller never calls S3, so its
+  `s3.operationTimeoutSeconds` has no effect and stays only for
+  compatibility.
 - **watcher** (client machines): `enable`, `package`, `endpoint`,
   `oidc.{issuer, clientId, audience, clientSecretFile}`, `nixDb`,
   `cursorPath`, `pollIntervalSeconds` (30), `jobs` (8), `zstdLevel` (3),
@@ -190,7 +223,8 @@ nothing to do — the first Pusher start makes the directory 0750 and the
 database files 0660. A custom `dbPath` directory must already be
 `garret:garret` 0750. A signing key readable by group
 `garret` (say `root:garret` 0440) must become `garret`-owned 0400, or the
-Puller can read it. Pointing `services.garret.puller.s3.credentialsFile` at
+Puller can read it. The Pusher refuses to start, naming the file and its mode, when a
+signing key's mode allows group or other access (Unix only). Pointing `services.garret.puller.s3.credentialsFile` at
 a GetObject-only key is optional, and takes bucket write away from the Puller.
 
 ### Sandboxing

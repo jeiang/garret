@@ -21,7 +21,8 @@ is also the upgrade path for older deployments. That step runs as `garret`,
 not root, so nothing in the directory can turn it against a file the Pusher
 does not already own. Signing keys stay owner-only (0400 `garret`) and the
 admin socket stays 0600; both are now out of the Puller's reach, and a key
-made group-readable would put it back. The Puller takes its own S3
+made group-readable would put it back, so the Pusher refuses to start
+on a signing key whose mode allows group or other access. The Puller takes its own S3
 credentials, and needs only GetObject: a presigned URL carries exactly its
 key's authority. A static user rather than `DynamicUser`, so the uid the file
 modes are reasoned about is stable and nameable. Consequences: the Puller

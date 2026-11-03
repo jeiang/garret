@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use aws_sdk_s3::{
     Client,
     config::Credentials,
+    error::SdkError,
     presigning::PresigningConfig,
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
@@ -40,6 +41,8 @@ pub struct UploadLimits {
     pub part_size: usize,
     /// Concurrent part uploads per NAR.
     pub max_parts_in_flight: usize,
+    /// How long a body may send nothing before the upload is abandoned.
+    pub body_idle: Duration,
     /// One permit per `unit` bytes of buffer, shared process-wide.
     pub part_slots: Arc<Semaphore>,
     /// Bytes one permit stands for: `part_size / 256`, at most 64 KiB.
@@ -61,11 +64,18 @@ impl UploadLimits {
         Self {
             part_size,
             max_parts_in_flight,
+            body_idle: BODY_IDLE_TIMEOUT,
             part_slots: Arc::new(Semaphore::new(total_units)),
             unit,
             part_units,
             total_units,
         }
+    }
+
+    /// Replaces the default [`BODY_IDLE_TIMEOUT`].
+    pub fn with_body_idle(mut self, idle: Duration) -> Self {
+        self.body_idle = idle;
+        self
     }
 
     /// How many part-sized buffers fit in the budget at once, process-wide.
@@ -78,17 +88,53 @@ impl UploadLimits {
         bytes.div_ceil(self.unit).clamp(1, self.part_units)
     }
 
+    /// Bytes of buffer currently reserved, process-wide.
+    pub fn in_flight_bytes(&self) -> u64 {
+        (self.total_units - self.part_slots.available_permits()) as u64 * self.unit as u64
+    }
+
     async fn acquire_units(&self, units: usize) -> Result<OwnedSemaphorePermit> {
-        self.part_slots
+        let started = std::time::Instant::now();
+        let permit = self
+            .part_slots
             .clone()
             .acquire_many_owned(units as u32)
             .await
-            .map_err(|_| anyhow!("upload capacity semaphore closed"))
+            .map_err(|_| anyhow!("upload capacity semaphore closed"))?;
+        metrics::histogram!("garret_upload_buffer_wait_seconds").record(started.elapsed());
+        Ok(permit)
     }
 
     /// Reserves room for a buffer of up to `bytes` (capped at one part).
     async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
         self.acquire_units(self.units(bytes)).await
+    }
+}
+
+/// Times one S3 request and, on failure, counts it by operation and error
+/// kind, so a timeout, a refused connection and a 5xx tell apart.
+async fn timed<T, E>(
+    op: &'static str,
+    fut: impl Future<Output = Result<T, SdkError<E>>>,
+) -> Result<T, SdkError<E>> {
+    let started = Instant::now();
+    let result = fut.await;
+    metrics::histogram!("garret_s3_request_duration_seconds", "operation" => op)
+        .record(started.elapsed());
+    if let Err(e) = &result {
+        metrics::counter!("garret_s3_errors_total", "operation" => op, "kind" => error_kind(e))
+            .increment(1);
+    }
+    result
+}
+
+fn error_kind<E>(e: &SdkError<E>) -> &'static str {
+    match e {
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(_) => "dispatch",
+        SdkError::ResponseError(_) => "response",
+        SdkError::ServiceError(_) => "service",
+        _ => "other",
     }
 }
 
@@ -106,8 +152,8 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .filter(|h| !h.is_empty())
 }
 
-/// How long an upload body may send nothing before the upload is abandoned
-/// (spec 01). A stalled body holds an upload slot, its in-flight claim and,
+/// Default for `limits.body_idle_timeout_secs`: how long an upload body may
+/// send nothing before the upload is abandoned (spec 01). A stalled body holds an upload slot, its in-flight claim and,
 /// mid-NAR, a part slot, so without a bound a few quiet senders starve every
 /// other push. Idle, not total: a slow sender that keeps moving is fine.
 pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -139,17 +185,33 @@ impl std::fmt::Display for BodyOverLimit {
 
 impl std::error::Error for BodyOverLimit {}
 
+/// Where an upload body stood when it went quiet, for the stall error.
+#[derive(Clone, Copy)]
+pub struct Stall {
+    /// Body bytes received before the read being waited on.
+    pub received: u64,
+    /// When the upload began.
+    pub started: Instant,
+    /// `preamble`, `first_part` or `multipart`.
+    pub phase: &'static str,
+}
+
 /// The body's next chunk, or a [`ClientBodyError`] once it has sent nothing
-/// for [`BODY_IDLE_TIMEOUT`].
-pub async fn next_chunk<S: Stream + Unpin>(body: &mut S) -> Result<Option<S::Item>> {
-    tokio::time::timeout(BODY_IDLE_TIMEOUT, body.next())
-        .await
-        .map_err(|_| {
-            anyhow::Error::new(ClientBodyError(format!(
-                "upload body stalled: nothing received for {}s",
-                BODY_IDLE_TIMEOUT.as_secs()
-            )))
-        })
+/// for `idle`.
+pub async fn next_chunk<S: Stream + Unpin>(
+    body: &mut S,
+    idle: Duration,
+    at: Stall,
+) -> Result<Option<S::Item>> {
+    tokio::time::timeout(idle, body.next()).await.map_err(|_| {
+        anyhow::Error::new(ClientBodyError(format!(
+            "upload body stalled: nothing received for {}s after {} bytes in {}s ({})",
+            idle.as_secs(),
+            at.received,
+            at.started.elapsed().as_secs(),
+            at.phase
+        )))
+    })
 }
 
 /// Appends body bytes to `part` until it holds `cap` bytes or the body ends,
@@ -163,6 +225,8 @@ async fn fill_part<S, E>(
     carry: &mut Option<Bytes>,
     cap: usize,
     hasher: &mut Sha256,
+    idle: Duration,
+    at: Stall,
 ) -> Result<()>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -172,7 +236,11 @@ where
         let chunk = match carry.take() {
             Some(left) => left,
             None => {
-                let Some(chunk) = next_chunk(body).await? else {
+                let here = Stall {
+                    received: at.received + part.len() as u64,
+                    ..at
+                };
+                let Some(chunk) = next_chunk(body, idle, here).await? else {
                     break;
                 };
                 chunk.map_err(|e| {
@@ -202,13 +270,15 @@ async fn read_part<S, E>(
     carry: &mut Option<Bytes>,
     part_size: usize,
     hasher: &mut Sha256,
+    idle: Duration,
+    at: Stall,
 ) -> Result<Bytes>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
     let mut part = BytesMut::with_capacity(part_size);
-    fill_part(&mut part, body, carry, part_size, hasher).await?;
+    fill_part(&mut part, body, carry, part_size, hasher, idle, at).await?;
     Ok(part.freeze())
 }
 
@@ -244,15 +314,17 @@ impl Storage {
         }
         // S4 and Garage both accept path-style; it avoids DNS games for dotted buckets.
         builder = builder.force_path_style(cfg.path_style);
-        // Overall deadline per call, not per attempt. UploadPart is also never
-        // retried by the SDK (see `upload_part`): re-uploading a part is
-        // forbidden on S4 (spec 03), so fail once and let the caller abort
-        // the multipart.
-        builder = builder.timeout_config(
-            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                .operation_timeout(std::time::Duration::from_secs(cfg.operation_timeout_secs))
-                .build(),
-        );
+        // The overall deadline covers the SDK's retries; the optional attempt
+        // deadline bounds each try, so a hung attempt leaves time for a retry
+        // inside the overall one. UploadPart is never retried by the SDK (see
+        // `upload_part`): re-uploading a part is forbidden on S4 (spec 03), so
+        // it fails once and the caller aborts the multipart.
+        let mut timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .operation_timeout(Duration::from_secs(cfg.operation_timeout_secs));
+        if let Some(secs) = cfg.operation_attempt_timeout_secs {
+            timeouts = timeouts.operation_attempt_timeout(Duration::from_secs(secs));
+        }
+        builder = builder.timeout_config(timeouts.build());
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: cfg.bucket.clone(),
@@ -263,15 +335,18 @@ impl Storage {
     /// part; larger uploads go through [`Storage::put_streaming`]).
     pub async fn put(&self, key: &str, body: Bytes) -> Result<()> {
         let bytes = body.len() as u64;
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(body))
-            .send()
-            .await
-            .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
-            .with_context(|| format!("uploading {key}"))?;
+        timed(
+            "put",
+            self.client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(body))
+                .send(),
+        )
+        .await
+        .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
+        .with_context(|| format!("uploading {key}"))?;
         metrics::counter!("garret_s3_puts_total").increment(1);
         metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
         Ok(())
@@ -304,12 +379,28 @@ impl Storage {
         let mut hasher = Sha256::new();
         let mut total: i64 = 0;
         let mut carry: Option<Bytes> = None;
+        let started = Instant::now();
+        let idle = limits.body_idle;
 
         // First part decides the shape: if the whole body fits, one PutObject.
         let reserve = first_part_hint.clamp(1, limits.part_size);
         let permit = limits.acquire(reserve).await?;
         let mut first = BytesMut::with_capacity(reserve);
-        fill_part(&mut first, &mut body, &mut carry, reserve, &mut hasher).await?;
+        let at = Stall {
+            received: 0,
+            started,
+            phase: "first_part",
+        };
+        fill_part(
+            &mut first,
+            &mut body,
+            &mut carry,
+            reserve,
+            &mut hasher,
+            idle,
+            at,
+        )
+        .await?;
         if first.len() == reserve && reserve < limits.part_size {
             // The hint is a hard cap for a body that is not a whole part: more
             // data means the body exceeds what the caller will accept, so fail
@@ -317,7 +408,12 @@ impl Storage {
             let more = match carry.as_ref() {
                 Some(left) => !left.is_empty(),
                 None => loop {
-                    match next_chunk(&mut body).await? {
+                    let at = Stall {
+                        received: first.len() as u64,
+                        started,
+                        phase: "first_part",
+                    };
+                    match next_chunk(&mut body, idle, at).await? {
                         None => break false,
                         Some(Ok(chunk)) if chunk.is_empty() => continue,
                         Some(Ok(_)) => break true,
@@ -343,16 +439,18 @@ impl Storage {
             return Ok((hasher.finalize().to_vec(), total));
         }
 
-        let upload_id = self
-            .client
-            .create_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .with_context(|| format!("starting multipart upload for {key}"))?
-            .upload_id
-            .context("S3 returned no upload id")?;
+        let upload_id = timed(
+            "create_mpu",
+            self.client
+                .create_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .send(),
+        )
+        .await
+        .with_context(|| format!("starting multipart upload for {key}"))?
+        .upload_id
+        .context("S3 returned no upload id")?;
         metrics::counter!("garret_s3_multipart_started_total").increment(1);
 
         // Any failure past this point must abort, or the parts linger and bill.
@@ -368,6 +466,7 @@ impl Storage {
                 limits,
                 &mut hasher,
                 &mut total,
+                started,
             )
             .await
         {
@@ -377,14 +476,16 @@ impl Storage {
                 // abort would re-create what the abort freed.
                 parts.shutdown().await;
                 metrics::counter!("garret_s3_multipart_aborted_total").increment(1);
-                if let Err(abort) = self
-                    .client
-                    .abort_multipart_upload()
-                    .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await
+                if let Err(abort) = timed(
+                    "abort_mpu",
+                    self.client
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .send(),
+                )
+                .await
                 {
                     tracing::error!("aborting multipart for {key} also failed: {abort}");
                 }
@@ -410,6 +511,7 @@ impl Storage {
         limits: &UploadLimits,
         hasher: &mut Sha256,
         total: &mut i64,
+        started: Instant,
     ) -> Result<()>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -425,7 +527,13 @@ impl Storage {
                 completed.push(collect(in_flight).await?);
             }
             let permit = limits.acquire(limits.part_size).await?;
-            let part = read_part(body, carry, limits.part_size, hasher).await?;
+            let at = Stall {
+                received: *total as u64,
+                started,
+                phase: "multipart",
+            };
+            let part =
+                read_part(body, carry, limits.part_size, hasher, limits.body_idle, at).await?;
             if part.is_empty() {
                 drop(permit);
                 break;
@@ -446,19 +554,22 @@ impl Storage {
 
         completed.sort_by_key(|p| p.part_number());
 
-        self.client
-            .complete_multipart_upload()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .multipart_upload(
-                CompletedMultipartUpload::builder()
-                    .set_parts(Some(completed))
-                    .build(),
-            )
-            .send()
-            .await
-            .with_context(|| format!("completing multipart upload for {key}"))?;
+        timed(
+            "complete_mpu",
+            self.client
+                .complete_multipart_upload()
+                .bucket(&self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed))
+                        .build(),
+                )
+                .send(),
+        )
+        .await
+        .with_context(|| format!("completing multipart upload for {key}"))?;
         metrics::counter!("garret_s3_multipart_completed_total").increment(1);
         Ok(())
     }
@@ -481,22 +592,25 @@ impl Storage {
         async move {
             let bytes = body.len() as u64;
             let started = Instant::now();
-            let output = client
-                .upload_part()
-                .bucket(&bucket)
-                .key(&key)
-                .upload_id(&upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(body))
-                .customize()
-                // S4 forbids re-uploading a part, so the SDK must not retry
-                // one: the caller aborts the whole multipart (spec 03-storage).
-                .config_override(aws_sdk_s3::config::Config::builder().retry_config(
-                    aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
-                ))
-                .send()
-                .await
-                .with_context(|| format!("uploading part {part_number} of {key}"))?;
+            let output = timed(
+                "upload_part",
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(body))
+                    .customize()
+                    // S4 forbids re-uploading a part, so the SDK must not retry
+                    // one: the caller aborts the whole multipart (spec 03-storage).
+                    .config_override(aws_sdk_s3::config::Config::builder().retry_config(
+                        aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+                    ))
+                    .send(),
+            )
+            .await
+            .with_context(|| format!("uploading part {part_number} of {key}"))?;
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);
@@ -515,15 +629,17 @@ impl Storage {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let page = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix("nar/")
-                .set_continuation_token(token.take())
-                .send()
-                .await
-                .context("listing blobs")?;
+            let page = timed(
+                "list",
+                self.client
+                    .list_objects_v2()
+                    .bucket(&self.bucket)
+                    .prefix("nar/")
+                    .set_continuation_token(token.take())
+                    .send(),
+            )
+            .await
+            .context("listing blobs")?;
 
             for object in page.contents() {
                 let Some(key) = object.key() else { continue };
@@ -562,14 +678,16 @@ impl Storage {
                 continue;
             }
             let requested = objects.len();
-            let output = self
-                .client
-                .delete_objects()
-                .bucket(&self.bucket)
-                .delete(Delete::builder().set_objects(Some(objects)).build()?)
-                .send()
-                .await
-                .context("deleting blobs")?;
+            let output = timed(
+                "delete",
+                self.client
+                    .delete_objects()
+                    .bucket(&self.bucket)
+                    .delete(Delete::builder().set_objects(Some(objects)).build()?)
+                    .send(),
+            )
+            .await
+            .context("deleting blobs")?;
             let before = failed;
             for e in output.errors() {
                 if e.code() == Some("NoSuchKey") {
@@ -603,13 +721,15 @@ impl Storage {
         grace: Duration,
         in_flight: &crate::inflight::InFlight,
     ) -> Result<usize> {
-        let uploads = self
-            .client
-            .list_multipart_uploads()
-            .bucket(&self.bucket)
-            .send()
-            .await
-            .context("listing multipart uploads")?;
+        let uploads = timed(
+            "list",
+            self.client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .send(),
+        )
+        .await
+        .context("listing multipart uploads")?;
 
         let mut aborted = 0;
         for upload in uploads.uploads() {
@@ -628,14 +748,17 @@ impl Storage {
             if age < grace {
                 continue;
             }
-            self.client
-                .abort_multipart_upload()
-                .bucket(&self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await
-                .with_context(|| format!("aborting stale multipart for {key}"))?;
+            timed(
+                "abort_mpu",
+                self.client
+                    .abort_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send(),
+            )
+            .await
+            .with_context(|| format!("aborting stale multipart for {key}"))?;
             aborted += 1;
         }
         Ok(aborted)
@@ -658,6 +781,14 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_error_kinds_come_from_the_sdk_variant() {
+        let timeout = SdkError::<()>::timeout_error("slow");
+        let other = SdkError::<()>::construction_failure("bad");
+        assert_eq!(error_kind(&timeout), "timeout");
+        assert_eq!(error_kind(&other), "other");
+    }
 
     #[test]
     fn key_layout_is_flat_and_derivable() {
@@ -689,9 +820,16 @@ mod tests {
             let mut sizes = Vec::new();
             let mut hasher = Sha256::new();
             loop {
-                let part = read_part(&mut body, &mut carry, part_size, &mut hasher)
-                    .await
-                    .unwrap();
+                let part = read_part(
+                    &mut body,
+                    &mut carry,
+                    part_size,
+                    &mut hasher,
+                    BODY_IDLE_TIMEOUT,
+                    test_stall(),
+                )
+                .await
+                .unwrap();
                 if part.is_empty() {
                     break;
                 }
@@ -771,10 +909,45 @@ mod tests {
             .chain(futures::stream::pending());
         let read = tokio::time::timeout(
             BODY_IDLE_TIMEOUT * 2,
-            read_part(&mut body, &mut None, 1024, &mut Sha256::new()),
+            read_part(
+                &mut body,
+                &mut None,
+                1024,
+                &mut Sha256::new(),
+                BODY_IDLE_TIMEOUT,
+                test_stall(),
+            ),
         )
         .await;
         assert!(read.expect("a stalled body hung the read").is_err());
+    }
+
+    fn test_stall() -> Stall {
+        Stall {
+            received: 0,
+            started: Instant::now(),
+            phase: "multipart",
+        }
+    }
+
+    /// The stall error names how much arrived, so an operator can tell a
+    /// sender that never started from one that died mid-NAR.
+    #[tokio::test(start_paused = true)]
+    async fn the_stall_error_carries_the_byte_count() {
+        let mut body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
+            .chain(futures::stream::pending());
+        let at = Stall {
+            received: 10,
+            started: Instant::now(),
+            phase: "multipart",
+        };
+        let idle = Duration::from_millis(10);
+        let err = read_part(&mut body, &mut None, 1024, &mut Sha256::new(), idle, at)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("after 13 bytes"), "{msg}");
+        assert!(msg.contains("(multipart)"), "{msg}");
     }
 
     /// The bound is on silence, not on total time: a sender that keeps
@@ -785,9 +958,16 @@ mod tests {
             tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
-        let part = read_part(&mut body, &mut None, 1024, &mut Sha256::new())
-            .await
-            .unwrap();
+        let part = read_part(
+            &mut body,
+            &mut None,
+            1024,
+            &mut Sha256::new(),
+            BODY_IDLE_TIMEOUT,
+            test_stall(),
+        )
+        .await
+        .unwrap();
         assert_eq!(part.len(), 8);
     }
     /// Just enough S3 on a loopback port. Every call succeeds, except that
@@ -853,6 +1033,7 @@ mod tests {
             access_key_id: Some("x".into()),
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 5,
+            operation_attempt_timeout_secs: None,
         })
         .await
         .unwrap()
@@ -862,6 +1043,16 @@ mod tests {
     /// finish. When parts were lazy futures polled only by their reader, a
     /// reader parked on the next slot held slots nobody could free, and this
     /// hung forever — so the timeout turns a regression into a failure.
+    #[tokio::test]
+    async fn in_flight_bytes_rises_on_acquire_and_returns_to_zero() {
+        let limits = UploadLimits::new(1024, 2, 4096);
+        assert_eq!(limits.in_flight_bytes(), 0);
+        let permit = limits.acquire(1024).await.unwrap();
+        assert_eq!(limits.in_flight_bytes(), 1024);
+        drop(permit);
+        assert_eq!(limits.in_flight_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn concurrent_multiparts_finish_on_fewer_slots_than_they_want() {
         let storage = fake_s3().await;

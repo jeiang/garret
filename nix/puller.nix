@@ -35,7 +35,7 @@ let
     };
   } // lib.optionalAttrs (cfg.browseOidc != null) { browse_oidc = cfg.browseOidc; };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" (stripNulls settings);
+  configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
 in
 {
   options.services.garret.puller = {
@@ -47,37 +47,46 @@ in
       description = "The garret-puller package to run.";
     };
 
+    extraSettings = mkOption {
+      type = (pkgs.formats.toml { }).type;
+      default = { };
+      description = ''
+        Raw TOML settings merged over the generated config (recursively), for
+        keys that have no typed option here.
+      '';
+    };
+
     listen = mkOption { type = types.str; default = "127.0.0.1:8081"; description = "Public substituter listener. Front it with TLS."; };
-    metricsListen = mkOption { type = types.str; default = "127.0.0.1:9092"; description = "Internal metrics listener."; };
+    metricsListen = mkOption { type = types.str; default = "127.0.0.1:9092"; description = "Internal metrics listener. Never expose this publicly."; };
     dbPath = mkOption { type = types.str; default = "/var/lib/garret/garret.db"; description = "The Pusher's database."; };
     storeDir = mkOption { type = types.str; default = "/nix/store"; description = "Reported in nix-cache-info."; };
 
     presignTtlSeconds = mkOption {
-      type = types.int;
+      type = types.ints.between 1 604800;
       default = 3600;
       description = "Lifetime of the presigned URLs NAR requests redirect to.";
     };
 
     bumpDebounceSeconds = mkOption {
-      type = types.int;
+      type = types.ints.unsigned;
       default = 86400;
       description = "Skip a last-accessed write if the stored value is newer than this.";
     };
 
     dbWaitTimeoutSeconds = mkOption {
-      type = types.int;
+      type = types.ints.positive;
       default = 300;
       description = "How long to wait for the Pusher to create the database before exiting.";
     };
 
     dbReadBudgetMs = mkOption {
-      type = types.int;
+      type = types.ints.positive;
       default = 250;
       description = "Pull-path database read budget before the request degrades to a 404 miss.";
     };
 
     presignBudgetMs = mkOption {
-      type = types.int;
+      type = types.ints.positive;
       default = 250;
       description = "Presign budget before a NAR request degrades to a 404 miss.";
     };
@@ -87,7 +96,7 @@ in
       endpointUrl = mkOption { type = types.nullOr types.str; default = null; description = "S3 endpoint."; };
       region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
       pathStyle = mkOption { type = types.bool; default = true; description = "Path-style addressing."; };
-      operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Per-operation S3 timeout."; };
+      operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Has no effect on the Puller (presigning is local, no S3 request is made). Kept for compatibility."; };
       credentialsFile = mkOption {
         type = types.path;
         description = ''

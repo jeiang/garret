@@ -13,14 +13,15 @@ use axum::{
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-/// Bucket bounds from spec 08: bytes 64 KiB…8 GiB, latency 1 ms…60 s.
+/// Bucket bounds from spec 08: bytes 64 KiB…8 GiB, latency 100 us…15 min.
 fn byte_buckets() -> Vec<f64> {
     (16..=33).map(|p| (1u64 << p) as f64).collect()
 }
 
 fn latency_buckets() -> Vec<f64> {
     vec![
-        0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+        0.0001, 0.00025, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        30.0, 60.0, 120.0, 300.0, 900.0,
     ]
 }
 
@@ -29,9 +30,20 @@ fn latency_buckets() -> Vec<f64> {
 pub fn install(service: &str) -> Result<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(Matcher::Suffix("_bytes".into()), &byte_buckets())?
+        .set_buckets_for_metric(Matcher::Suffix("_wait_seconds".into()), &latency_buckets())?
         .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".into()),
             &latency_buckets(),
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("garret_negotiation_batch_size".into()),
+            &[
+                1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+            ],
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("garret_negotiation_missing_ratio".into()),
+            &[0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0],
         )?
         .install_recorder()
         .context("installing the Prometheus recorder")?;
@@ -54,15 +66,22 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
 
 /// Serves `/metrics` and `/healthz` on the pre-bound `listener`, forever.
 /// Binding is the caller's job, so a bad address or a taken port fails
-/// startup rather than a detached task.
-pub async fn serve(handle: PrometheusHandle, listener: tokio::net::TcpListener) -> Result<()> {
+/// startup rather than a detached task. `scrape` runs before every render, to
+/// refresh gauges that are cheaper to read than to keep current.
+pub async fn serve(
+    handle: PrometheusHandle,
+    listener: tokio::net::TcpListener,
+    scrape: impl Fn() + Clone + Send + Sync + 'static,
+) -> Result<()> {
     let app = Router::new()
         .route(
             "/metrics",
             get(move || {
                 let handle = handle.clone();
+                let scrape = scrape.clone();
                 async move {
                     record_process_metrics();
+                    scrape();
                     handle.render()
                 }
             }),
@@ -83,10 +102,11 @@ pub async fn track_http(request: Request, next: Next) -> Response {
         .unwrap_or_else(|| "unmatched".into());
     let method = method_label(request.method());
 
-    metrics::gauge!("garret_http_requests_in_flight").increment(1.0);
     let started = Instant::now();
-    let response = next.run(request).await;
-    metrics::gauge!("garret_http_requests_in_flight").decrement(1.0);
+    let response = {
+        let _in_flight = InFlight::enter();
+        next.run(request).await
+    };
 
     let status = status_class(response.status().as_u16());
     metrics::counter!(
@@ -100,6 +120,23 @@ pub async fn track_http(request: Request, next: Next) -> Response {
     )
     .record(started.elapsed());
     response
+}
+
+/// Counts a request in `garret_http_requests_in_flight` while it lives, so a
+/// handler future dropped mid-request (client disconnect) still gives it back.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> Self {
+        metrics::gauge!("garret_http_requests_in_flight").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        metrics::gauge!("garret_http_requests_in_flight").decrement(1.0);
+    }
 }
 
 /// Status *class*, not code — one series per class keeps cardinality bounded.
@@ -187,8 +224,20 @@ mod tests {
         assert_eq!(bytes.first(), Some(&(64.0 * 1024.0)));
         assert_eq!(bytes.last(), Some(&(8.0 * 1024.0 * 1024.0 * 1024.0)));
         let latency = latency_buckets();
-        assert_eq!(latency.first(), Some(&0.001));
-        assert_eq!(latency.last(), Some(&60.0));
+        assert_eq!(latency.first(), Some(&0.0001));
+        assert_eq!(latency.last(), Some(&900.0));
+    }
+
+    #[test]
+    fn render_has_extended_and_negotiation_buckets() {
+        let handle = install("test").unwrap();
+        metrics::histogram!("garret_x_duration_seconds").record(1.0);
+        metrics::histogram!("garret_negotiation_batch_size").record(3.0);
+        metrics::histogram!("garret_negotiation_missing_ratio").record(0.5);
+        let out = handle.render();
+        assert!(out.contains("garret_x_duration_seconds_bucket{le=\"900\"}"));
+        assert!(out.contains("garret_negotiation_batch_size_bucket{le=\"10000\"}"));
+        assert!(out.contains("garret_negotiation_missing_ratio_bucket{le=\"0.75\"}"));
     }
 
     #[test]
@@ -199,5 +248,33 @@ mod tests {
         let custom = Method::from_bytes(b"BREW").unwrap();
         assert_eq!(method_label(&custom), "OTHER");
         assert_eq!(method_label(&Method::PATCH), "OTHER");
+    }
+
+    /// A request future dropped mid-flight (client gone) leaves the gauge at 0.
+    #[tokio::test]
+    async fn dropped_request_gives_back_in_flight_count() {
+        use tower::ServiceExt;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let app = Router::new()
+            .route("/hang", get(std::future::pending::<&'static str>))
+            .layer(axum::middleware::from_fn(track_http));
+        let request = || {
+            axum::http::Request::get("/hang")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            app.clone().oneshot(request()),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        assert!(
+            handle.render().contains("garret_http_requests_in_flight 0"),
+            "{}",
+            handle.render()
+        );
     }
 }

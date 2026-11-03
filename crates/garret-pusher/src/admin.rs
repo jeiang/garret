@@ -78,7 +78,7 @@ async fn handle(stream: UnixStream, state: Arc<AppState>, gc: Option<Arc<Gc>>) -
 
 async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Response {
     let result = match request {
-        Request::Status => status(state, gc),
+        Request::Status => status(state, gc).await,
         Request::GcRun => match gc {
             Some(gc) => gc.run().await.map(|pass| Response::Gc {
                 evicted: pass.evicted,
@@ -89,19 +89,24 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
                 message: "no [gc] section is configured".into(),
             }),
         },
-        Request::Resign => resign(state),
+        Request::Resign => resign(state).await,
         Request::Delete { hashes, dry_run } => delete(state, &hashes, dry_run).await,
         Request::Pin {
             name,
             hash,
             expires_at,
         } => {
-            let conn = state.conn.lock();
-            db::pin(&conn, &name, &hash, expires_at, garret_server::now()).map(|()| Response::Pin)
+            crate::db_run(&state.conn, move |conn| {
+                db::pin(conn, &name, &hash, expires_at, garret_server::now())
+                    .map(|()| Response::Pin)
+            })
+            .await
         }
         Request::Unpin { name } => {
-            let conn = state.conn.lock();
-            db::unpin(&conn, &name).map(|removed| Response::Unpin { removed })
+            crate::db_run(&state.conn, move |conn| {
+                db::unpin(conn, &name).map(|removed| Response::Unpin { removed })
+            })
+            .await
         }
         Request::Fsck {
             repair,
@@ -129,14 +134,18 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
     })
 }
 
-fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
-    let conn = state.conn.lock();
-    Ok(Response::Status {
-        objects: conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?,
-        total_bytes: db::total_bytes(&conn)?,
-        quota_bytes: gc.map(|gc| gc.cfg.quota_bytes),
-        uploads_in_flight: state.in_flight.uploads(),
+async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
+    let (quota_bytes, uploads_in_flight) =
+        (gc.map(|gc| gc.cfg.quota_bytes), state.in_flight.uploads());
+    crate::db_run(&state.conn, move |conn| {
+        Ok(Response::Status {
+            objects: conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?,
+            total_bytes: db::total_bytes(conn)?,
+            quota_bytes,
+            uploads_in_flight,
+        })
     })
+    .await
 }
 
 /// Removes objects outright: row first, blob second, exactly as GC does
@@ -264,18 +273,20 @@ fn pushed_by(
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
 /// chose the cutoff. Row first, blob second, as everywhere else.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
-    let (pruned, claims) = {
-        let mut conn = state.conn.lock();
-        let doomed = db::prunable(&conn, before, garret_server::now())?;
+    let in_flight = state.in_flight.clone();
+    // One closure, so listing and deleting stay atomic under the lock.
+    let (pruned, claims) = crate::db_run(&state.conn, move |conn| {
+        let doomed = db::prunable(conn, before, garret_server::now())?;
         if dry_run {
-            (doomed, Vec::new())
+            Ok((doomed, Vec::new()))
         } else {
             let hashes: Vec<&str> = doomed.iter().map(|(hash, _, _)| hash.as_str()).collect();
-            let claims = claim_deletions(&state.in_flight, &hashes)?;
-            db::delete_pruned(&mut conn, &doomed)?;
-            (doomed, claims)
+            let claims = claim_deletions(&in_flight, &hashes)?;
+            db::delete_pruned(conn, &doomed)?;
+            Ok((doomed, claims))
         }
-    };
+    })
+    .await?;
     let bytes_freed = pruned.iter().map(|(_, _, size)| size).sum();
     if !dry_run {
         let keys: Vec<String> = pruned
@@ -326,25 +337,49 @@ fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> 
 /// configured key: re-signing blindly would turn tampered metadata (a database
 /// write by anything that can reach the file) into a valid signature. Rows that
 /// fail are counted as refused and left untouched.
-fn resign(state: &AppState) -> Result<Response> {
-    let mut conn = state.conn.lock();
-    let hashes = db::all_hashes(&conn)?;
+async fn resign(state: &AppState) -> Result<Response> {
+    /// Rows per lock hold: pushes wait at most one chunk's reads or writes.
+    const CHUNK: usize = 500;
+    let hashes: Vec<String> = crate::db_run(&state.conn, |conn| db::all_hashes(conn))
+        .await?
+        .into_iter()
+        .collect();
     let mut resigned = 0;
     let mut refused = 0;
-    for hash in hashes {
-        let Some(object) = db::get_object(&conn, &hash)? else {
-            continue;
-        };
-        if !narinfo::verify(&object, &state.store_dir, &state.keys) {
-            tracing::warn!(hash, "refusing to re-sign: no existing signature verifies");
-            refused += 1;
-            continue;
+    for chunk in hashes.chunks(CHUNK) {
+        let chunk = chunk.to_vec();
+        let objects = crate::db_run(&state.conn, move |conn| {
+            chunk
+                .iter()
+                .filter_map(|hash| db::get_object(conn, hash).transpose())
+                .collect::<Result<Vec<_>>>()
+        })
+        .await?;
+        // Verify and sign without the lock.
+        let mut updates = Vec::new();
+        for object in objects {
+            if !narinfo::verify(&object, &state.store_dir, &state.keys) {
+                tracing::warn!(
+                    hash = object.store_path_hash,
+                    "refusing to re-sign: no existing signature verifies"
+                );
+                refused += 1;
+                continue;
+            }
+            let sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
+            if sigs != object.sigs {
+                updates.push((object.store_path_hash, sigs));
+            }
         }
-        let sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
-        if sigs != object.sigs {
-            db::update_sigs(&mut conn, &hash, &sigs)?;
-            resigned += 1;
-        }
+        resigned += updates.len();
+        crate::db_run(&state.conn, move |conn| {
+            let tx = conn.transaction()?;
+            for (hash, sigs) in &updates {
+                db::update_sigs(&tx, hash, sigs)?;
+            }
+            Ok(tx.commit()?)
+        })
+        .await?;
     }
     Ok(Response::Resign { resigned, refused })
 }
@@ -593,7 +628,7 @@ mod tests {
         let mut state = test_state(conn).await;
         Arc::get_mut(&mut state).unwrap().keys = vec![key, key_two()];
 
-        let Response::Resign { resigned, refused } = resign(&state).unwrap() else {
+        let Response::Resign { resigned, refused } = resign(&state).await.unwrap() else {
             panic!("not a resign response");
         };
         assert_eq!((resigned, refused), (1, 2));

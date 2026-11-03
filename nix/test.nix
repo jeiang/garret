@@ -122,6 +122,9 @@ in
         inherit s3;
         signingKeyFiles = [ "/etc/garret/signing-key" ];
         oidc = [{ issuer = issuerUrl; audience = "garret"; jwks_url = "${oidc}/jwks.json"; }];
+        # fsck needs the [gc] section; far above test usage, so GC never evicts.
+        quotaBytes = 10737418240;
+        fsck = { calendar = "weekly"; extraArgs = [ "--verify-sizes" ]; };
       };
       puller = {
         enable = true;
@@ -143,9 +146,17 @@ in
       serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${issuer}";
     };
 
+    # The client accepts plain http only to loopback, so the watcher reaches
+    # the Pusher through a local forward rather than by the `cache` hostname.
+    systemd.services.garret-test-forward = {
+      wantedBy = [ "multi-user.target" ];
+      before = [ "garret-watcher.service" ];
+      serviceConfig.ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr TCP:cache:8080";
+    };
+
     services.garret.watcher = {
       enable = true;
-      endpoint = "http://cache:8080";
+      endpoint = "http://127.0.0.1:8080";
       oidc = {
         issuer = issuerUrl;
         clientId = "builder";
@@ -210,6 +221,10 @@ in
     with subtest("an online backup lands beside the database, owner-only"):
         cache.succeed("garret-admin backup /var/lib/garret/backup.db")
         cache.succeed('test "$(stat -c %U:%a /var/lib/garret/backup.db)" = garret:600')
+
+    with subtest("the scheduled fsck finds a consistent cache"):
+        cache.succeed("systemctl is-enabled garret-fsck.timer")
+        cache.succeed("systemctl start garret-fsck.service")
 
     with subtest("the Puller starts while the Pusher cannot"):
         cache.succeed("systemctl stop garret-puller garret-pusher")

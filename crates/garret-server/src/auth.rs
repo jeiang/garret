@@ -157,7 +157,9 @@ impl Authenticator {
     }
 
     /// Validates a bearer token and returns its subject, or an error naming
-    /// only what the caller may safely learn (log it via [`loggable`]).
+    /// only what the caller may safely learn (log it via [`loggable`]). A
+    /// verified token that fails an issuer policy gate carries
+    /// [`PolicyRefused`] (`e.is::<PolicyRefused>()`).
     pub async fn authenticate(&self, token: &str) -> Result<Subject> {
         let (issuer, verdict) = self.check(token).await;
         let outcome = match &verdict {
@@ -230,8 +232,29 @@ impl Authenticator {
             .map_err(|e| ("invalid", e))?
             .claims;
 
-        authorize(&issuer.cfg, &claims).map_err(|e| ("unauthorized", e))?;
+        authorize(&issuer.cfg, &claims).map_err(|(claim, e)| {
+            // The claim name is a fixed tag; its value goes in the log only.
+            metrics::counter!(
+                "garret_auth_unauthorized_total",
+                "issuer" => issuer.cfg.issuer.clone(), "claim" => claim,
+            )
+            .increment(1);
+            ("unauthorized", e.context(PolicyRefused))
+        })?;
         Ok(Subject(format!("{}#{}", claims.iss, claims.sub)))
+    }
+}
+
+/// Context on an [`Authenticator::authenticate`] error: the token verified, but
+/// an issuer policy gate refused it. Callers answer 403 for it (the identity
+/// is known and will stay refused) and 401 for every other failure, some of
+/// which are transient (spec 04).
+#[derive(Debug)]
+pub struct PolicyRefused;
+
+impl std::fmt::Display for PolicyRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("refused by policy")
     }
 }
 
@@ -400,15 +423,20 @@ fn base64_url(s: &str) -> Result<Vec<u8>> {
 /// Authorization, which lives at the issuer wherever possible (ADR-0003):
 /// Pocket ID grants by audience alone unless groups are configured; GitHub
 /// grants by immutable owner id and optional ref, repository, event and
-/// workflow constraints.
-fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
+/// workflow constraints. A refusal carries the failed gate (`owner`, `ref`,
+/// `ref_protected`, `repository_id`, `event_name`, `job_workflow_ref`,
+/// `group`) for `garret_auth_unauthorized_total`.
+fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (&'static str, anyhow::Error)> {
     if let Some(expected) = &cfg.github_owner_id {
         let owner = claims
             .repository_owner_id
             .as_deref()
-            .ok_or_else(|| anyhow!("token has no repository_owner_id"))?;
+            .ok_or_else(|| ("owner", anyhow!("token has no repository_owner_id")))?;
         if owner != expected {
-            bail!("repository owner is not authorized");
+            return Err((
+                "owner",
+                anyhow!("repository owner {owner:?} is not authorized"),
+            ));
         }
     }
     allowlisted(
@@ -421,10 +449,13 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
         let actual = claims
             .ref_protected
             .as_deref()
-            .ok_or_else(|| anyhow!("token has no ref_protected"))?;
+            .ok_or_else(|| ("ref_protected", anyhow!("token has no ref_protected")))?;
         let expected = if expected { "true" } else { "false" };
         if actual != expected {
-            bail!("ref protection status is not authorized");
+            return Err((
+                "ref_protected",
+                anyhow!("ref protection status {actual:?} is not authorized"),
+            ));
         }
     }
     allowlisted(
@@ -452,19 +483,22 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
         let repository = claims
             .repository
             .as_deref()
-            .ok_or_else(|| anyhow!("token has no repository"))?;
+            .ok_or_else(|| ("job_workflow_ref", anyhow!("token has no repository")))?;
         if jwr
             .strip_prefix(repository)
             .and_then(|rest| rest.strip_prefix('/'))
             .is_none()
         {
-            bail!("job_workflow_ref is not from the token's repository");
+            return Err((
+                "job_workflow_ref",
+                anyhow!("job_workflow_ref {jwr:?} is not from the token's repository"),
+            ));
         }
     }
     if !cfg.allowed_groups.is_empty()
         && !claims.groups.iter().any(|g| cfg.allowed_groups.contains(g))
     {
-        bail!("subject is not in an allowed group");
+        return Err(("group", anyhow!("subject is not in an allowed group")));
     }
     Ok(())
 }
@@ -474,15 +508,15 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<()> {
 fn allowlisted(
     allowed: &[String],
     claim: Option<&str>,
-    name: &str,
+    name: &'static str,
     matches: impl Fn(&str, &str) -> bool,
-) -> Result<()> {
+) -> Result<(), (&'static str, anyhow::Error)> {
     if allowed.is_empty() {
         return Ok(());
     }
-    let value = claim.ok_or_else(|| anyhow!("token has no {name}"))?;
+    let value = claim.ok_or_else(|| (name, anyhow!("token has no {name}")))?;
     if !allowed.iter().any(|a| matches(a, value)) {
-        bail!("{name} is not authorized");
+        return Err((name, anyhow!("{name} {value:?} is not authorized")));
     }
     Ok(())
 }
@@ -589,6 +623,26 @@ mod tests {
         assert!(authorize(&cfg, &c).is_err());
         c.repository_id = None;
         assert!(authorize(&cfg, &c).is_err());
+    }
+
+    #[test]
+    fn refusal_names_the_value_and_the_failed_claim() {
+        let mut cfg = github("1234", &["refs/heads/main"]);
+        cfg.repository_ids = vec!["42".into()];
+        let mut c = claims(Some("1234"), Some("refs/heads/main"), &[]);
+        c.repository_id = Some("99".into());
+        let (claim, e) = authorize(&cfg, &c).unwrap_err();
+        assert_eq!(claim, "repository_id");
+        assert!(format!("{e:#}").contains("\"99\""));
+
+        let (claim, e) =
+            authorize(&github("1234", &[]), &claims(Some("7"), None, &[])).unwrap_err();
+        assert_eq!((claim, format!("{e:#}").contains("\"7\"")), ("owner", true));
+
+        let mut cfg = github("1234", &[]);
+        cfg.allowed_groups = vec!["builders".into()];
+        let (claim, _) = authorize(&cfg, &claims(Some("1234"), None, &["others"])).unwrap_err();
+        assert_eq!(claim, "group");
     }
 
     #[test]
@@ -1056,5 +1110,35 @@ mod tests {
 
         let flood = anyhow!("no signing key for kid {}", "k".repeat(10_000));
         assert!(loggable(&flood).chars().count() <= 257);
+    }
+
+    /// A verified token a policy gate refuses is the one failure that carries
+    /// [`PolicyRefused`]; callers answer it 403, everything else 401.
+    #[tokio::test]
+    async fn only_a_verified_token_refused_by_policy_is_a_policy_refusal() {
+        let jwks = std::env::temp_dir().join(format!("garret-jwks-{}", std::process::id()));
+        std::fs::write(&jwks, crate::testing::jwks()).unwrap();
+        let mut cfg = dev_issuer(jwks.to_str().unwrap());
+        cfg.repository_ids = vec!["42".into()];
+        let auth = Authenticator::new(vec![cfg]).unwrap();
+        let token = |repository_id: &str| {
+            crate::testing::sign(&format!(
+                r#"{{"iss":"{DEV_ISSUER}","sub":"ci","aud":"garret","exp":4102444800,"repository_id":"{repository_id}"}}"#
+            ))
+        };
+        assert!(auth.authenticate(&token("42")).await.is_ok());
+        let refused = auth.authenticate(&token("99")).await.unwrap_err();
+        assert!(refused.is::<PolicyRefused>());
+        assert!(loggable(&refused).contains("repository_id"), "{refused:#}");
+        for bad in ["not-a-jwt".to_owned(), token_with_kid("forged")] {
+            assert!(
+                !auth
+                    .authenticate(&bad)
+                    .await
+                    .unwrap_err()
+                    .is::<PolicyRefused>()
+            );
+        }
+        let _ = std::fs::remove_file(jwks);
     }
 }

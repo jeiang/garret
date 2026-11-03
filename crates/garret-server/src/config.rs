@@ -29,6 +29,12 @@ pub struct S3Config {
     /// larger parts.
     #[serde(default = "s3_operation_timeout")]
     pub operation_timeout_secs: u64,
+    /// Deadline for each attempt inside the overall one. Unset (default), a
+    /// hung attempt uses the whole overall deadline and nothing retries. Set
+    /// it above the time to send `part_size` on the slowest uplink and below
+    /// `operation_timeout_secs`.
+    #[serde(default)]
+    pub operation_attempt_timeout_secs: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -116,6 +122,10 @@ pub struct Limits {
     /// Concurrent part uploads per NAR. Default 4.
     #[serde(default = "max_parts_in_flight")]
     pub max_parts_in_flight: usize,
+    /// Seconds an upload body may send nothing before the upload is
+    /// abandoned. Raising it holds upload slots longer. Default 60.
+    #[serde(default = "body_idle_timeout")]
+    pub body_idle_timeout_secs: u64,
 }
 
 impl Default for Limits {
@@ -125,8 +135,13 @@ impl Default for Limits {
             max_in_flight_bytes: max_in_flight_bytes(),
             part_size: part_size(),
             max_parts_in_flight: max_parts_in_flight(),
+            body_idle_timeout_secs: body_idle_timeout(),
         }
     }
+}
+
+fn body_idle_timeout() -> u64 {
+    crate::storage::BODY_IDLE_TIMEOUT.as_secs()
 }
 
 fn max_concurrent_uploads() -> usize {
@@ -268,7 +283,23 @@ impl PusherConfig {
         if self.s3.operation_timeout_secs == 0 {
             bail!("s3.operation_timeout_secs must be at least 1");
         }
+        if l.body_idle_timeout_secs == 0 {
+            bail!("limits.body_idle_timeout_secs must be at least 1");
+        }
+        if let Some(attempt) = self.s3.operation_attempt_timeout_secs
+            && (attempt == 0 || attempt >= self.s3.operation_timeout_secs)
+        {
+            bail!(
+                "s3.operation_attempt_timeout_secs ({attempt}) must be at least 1 and below s3.operation_timeout_secs ({})",
+                self.s3.operation_timeout_secs
+            );
+        }
         if let Some(gc) = &self.gc {
+            // A zero quota puts every Blob over the high watermark, so GC would
+            // evict the whole cache.
+            if gc.quota_bytes == 0 {
+                bail!("gc.quota_bytes must be at least 1 (omit [gc] to disable the quota)");
+            }
             if gc.interval_secs == 0 {
                 bail!("gc.interval_secs must be at least 1");
             }
@@ -336,6 +367,34 @@ pub struct PullerConfig {
     /// miss (ticket 25). Measured p99 is ~2.4 ms. Default 250.
     #[serde(default = "presign_budget")]
     pub presign_budget_ms: u64,
+}
+
+impl PullerConfig {
+    /// Rejects values that would break every pull (a zero or over-long presign
+    /// lifetime, a zero budget that degrades every request to a miss) naming
+    /// the key, at startup.
+    pub fn validate(&self) -> Result<()> {
+        // 7 days is the SigV4 presigned-URL maximum.
+        if !(1..=604_800).contains(&self.presign_ttl_secs) {
+            bail!(
+                "presign_ttl_secs must be between 1 and 604800, got {}",
+                self.presign_ttl_secs
+            );
+        }
+        if self.db_read_budget_ms == 0 {
+            bail!("db_read_budget_ms must be at least 1");
+        }
+        if self.presign_budget_ms == 0 {
+            bail!("presign_budget_ms must be at least 1");
+        }
+        if self.bump_debounce_secs < 0 {
+            bail!("bump_debounce_secs must not be negative");
+        }
+        if self.db_wait_timeout_secs == 0 {
+            bail!("db_wait_timeout_secs must be at least 1");
+        }
+        Ok(())
+    }
 }
 
 fn db_wait_timeout() -> u64 {
@@ -442,6 +501,33 @@ mod validate_tests {
             "max_concurrent_uploads",
         );
         rejects(|c| c.limits.max_parts_in_flight = 0, "max_parts_in_flight");
+        rejects(|c| c.gc.as_mut().unwrap().quota_bytes = 0, "quota_bytes");
+        rejects(
+            |c| c.limits.body_idle_timeout_secs = 0,
+            "body_idle_timeout_secs",
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_keep_current_behavior() {
+        let c = cfg();
+        assert_eq!(c.limits.body_idle_timeout_secs, 60);
+        assert_eq!(c.s3.operation_attempt_timeout_secs, None);
+    }
+
+    #[test]
+    fn attempt_timeout_must_fit_inside_the_overall_one() {
+        let mut c = cfg();
+        c.s3.operation_attempt_timeout_secs = Some(c.s3.operation_timeout_secs - 1);
+        c.validate().unwrap();
+        rejects(
+            |c| c.s3.operation_attempt_timeout_secs = Some(0),
+            "attempt_timeout",
+        );
+        rejects(
+            |c| c.s3.operation_attempt_timeout_secs = Some(c.s3.operation_timeout_secs),
+            "attempt_timeout",
+        );
     }
 
     #[test]
@@ -510,5 +596,43 @@ mod strictness_tests {
             toml::from_str::<PusherConfig>(&misplaced).is_err(),
             "a root key inside [limits] must not be silently swallowed"
         );
+    }
+}
+
+#[cfg(test)]
+mod puller_validate_tests {
+    use super::*;
+
+    fn cfg() -> PullerConfig {
+        toml::from_str(
+            r#"
+            db_path = "/tmp/x.db"
+            [s3]
+            bucket = "b"
+        "#,
+        )
+        .unwrap()
+    }
+
+    fn rejects(edit: impl FnOnce(&mut PullerConfig), key: &str) {
+        let mut c = cfg();
+        edit(&mut c);
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e:#}").contains(key), "{e:#}");
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        cfg().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_bad_values() {
+        rejects(|c| c.presign_ttl_secs = 0, "presign_ttl_secs");
+        rejects(|c| c.presign_ttl_secs = 604_801, "presign_ttl_secs");
+        rejects(|c| c.db_read_budget_ms = 0, "db_read_budget_ms");
+        rejects(|c| c.presign_budget_ms = 0, "presign_budget_ms");
+        rejects(|c| c.bump_debounce_secs = -1, "bump_debounce_secs");
+        rejects(|c| c.db_wait_timeout_secs = 0, "db_wait_timeout_secs");
     }
 }

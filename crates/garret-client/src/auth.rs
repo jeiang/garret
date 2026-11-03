@@ -503,6 +503,22 @@ struct Held {
 }
 
 impl TokenSource {
+    /// A source minting `t1`, `t2`, ... for other modules' tests, and a count
+    /// of mints.
+    #[cfg(test)]
+    pub(crate) fn counting() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mints = Arc::new(AtomicUsize::new(0));
+        let counter = mints.clone();
+        let mint = Mint::Fake(Box::new(move || {
+            format!("t{}", counter.fetch_add(1, Ordering::SeqCst) + 1)
+        }));
+        (Self::new(&reqwest::Client::new(), mint), mints)
+    }
+
     fn new(http: &reqwest::Client, mint: Mint) -> Self {
         Self {
             http: http.clone(),

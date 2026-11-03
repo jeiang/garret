@@ -18,7 +18,7 @@ use axum::{
 use garret_server::{
     auth::Authenticator,
     browse,
-    config::PullerConfig,
+    config::{IssuerConfig, PullerConfig},
     db, metrics as garret_metrics, narinfo, now,
     storage::{self, Storage},
 };
@@ -110,7 +110,7 @@ async fn flush_bumps(state: Arc<AppState>, conn: rusqlite::Connection) {
         tick.tick().await;
         let (state, conn) = (state.clone(), conn.clone());
         let flushed = tokio::task::spawn_blocking(move || {
-            let mut conn = conn.lock();
+            let mut conn = lock_timed(&conn, "bump");
             state.bumps.flush(&mut conn, now(), state.bump_debounce)
         })
         .await;
@@ -169,7 +169,7 @@ where
     // request has already been answered: check the deadline under the lock.
     let deadline = Instant::now() + budget;
     let task = tokio::task::spawn_blocking(move || {
-        let conn = conn.lock();
+        let conn = lock_timed(&conn, "pull");
         if Instant::now() > deadline {
             anyhow::bail!("db read abandoned: budget elapsed while queued");
         }
@@ -181,6 +181,17 @@ where
         }
         Err(_elapsed) => None,
     }
+}
+
+/// Locks a connection, recording the wait as `garret_db_lock_wait_seconds`.
+fn lock_timed<'a>(
+    conn: &'a Mutex<rusqlite::Connection>,
+    which: &'static str,
+) -> parking_lot::MutexGuard<'a, rusqlite::Connection> {
+    let waited = Instant::now();
+    let guard = conn.lock();
+    metrics::histogram!("garret_db_lock_wait_seconds", "conn" => which).record(waited.elapsed());
+    guard
 }
 
 /// A browse query (spec 07) on the browse connection: one at a time, on the
@@ -199,12 +210,36 @@ where
     T: Send + 'static,
 {
     let query = async move {
+        let waited = Instant::now();
         let conn = conn.lock_owned().await;
+        metrics::histogram!("garret_db_lock_wait_seconds", "conn" => "browse")
+            .record(waited.elapsed());
         tokio::task::spawn_blocking(move || read(&conn))
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("browse task failed: {e}")))
     };
     tokio::time::timeout(budget, query).await.ok()
+}
+
+/// Browse routes are the only authenticated surface here, and they are
+/// simply absent when no issuer is configured (spec 07). `route_layer` keeps
+/// the auth check off unmatched paths, which stay a plain 404.
+fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>> {
+    let Some(issuer) = issuer else {
+        tracing::info!("no browse_oidc configured: the browse API is not served");
+        return Ok(Router::new());
+    };
+    let auth = Arc::new(Authenticator::new(vec![issuer.clone()])?);
+    Ok(Router::new()
+        .route("/api/v1/objects", get(list_objects))
+        .route("/api/v1/objects/{hash}", get(object_detail))
+        .route("/api/v1/objects/{hash}/tree", get(object_tree))
+        .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
+        .route("/api/v1/pins", get(list_pins))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth,
+            require_browse_oidc,
+        )))
 }
 
 #[tokio::main]
@@ -214,6 +249,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("usage: garret-puller <config.toml>")?;
     let cfg: PullerConfig = garret_server::config::load(&path)?;
+    cfg.validate()?;
 
     let state = Arc::new(AppState {
         conn: OnceLock::new(),
@@ -237,6 +273,8 @@ async fn main() -> Result<()> {
             let opened = db::open_when_ready(&db_path, timeout)
                 .await
                 .and_then(|conn| {
+                    // A pull read must not outwait its own budget on SQLite.
+                    conn.busy_timeout(state.db_read_budget)?;
                     // Bumps and browse get their own connections, so neither
                     // a flush waiting on a Pusher write nor a slow browse
                     // query ever holds up a pull-path read.
@@ -270,33 +308,13 @@ async fn main() -> Result<()> {
     let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
     tracing::info!("metrics listening on {metrics_addr}");
     tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener).await {
+        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener, || {}).await {
             tracing::error!("metrics listener failed: {e:#}");
         }
     });
 
     let store_dir = cfg.store_dir.clone();
-    // Browse routes are the only authenticated surface here, and they are
-    // simply absent when no issuer is configured (spec 07).
-    let browse_routes = match &cfg.browse_oidc {
-        Some(issuer) => {
-            let auth = Arc::new(Authenticator::new(vec![issuer.clone()])?);
-            Router::new()
-                .route("/api/v1/objects", get(list_objects))
-                .route("/api/v1/objects/{hash}", get(object_detail))
-                .route("/api/v1/objects/{hash}/tree", get(object_tree))
-                .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
-                .route("/api/v1/pins", get(list_pins))
-                .layer(axum::middleware::from_fn_with_state(
-                    auth,
-                    require_browse_oidc,
-                ))
-        }
-        None => {
-            tracing::info!("no browse_oidc configured: the browse API is not served");
-            Router::new()
-        }
-    };
+    let browse_routes = browse_routes(cfg.browse_oidc.as_ref())?;
 
     let app = Router::new()
         .route(
@@ -417,11 +435,13 @@ async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
     let probe = {
         let state = state.clone();
         async move {
+            let started = Instant::now();
             let outcome = tokio::time::timeout(READ_PROBE_TIMEOUT, probe_read(&state, conn))
                 .await
                 .unwrap_or_else(|_| Err(format!("no answer within {READ_PROBE_TIMEOUT:?}")));
             let label = if outcome.is_ok() { "ok" } else { "failed" };
             metrics::counter!("garret_s3_read_probes_total", "outcome" => label).increment(1);
+            metrics::histogram!("garret_s3_read_probe_duration_seconds").record(started.elapsed());
             if let Err(e) = &outcome {
                 tracing::warn!("deep readiness: {e}");
             }
@@ -557,15 +577,35 @@ async fn require_browse_oidc(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match token {
-        Some(token) if auth.authenticate(token).await.is_ok() => next.run(request).await,
+    let verdict = match token {
+        Some(token) => Some(auth.authenticate(token).await),
+        None => None,
+    };
+    match verdict {
+        Some(Ok(_)) => next.run(request).await,
         other => {
-            let reason = if other.is_none() {
-                "missing_bearer"
-            } else {
-                "token_rejected"
+            let mut refused = false;
+            let reason = match other {
+                None => "missing_bearer",
+                Some(verdict) => {
+                    // Debug, not warn: browse is a public surface and any
+                    // client can flood this line.
+                    if let Err(e) = verdict {
+                        tracing::debug!(
+                            "rejected browse token: {}",
+                            garret_server::auth::loggable(&e)
+                        );
+                        refused = e.is::<garret_server::auth::PolicyRefused>();
+                    }
+                    "token_rejected"
+                }
             };
             metrics::counter!("garret_browse_auth_failures_total", "reason" => reason).increment(1);
+            // A verified identity that policy refuses is a 403 (spec 04);
+            // every other failure may be transient and stays a 401.
+            if refused {
+                return (StatusCode::FORBIDDEN, "not authorized").into_response();
+            }
             (
                 StatusCode::UNAUTHORIZED,
                 [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
@@ -888,5 +928,118 @@ mod tests {
         assert_eq!(panicked.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let next = browse(conn, "tree", |_| Ok(Some(42))).await;
         assert_eq!(next.status(), StatusCode::OK);
+    }
+
+    async fn state() -> Arc<AppState> {
+        let storage = Storage::new(&garret_server::config::S3Config {
+            bucket: "test".into(),
+            endpoint_url: Some("http://127.0.0.1:1".into()),
+            region: Some("us-east-1".into()),
+            path_style: true,
+            access_key_id: Some("x".into()),
+            secret_access_key: Some("x".into()),
+            operation_timeout_secs: 1,
+            operation_attempt_timeout_secs: None,
+        })
+        .await
+        .unwrap();
+        Arc::new(AppState {
+            conn: OnceLock::new(),
+            browse_conn: OnceLock::new(),
+            storage,
+            presign_ttl: Duration::from_secs(1),
+            bump_debounce: 0,
+            bumps: Bumps::default(),
+            db_read_budget: Duration::from_secs(1),
+            presign_budget: Duration::from_secs(1),
+            read_probe: ProbeCache::default(),
+            http: reqwest::Client::new(),
+        })
+    }
+
+    /// Browse auth wraps only the browse routes: an unmatched path is a plain
+    /// 404, not a 401 that counts as a browse auth failure.
+    #[tokio::test]
+    async fn browse_auth_leaves_unmatched_paths_a_plain_404() {
+        use tower::ServiceExt;
+        let issuer = IssuerConfig {
+            issuer: "https://issuer.example".into(),
+            audience: "aud".into(),
+            extra_audiences: vec![],
+            client_id: None,
+            jwks_url: None,
+            github_owner_id: None,
+            ref_patterns: vec![],
+            ref_protected: None,
+            repository_ids: vec![],
+            event_names: vec![],
+            job_workflow_refs: vec![],
+            allowed_groups: vec![],
+        };
+        let app = Router::new()
+            .route("/{file}", get(narinfo_route))
+            .merge(browse_routes(Some(&issuer)).unwrap())
+            .with_state(state().await);
+        let get_status = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let req = axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.unwrap()
+            }
+        };
+        for uri in ["/a/b", "/"] {
+            let res = get_status(uri).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+        }
+        let res = get_status("/api/v1/objects").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A verified token that a policy gate refuses is a 403; an unverifiable
+    /// one stays a 401 (spec 04).
+    #[tokio::test]
+    async fn browse_answers_403_for_a_policy_refusal_and_401_otherwise() {
+        use tower::ServiceExt;
+        let jwks = std::env::temp_dir().join(format!("garret-puller-jwks-{}", std::process::id()));
+        std::fs::write(&jwks, garret_server::testing::jwks()).unwrap();
+        let issuer = IssuerConfig {
+            issuer: "https://issuer.example".into(),
+            audience: "aud".into(),
+            extra_audiences: vec![],
+            client_id: None,
+            jwks_url: Some(jwks.to_str().unwrap().into()),
+            github_owner_id: None,
+            ref_patterns: vec![],
+            ref_protected: None,
+            repository_ids: vec!["42".into()],
+            event_names: vec![],
+            job_workflow_refs: vec![],
+            allowed_groups: vec![],
+        };
+        let app = browse_routes(Some(&issuer))
+            .unwrap()
+            .with_state(state().await);
+        let send = |token: String| {
+            let app = app.clone();
+            async move {
+                let req = axum::http::Request::get("/api/v1/objects")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.unwrap()
+            }
+        };
+        let signed = garret_server::testing::sign(
+            r#"{"iss": "https://issuer.example", "sub": "ci", "aud": "aud", "exp": 4102444800, "repository_id": "99"}"#,
+        );
+        let res = send(signed).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+        let res = send("not-a-jwt".into()).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(jwks);
     }
 }

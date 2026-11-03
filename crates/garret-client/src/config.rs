@@ -23,6 +23,12 @@ pub struct Config {
     /// connections. A 429 does not spend these: it waits out `Retry-After`.
     #[serde(default = "max_retries")]
     pub max_retries: u32,
+    /// Seconds an upload may go without progress (no body chunk taken, or no
+    /// answer once sent) before it is abandoned and retried. Keep it above
+    /// the Pusher's `limits.body_idle_timeout_secs`, or the client gives up
+    /// on an upload the server is still willing to wait for.
+    #[serde(default = "upload_idle_secs")]
+    pub upload_idle_secs: u64,
     /// Puller base URL — `list` and `tree` query the browse API, not the Pusher.
     pub puller_endpoint: Option<String>,
     /// The cache's signing keys, public halves, as `garret use` writes them into
@@ -44,7 +50,7 @@ pub struct Config {
 }
 
 /// Store watcher settings; only the daemon reads these.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Watch {
     /// The Nix database the watcher polls for newly validated paths.
@@ -73,6 +79,13 @@ pub struct Watch {
     /// after `poll_interval_secs`.
     #[serde(default = "socket_path")]
     pub socket_path: String,
+}
+
+/// An absent `[watch]` table must equal an empty one, not zeroed fields.
+impl Default for Watch {
+    fn default() -> Self {
+        toml::from_str("").expect("every Watch field has a serde default")
+    }
 }
 
 fn nix_db() -> String {
@@ -142,6 +155,10 @@ fn zstd_level() -> i32 {
     3
 }
 
+fn upload_idle_secs() -> u64 {
+    5 * 60
+}
+
 fn max_retries() -> u32 {
     5
 }
@@ -179,10 +196,36 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading client config {}", path.display()))?;
     let mut cfg: Config = toml::from_str(&text).context("parsing client config")?;
+    anyhow::ensure!(
+        cfg.upload_idle_secs > 0,
+        "upload_idle_secs must be at least 1"
+    );
+    cfg.validate()?;
     if let Ok(endpoint) = std::env::var("GARRET_ENDPOINT") {
         cfg.endpoint = endpoint;
     }
+    crate::discovery::check_url("endpoint", &cfg.endpoint)?;
+    if let Some(issuer) = &cfg.oidc.issuer {
+        crate::discovery::check_url("oidc.issuer", issuer)?;
+    }
     Ok(cfg)
+}
+
+impl Config {
+    /// Rejects zero values that would deadlock the uploader or spin the
+    /// watcher, naming the key.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.jobs >= 1, "jobs must be at least 1");
+        anyhow::ensure!(
+            self.watch.poll_interval_secs >= 1,
+            "watch.poll_interval_secs must be at least 1"
+        );
+        anyhow::ensure!(
+            self.watch.max_attempts >= 1,
+            "watch.max_attempts must be at least 1"
+        );
+        Ok(())
+    }
 }
 
 /// TOML-quotes a string. Base64 signing keys carry `+/=` and issuer URLs carry
@@ -275,6 +318,35 @@ mod tests {
                 client_id: Some("garret-cli".into()),
             }),
         }
+    }
+
+    #[test]
+    fn validate_rejects_zero_values() {
+        let base = render("https://push.example", &discovery()).unwrap();
+        let ok: Config = toml::from_str(&base).unwrap();
+        ok.validate().unwrap();
+        for (edit, key) in [
+            ("jobs = 0\n", "jobs"),
+            ("[watch]\npoll_interval_secs = 0\n", "poll_interval_secs"),
+            ("[watch]\nmax_attempts = 0\n", "max_attempts"),
+        ] {
+            // Top-level keys must precede the first table.
+            let text = if edit.starts_with('[') {
+                format!("{base}\n{edit}")
+            } else {
+                format!("{edit}{base}")
+            };
+            let c: Config = toml::from_str(&text).unwrap();
+            let e = c.validate().unwrap_err();
+            assert!(format!("{e:#}").contains(key), "{e:#}");
+        }
+    }
+
+    #[test]
+    fn upload_idle_defaults_to_five_minutes() {
+        let text = render("https://push.example", &discovery()).unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.upload_idle_secs, 300);
     }
 
     /// The template and the struct can drift; this is what stops them. It also

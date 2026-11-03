@@ -28,6 +28,9 @@ JWKS. There is no token-exchange service and no garret-issued token.
   missing the claim is refused (fail closed). Startup is refused when the
   GitHub issuer sets neither `github_owner_id` nor `repository_ids`, since
   any GitHub repository could then mint a token for the audience.
+  A refusal names the gate and the refused value in the log (for example
+  `repository_id "99" is not authorized`); the `iss` and `sub` are not
+  repeated, as GitHub's `sub` already carries the repository and ref.
   - `ref_patterns`: allowed `ref`s (trailing-`*` globs). Applies with or
     without `github_owner_id`.
   - `ref_protected`: the claim must be present and equal; `true` requires a
@@ -81,6 +84,17 @@ router reordering cannot silently re-authenticate it. See
 [ADR-0006](../adr/0006-server-served-client-discovery.md).
 
 ## Validation mechanics
+
+**Status codes.** A token that fails verification (malformed, untrusted
+issuer, unknown key, JWKS unavailable, invalid or expired) is a `401` with
+`WWW-Authenticate: Bearer`: the client may renew the token or retry, and
+some causes are transient. A token that verifies but that an issuer policy
+gate refuses (`owner`, `ref`, `ref_protected`, `repository_id`,
+`event_name`, `job_workflow_ref`, `group`) is a `403`
+`{"error":"not authorized"}` with no `WWW-Authenticate`: the identity is
+known and stays refused, so retrying cannot help. The Puller's browse
+routes use the same split (a `403` body of `not authorized`). A missing
+bearer header is a `401`. Older clients treat the `403` as a plain failure.
 
 Stacked per-issuer authorizers (jwt-authorizer-style): RS256 pinned,
 `aud`, `iss` and `exp` all required (a token omitting any is refused),

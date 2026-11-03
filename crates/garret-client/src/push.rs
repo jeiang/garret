@@ -264,6 +264,9 @@ pub struct Pusher {
     /// Retries per path on 5xx and dropped connections, with exponential
     /// jittered backoff; 429s wait out `Retry-After` instead.
     pub max_retries: u32,
+    /// How long an upload may go without progress before it is abandoned as
+    /// [`Stalled`] and retried.
+    pub upload_idle: Duration,
 }
 
 /// The subset of `nix path-info --json` garret needs. Shelling out to nix
@@ -398,7 +401,7 @@ impl Pusher {
         let token = self.tokens.get().await?;
         let mut response = send(&token).await.context("negotiating missing paths")?;
         // Expired or revoked since it was minted: replace it once and ask
-        // again. A second 401 is a real refusal, reported below.
+        // again. Only a 401 renews: a 403 is a permanent policy refusal.
         if response.status() == StatusCode::UNAUTHORIZED
             && let Some(token) = self
                 .tokens
@@ -410,8 +413,12 @@ impl Pusher {
         }
 
         // `error_for_status` drops the body, which is where the server explains
-        // itself — a bare "401 Unauthorized" says nothing a log can act on.
+        // itself; a bare "403 Forbidden" says nothing a log can act on.
         let status = response.status();
+        if status == StatusCode::FORBIDDEN {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Refused(body.trim().to_owned()).into());
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             bail!("negotiation rejected with {status}: {}", body.trim());
@@ -530,7 +537,7 @@ impl Pusher {
                 hash_of_store_path(&info.path)
             ))
             .bearer_auth(token);
-        let response = send_watched(request, body, UPLOAD_IDLE)
+        let response = send_watched(request, body, self.upload_idle)
             .await
             .context("uploading NAR")?;
 
@@ -544,7 +551,11 @@ impl Pusher {
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("upload rejected with {status}: {}", body.trim());
+            return Err(Rejected {
+                status,
+                body: body.trim().to_owned(),
+            }
+            .into());
         }
 
         #[derive(Deserialize)]
@@ -615,13 +626,9 @@ fn references_first(paths: Vec<PathInfo>) -> Vec<PathInfo> {
 /// Generous for one missing-paths round-trip, even over a whole closure.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-/// How long an upload may go without the connection taking another body
-/// chunk — or, once the body is sent, without an answer — before it is
-/// abandoned as [`Stalled`] and retried. Generous, because the server stops
-/// reading on purpose while it waits for a part slot behind other uploads.
-const UPLOAD_IDLE: Duration = Duration::from_secs(5 * 60);
-
-/// The upload went [`UPLOAD_IDLE`] without progress. Retryable: negotiation
+/// The upload went [`Pusher::upload_idle`] without progress (default 5 min,
+/// generous because the server stops reading on purpose while it waits for a
+/// part slot behind other uploads). Retryable: negotiation
 /// makes the retry idempotent, and a fresh connection may well not stall.
 #[derive(Debug)]
 struct Stalled(Duration);
@@ -720,6 +727,45 @@ impl std::fmt::Display for Unauthorized {
 }
 
 impl std::error::Error for Unauthorized {}
+
+/// The Pusher refused an upload with a status other than 401 or 429. Typed so
+/// [`is_retryable`] reads the status instead of searching the message.
+#[derive(Debug)]
+struct Rejected {
+    status: StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upload rejected with {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// The Negotiation got a 403: the Pusher's policy refuses this identity, now
+/// and on every retry. Typed so the watcher logs it once and drops the batch
+/// instead of retrying. A 401 that survives renewal is not this: it can be
+/// transient (JWKS outage), so it is an ordinary failure.
+#[derive(Debug)]
+pub struct Refused(
+    /// The Pusher's explanation, as sent.
+    pub String,
+);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "negotiation rejected with {}: {}",
+            StatusCode::FORBIDDEN,
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// The server shed the upload (429) and said when to come back. Typed so
 /// [`Backoff`] waits out `Retry-After` instead of parsing the message.
@@ -890,7 +936,9 @@ fn shed_for(retry_after: Option<&str>) -> Duration {
 /// 5xx and dropped, timed-out or stalled connections are retryable; 4xx are
 /// the client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
 fn is_retryable(error: &anyhow::Error) -> bool {
-    error.to_string().contains(" 50")
+    error
+        .downcast_ref::<Rejected>()
+        .is_some_and(|r| r.status.is_server_error())
         || error.is::<Stalled>()
         || error
             .downcast_ref::<reqwest::Error>()
@@ -1032,7 +1080,11 @@ mod tests {
 
     fn rejected(status: u16) -> anyhow::Error {
         let status = StatusCode::from_u16(status).unwrap();
-        anyhow::anyhow!("upload rejected with {status}: nope")
+        Rejected {
+            status,
+            body: "nope".into(),
+        }
+        .into()
     }
 
     /// Six CI legs against sixteen upload slots is the normal load: a path
@@ -1145,6 +1197,18 @@ mod tests {
     }
 
     #[test]
+    fn only_a_server_status_is_retryable_never_a_body_that_looks_like_one() {
+        let body_with_50 = Rejected {
+            status: StatusCode::BAD_REQUEST,
+            body: "bad nar 500 bytes".into(),
+        };
+        assert!(!is_retryable(&body_with_50.into()));
+        assert!(is_retryable(&rejected(503)));
+        assert!(!is_retryable(&Refused("no".into()).into()));
+        assert!(!is_retryable(&rejected(403)));
+    }
+
+    #[test]
     fn server_errors_back_off_doubling_and_client_errors_fail_at_once() {
         let mut backoff = Backoff::new(5);
         let first = backoff.next(&rejected(503)).unwrap();
@@ -1153,6 +1217,9 @@ mod tests {
         assert!((Duration::from_millis(500)..Duration::from_millis(1000)).contains(&second));
         assert!(backoff.next(&rejected(400)).is_none());
         assert!(backoff.next(&rejected(401)).is_none());
+        // A 403 is permanent: no retry, no wait.
+        assert!(backoff.next(&Refused("no".into()).into()).is_none());
+        assert!(backoff.next(&rejected(403)).is_none());
     }
 
     /// An idle limit, not a total one: an upload that keeps moving may take
@@ -1299,5 +1366,73 @@ mod tests {
                 format!("/nix/store/{c}-three")
             ]
         );
+    }
+
+    /// Serves `status` with `body` to every request, counting them.
+    async fn answering(
+        status: u16,
+        body: &'static str,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                counter.fetch_add(1, Ordering::SeqCst);
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (endpoint, hits)
+    }
+
+    fn pusher(endpoint: String) -> (Pusher, Arc<std::sync::atomic::AtomicUsize>) {
+        let (tokens, mints) = crate::auth::TokenSource::counting();
+        let pusher = Pusher {
+            http: reqwest::Client::new(),
+            endpoint,
+            tokens,
+            jobs: 1,
+            zstd_level: 3,
+            max_retries: 0,
+            upload_idle: Duration::from_secs(5),
+        };
+        (pusher, mints)
+    }
+
+    /// 403 is a permanent refusal: no renewal, one request, typed `Refused`.
+    #[tokio::test]
+    async fn a_403_negotiation_is_refused_without_renewing_the_token() {
+        use std::sync::atomic::Ordering;
+        let (endpoint, requests) = answering(403, r#"{"error":"not authorized"}"#).await;
+        let (pusher, mints) = pusher(endpoint);
+        let error = pusher.negotiate(&["h"]).await.unwrap_err();
+        let refused = error.downcast_ref::<Refused>().expect("typed Refused");
+        assert!(refused.0.contains("not authorized"), "{}", refused.0);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(mints.load(Ordering::SeqCst), 1);
+    }
+
+    /// A 401 renews the token once; if it persists it is an ordinary failure,
+    /// not `Refused`, so the watcher keeps the paths (transient causes).
+    #[tokio::test]
+    async fn a_persistent_401_renews_once_and_is_not_a_refusal() {
+        use std::sync::atomic::Ordering;
+        let (endpoint, requests) = answering(401, r#"{"error":"invalid token"}"#).await;
+        let (pusher, mints) = pusher(endpoint);
+        let error = pusher.negotiate(&["h"]).await.unwrap_err();
+        assert!(!error.is::<Refused>());
+        assert!(format!("{error:#}").contains("401"), "{error:#}");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
     }
 }

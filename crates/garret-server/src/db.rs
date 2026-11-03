@@ -529,7 +529,7 @@ pub fn delete_object(conn: &mut Connection, hash: &str) -> Result<i64> {
 }
 
 /// Replaces an object's stored signatures (`garret-admin resign`).
-pub fn update_sigs(conn: &mut Connection, hash: &str, sigs: &[String]) -> Result<()> {
+pub fn update_sigs(conn: &Connection, hash: &str, sigs: &[String]) -> Result<()> {
     conn.execute(
         "UPDATE objects SET sigs = ?2 WHERE store_path_hash = ?1",
         params![hash, serde_json::to_string(sigs)?],

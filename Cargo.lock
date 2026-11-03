@@ -1406,6 +1406,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -1427,6 +1428,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "zstd",
@@ -1438,6 +1440,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aws-config",
+ "aws-lc-rs",
  "aws-sdk-s3",
  "axum",
  "base64",
@@ -1445,6 +1448,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "garret-common",
+ "garret-server",
  "hyper",
  "hyper-util",
  "jsonwebtoken",
@@ -1458,6 +1462,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

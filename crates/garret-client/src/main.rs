@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
     // connection that stalls once open is `push`'s to catch: reqwest's read
     // timeout cannot tell a slow upload from a stuck one.
     let http = reqwest::Client::builder()
+        .user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(30))
         // The servers close connections idle for 30 s; retire pooled ones
         // first so an upload is never sent on a connection mid-close.
@@ -180,6 +181,7 @@ async fn main() -> Result<()> {
             // gets a hard timeout, unlike the push path, which gives up only
             // on a stalled connection, never on a slow one.
             let timed = reqwest::Client::builder()
+                .user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(15))
                 .build()?;
             let checks = doctor::run(&cfg.unwrap(), &timed, path.as_deref()).await;
@@ -653,13 +655,16 @@ fn pusher(
     http: &reqwest::Client,
     jobs: Option<usize>,
 ) -> Result<push::Pusher> {
+    let jobs = jobs.unwrap_or(cfg.jobs);
+    anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
     Ok(push::Pusher {
         tokens: auth::TokenSource::for_config(http, cfg)?,
         http: http.clone(),
         endpoint: cfg.endpoint.clone(),
-        jobs: jobs.unwrap_or(cfg.jobs),
+        jobs,
         zstd_level: cfg.zstd_level,
         max_retries: cfg.max_retries,
+        upload_idle: std::time::Duration::from_secs(cfg.upload_idle_secs),
     })
 }
 

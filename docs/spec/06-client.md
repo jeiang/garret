@@ -131,6 +131,12 @@ failure summary goes to stderr):
 Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), idempotent retries. No client metrics endpoint in v1.
 
+Every request carries `User-Agent: garret/<version>`. The configured Pusher
+URL (after any `GARRET_ENDPOINT` override), `oidc.issuer` and the OIDC
+`token_endpoint` and `device_authorization_endpoint` must follow the same
+https rule as discovery (plain `http` only to loopback); a config or issuer
+that breaks it is refused before any token is sent.
+
 **Retries** run on two schedules. A `429` is the server's queue, not a
 fault: the path waits out `Retry-After` (held between 1 s and 15 minutes,
 plus up to as much again in jitter) and tries again, for up to 15 minutes
@@ -168,11 +174,12 @@ still reported and the run then exits non-zero.
 30 s, a Negotiation after 2 minutes, and a request to the token provider
 (discovery, device flow, refresh, GitHub OIDC, client credentials) after
 60 s. An upload has no total limit — a
-large NAR over a slow link takes as long as it takes — but one that goes 5
-minutes without the connection taking another body chunk, or without an
+large NAR over a slow link takes as long as it takes — but one that goes
+`upload_idle_secs` (default 300, at least 1) without the connection taking another body chunk, or without an
 answer once the body is sent, is abandoned as stalled and retried like a
 dropped connection. Five minutes is generous on purpose: the server stops
-reading while it waits for a part slot behind other uploads. (reqwest's own
+reading while it waits for a part slot behind other uploads. Keep it above
+the Pusher's `limits.body_idle_timeout_secs`. (reqwest's own
 read timeout cannot do this: it is not reset while the request body is
 sent, so on an upload it would cap the whole transfer.)
 
@@ -191,8 +198,15 @@ its own `exp − iat` declares — for a five-minute GitHub runner token, spec
 04's "re-mint once it is >4 min old" — and concurrent requests share one
 mint, which rotating refresh tokens require. A 401 on the Negotiation or an
 upload renews the token once and retries straight away, for what aging
-cannot see (revocation, a token that declares no lifetime); a second 401 is a
-real refusal. `GARRET_TOKEN` is used as given and never renewed.
+cannot see (revocation, a token that declares no lifetime). A second 401 is
+an ordinary failure: an upload fails at once, and the watcher logs the
+Negotiation's failure and keeps the batch's paths on the failed list, since
+the Pusher answers 401 for transient causes too (an unreachable issuer JWKS,
+a key rotation), so a restart or drain retries them. A 403 is a permanent
+policy refusal (spec 04): it is never renewed or retried, an upload fails at
+once, and the watcher logs the Negotiation's refusal once at error level,
+naming the Pusher's reason, and does not put the batch's paths on the failed
+list. An older Pusher answers 401 for these, which follows the 401 rule. `GARRET_TOKEN` is used as given and never renewed.
 
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure

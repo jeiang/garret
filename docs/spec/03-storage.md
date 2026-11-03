@@ -71,6 +71,19 @@ Defaults, all configurable:
   than per-attempt on purpose. A stalled upstream therefore costs one
   timeout and a loud failed push instead of holding an upload permit and
   its in-flight bytes forever.
+  The deadline also bounds throughput: a full buffer budget must drain
+  within it, so the Pusher needs an uplink of at least
+  `max_in_flight_bytes / operation_timeout_secs`, about 36 Mbit/s at the
+  defaults (256 MiB over 60 s). A slower link fails uploads with
+  timeouts; raise `operation_timeout_secs` or lower `max_in_flight_bytes`.
+- `[s3] operation_attempt_timeout_secs` (default unset) bounds each
+  attempt inside the overall deadline. Unset, a hung attempt consumes the
+  whole overall deadline and the SDK never gets to retry; set, a hung
+  attempt is cut early and retried within it. It must be below
+  `operation_timeout_secs` (a value of 0 or at least the overall deadline
+  is rejected at startup), and above the time to send `part_size` on the
+  slowest uplink, or healthy part uploads are cut off. `UploadPart` is not
+  retried, so for it this only shortens the wait for failure.
 - **`UploadPart` is never retried by the SDK** (max attempts 1, set per
   operation): part re-upload is forbidden below, so a failed part aborts
   the multipart at once rather than after retries have burned the
@@ -99,7 +112,7 @@ anything else.
 ## Read path (Puller): presigned redirect
 
 The Puller **does not proxy NAR bytes**. `GET /nar/<hash>.nar.zst`
-answers `302` with a presigned S4 URL (TTL configurable, default 1 h);
+answers `307 Temporary Redirect` with a presigned S4 URL (TTL configurable, default 1 h);
 the client fetches bytes directly from S4, which serves Range requests
 itself. Narinfo is still served by the Puller — it holds the signatures
 — so the substituter surface is unchanged from a client's view.

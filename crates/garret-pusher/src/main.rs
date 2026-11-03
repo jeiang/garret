@@ -75,11 +75,6 @@ async fn main() -> Result<()> {
     let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
         .await
         .with_context(|| format!("binding metrics listener {metrics_addr}"))?;
-    tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener).await {
-            tracing::error!("metrics listener failed: {e:#}");
-        }
-    });
 
     let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
     let listener = tokio::net::TcpListener::bind(addr)
@@ -104,7 +99,8 @@ async fn main() -> Result<()> {
             cfg.limits.part_size,
             cfg.limits.max_parts_in_flight,
             cfg.limits.max_in_flight_bytes,
-        ),
+        )
+        .with_body_idle(Duration::from_secs(cfg.limits.body_idle_timeout_secs)),
         uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
         in_flight: InFlight::new(),
         quiescing: Arc::new(AtomicBool::new(false)),
@@ -116,6 +112,17 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_uploads_limit").set(cfg.limits.max_concurrent_uploads as f64);
     metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
+
+    let scrape_state = state.clone();
+    tokio::spawn(async move {
+        let scrape = move || {
+            metrics::gauge!("garret_in_flight_bytes")
+                .set(scrape_state.limits.in_flight_bytes() as f64);
+        };
+        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener, scrape).await {
+            tracing::error!("metrics listener failed: {e:#}");
+        }
+    });
 
     let collector = cfg.gc.clone().map(|gc_cfg| {
         Arc::new(gc::Gc::new(
@@ -200,13 +207,23 @@ async fn main() -> Result<()> {
 
     // Kept for shutdown: `state` itself moves into the router.
     let storage = state.storage.clone();
-    let app = Router::new()
+    let app = router(state, discovery);
+
+    tracing::info!("pusher listening on {addr}");
+    // Every listener is bound and every background task spawned.
+    garret_server::runtime::notify_ready();
+    serve_until_stopped(listener, app, storage).await
+}
+
+/// The Pusher's routes: OIDC on the push endpoints, anonymous discovery.
+fn router(state: Arc<AppState>, discovery: String) -> Router {
+    Router::new()
         .route("/api/v1/missing-paths", post(missing_paths))
         .route("/api/v1/nar/{hash}", put(upload))
-        .layer(middleware::from_fn_with_state(state.clone(), require_oidc))
-        // Registered *after* the auth layer, which wraps only the routes above
-        // it — that placement is the whole reason this route is anonymous, so
-        // do not reorder it upwards.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_oidc))
+        // `route_layer` wraps only the routes above it, so unmatched paths get
+        // a plain 404, not a 401. Discovery stays anonymous because it is
+        // registered after the layer; do not reorder it upwards.
         .route(
             "/api/v1/discovery",
             get(move || {
@@ -215,12 +232,7 @@ async fn main() -> Result<()> {
             }),
         )
         .layer(middleware::from_fn(garret_metrics::track_http))
-        .with_state(state);
-
-    tracing::info!("pusher listening on {addr}");
-    // Every listener is bound and every background task spawned.
-    garret_server::runtime::notify_ready();
-    serve_until_stopped(listener, app, storage).await
+        .with_state(state)
 }
 
 /// How long a SIGTERM/SIGINT waits for in-flight uploads to finish. With
@@ -291,12 +303,23 @@ async fn stop_signal() {
 }
 
 #[derive(Debug)]
-struct Error(StatusCode, String);
+struct Error(StatusCode, String, &'static str);
 
 impl Error {
     /// 429s carry Retry-After so clients back off on the server's terms.
     fn retry_after(status: StatusCode, message: &str) -> Self {
-        Error(status, message.to_owned())
+        Error::new(status, message.to_owned())
+    }
+
+    /// An error the handler raised itself: a 400 is a refused upload, and
+    /// anything else here is a policy answer (shed, quiescing), not a fault.
+    fn new(status: StatusCode, message: String) -> Self {
+        let reason = if status == StatusCode::BAD_REQUEST {
+            "refused"
+        } else {
+            "internal"
+        };
+        Error(status, message, reason)
     }
 }
 
@@ -319,13 +342,14 @@ impl IntoResponse for Error {
 /// fresh id and the caller gets only the id to quote back.
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
+        let reason = failure_reason(&e);
         if let Some(over) = e.downcast_ref::<storage::BodyOverLimit>() {
-            return Error(StatusCode::BAD_REQUEST, over.to_string());
+            return Error::new(StatusCode::BAD_REQUEST, over.to_string());
         }
         let id = format!("{:016x}", fastrand::u64(..));
         // A sender that stalled or dropped mid-body failed; the server did
         // not. Same id and 500, but a warning rather than an error.
-        if e.downcast_ref::<storage::ClientBodyError>().is_some() {
+        if reason == "client_body" {
             tracing::warn!(error_id = %id, kind = "client_body", "client body failed: {e:#}");
         } else {
             tracing::error!(error_id = %id, "{e:#}");
@@ -333,7 +357,27 @@ impl From<anyhow::Error> for Error {
         Error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("internal error (id {id})"),
+            reason,
         )
+    }
+}
+
+/// The `reason` label of `garret_uploads_failed_total`, from the error
+/// chain: a sender that failed mid-body, a refused body, an S3 failure (the
+/// storage layer's context strings; the SDK error type is generic and cannot
+/// be downcast), or anything else.
+fn failure_reason(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<storage::ClientBodyError>().is_some() {
+        "client_body"
+    } else if e.downcast_ref::<storage::BodyOverLimit>().is_some() {
+        "refused"
+    } else if e.chain().any(|c| {
+        let m = c.to_string();
+        m.contains("multipart") || m.contains("S3") || m.starts_with("uploading ")
+    }) {
+        "storage"
+    } else {
+        "internal"
     }
 }
 
@@ -350,9 +394,15 @@ where
     T: Send + 'static,
 {
     let conn = conn.clone();
-    tokio::task::spawn_blocking(move || f(&mut conn.lock()))
-        .await
-        .context("database task failed")?
+    tokio::task::spawn_blocking(move || {
+        let waited = std::time::Instant::now();
+        let mut conn = conn.lock();
+        metrics::histogram!("garret_db_lock_wait_seconds", "conn" => "pusher")
+            .record(waited.elapsed());
+        f(&mut conn)
+    })
+    .await
+    .context("database task failed")?
 }
 
 /// Whether the object's row exists, i.e. the push is already complete.
@@ -369,21 +419,24 @@ fn exists_response() -> Response {
     (StatusCode::OK, Json(json!({"status": "exists"}))).into_response()
 }
 
-/// Counts an upload in `garret_uploads_in_flight` for as long as it lives, so
-/// a handler future dropped mid-upload (client disconnect, shutdown) still
-/// gives its count back.
-struct UploadGauge;
+/// Holds an upload slot's accounting for as long as it lives: counts in
+/// `garret_uploads_in_flight` and, on drop, adds the slot's hold time to
+/// `garret_upload_slot_milliseconds_total`. A handler future dropped mid-upload
+/// (client disconnect, shutdown) still gives both back.
+struct UploadGauge(std::time::Instant);
 
 impl UploadGauge {
     fn enter() -> Self {
         metrics::gauge!("garret_uploads_in_flight").increment(1.0);
-        Self
+        Self(std::time::Instant::now())
     }
 }
 
 impl Drop for UploadGauge {
     fn drop(&mut self) {
         metrics::gauge!("garret_uploads_in_flight").decrement(1.0);
+        metrics::counter!("garret_upload_slot_milliseconds_total")
+            .increment(self.0.elapsed().as_millis() as u64);
     }
 }
 
@@ -409,7 +462,18 @@ async fn require_oidc(
         // The reason stays in the log; the caller learns only that it failed.
         Err(e) => {
             tracing::warn!("rejected token: {}", auth::loggable(&e));
-            unauthorized("invalid token")
+            // A verified identity that policy refuses stays refused: 403,
+            // so clients do not renew or retry. Anything else may be
+            // transient (JWKS outage), so it stays a 401.
+            if e.is::<auth::PolicyRefused>() {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "not authorized" })),
+                )
+                    .into_response()
+            } else {
+                unauthorized("invalid token")
+            }
         }
     }
 }
@@ -425,6 +489,7 @@ fn unauthorized(message: &str) -> Response {
 
 async fn missing_paths(
     State(state): State<Arc<AppState>>,
+    axum::Extension(subject): axum::Extension<Subject>,
     Json(hashes): Json<Vec<String>>,
 ) -> Result<Json<Vec<String>>, Error> {
     let batch = hashes.len();
@@ -432,7 +497,9 @@ async fn missing_paths(
         db::missing(conn, &hashes, garret_server::now())
     })
     .await?;
+    tracing::debug!(subject = %subject.0, batch, missing = missing.len(), "negotiation");
     metrics::histogram!("garret_negotiation_batch_size").record(batch as f64);
+    metrics::counter!("garret_negotiation_missing_paths_total").increment(missing.len() as u64);
     if batch > 0 {
         metrics::histogram!("garret_negotiation_missing_ratio")
             .record(missing.len() as f64 / batch as f64);
@@ -450,7 +517,7 @@ async fn upload(
     // pushes rejected outright while it drains and repairs (spec 05-gc).
     if state.quiescing.load(std::sync::atomic::Ordering::SeqCst) {
         metrics::counter!("garret_upload_skipped_total", "reason" => "quiescing").increment(1);
-        return Err(Error(
+        return Err(Error::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "cache is quiescing for fsck --repair --quiesce".into(),
         ));
@@ -459,7 +526,7 @@ async fn upload(
     // The hash becomes the DB key and the S3 key, so it is checked before
     // either sees it — and before a byte of the body is read.
     if !is_store_hash(&hash) {
-        return Err(Error(
+        return Err(Error::new(
             StatusCode::BAD_REQUEST,
             format!("{hash:?} is not a store path hash"),
         ));
@@ -480,6 +547,7 @@ async fn upload(
             "too many concurrent uploads",
         ));
     };
+    let _gauge = UploadGauge::enter();
     let claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
         Ok(claim) => claim,
         // Second pusher for the same path: first writer wins. The loser is
@@ -512,19 +580,18 @@ async fn upload(
     }
 
     let started = std::time::Instant::now();
-    let result = {
-        let _gauge = UploadGauge::enter();
-        store_upload(&state, &hash, &subject, body, claim).await
-    };
+    let result = store_upload(&state, &hash, &subject, body, claim).await;
 
     match &result {
         Ok(size) => {
             metrics::counter!("garret_uploads_accepted_total").increment(1);
             metrics::histogram!("garret_upload_bytes").record(*size as f64);
-            metrics::histogram!("garret_upload_duration_seconds").record(started.elapsed());
         }
-        Err(_) => metrics::counter!("garret_uploads_failed_total").increment(1),
+        Err(e) => metrics::counter!("garret_uploads_failed_total", "reason" => e.2).increment(1),
     }
+    let outcome = if result.is_ok() { "accepted" } else { "failed" };
+    metrics::histogram!("garret_upload_duration_seconds", "outcome" => outcome)
+        .record(started.elapsed());
     result?;
     Ok((StatusCode::CREATED, Json(json!({"status": "created"}))).into_response())
 }
@@ -540,17 +607,26 @@ async fn store_upload(
 ) -> Result<i64, Error> {
     let mut stream = body.into_data_stream();
     let mut head: Vec<u8> = Vec::new();
+    let started = std::time::Instant::now();
     let preamble = loop {
         if let Some(preamble) = take_preamble(&mut head)? {
             break preamble;
         }
-        let Some(chunk) = storage::next_chunk(&mut stream).await? else {
-            return Err(Error(
+        let at = storage::Stall {
+            received: head.len() as u64,
+            started,
+            phase: "preamble",
+        };
+        let Some(chunk) = storage::next_chunk(&mut stream, state.limits.body_idle, at).await?
+        else {
+            return Err(Error::new(
                 StatusCode::BAD_REQUEST,
                 "body ended before the preamble was complete".into(),
             ));
         };
-        head.extend_from_slice(&chunk.map_err(|e| Error(StatusCode::BAD_REQUEST, e.to_string()))?);
+        head.extend_from_slice(
+            &chunk.map_err(|e| Error::new(StatusCode::BAD_REQUEST, e.to_string()))?,
+        );
     };
 
     // Validated before a byte is stored: a refused preamble leaves no blob.
@@ -576,7 +652,7 @@ async fn store_upload(
         )
         .await;
     if let Some(reason) = nar.refused {
-        return Err(Error(StatusCode::BAD_REQUEST, reason));
+        return Err(Error::new(StatusCode::BAD_REQUEST, reason));
     }
     let (digest, file_size) = stored?;
 
@@ -605,7 +681,7 @@ fn take_preamble(buf: &mut Vec<u8>) -> Result<Option<Preamble>, Error> {
     }
     let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
     if len > MAX_PREAMBLE {
-        return Err(Error(
+        return Err(Error::new(
             StatusCode::BAD_REQUEST,
             "preamble length is implausible".into(),
         ));
@@ -614,7 +690,7 @@ fn take_preamble(buf: &mut Vec<u8>) -> Result<Option<Preamble>, Error> {
         return Ok(None);
     }
     let preamble: Preamble = serde_json::from_slice(&buf[4..4 + len])
-        .map_err(|e| Error(StatusCode::BAD_REQUEST, format!("bad preamble: {e}")))?;
+        .map_err(|e| Error::new(StatusCode::BAD_REQUEST, format!("bad preamble: {e}")))?;
     buf.drain(..4 + len);
     Ok(Some(preamble))
 }
@@ -633,7 +709,7 @@ fn build_object(
     store_dir: &str,
     subject: &Subject,
 ) -> Result<Object, Error> {
-    let bad = |message: String| Error(StatusCode::BAD_REQUEST, message);
+    let bad = |message: String| Error::new(StatusCode::BAD_REQUEST, message);
     let name = store_basename(&preamble.store_path, store_dir)
         .and_then(|base| base.strip_prefix(hash)?.strip_prefix('-'))
         .ok_or_else(|| {
@@ -720,6 +796,7 @@ mod tests {
             access_key_id: Some("x".into()),
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 1,
+            operation_attempt_timeout_secs: None,
         })
         .await
         .unwrap()
@@ -1090,5 +1167,82 @@ mod tests {
         let log = String::from_utf8(log.0.lock().clone()).unwrap();
         assert!(log.contains("WARN") && log.contains("error_id="), "{log}");
         assert!(!log.contains("ERROR"), "{log}");
+    }
+
+    #[test]
+    fn failure_reason_classifies_the_chain() {
+        let body = anyhow::Error::new(storage::ClientBodyError("stalled".into()));
+        assert_eq!(failure_reason(&body), "client_body");
+        let over = anyhow::Error::new(storage::BodyOverLimit("too big".into()));
+        assert_eq!(failure_reason(&over), "refused");
+        let s3 = anyhow::anyhow!("boom").context("completing multipart upload for k");
+        assert_eq!(failure_reason(&s3), "storage");
+        assert_eq!(failure_reason(&anyhow::anyhow!("disk")), "internal");
+        // A context layer over a client error still classifies by the root.
+        let wrapped = body.context("storing");
+        assert_eq!(failure_reason(&wrapped), "client_body");
+    }
+
+    /// Auth wraps only the push routes: an unmatched path is a plain 404, and
+    /// a push route without a token is still a 401.
+    #[tokio::test]
+    async fn auth_leaves_unmatched_paths_a_plain_404() {
+        use tower::ServiceExt;
+        let app = router(test_state(open_db()).await, "{}".into());
+        let send = |req: axum::http::request::Builder| {
+            let app = app.clone();
+            async move { app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap() }
+        };
+        let res = send(Request::get("/a/b").header(header::AUTHORIZATION, "Bearer x")).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = send(Request::post("/api/v1/missing-paths")).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A verified token that a policy gate refuses is a 403 with no
+    /// `WWW-Authenticate`; an unverifiable one stays a 401 (spec 04).
+    #[tokio::test]
+    async fn a_policy_refused_token_gets_403_and_a_bad_token_401() {
+        use tower::ServiceExt;
+        let jwks = std::env::temp_dir().join(format!("garret-pusher-jwks-{}", std::process::id()));
+        std::fs::write(&jwks, garret_server::testing::jwks()).unwrap();
+        let mut state = Arc::into_inner(test_state(open_db()).await).unwrap();
+        state.auth = Authenticator::new(vec![IssuerConfig {
+            issuer: "https://issuer.example".into(),
+            audience: "aud".into(),
+            extra_audiences: vec![],
+            client_id: None,
+            jwks_url: Some(jwks.to_str().unwrap().into()),
+            github_owner_id: None,
+            ref_patterns: vec![],
+            ref_protected: None,
+            repository_ids: vec!["42".into()],
+            event_names: vec![],
+            job_workflow_refs: vec![],
+            allowed_groups: vec![],
+        }])
+        .unwrap();
+        let app = router(Arc::new(state), "{}".into());
+        let send = |token: String| {
+            let app = app.clone();
+            async move {
+                let req = Request::post("/api/v1/missing-paths")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.unwrap()
+            }
+        };
+        let signed = garret_server::testing::sign(
+            r#"{"iss": "https://issuer.example", "sub": "ci", "aud": "aud", "exp": 4102444800, "repository_id": "99"}"#,
+        );
+        let res = send(signed).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"not authorized"}"#);
+        let res = send("not-a-jwt".into()).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(jwks);
     }
 }
