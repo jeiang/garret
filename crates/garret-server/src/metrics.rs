@@ -13,14 +13,15 @@ use axum::{
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-/// Bucket bounds from spec 08: bytes 64 KiB…8 GiB, latency 1 ms…60 s.
+/// Bucket bounds from spec 08: bytes 64 KiB…8 GiB, latency 100 us…15 min.
 fn byte_buckets() -> Vec<f64> {
     (16..=33).map(|p| (1u64 << p) as f64).collect()
 }
 
 fn latency_buckets() -> Vec<f64> {
     vec![
-        0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+        0.0001, 0.00025, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+        30.0, 60.0, 120.0, 300.0, 900.0,
     ]
 }
 
@@ -32,6 +33,16 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
         .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".into()),
             &latency_buckets(),
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("garret_negotiation_batch_size".into()),
+            &[
+                1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+            ],
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("garret_negotiation_missing_ratio".into()),
+            &[0.0, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0],
         )?
         .install_recorder()
         .context("installing the Prometheus recorder")?;
@@ -187,8 +198,20 @@ mod tests {
         assert_eq!(bytes.first(), Some(&(64.0 * 1024.0)));
         assert_eq!(bytes.last(), Some(&(8.0 * 1024.0 * 1024.0 * 1024.0)));
         let latency = latency_buckets();
-        assert_eq!(latency.first(), Some(&0.001));
-        assert_eq!(latency.last(), Some(&60.0));
+        assert_eq!(latency.first(), Some(&0.0001));
+        assert_eq!(latency.last(), Some(&900.0));
+    }
+
+    #[test]
+    fn render_has_extended_and_negotiation_buckets() {
+        let handle = install("test").unwrap();
+        metrics::histogram!("garret_x_duration_seconds").record(1.0);
+        metrics::histogram!("garret_negotiation_batch_size").record(3.0);
+        metrics::histogram!("garret_negotiation_missing_ratio").record(0.5);
+        let out = handle.render();
+        assert!(out.contains("garret_x_duration_seconds_bucket{le=\"900\"}"));
+        assert!(out.contains("garret_negotiation_batch_size_bucket{le=\"10000\"}"));
+        assert!(out.contains("garret_negotiation_missing_ratio_bucket{le=\"0.75\"}"));
     }
 
     #[test]

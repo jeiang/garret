@@ -440,6 +440,7 @@ async fn missing_paths(
     .await?;
     tracing::debug!(subject = %subject.0, batch, missing = missing.len(), "negotiation");
     metrics::histogram!("garret_negotiation_batch_size").record(batch as f64);
+    metrics::counter!("garret_negotiation_missing_paths_total").increment(missing.len() as u64);
     if batch > 0 {
         metrics::histogram!("garret_negotiation_missing_ratio")
             .record(missing.len() as f64 / batch as f64);

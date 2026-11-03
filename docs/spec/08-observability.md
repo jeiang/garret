@@ -44,7 +44,7 @@ The `method` label is one of `GET`, `HEAD`, `POST`, `PUT`, `DELETE` or
 headers cannot mint series.
 **Never per-object labels** (store path hashes as label values would
 explode series); per-object insight is the logs' job. Histogram buckets:
-bytes 64 KiB…8 GiB log-scale; latency 1 ms…60 s.
+bytes 64 KiB…8 GiB log-scale; latency 100 us…15 min.
 
 ## Catalog
 
@@ -67,7 +67,9 @@ Prefix `garret_`; service distinguished by scrape job.
 - **Pusher — uploads**: in-flight uploads and in-flight bytes gauges
   *versus their configured caps* (saturation visible before it hurts);
   upload size/duration histograms; accepted/failed/shed(429) counters;
-  negotiation batch-size and missing-ratio histograms;
+  negotiation batch-size (1…10000) and missing-ratio (0…1) histograms with
+  their own buckets, plus `garret_negotiation_missing_paths_total` (a
+  weighted ratio is its rate over the batch-size `_sum` rate);
   `garret_upload_skipped_total` by `reason` (`exists`, `in-progress`,
   `quiescing`, and `deleting` for an upload turned away with `503`
   because GC, `delete` or prune is removing the path, spec 05).
