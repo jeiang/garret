@@ -200,13 +200,23 @@ async fn main() -> Result<()> {
 
     // Kept for shutdown: `state` itself moves into the router.
     let storage = state.storage.clone();
-    let app = Router::new()
+    let app = router(state, discovery);
+
+    tracing::info!("pusher listening on {addr}");
+    // Every listener is bound and every background task spawned.
+    garret_server::runtime::notify_ready();
+    serve_until_stopped(listener, app, storage).await
+}
+
+/// The Pusher's routes: OIDC on the push endpoints, anonymous discovery.
+fn router(state: Arc<AppState>, discovery: String) -> Router {
+    Router::new()
         .route("/api/v1/missing-paths", post(missing_paths))
         .route("/api/v1/nar/{hash}", put(upload))
-        .layer(middleware::from_fn_with_state(state.clone(), require_oidc))
-        // Registered *after* the auth layer, which wraps only the routes above
-        // it — that placement is the whole reason this route is anonymous, so
-        // do not reorder it upwards.
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_oidc))
+        // `route_layer` wraps only the routes above it, so unmatched paths get
+        // a plain 404, not a 401. Discovery stays anonymous because it is
+        // registered after the layer; do not reorder it upwards.
         .route(
             "/api/v1/discovery",
             get(move || {
@@ -215,12 +225,7 @@ async fn main() -> Result<()> {
             }),
         )
         .layer(middleware::from_fn(garret_metrics::track_http))
-        .with_state(state);
-
-    tracing::info!("pusher listening on {addr}");
-    // Every listener is bound and every background task spawned.
-    garret_server::runtime::notify_ready();
-    serve_until_stopped(listener, app, storage).await
+        .with_state(state)
 }
 
 /// How long a SIGTERM/SIGINT waits for in-flight uploads to finish. With
@@ -1090,5 +1095,21 @@ mod tests {
         let log = String::from_utf8(log.0.lock().clone()).unwrap();
         assert!(log.contains("WARN") && log.contains("error_id="), "{log}");
         assert!(!log.contains("ERROR"), "{log}");
+    }
+
+    /// Auth wraps only the push routes: an unmatched path is a plain 404, and
+    /// a push route without a token is still a 401.
+    #[tokio::test]
+    async fn auth_leaves_unmatched_paths_a_plain_404() {
+        use tower::ServiceExt;
+        let app = router(test_state(open_db()).await, "{}".into());
+        let send = |req: axum::http::request::Builder| {
+            let app = app.clone();
+            async move { app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap() }
+        };
+        let res = send(Request::get("/a/b").header(header::AUTHORIZATION, "Bearer x")).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = send(Request::post("/api/v1/missing-paths")).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

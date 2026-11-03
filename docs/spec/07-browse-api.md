@@ -4,7 +4,8 @@ Source: [ticket 14](../../.scratch/spec/issues/14-browse-api.md).
 
 Hosted on the **Puller** (public endpoint — `garret list`/`tree` work
 from anywhere you can log in). OIDC (Pocket ID) required on these routes
-only; narinfo/NAR remain anonymous.
+only; narinfo/NAR remain anonymous. Unmatched paths are a plain 404
+and are never counted as browse auth failures.
 
 All JSON under `/api/v1`:
 

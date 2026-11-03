@@ -1406,6 +1406,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -1427,6 +1428,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "zstd",

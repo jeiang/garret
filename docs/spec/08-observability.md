@@ -114,7 +114,7 @@ Prefix `garret_`; service distinguished by scrape job.
   (hits on a fresh row, no write) and `garret_bump_failures_total`
   (failed flushes, batch dropped); browse requests by endpoint;
   browse auth failures (`garret_browse_auth_failures_total` by `reason`:
-  `missing_bearer`, `token_rejected`); `garret_s3_read_probes_total` by `outcome`
+  `missing_bearer`, `token_rejected`; unmatched paths are 404 and not counted); `garret_s3_read_probes_total` by `outcome`
   (deep readiness, [above](#readiness)). The Puller no longer sees NAR bytes
   ([ADR-0005](../adr/0005-remote-object-store-presigned-reads.md)), so
   bytes-served, serve-duration, first-byte and Range counters are gone —

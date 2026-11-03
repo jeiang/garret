@@ -18,7 +18,7 @@ use axum::{
 use garret_server::{
     auth::Authenticator,
     browse,
-    config::PullerConfig,
+    config::{IssuerConfig, PullerConfig},
     db, metrics as garret_metrics, narinfo, now,
     storage::{self, Storage},
 };
@@ -207,6 +207,27 @@ where
     tokio::time::timeout(budget, query).await.ok()
 }
 
+/// Browse routes are the only authenticated surface here, and they are
+/// simply absent when no issuer is configured (spec 07). `route_layer` keeps
+/// the auth check off unmatched paths, which stay a plain 404.
+fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>> {
+    let Some(issuer) = issuer else {
+        tracing::info!("no browse_oidc configured: the browse API is not served");
+        return Ok(Router::new());
+    };
+    let auth = Arc::new(Authenticator::new(vec![issuer.clone()])?);
+    Ok(Router::new()
+        .route("/api/v1/objects", get(list_objects))
+        .route("/api/v1/objects/{hash}", get(object_detail))
+        .route("/api/v1/objects/{hash}/tree", get(object_tree))
+        .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
+        .route("/api/v1/pins", get(list_pins))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth,
+            require_browse_oidc,
+        )))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     garret_server::runtime::init_tracing();
@@ -276,27 +297,7 @@ async fn main() -> Result<()> {
     });
 
     let store_dir = cfg.store_dir.clone();
-    // Browse routes are the only authenticated surface here, and they are
-    // simply absent when no issuer is configured (spec 07).
-    let browse_routes = match &cfg.browse_oidc {
-        Some(issuer) => {
-            let auth = Arc::new(Authenticator::new(vec![issuer.clone()])?);
-            Router::new()
-                .route("/api/v1/objects", get(list_objects))
-                .route("/api/v1/objects/{hash}", get(object_detail))
-                .route("/api/v1/objects/{hash}/tree", get(object_tree))
-                .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
-                .route("/api/v1/pins", get(list_pins))
-                .layer(axum::middleware::from_fn_with_state(
-                    auth,
-                    require_browse_oidc,
-                ))
-        }
-        None => {
-            tracing::info!("no browse_oidc configured: the browse API is not served");
-            Router::new()
-        }
-    };
+    let browse_routes = browse_routes(cfg.browse_oidc.as_ref())?;
 
     let app = Router::new()
         .route(
@@ -888,5 +889,72 @@ mod tests {
         assert_eq!(panicked.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let next = browse(conn, "tree", |_| Ok(Some(42))).await;
         assert_eq!(next.status(), StatusCode::OK);
+    }
+
+    async fn state() -> Arc<AppState> {
+        let storage = Storage::new(&garret_server::config::S3Config {
+            bucket: "test".into(),
+            endpoint_url: Some("http://127.0.0.1:1".into()),
+            region: Some("us-east-1".into()),
+            path_style: true,
+            access_key_id: Some("x".into()),
+            secret_access_key: Some("x".into()),
+            operation_timeout_secs: 1,
+        })
+        .await
+        .unwrap();
+        Arc::new(AppState {
+            conn: OnceLock::new(),
+            browse_conn: OnceLock::new(),
+            storage,
+            presign_ttl: Duration::from_secs(1),
+            bump_debounce: 0,
+            bumps: Bumps::default(),
+            db_read_budget: Duration::from_secs(1),
+            presign_budget: Duration::from_secs(1),
+            read_probe: ProbeCache::default(),
+            http: reqwest::Client::new(),
+        })
+    }
+
+    /// Browse auth wraps only the browse routes: an unmatched path is a plain
+    /// 404, not a 401 that counts as a browse auth failure.
+    #[tokio::test]
+    async fn browse_auth_leaves_unmatched_paths_a_plain_404() {
+        use tower::ServiceExt;
+        let issuer = IssuerConfig {
+            issuer: "https://issuer.example".into(),
+            audience: "aud".into(),
+            extra_audiences: vec![],
+            client_id: None,
+            jwks_url: None,
+            github_owner_id: None,
+            ref_patterns: vec![],
+            ref_protected: None,
+            repository_ids: vec![],
+            event_names: vec![],
+            job_workflow_refs: vec![],
+            allowed_groups: vec![],
+        };
+        let app = Router::new()
+            .route("/{file}", get(narinfo_route))
+            .merge(browse_routes(Some(&issuer)).unwrap())
+            .with_state(state().await);
+        let get_status = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let req = axum::http::Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.unwrap()
+            }
+        };
+        for uri in ["/a/b", "/"] {
+            let res = get_status(uri).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+        }
+        let res = get_status("/api/v1/objects").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }
