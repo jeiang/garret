@@ -32,7 +32,9 @@ The Puller's public listener answers two readiness probes:
     probe that finishes even if its caller disconnects. However often
     the public route is hit, it costs at most one one-byte S3 read per
     30 s. Each probe counts in `garret_s3_read_probes_total` by
-    `outcome` (`ok`, `failed`).
+    `outcome` (`ok`, `failed`) and is timed in the
+    `garret_s3_read_probe_duration_seconds` histogram; cached answers
+    are neither counted nor timed.
   - Monitoring should probe `/ready/deep` rather than `/ready`, at an
     interval of 30 s or more, and alert on a few consecutive failures.
 
@@ -113,8 +115,12 @@ Prefix `garret_`; service distinguished by scrape job.
   the JWKS floor is absorbing (spec 04) or, if refresh failures rise too,
   a down issuer: during the floor after a failed fetch, unknown kids count
   as `unknown_key`, not `jwks_unavailable`.
-- **Pusher — GC**: usage and quota gauges; evicted objects/bytes per
-  pass; pass duration; orphans found; candidates-exhausted alarm
+- **Pusher — GC**: usage and quota gauges; `garret_gc_high_watermark_bytes`
+  and `garret_gc_low_watermark_bytes` gauges (the eviction trigger and
+  target); evicted objects/bytes per
+  pass; pass duration; `garret_gc_orphans_deleted_total`; `garret_gc_last_sweep_timestamp_seconds`,
+  set by every successful orphan sweep, even one that deletes nothing;
+  candidates-exhausted alarm
   counter; `garret_gc_failures_total` by `phase` (`pass`, `sweep`), for
   passes and orphan sweeps that errored, whoever triggered them;
   `garret_gc_last_success_timestamp`, set by every successful pass and

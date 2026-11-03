@@ -434,11 +434,13 @@ async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
     let probe = {
         let state = state.clone();
         async move {
+            let started = Instant::now();
             let outcome = tokio::time::timeout(READ_PROBE_TIMEOUT, probe_read(&state, conn))
                 .await
                 .unwrap_or_else(|_| Err(format!("no answer within {READ_PROBE_TIMEOUT:?}")));
             let label = if outcome.is_ok() { "ok" } else { "failed" };
             metrics::counter!("garret_s3_read_probes_total", "outcome" => label).increment(1);
+            metrics::histogram!("garret_s3_read_probe_duration_seconds").record(started.elapsed());
             if let Err(e) = &outcome {
                 tracing::warn!("deep readiness: {e}");
             }

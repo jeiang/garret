@@ -70,6 +70,8 @@ impl Gc {
         )?;
         metrics::gauge!("garret_gc_usage_bytes").set(usage as f64);
         metrics::gauge!("garret_gc_quota_bytes").set(self.cfg.quota_bytes as f64);
+        metrics::gauge!("garret_gc_high_watermark_bytes").set(self.cfg.high() as f64);
+        metrics::gauge!("garret_gc_low_watermark_bytes").set(self.cfg.low() as f64);
 
         if usage < self.cfg.high() {
             metrics::gauge!("garret_gc_last_success_timestamp").set(now() as f64);
@@ -214,6 +216,7 @@ impl Gc {
 
         metrics::counter!("garret_gc_orphans_deleted_total").increment(count as u64);
         metrics::counter!("garret_gc_stale_multiparts_aborted_total").increment(aborted as u64);
+        metrics::gauge!("garret_gc_last_sweep_timestamp_seconds").set(now() as f64);
         if count > 0 || aborted > 0 {
             tracing::info!(
                 orphans = count,
