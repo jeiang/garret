@@ -237,6 +237,37 @@ in
         socket.
       '';
     };
+
+    fsck = {
+      calendar = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "weekly";
+        description = ''
+          systemd `OnCalendar` expression for a scheduled `garret-admin fsck`.
+          Null (the default) defines no unit and no timer. The run is a
+          read-only dry run: it reports drift, never repairs. Its findings
+          reach the `garret_fsck_findings` gauge, and the unit fails (exit 1)
+          when it finds dangling rows or size mismatches. Needs
+          `adminSocketPath`.
+
+          One run lists the whole bucket (one S3 `ListObjectsV2` request per
+          1000 blobs, no per-object requests) and reads every Object row into
+          memory, so size the schedule to the cache, not to the clock.
+        '';
+      };
+      extraArgs = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        example = [ "--verify-sizes" ];
+        description = ''
+          Extra arguments for `garret-admin fsck`. `--verify-sizes` costs
+          nothing more, because blob sizes come from the same listing. Do not
+          add `--repair`: repair needs a decision per run, see the restore
+          steps in the packaging spec.
+        '';
+      };
+    };
   };
 
   config = mkIf cfg.enable {
@@ -245,6 +276,10 @@ in
     assertions = [{
       assertion = cfg.oidc != [ ];
       message = "services.garret.pusher.oidc must list at least one issuer.";
+    }
+    {
+      assertion = cfg.fsck.calendar == null || cfg.adminSocketPath != null;
+      message = "services.garret.pusher.fsck.calendar needs adminSocketPath: fsck runs on the admin socket.";
     }];
 
     systemd.services.garret-pusher = {
@@ -278,6 +313,34 @@ in
         User = "garret";
         Group = "garret";
         ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
+      };
+    };
+
+    systemd.services.garret-fsck = mkIf (cfg.fsck.calendar != null) {
+      description = "garret fsck (read-only audit)";
+      after = [ "garret-pusher.service" ];
+      requires = [ "garret-pusher.service" ];
+      serviceConfig = import ./sandbox.nix // {
+        Type = "oneshot";
+        ExecStart = lib.escapeShellArgs ([
+          "${self.packages.${pkgs.stdenv.hostPlatform.system}.garret-admin}/bin/garret-admin"
+          "--socket"
+          cfg.adminSocketPath
+          "fsck"
+        ] ++ cfg.fsck.extraArgs);
+        User = "garret";
+        Group = "garret";
+        # Only the admin socket: the Pusher does the S3 and DB work.
+        RestrictAddressFamilies = [ "AF_UNIX" ];
+      };
+    };
+
+    systemd.timers.garret-fsck = mkIf (cfg.fsck.calendar != null) {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnCalendar = cfg.fsck.calendar;
+        Persistent = true;
+        RandomizedDelaySec = "15m";
       };
     };
 

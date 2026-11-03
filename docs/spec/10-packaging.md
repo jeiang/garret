@@ -123,7 +123,8 @@ Module options (all under `services.garret.*`; defaults in parentheses):
   `issuer`, `audience`, `extra_audiences`, `client_id`, `jwks_url`,
   `github_owner_id`, `ref_patterns`, `ref_protected`, `repository_ids`,
   `event_names`, `job_workflow_refs`, `allowed_groups`), `adminSocketPath`
-  (`/run/garret/admin.sock`).
+  (`/run/garret/admin.sock`), `fsck.{calendar (null: no scheduled fsck),
+  extraArgs ([])}`.
 - **puller**: `enable`, `package`, `listen` (`127.0.0.1:8081` — front it with
   TLS), `metricsListen` (`127.0.0.1:9092`), `dbPath`, `storeDir`, `s3.*`
   (same), `presignTtlSeconds` (3600), `bumpDebounceSeconds` (86400),
@@ -135,6 +136,20 @@ Module options (all under `services.garret.*`; defaults in parentheses):
   `browse_oidc.extra_audiences` and `browse_oidc.client_id` on the Puller).
   The watcher adds `oidc.resource` (null: not sent). Enabling the pusher puts
   `garret-admin` on the system PATH.
+- `services.garret.pusher.fsck.calendar` (a systemd `OnCalendar` expression)
+  adds `garret-fsck.service` and `garret-fsck.timer`. The service is a
+  oneshot as `garret:garret`, after and requiring `garret-pusher.service`,
+  in the common sandbox with only `AF_UNIX` sockets. It runs
+  `garret-admin --socket <adminSocketPath> fsck <fsck.extraArgs>`: a
+  read-only dry run, never `--repair` and never `--quiesce`, so it cannot
+  delete a row or reject a push. The timer is `Persistent=true` with
+  `RandomizedDelaySec=15m`. The unit exits 1, and so shows as failed, when
+  the run finds dangling rows or size mismatches (orphan Blobs alone do not
+  fail it); the findings also set the `garret_fsck_findings` gauge (spec
+  08). The cost of a run is one S3 `ListObjectsV2` request per 1000 Blobs
+  and no per-object request (`--verify-sizes` reuses the listed sizes),
+  plus one read of every Object row. Repair stays a manual step. The option
+  needs `adminSocketPath`; an assertion rejects `calendar` without it.
 - Option types reject the values the binaries reject, at evaluation time:
   the Pusher quota, intervals and `limits.*` are positive integers,
   watermarks lie in 0 to 1, `presignTtlSeconds` is 1 to 604800 (the SigV4

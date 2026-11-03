@@ -122,6 +122,7 @@ in
         inherit s3;
         signingKeyFiles = [ "/etc/garret/signing-key" ];
         oidc = [{ issuer = issuerUrl; audience = "garret"; jwks_url = "${oidc}/jwks.json"; }];
+        fsck = { calendar = "weekly"; extraArgs = [ "--verify-sizes" ]; };
       };
       puller = {
         enable = true;
@@ -218,6 +219,10 @@ in
     with subtest("an online backup lands beside the database, owner-only"):
         cache.succeed("garret-admin backup /var/lib/garret/backup.db")
         cache.succeed('test "$(stat -c %U:%a /var/lib/garret/backup.db)" = garret:600')
+
+    with subtest("the scheduled fsck finds a consistent cache"):
+        cache.succeed("systemctl is-enabled garret-fsck.timer")
+        cache.succeed("systemctl start garret-fsck.service")
 
     with subtest("the Puller starts while the Pusher cannot"):
         cache.succeed("systemctl stop garret-puller garret-pusher")
