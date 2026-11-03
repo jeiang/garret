@@ -11,6 +11,8 @@ pub mod narinfo;
 pub mod nix_base32;
 pub mod runtime;
 pub mod storage;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 use anyhow::Result;
 

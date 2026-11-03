@@ -85,6 +85,17 @@ router reordering cannot silently re-authenticate it. See
 
 ## Validation mechanics
 
+**Status codes.** A token that fails verification (malformed, untrusted
+issuer, unknown key, JWKS unavailable, invalid or expired) is a `401` with
+`WWW-Authenticate: Bearer`: the client may renew the token or retry, and
+some causes are transient. A token that verifies but that an issuer policy
+gate refuses (`owner`, `ref`, `ref_protected`, `repository_id`,
+`event_name`, `job_workflow_ref`, `group`) is a `403`
+`{"error":"not authorized"}` with no `WWW-Authenticate`: the identity is
+known and stays refused, so retrying cannot help. The Puller's browse
+routes use the same split (a `403` body of `not authorized`). A missing
+bearer header is a `401`. Older clients treat the `403` as a plain failure.
+
 Stacked per-issuer authorizers (jwt-authorizer-style): RS256 pinned,
 `aud`, `iss` and `exp` all required (a token omitting any is refused),
 `nbf` checked when present, ~60 s clock skew. An issuer may list

@@ -5,7 +5,9 @@ Source: [ticket 06](../../.scratch/spec/issues/06-push-protocol.md).
 Two-step flow, zero avoidable round-trips: one batch negotiation, then
 fully parallel, self-contained, idempotent uploads. All endpoints are
 versioned under `/api/v1` on the Pusher and require a valid OIDC bearer
-token (see [04-auth.md](04-auth.md)).
+token (see [04-auth.md](04-auth.md)). A token that fails verification gets
+`401`; a verified token that policy refuses gets `403`, which is permanent
+(clients do not renew or retry it).
 
 ## Negotiation
 

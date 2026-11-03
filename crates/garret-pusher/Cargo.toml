@@ -22,6 +22,7 @@ tracing = "0.1"
 zstd = "0.13"
 
 [dev-dependencies]
+garret-server = { workspace = true, features = ["test-support"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = "0.3"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }

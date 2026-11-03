@@ -157,7 +157,9 @@ impl Authenticator {
     }
 
     /// Validates a bearer token and returns its subject, or an error naming
-    /// only what the caller may safely learn (log it via [`loggable`]).
+    /// only what the caller may safely learn (log it via [`loggable`]). A
+    /// verified token that fails an issuer policy gate carries
+    /// [`PolicyRefused`] (`e.is::<PolicyRefused>()`).
     pub async fn authenticate(&self, token: &str) -> Result<Subject> {
         let (issuer, verdict) = self.check(token).await;
         let outcome = match &verdict {
@@ -237,9 +239,22 @@ impl Authenticator {
                 "issuer" => issuer.cfg.issuer.clone(), "claim" => claim,
             )
             .increment(1);
-            ("unauthorized", e)
+            ("unauthorized", e.context(PolicyRefused))
         })?;
         Ok(Subject(format!("{}#{}", claims.iss, claims.sub)))
+    }
+}
+
+/// Context on an [`Authenticator::authenticate`] error: the token verified, but
+/// an issuer policy gate refused it. Callers answer 403 for it (the identity
+/// is known and will stay refused) and 401 for every other failure, some of
+/// which are transient (spec 04).
+#[derive(Debug)]
+pub struct PolicyRefused;
+
+impl std::fmt::Display for PolicyRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("refused by policy")
     }
 }
 
@@ -1095,5 +1110,35 @@ mod tests {
 
         let flood = anyhow!("no signing key for kid {}", "k".repeat(10_000));
         assert!(loggable(&flood).chars().count() <= 257);
+    }
+
+    /// A verified token a policy gate refuses is the one failure that carries
+    /// [`PolicyRefused`]; callers answer it 403, everything else 401.
+    #[tokio::test]
+    async fn only_a_verified_token_refused_by_policy_is_a_policy_refusal() {
+        let jwks = std::env::temp_dir().join(format!("garret-jwks-{}", std::process::id()));
+        std::fs::write(&jwks, crate::testing::jwks()).unwrap();
+        let mut cfg = dev_issuer(jwks.to_str().unwrap());
+        cfg.repository_ids = vec!["42".into()];
+        let auth = Authenticator::new(vec![cfg]).unwrap();
+        let token = |repository_id: &str| {
+            crate::testing::sign(&format!(
+                r#"{{"iss":"{DEV_ISSUER}","sub":"ci","aud":"garret","exp":4102444800,"repository_id":"{repository_id}"}}"#
+            ))
+        };
+        assert!(auth.authenticate(&token("42")).await.is_ok());
+        let refused = auth.authenticate(&token("99")).await.unwrap_err();
+        assert!(refused.is::<PolicyRefused>());
+        assert!(loggable(&refused).contains("repository_id"), "{refused:#}");
+        for bad in ["not-a-jwt".to_owned(), token_with_kid("forged")] {
+            assert!(
+                !auth
+                    .authenticate(&bad)
+                    .await
+                    .unwrap_err()
+                    .is::<PolicyRefused>()
+            );
+        }
+        let _ = std::fs::remove_file(jwks);
     }
 }

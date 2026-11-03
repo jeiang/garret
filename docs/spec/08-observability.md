@@ -175,8 +175,9 @@ A rejected token's reason is logged escaped and cut at 256 characters: it
 can carry attacker-controlled token text (the `kid`, header fields echoed
 by parse errors), which must not forge log lines or flood the journal.
 An `unauthorized` reason names the refused claim value (`ref "refs/heads/wip"
-is not authorized`) at the front, so the 256-character cut keeps it. The
-Pusher logs the refusal at warn. The Puller logs a rejected browse token at
+is not authorized`) near the front (after a `refused by policy` prefix),
+so the 256-character cut keeps it. An `unauthorized` outcome is answered
+`403`; every other outcome is a `401` (spec 04). The Pusher logs the refusal at warn. The Puller logs a rejected browse token at
 debug only, since that surface is public. The Pusher logs each Negotiation
 at debug with the subject, batch size and missing count, to attribute
 wasted negotiation to a token.

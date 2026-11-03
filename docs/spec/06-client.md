@@ -198,11 +198,15 @@ its own `exp − iat` declares — for a five-minute GitHub runner token, spec
 04's "re-mint once it is >4 min old" — and concurrent requests share one
 mint, which rotating refresh tokens require. A 401 on the Negotiation or an
 upload renews the token once and retries straight away, for what aging
-cannot see (revocation, a token that declares no lifetime); a second 401 is a
-real refusal: an upload fails at once, and the watcher logs the Negotiation's
-refusal once at error level and keeps the batch's paths on the failed list.
-The Pusher answers 401 for transient causes too (an unreachable issuer JWKS,
-a key rotation), so a restart or drain retries them. `GARRET_TOKEN` is used as given and never renewed.
+cannot see (revocation, a token that declares no lifetime). A second 401 is
+an ordinary failure: an upload fails at once, and the watcher logs the
+Negotiation's failure and keeps the batch's paths on the failed list, since
+the Pusher answers 401 for transient causes too (an unreachable issuer JWKS,
+a key rotation), so a restart or drain retries them. A 403 is a permanent
+policy refusal (spec 04): it is never renewed or retried, an upload fails at
+once, and the watcher logs the Negotiation's refusal once at error level,
+naming the Pusher's reason, and does not put the batch's paths on the failed
+list. An older Pusher answers 401 for these, which follows the 401 rule. `GARRET_TOKEN` is used as given and never renewed.
 
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure

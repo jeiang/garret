@@ -462,7 +462,18 @@ async fn require_oidc(
         // The reason stays in the log; the caller learns only that it failed.
         Err(e) => {
             tracing::warn!("rejected token: {}", auth::loggable(&e));
-            unauthorized("invalid token")
+            // A verified identity that policy refuses stays refused: 403,
+            // so clients do not renew or retry. Anything else may be
+            // transient (JWKS outage), so it stays a 401.
+            if e.is::<auth::PolicyRefused>() {
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({ "error": "not authorized" })),
+                )
+                    .into_response()
+            } else {
+                unauthorized("invalid token")
+            }
         }
     }
 }
@@ -1186,5 +1197,52 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let res = send(Request::post("/api/v1/missing-paths")).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A verified token that a policy gate refuses is a 403 with no
+    /// `WWW-Authenticate`; an unverifiable one stays a 401 (spec 04).
+    #[tokio::test]
+    async fn a_policy_refused_token_gets_403_and_a_bad_token_401() {
+        use tower::ServiceExt;
+        let jwks = std::env::temp_dir().join(format!("garret-pusher-jwks-{}", std::process::id()));
+        std::fs::write(&jwks, garret_server::testing::jwks()).unwrap();
+        let mut state = Arc::into_inner(test_state(open_db()).await).unwrap();
+        state.auth = Authenticator::new(vec![IssuerConfig {
+            issuer: "https://issuer.example".into(),
+            audience: "aud".into(),
+            extra_audiences: vec![],
+            client_id: None,
+            jwks_url: Some(jwks.to_str().unwrap().into()),
+            github_owner_id: None,
+            ref_patterns: vec![],
+            ref_protected: None,
+            repository_ids: vec!["42".into()],
+            event_names: vec![],
+            job_workflow_refs: vec![],
+            allowed_groups: vec![],
+        }])
+        .unwrap();
+        let app = router(Arc::new(state), "{}".into());
+        let send = |token: String| {
+            let app = app.clone();
+            async move {
+                let req = Request::post("/api/v1/missing-paths")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap();
+                app.oneshot(req).await.unwrap()
+            }
+        };
+        let signed = garret_server::testing::sign(
+            r#"{"iss": "https://issuer.example", "sub": "ci", "aud": "aud", "exp": 4102444800, "repository_id": "99"}"#,
+        );
+        let res = send(signed).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], br#"{"error":"not authorized"}"#);
+        let res = send("not-a-jwt".into()).await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_file(jwks);
     }
 }

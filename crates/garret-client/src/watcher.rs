@@ -455,14 +455,15 @@ impl Watcher {
         let hashes = negotiation_hashes(&infos);
         let missing = match pusher.negotiate(&hashes).await {
             Ok(missing) => missing,
-            // The Pusher answers 401 for transient causes too (JWKS fetch
-            // failure, key rotation), so the paths stay on the failed list.
-            // The typed error only makes the log a single error line.
+            // A 403 is a permanent policy refusal: retrying cannot succeed,
+            // so say it once and leave the paths off the failed list.
             Err(e) if e.is::<Refused>() => {
-                tracing::error!(paths = infos.len(), "{e:#}; keeping the batch for retry");
-                failed.extend(infos.into_iter().map(|info| info.path));
+                tracing::error!(paths = infos.len(), "{e:#}; dropping the batch");
                 return failed;
             }
+            // Any other failure keeps the paths on the failed list, a 401
+            // that survives renewal included: the Pusher answers 401 for
+            // transient causes too (JWKS fetch failure, key rotation).
             Err(e) => {
                 tracing::warn!(paths = infos.len(), "negotiation failed: {e:#}");
                 failed.extend(infos.into_iter().map(|info| info.path));
