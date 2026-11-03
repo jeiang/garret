@@ -745,8 +745,8 @@ impl std::fmt::Display for Rejected {
 impl std::error::Error for Rejected {}
 
 /// The Negotiation got a 401 even after the token was renewed: the Pusher
-/// refuses this identity. Typed so the watcher logs it once and does not
-/// requeue the paths, which would only repeat the refusal.
+/// refuses this identity. Typed so the watcher logs it as one error line;
+/// the paths still go on the failed list, since a 401 can be transient.
 #[derive(Debug)]
 pub struct Refused(
     /// The Pusher's explanation, as sent.

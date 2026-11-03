@@ -200,8 +200,9 @@ mint, which rotating refresh tokens require. A 401 on the Negotiation or an
 upload renews the token once and retries straight away, for what aging
 cannot see (revocation, a token that declares no lifetime); a second 401 is a
 real refusal: an upload fails at once, and the watcher logs the Negotiation's
-refusal once at error level and drops the batch instead of queueing its paths
-for another round. `GARRET_TOKEN` is used as given and never renewed.
+refusal once at error level and keeps the batch's paths on the failed list.
+The Pusher answers 401 for transient causes too (an unreachable issuer JWKS,
+a key rotation), so a restart or drain retries them. `GARRET_TOKEN` is used as given and never renewed.
 
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure

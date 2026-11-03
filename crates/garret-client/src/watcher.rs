@@ -455,10 +455,12 @@ impl Watcher {
         let hashes = negotiation_hashes(&infos);
         let missing = match pusher.negotiate(&hashes).await {
             Ok(missing) => missing,
-            // The Pusher refuses this identity: requeueing would only repeat
-            // the refusal, so say it once and drop the batch.
+            // The Pusher answers 401 for transient causes too (JWKS fetch
+            // failure, key rotation), so the paths stay on the failed list.
+            // The typed error only makes the log a single error line.
             Err(e) if e.is::<Refused>() => {
-                tracing::error!(paths = infos.len(), "{e:#}; dropping the batch");
+                tracing::error!(paths = infos.len(), "{e:#}; keeping the batch for retry");
+                failed.extend(infos.into_iter().map(|info| info.path));
                 return failed;
             }
             Err(e) => {
