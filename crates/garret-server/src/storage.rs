@@ -78,12 +78,21 @@ impl UploadLimits {
         bytes.div_ceil(self.unit).clamp(1, self.part_units)
     }
 
+    /// Bytes of buffer currently reserved, process-wide.
+    pub fn in_flight_bytes(&self) -> u64 {
+        (self.total_units - self.part_slots.available_permits()) as u64 * self.unit as u64
+    }
+
     async fn acquire_units(&self, units: usize) -> Result<OwnedSemaphorePermit> {
-        self.part_slots
+        let started = std::time::Instant::now();
+        let permit = self
+            .part_slots
             .clone()
             .acquire_many_owned(units as u32)
             .await
-            .map_err(|_| anyhow!("upload capacity semaphore closed"))
+            .map_err(|_| anyhow!("upload capacity semaphore closed"))?;
+        metrics::histogram!("garret_upload_buffer_wait_seconds").record(started.elapsed());
+        Ok(permit)
     }
 
     /// Reserves room for a buffer of up to `bytes` (capped at one part).
@@ -862,6 +871,16 @@ mod tests {
     /// finish. When parts were lazy futures polled only by their reader, a
     /// reader parked on the next slot held slots nobody could free, and this
     /// hung forever — so the timeout turns a regression into a failure.
+    #[tokio::test]
+    async fn in_flight_bytes_rises_on_acquire_and_returns_to_zero() {
+        let limits = UploadLimits::new(1024, 2, 4096);
+        assert_eq!(limits.in_flight_bytes(), 0);
+        let permit = limits.acquire(1024).await.unwrap();
+        assert_eq!(limits.in_flight_bytes(), 1024);
+        drop(permit);
+        assert_eq!(limits.in_flight_bytes(), 0);
+    }
+
     #[tokio::test]
     async fn concurrent_multiparts_finish_on_fewer_slots_than_they_want() {
         let storage = fake_s3().await;

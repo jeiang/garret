@@ -30,6 +30,7 @@ fn latency_buckets() -> Vec<f64> {
 pub fn install(service: &str) -> Result<PrometheusHandle> {
     let handle = PrometheusBuilder::new()
         .set_buckets_for_metric(Matcher::Suffix("_bytes".into()), &byte_buckets())?
+        .set_buckets_for_metric(Matcher::Suffix("_wait_seconds".into()), &latency_buckets())?
         .set_buckets_for_metric(
             Matcher::Suffix("_duration_seconds".into()),
             &latency_buckets(),
@@ -65,15 +66,22 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
 
 /// Serves `/metrics` and `/healthz` on the pre-bound `listener`, forever.
 /// Binding is the caller's job, so a bad address or a taken port fails
-/// startup rather than a detached task.
-pub async fn serve(handle: PrometheusHandle, listener: tokio::net::TcpListener) -> Result<()> {
+/// startup rather than a detached task. `scrape` runs before every render, to
+/// refresh gauges that are cheaper to read than to keep current.
+pub async fn serve(
+    handle: PrometheusHandle,
+    listener: tokio::net::TcpListener,
+    scrape: impl Fn() + Clone + Send + Sync + 'static,
+) -> Result<()> {
     let app = Router::new()
         .route(
             "/metrics",
             get(move || {
                 let handle = handle.clone();
+                let scrape = scrape.clone();
                 async move {
                     record_process_metrics();
+                    scrape();
                     handle.render()
                 }
             }),

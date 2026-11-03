@@ -110,7 +110,7 @@ async fn flush_bumps(state: Arc<AppState>, conn: rusqlite::Connection) {
         tick.tick().await;
         let (state, conn) = (state.clone(), conn.clone());
         let flushed = tokio::task::spawn_blocking(move || {
-            let mut conn = conn.lock();
+            let mut conn = lock_timed(&conn, "bump");
             state.bumps.flush(&mut conn, now(), state.bump_debounce)
         })
         .await;
@@ -169,7 +169,7 @@ where
     // request has already been answered: check the deadline under the lock.
     let deadline = Instant::now() + budget;
     let task = tokio::task::spawn_blocking(move || {
-        let conn = conn.lock();
+        let conn = lock_timed(&conn, "pull");
         if Instant::now() > deadline {
             anyhow::bail!("db read abandoned: budget elapsed while queued");
         }
@@ -181,6 +181,17 @@ where
         }
         Err(_elapsed) => None,
     }
+}
+
+/// Locks a connection, recording the wait as `garret_db_lock_wait_seconds`.
+fn lock_timed<'a>(
+    conn: &'a Mutex<rusqlite::Connection>,
+    which: &'static str,
+) -> parking_lot::MutexGuard<'a, rusqlite::Connection> {
+    let waited = Instant::now();
+    let guard = conn.lock();
+    metrics::histogram!("garret_db_lock_wait_seconds", "conn" => which).record(waited.elapsed());
+    guard
 }
 
 /// A browse query (spec 07) on the browse connection: one at a time, on the
@@ -199,7 +210,10 @@ where
     T: Send + 'static,
 {
     let query = async move {
+        let waited = Instant::now();
         let conn = conn.lock_owned().await;
+        metrics::histogram!("garret_db_lock_wait_seconds", "conn" => "browse")
+            .record(waited.elapsed());
         tokio::task::spawn_blocking(move || read(&conn))
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("browse task failed: {e}")))
@@ -258,6 +272,8 @@ async fn main() -> Result<()> {
             let opened = db::open_when_ready(&db_path, timeout)
                 .await
                 .and_then(|conn| {
+                    // A pull read must not outwait its own budget on SQLite.
+                    conn.busy_timeout(state.db_read_budget)?;
                     // Bumps and browse get their own connections, so neither
                     // a flush waiting on a Pusher write nor a slow browse
                     // query ever holds up a pull-path read.
@@ -291,7 +307,7 @@ async fn main() -> Result<()> {
     let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
     tracing::info!("metrics listening on {metrics_addr}");
     tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener).await {
+        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener, || {}).await {
             tracing::error!("metrics listener failed: {e:#}");
         }
     });

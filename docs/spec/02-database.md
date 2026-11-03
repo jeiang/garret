@@ -115,7 +115,7 @@ Notes:
 ## Pragmas
 
 WAL; `synchronous=NORMAL` (power-loss window acceptable for a cache);
-`busy_timeout=5000`; `mmap_size=512MiB` (never attic's 28 GiB);
+`busy_timeout=5000` (the Puller's pull-path connection lowers it to `db_read_budget_ms`, so a read never outwaits its budget); `mmap_size=512MiB` (never attic's 28 GiB);
 `journal_size_limit=64MiB`; `foreign_keys=ON`; persistent WAL, so `-wal`
 and `-shm` outlive the last connection (the Puller cannot create them,
 spec 10). Replace or restore the database only with both removed, or the

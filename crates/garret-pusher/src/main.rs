@@ -75,11 +75,6 @@ async fn main() -> Result<()> {
     let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
         .await
         .with_context(|| format!("binding metrics listener {metrics_addr}"))?;
-    tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener).await {
-            tracing::error!("metrics listener failed: {e:#}");
-        }
-    });
 
     let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
     let listener = tokio::net::TcpListener::bind(addr)
@@ -116,6 +111,17 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_uploads_limit").set(cfg.limits.max_concurrent_uploads as f64);
     metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
+
+    let scrape_state = state.clone();
+    tokio::spawn(async move {
+        let scrape = move || {
+            metrics::gauge!("garret_in_flight_bytes")
+                .set(scrape_state.limits.in_flight_bytes() as f64);
+        };
+        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener, scrape).await {
+            tracing::error!("metrics listener failed: {e:#}");
+        }
+    });
 
     let collector = cfg.gc.clone().map(|gc_cfg| {
         Arc::new(gc::Gc::new(
@@ -387,9 +393,15 @@ where
     T: Send + 'static,
 {
     let conn = conn.clone();
-    tokio::task::spawn_blocking(move || f(&mut conn.lock()))
-        .await
-        .context("database task failed")?
+    tokio::task::spawn_blocking(move || {
+        let waited = std::time::Instant::now();
+        let mut conn = conn.lock();
+        metrics::histogram!("garret_db_lock_wait_seconds", "conn" => "pusher")
+            .record(waited.elapsed());
+        f(&mut conn)
+    })
+    .await
+    .context("database task failed")?
 }
 
 /// Whether the object's row exists, i.e. the push is already complete.

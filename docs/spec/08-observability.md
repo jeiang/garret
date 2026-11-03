@@ -51,7 +51,9 @@ bytes 64 KiB…8 GiB log-scale; latency 100 us…15 min.
 Prefix `garret_`; service distinguished by scrape job.
 
 - **Common**: HTTP requests/duration by route + method + status class;
-  in-flight gauge; SQLite busy/lock-wait histogram;
+  in-flight gauge; `garret_db_lock_wait_seconds` histogram by `conn`
+  (`pusher`, `pull`, `browse`, `bump`): time spent waiting for a
+  connection's lock, which is where SQLite contention shows up;
   `garret_db_query_duration_seconds` by `query` (statement family:
   `missing`, `insert_object`, `get_object`, `exists`, `bump_flush`,
   `evictable`, `evict_object`); standard `process_*` metrics
@@ -64,8 +66,11 @@ Prefix `garret_`; service distinguished by scrape job.
   and works under `ProcSubset=pid`, on every platform);
   `garret_build_info` with `service`, `version` and `revision` (the
   commit the binary was built from, `unknown` outside the Nix build).
-- **Pusher — uploads**: in-flight uploads and in-flight bytes gauges
-  *versus their configured caps* (saturation visible before it hurts);
+- **Pusher — uploads**: in-flight uploads and `garret_in_flight_bytes` gauges
+  *versus their configured caps* (saturation visible before it hurts;
+  `garret_in_flight_bytes` is read from the upload budget on each scrape);
+  `garret_upload_buffer_wait_seconds`, the time an upload waited for buffer
+  room in that budget;
   upload size histogram; `garret_upload_duration_seconds` by `outcome`
   (`accepted`, `failed`), so slow failures stay visible;
   accepted/shed(429) counters; `garret_uploads_failed_total` by `reason`
@@ -140,7 +145,7 @@ Prefix `garret_`; service distinguished by scrape job.
 `tracing` crate, human-readable, on stdout. Verbosity follows `RUST_LOG`
 (default `info`). Output is plain, with no ANSI colour codes, whenever stdout is
 not a terminal, so journald and files stay clean; there is no JSON
-logging. Per-request spans with request ids. No OTLP/distributed tracing
+logging. No OTLP/distributed tracing
 in v1. The client is metrics-free: progress output, logs, and the
 watcher's failed list.
 
