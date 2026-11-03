@@ -931,6 +931,7 @@ mod tests {
             access_key_id: Some("x".into()),
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 1,
+            operation_attempt_timeout_secs: None,
         })
         .await
         .unwrap();

@@ -264,6 +264,9 @@ pub struct Pusher {
     /// Retries per path on 5xx and dropped connections, with exponential
     /// jittered backoff; 429s wait out `Retry-After` instead.
     pub max_retries: u32,
+    /// How long an upload may go without progress before it is abandoned as
+    /// [`Stalled`] and retried.
+    pub upload_idle: Duration,
 }
 
 /// The subset of `nix path-info --json` garret needs. Shelling out to nix
@@ -530,7 +533,7 @@ impl Pusher {
                 hash_of_store_path(&info.path)
             ))
             .bearer_auth(token);
-        let response = send_watched(request, body, UPLOAD_IDLE)
+        let response = send_watched(request, body, self.upload_idle)
             .await
             .context("uploading NAR")?;
 
@@ -615,13 +618,9 @@ fn references_first(paths: Vec<PathInfo>) -> Vec<PathInfo> {
 /// Generous for one missing-paths round-trip, even over a whole closure.
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
-/// How long an upload may go without the connection taking another body
-/// chunk — or, once the body is sent, without an answer — before it is
-/// abandoned as [`Stalled`] and retried. Generous, because the server stops
-/// reading on purpose while it waits for a part slot behind other uploads.
-const UPLOAD_IDLE: Duration = Duration::from_secs(5 * 60);
-
-/// The upload went [`UPLOAD_IDLE`] without progress. Retryable: negotiation
+/// The upload went [`Pusher::upload_idle`] without progress (default 5 min,
+/// generous because the server stops reading on purpose while it waits for a
+/// part slot behind other uploads). Retryable: negotiation
 /// makes the retry idempotent, and a fresh connection may well not stall.
 #[derive(Debug)]
 struct Stalled(Duration);

@@ -35,12 +35,14 @@ let
       endpoint_url = cfg.s3.endpointUrl;
       path_style = cfg.s3.pathStyle;
       operation_timeout_secs = cfg.s3.operationTimeoutSeconds;
+      operation_attempt_timeout_secs = cfg.s3.operationAttemptTimeoutSeconds;
     };
     limits = {
       max_concurrent_uploads = cfg.limits.maxConcurrentUploads;
       max_in_flight_bytes = cfg.limits.maxInFlightBytes;
       part_size = cfg.limits.partSize;
       max_parts_in_flight = cfg.limits.maxPartsInFlight;
+      body_idle_timeout_secs = cfg.limits.bodyIdleTimeoutSeconds;
     };
     oidc = cfg.oidc;
   } // lib.optionalAttrs (cfg.quotaBytes != null) {
@@ -121,6 +123,11 @@ in
       region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
       pathStyle = mkOption { type = types.bool; default = true; description = "Path-style addressing."; };
       operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Per-operation S3 timeout."; };
+      operationAttemptTimeoutSeconds = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Per-attempt S3 timeout inside the overall one; must be below operationTimeoutSeconds and above the time to send partSize on the slowest uplink. Null: unset.";
+      };
       credentialsFile = mkOption {
         type = types.path;
         description = ''
@@ -176,6 +183,7 @@ in
       maxInFlightBytes = mkOption { type = types.int; default = 268435456; description = "Cap on buffered upload bytes."; };
       partSize = mkOption { type = types.int; default = 16777216; description = "Multipart part size; also the single-PutObject threshold."; };
       maxPartsInFlight = mkOption { type = types.int; default = 4; description = "Concurrent parts per upload."; };
+      bodyIdleTimeoutSeconds = mkOption { type = types.ints.positive; default = 60; description = "Seconds an upload body may send nothing before it is abandoned."; };
     };
 
     oidc = mkOption {

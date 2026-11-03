@@ -99,7 +99,8 @@ async fn main() -> Result<()> {
             cfg.limits.part_size,
             cfg.limits.max_parts_in_flight,
             cfg.limits.max_in_flight_bytes,
-        ),
+        )
+        .with_body_idle(Duration::from_secs(cfg.limits.body_idle_timeout_secs)),
         uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
         in_flight: InFlight::new(),
         quiescing: Arc::new(AtomicBool::new(false)),
@@ -595,11 +596,18 @@ async fn store_upload(
 ) -> Result<i64, Error> {
     let mut stream = body.into_data_stream();
     let mut head: Vec<u8> = Vec::new();
+    let started = std::time::Instant::now();
     let preamble = loop {
         if let Some(preamble) = take_preamble(&mut head)? {
             break preamble;
         }
-        let Some(chunk) = storage::next_chunk(&mut stream).await? else {
+        let at = storage::Stall {
+            received: head.len() as u64,
+            started,
+            phase: "preamble",
+        };
+        let Some(chunk) = storage::next_chunk(&mut stream, state.limits.body_idle, at).await?
+        else {
             return Err(Error::new(
                 StatusCode::BAD_REQUEST,
                 "body ended before the preamble was complete".into(),
@@ -777,6 +785,7 @@ mod tests {
             access_key_id: Some("x".into()),
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 1,
+            operation_attempt_timeout_secs: None,
         })
         .await
         .unwrap()

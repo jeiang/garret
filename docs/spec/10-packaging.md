@@ -115,11 +115,11 @@ Module options (all under `services.garret.*`; defaults in parentheses):
 - **pusher**: `enable`, `package`, `listen` (`127.0.0.1:8080`),
   `metricsListen` (`127.0.0.1:9091`), `dbPath`, `storeDir`,
   `s3.{bucket, endpointUrl, region, pathStyle (true), operationTimeoutSeconds
-  (60), credentialsFile}`, `signingKeyFiles` (list — active + retiring),
+  (60), operationAttemptTimeoutSeconds (null: unset), credentialsFile}`, `signingKeyFiles` (list — active + retiring),
   `pullerEndpoint`, `quotaBytes` (null: no quota), `watermarks.{high (0.95),
   low (0.85)}`, `gcIntervalSeconds` (300), `orphanGraceSeconds` (86400),
   `limits.{maxConcurrentUploads (16), maxInFlightBytes (256 MiB), partSize
-  (16 MiB), maxPartsInFlight (4)}`, `oidc` (list of issuer submodules:
+  (16 MiB), maxPartsInFlight (4), bodyIdleTimeoutSeconds (60)}`, `oidc` (list of issuer submodules:
   `issuer`, `audience`, `extra_audiences`, `client_id`, `jwks_url`,
   `github_owner_id`, `ref_patterns`, `ref_protected`, `repository_ids`,
   `event_names`, `job_workflow_refs`, `allowed_groups`), `adminSocketPath`

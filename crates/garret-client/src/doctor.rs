@@ -440,6 +440,7 @@ mod tests {
             jobs: 8,
             zstd_level: 3,
             max_retries: 5,
+            upload_idle_secs: 300,
             puller_endpoint: Some("https://cache.example".into()),
             public_keys: vec!["garret-1:AAAA=".into()],
             upstream_keys: vec!["cache.nixos.org-1".into()],

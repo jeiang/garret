@@ -23,6 +23,12 @@ pub struct Config {
     /// connections. A 429 does not spend these: it waits out `Retry-After`.
     #[serde(default = "max_retries")]
     pub max_retries: u32,
+    /// Seconds an upload may go without progress (no body chunk taken, or no
+    /// answer once sent) before it is abandoned and retried. Keep it above
+    /// the Pusher's `limits.body_idle_timeout_secs`, or the client gives up
+    /// on an upload the server is still willing to wait for.
+    #[serde(default = "upload_idle_secs")]
+    pub upload_idle_secs: u64,
     /// Puller base URL — `list` and `tree` query the browse API, not the Pusher.
     pub puller_endpoint: Option<String>,
     /// The cache's signing keys, public halves, as `garret use` writes them into
@@ -142,6 +148,10 @@ fn zstd_level() -> i32 {
     3
 }
 
+fn upload_idle_secs() -> u64 {
+    5 * 60
+}
+
 fn max_retries() -> u32 {
     5
 }
@@ -179,6 +189,10 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading client config {}", path.display()))?;
     let mut cfg: Config = toml::from_str(&text).context("parsing client config")?;
+    anyhow::ensure!(
+        cfg.upload_idle_secs > 0,
+        "upload_idle_secs must be at least 1"
+    );
     if let Ok(endpoint) = std::env::var("GARRET_ENDPOINT") {
         cfg.endpoint = endpoint;
     }
@@ -275,6 +289,13 @@ mod tests {
                 client_id: Some("garret-cli".into()),
             }),
         }
+    }
+
+    #[test]
+    fn upload_idle_defaults_to_five_minutes() {
+        let text = render("https://push.example", &discovery()).unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.upload_idle_secs, 300);
     }
 
     /// The template and the struct can drift; this is what stops them. It also

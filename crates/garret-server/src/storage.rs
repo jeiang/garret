@@ -41,6 +41,8 @@ pub struct UploadLimits {
     pub part_size: usize,
     /// Concurrent part uploads per NAR.
     pub max_parts_in_flight: usize,
+    /// How long a body may send nothing before the upload is abandoned.
+    pub body_idle: Duration,
     /// One permit per `unit` bytes of buffer, shared process-wide.
     pub part_slots: Arc<Semaphore>,
     /// Bytes one permit stands for: `part_size / 256`, at most 64 KiB.
@@ -62,11 +64,18 @@ impl UploadLimits {
         Self {
             part_size,
             max_parts_in_flight,
+            body_idle: BODY_IDLE_TIMEOUT,
             part_slots: Arc::new(Semaphore::new(total_units)),
             unit,
             part_units,
             total_units,
         }
+    }
+
+    /// Replaces the default [`BODY_IDLE_TIMEOUT`].
+    pub fn with_body_idle(mut self, idle: Duration) -> Self {
+        self.body_idle = idle;
+        self
     }
 
     /// How many part-sized buffers fit in the budget at once, process-wide.
@@ -143,8 +152,8 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .filter(|h| !h.is_empty())
 }
 
-/// How long an upload body may send nothing before the upload is abandoned
-/// (spec 01). A stalled body holds an upload slot, its in-flight claim and,
+/// Default for `limits.body_idle_timeout_secs`: how long an upload body may
+/// send nothing before the upload is abandoned (spec 01). A stalled body holds an upload slot, its in-flight claim and,
 /// mid-NAR, a part slot, so without a bound a few quiet senders starve every
 /// other push. Idle, not total: a slow sender that keeps moving is fine.
 pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -176,17 +185,33 @@ impl std::fmt::Display for BodyOverLimit {
 
 impl std::error::Error for BodyOverLimit {}
 
+/// Where an upload body stood when it went quiet, for the stall error.
+#[derive(Clone, Copy)]
+pub struct Stall {
+    /// Body bytes received before the read being waited on.
+    pub received: u64,
+    /// When the upload began.
+    pub started: Instant,
+    /// `preamble`, `first_part` or `multipart`.
+    pub phase: &'static str,
+}
+
 /// The body's next chunk, or a [`ClientBodyError`] once it has sent nothing
-/// for [`BODY_IDLE_TIMEOUT`].
-pub async fn next_chunk<S: Stream + Unpin>(body: &mut S) -> Result<Option<S::Item>> {
-    tokio::time::timeout(BODY_IDLE_TIMEOUT, body.next())
-        .await
-        .map_err(|_| {
-            anyhow::Error::new(ClientBodyError(format!(
-                "upload body stalled: nothing received for {}s",
-                BODY_IDLE_TIMEOUT.as_secs()
-            )))
-        })
+/// for `idle`.
+pub async fn next_chunk<S: Stream + Unpin>(
+    body: &mut S,
+    idle: Duration,
+    at: Stall,
+) -> Result<Option<S::Item>> {
+    tokio::time::timeout(idle, body.next()).await.map_err(|_| {
+        anyhow::Error::new(ClientBodyError(format!(
+            "upload body stalled: nothing received for {}s after {} bytes in {}s ({})",
+            idle.as_secs(),
+            at.received,
+            at.started.elapsed().as_secs(),
+            at.phase
+        )))
+    })
 }
 
 /// Appends body bytes to `part` until it holds `cap` bytes or the body ends,
@@ -200,6 +225,8 @@ async fn fill_part<S, E>(
     carry: &mut Option<Bytes>,
     cap: usize,
     hasher: &mut Sha256,
+    idle: Duration,
+    at: Stall,
 ) -> Result<()>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -209,7 +236,11 @@ where
         let chunk = match carry.take() {
             Some(left) => left,
             None => {
-                let Some(chunk) = next_chunk(body).await? else {
+                let here = Stall {
+                    received: at.received + part.len() as u64,
+                    ..at
+                };
+                let Some(chunk) = next_chunk(body, idle, here).await? else {
                     break;
                 };
                 chunk.map_err(|e| {
@@ -239,13 +270,15 @@ async fn read_part<S, E>(
     carry: &mut Option<Bytes>,
     part_size: usize,
     hasher: &mut Sha256,
+    idle: Duration,
+    at: Stall,
 ) -> Result<Bytes>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
     let mut part = BytesMut::with_capacity(part_size);
-    fill_part(&mut part, body, carry, part_size, hasher).await?;
+    fill_part(&mut part, body, carry, part_size, hasher, idle, at).await?;
     Ok(part.freeze())
 }
 
@@ -281,15 +314,17 @@ impl Storage {
         }
         // S4 and Garage both accept path-style; it avoids DNS games for dotted buckets.
         builder = builder.force_path_style(cfg.path_style);
-        // Overall deadline per call, not per attempt. UploadPart is also never
-        // retried by the SDK (see `upload_part`): re-uploading a part is
-        // forbidden on S4 (spec 03), so fail once and let the caller abort
-        // the multipart.
-        builder = builder.timeout_config(
-            aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-                .operation_timeout(std::time::Duration::from_secs(cfg.operation_timeout_secs))
-                .build(),
-        );
+        // The overall deadline covers the SDK's retries; the optional attempt
+        // deadline bounds each try, so a hung attempt leaves time for a retry
+        // inside the overall one. UploadPart is never retried by the SDK (see
+        // `upload_part`): re-uploading a part is forbidden on S4 (spec 03), so
+        // it fails once and the caller aborts the multipart.
+        let mut timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .operation_timeout(Duration::from_secs(cfg.operation_timeout_secs));
+        if let Some(secs) = cfg.operation_attempt_timeout_secs {
+            timeouts = timeouts.operation_attempt_timeout(Duration::from_secs(secs));
+        }
+        builder = builder.timeout_config(timeouts.build());
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: cfg.bucket.clone(),
@@ -344,12 +379,28 @@ impl Storage {
         let mut hasher = Sha256::new();
         let mut total: i64 = 0;
         let mut carry: Option<Bytes> = None;
+        let started = Instant::now();
+        let idle = limits.body_idle;
 
         // First part decides the shape: if the whole body fits, one PutObject.
         let reserve = first_part_hint.clamp(1, limits.part_size);
         let permit = limits.acquire(reserve).await?;
         let mut first = BytesMut::with_capacity(reserve);
-        fill_part(&mut first, &mut body, &mut carry, reserve, &mut hasher).await?;
+        let at = Stall {
+            received: 0,
+            started,
+            phase: "first_part",
+        };
+        fill_part(
+            &mut first,
+            &mut body,
+            &mut carry,
+            reserve,
+            &mut hasher,
+            idle,
+            at,
+        )
+        .await?;
         if first.len() == reserve && reserve < limits.part_size {
             // The hint is a hard cap for a body that is not a whole part: more
             // data means the body exceeds what the caller will accept, so fail
@@ -357,7 +408,12 @@ impl Storage {
             let more = match carry.as_ref() {
                 Some(left) => !left.is_empty(),
                 None => loop {
-                    match next_chunk(&mut body).await? {
+                    let at = Stall {
+                        received: first.len() as u64,
+                        started,
+                        phase: "first_part",
+                    };
+                    match next_chunk(&mut body, idle, at).await? {
                         None => break false,
                         Some(Ok(chunk)) if chunk.is_empty() => continue,
                         Some(Ok(_)) => break true,
@@ -410,6 +466,7 @@ impl Storage {
                 limits,
                 &mut hasher,
                 &mut total,
+                started,
             )
             .await
         {
@@ -454,6 +511,7 @@ impl Storage {
         limits: &UploadLimits,
         hasher: &mut Sha256,
         total: &mut i64,
+        started: Instant,
     ) -> Result<()>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -469,7 +527,13 @@ impl Storage {
                 completed.push(collect(in_flight).await?);
             }
             let permit = limits.acquire(limits.part_size).await?;
-            let part = read_part(body, carry, limits.part_size, hasher).await?;
+            let at = Stall {
+                received: *total as u64,
+                started,
+                phase: "multipart",
+            };
+            let part =
+                read_part(body, carry, limits.part_size, hasher, limits.body_idle, at).await?;
             if part.is_empty() {
                 drop(permit);
                 break;
@@ -756,9 +820,16 @@ mod tests {
             let mut sizes = Vec::new();
             let mut hasher = Sha256::new();
             loop {
-                let part = read_part(&mut body, &mut carry, part_size, &mut hasher)
-                    .await
-                    .unwrap();
+                let part = read_part(
+                    &mut body,
+                    &mut carry,
+                    part_size,
+                    &mut hasher,
+                    BODY_IDLE_TIMEOUT,
+                    test_stall(),
+                )
+                .await
+                .unwrap();
                 if part.is_empty() {
                     break;
                 }
@@ -838,10 +909,45 @@ mod tests {
             .chain(futures::stream::pending());
         let read = tokio::time::timeout(
             BODY_IDLE_TIMEOUT * 2,
-            read_part(&mut body, &mut None, 1024, &mut Sha256::new()),
+            read_part(
+                &mut body,
+                &mut None,
+                1024,
+                &mut Sha256::new(),
+                BODY_IDLE_TIMEOUT,
+                test_stall(),
+            ),
         )
         .await;
         assert!(read.expect("a stalled body hung the read").is_err());
+    }
+
+    fn test_stall() -> Stall {
+        Stall {
+            received: 0,
+            started: Instant::now(),
+            phase: "multipart",
+        }
+    }
+
+    /// The stall error names how much arrived, so an operator can tell a
+    /// sender that never started from one that died mid-NAR.
+    #[tokio::test(start_paused = true)]
+    async fn the_stall_error_carries_the_byte_count() {
+        let mut body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
+            .chain(futures::stream::pending());
+        let at = Stall {
+            received: 10,
+            started: Instant::now(),
+            phase: "multipart",
+        };
+        let idle = Duration::from_millis(10);
+        let err = read_part(&mut body, &mut None, 1024, &mut Sha256::new(), idle, at)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("after 13 bytes"), "{msg}");
+        assert!(msg.contains("(multipart)"), "{msg}");
     }
 
     /// The bound is on silence, not on total time: a sender that keeps
@@ -852,9 +958,16 @@ mod tests {
             tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
-        let part = read_part(&mut body, &mut None, 1024, &mut Sha256::new())
-            .await
-            .unwrap();
+        let part = read_part(
+            &mut body,
+            &mut None,
+            1024,
+            &mut Sha256::new(),
+            BODY_IDLE_TIMEOUT,
+            test_stall(),
+        )
+        .await
+        .unwrap();
         assert_eq!(part.len(), 8);
     }
     /// Just enough S3 on a loopback port. Every call succeeds, except that
@@ -920,6 +1033,7 @@ mod tests {
             access_key_id: Some("x".into()),
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 5,
+            operation_attempt_timeout_secs: None,
         })
         .await
         .unwrap()

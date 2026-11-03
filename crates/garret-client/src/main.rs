@@ -660,6 +660,7 @@ fn pusher(
         jobs: jobs.unwrap_or(cfg.jobs),
         zstd_level: cfg.zstd_level,
         max_retries: cfg.max_retries,
+        upload_idle: std::time::Duration::from_secs(cfg.upload_idle_secs),
     })
 }
 

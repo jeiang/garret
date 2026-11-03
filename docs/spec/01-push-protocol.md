@@ -133,10 +133,13 @@ check: its window (at most 8 MiB; 2 MiB at the default level) plus a
 **A stalled body is abandoned.** An admitted upload holds an upload
 slot, its in-flight claim and, mid-NAR, buffer capacity, so a sender that
 stops sending would hold them forever. If the body delivers nothing for
-**60 s** (a fixed bound), the server gives up: any multipart upload is
+`limits.body_idle_timeout_secs` (default **60 s**), the server gives up: any multipart upload is
 aborted and the reply is a `500`, retryable like any `5xx`. The bound is
 on silence, not total time — only time spent waiting for the next chunk
-counts, so a slow sender that keeps moving is never cut off. A stalled or
+counts, so a slow sender that keeps moving is never cut off. Raising the
+bound holds upload slots, claims and buffers longer per quiet sender. The
+error names the bound, the bytes received, the elapsed time and the phase
+(`preamble`, `first_part` or `multipart`). A stalled or
 broken client body is the sender's failure, so the Pusher logs it as a
 warning (still with the `error_id`), not an error. There is
 deliberately no per-NAR size cap: every pusher is authenticated, and the

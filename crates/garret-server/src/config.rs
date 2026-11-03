@@ -29,6 +29,12 @@ pub struct S3Config {
     /// larger parts.
     #[serde(default = "s3_operation_timeout")]
     pub operation_timeout_secs: u64,
+    /// Deadline for each attempt inside the overall one. Unset (default), a
+    /// hung attempt uses the whole overall deadline and nothing retries. Set
+    /// it above the time to send `part_size` on the slowest uplink and below
+    /// `operation_timeout_secs`.
+    #[serde(default)]
+    pub operation_attempt_timeout_secs: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -116,6 +122,10 @@ pub struct Limits {
     /// Concurrent part uploads per NAR. Default 4.
     #[serde(default = "max_parts_in_flight")]
     pub max_parts_in_flight: usize,
+    /// Seconds an upload body may send nothing before the upload is
+    /// abandoned. Raising it holds upload slots longer. Default 60.
+    #[serde(default = "body_idle_timeout")]
+    pub body_idle_timeout_secs: u64,
 }
 
 impl Default for Limits {
@@ -125,8 +135,13 @@ impl Default for Limits {
             max_in_flight_bytes: max_in_flight_bytes(),
             part_size: part_size(),
             max_parts_in_flight: max_parts_in_flight(),
+            body_idle_timeout_secs: body_idle_timeout(),
         }
     }
+}
+
+fn body_idle_timeout() -> u64 {
+    crate::storage::BODY_IDLE_TIMEOUT.as_secs()
 }
 
 fn max_concurrent_uploads() -> usize {
@@ -267,6 +282,17 @@ impl PusherConfig {
         }
         if self.s3.operation_timeout_secs == 0 {
             bail!("s3.operation_timeout_secs must be at least 1");
+        }
+        if l.body_idle_timeout_secs == 0 {
+            bail!("limits.body_idle_timeout_secs must be at least 1");
+        }
+        if let Some(attempt) = self.s3.operation_attempt_timeout_secs
+            && (attempt == 0 || attempt >= self.s3.operation_timeout_secs)
+        {
+            bail!(
+                "s3.operation_attempt_timeout_secs ({attempt}) must be at least 1 and below s3.operation_timeout_secs ({})",
+                self.s3.operation_timeout_secs
+            );
         }
         if let Some(gc) = &self.gc {
             if gc.interval_secs == 0 {
@@ -442,6 +468,32 @@ mod validate_tests {
             "max_concurrent_uploads",
         );
         rejects(|c| c.limits.max_parts_in_flight = 0, "max_parts_in_flight");
+        rejects(
+            |c| c.limits.body_idle_timeout_secs = 0,
+            "body_idle_timeout_secs",
+        );
+    }
+
+    #[test]
+    fn timeout_defaults_keep_current_behavior() {
+        let c = cfg();
+        assert_eq!(c.limits.body_idle_timeout_secs, 60);
+        assert_eq!(c.s3.operation_attempt_timeout_secs, None);
+    }
+
+    #[test]
+    fn attempt_timeout_must_fit_inside_the_overall_one() {
+        let mut c = cfg();
+        c.s3.operation_attempt_timeout_secs = Some(c.s3.operation_timeout_secs - 1);
+        c.validate().unwrap();
+        rejects(
+            |c| c.s3.operation_attempt_timeout_secs = Some(0),
+            "attempt_timeout",
+        );
+        rejects(
+            |c| c.s3.operation_attempt_timeout_secs = Some(c.s3.operation_timeout_secs),
+            "attempt_timeout",
+        );
     }
 
     #[test]

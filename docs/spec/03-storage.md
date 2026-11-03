@@ -76,6 +76,14 @@ Defaults, all configurable:
   `max_in_flight_bytes / operation_timeout_secs`, about 36 Mbit/s at the
   defaults (256 MiB over 60 s). A slower link fails uploads with
   timeouts; raise `operation_timeout_secs` or lower `max_in_flight_bytes`.
+- `[s3] operation_attempt_timeout_secs` (default unset) bounds each
+  attempt inside the overall deadline. Unset, a hung attempt consumes the
+  whole overall deadline and the SDK never gets to retry; set, a hung
+  attempt is cut early and retried within it. It must be below
+  `operation_timeout_secs` (a value of 0 or at least the overall deadline
+  is rejected at startup), and above the time to send `part_size` on the
+  slowest uplink, or healthy part uploads are cut off. `UploadPart` is not
+  retried, so for it this only shortens the wait for failure.
 - **`UploadPart` is never retried by the SDK** (max attempts 1, set per
   operation): part re-upload is forbidden below, so a failed part aborts
   the multipart at once rather than after retries have burned the

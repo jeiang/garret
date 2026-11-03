@@ -168,11 +168,12 @@ still reported and the run then exits non-zero.
 30 s, a Negotiation after 2 minutes, and a request to the token provider
 (discovery, device flow, refresh, GitHub OIDC, client credentials) after
 60 s. An upload has no total limit — a
-large NAR over a slow link takes as long as it takes — but one that goes 5
-minutes without the connection taking another body chunk, or without an
+large NAR over a slow link takes as long as it takes — but one that goes
+`upload_idle_secs` (default 300, at least 1) without the connection taking another body chunk, or without an
 answer once the body is sent, is abandoned as stalled and retried like a
 dropped connection. Five minutes is generous on purpose: the server stops
-reading while it waits for a part slot behind other uploads. (reqwest's own
+reading while it waits for a part slot behind other uploads. Keep it above
+the Pusher's `limits.body_idle_timeout_secs`. (reqwest's own
 read timeout cannot do this: it is not reset while the request body is
 sent, so on an upload it would cap the whole transfer.)
 
