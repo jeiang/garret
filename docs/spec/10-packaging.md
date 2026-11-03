@@ -205,8 +205,8 @@ nothing to do — the first Pusher start makes the directory 0750 and the
 database files 0660. A custom `dbPath` directory must already be
 `garret:garret` 0750. A signing key readable by group
 `garret` (say `root:garret` 0440) must become `garret`-owned 0400, or the
-Puller can read it. Startup logs a warning (it does not fail) for a signing key
-whose mode allows group or other access. Pointing `services.garret.puller.s3.credentialsFile` at
+Puller can read it. The Pusher refuses to start, naming the file and its mode, when a
+signing key's mode allows group or other access (Unix only). Pointing `services.garret.puller.s3.credentialsFile` at
 a GetObject-only key is optional, and takes bucket write away from the Puller.
 
 ### Sandboxing
