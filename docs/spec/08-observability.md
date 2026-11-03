@@ -66,7 +66,17 @@ Prefix `garret_`; service distinguished by scrape job.
   commit the binary was built from, `unknown` outside the Nix build).
 - **Pusher — uploads**: in-flight uploads and in-flight bytes gauges
   *versus their configured caps* (saturation visible before it hurts);
-  upload size/duration histograms; accepted/failed/shed(429) counters;
+  upload size histogram; `garret_upload_duration_seconds` by `outcome`
+  (`accepted`, `failed`), so slow failures stay visible;
+  accepted/shed(429) counters; `garret_uploads_failed_total` by `reason`
+  (`client_body`: the sender stalled or dropped; `refused`: the body or
+  preamble was rejected with `400`; `storage`: an S3 failure; `internal`:
+  anything else);
+  `garret_upload_slot_milliseconds_total`, the time upload slots were held
+  (from the slot acquire to the end of the upload, dropped handlers
+  included), so `rate(garret_upload_slot_milliseconds_total[5m]) / 1000 /
+  uploads_limit` is slot utilization: alert on it near 1, since the
+  in-flight gauge alone undersamples short bursts;
   negotiation batch-size (1…10000) and missing-ratio (0…1) histograms with
   their own buckets, plus `garret_negotiation_missing_paths_total` (a
   weighted ratio is its rate over the batch-size `_sum` rate);

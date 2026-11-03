@@ -296,12 +296,23 @@ async fn stop_signal() {
 }
 
 #[derive(Debug)]
-struct Error(StatusCode, String);
+struct Error(StatusCode, String, &'static str);
 
 impl Error {
     /// 429s carry Retry-After so clients back off on the server's terms.
     fn retry_after(status: StatusCode, message: &str) -> Self {
-        Error(status, message.to_owned())
+        Error::new(status, message.to_owned())
+    }
+
+    /// An error the handler raised itself: a 400 is a refused upload, and
+    /// anything else here is a policy answer (shed, quiescing), not a fault.
+    fn new(status: StatusCode, message: String) -> Self {
+        let reason = if status == StatusCode::BAD_REQUEST {
+            "refused"
+        } else {
+            "internal"
+        };
+        Error(status, message, reason)
     }
 }
 
@@ -324,13 +335,14 @@ impl IntoResponse for Error {
 /// fresh id and the caller gets only the id to quote back.
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
+        let reason = failure_reason(&e);
         if let Some(over) = e.downcast_ref::<storage::BodyOverLimit>() {
-            return Error(StatusCode::BAD_REQUEST, over.to_string());
+            return Error::new(StatusCode::BAD_REQUEST, over.to_string());
         }
         let id = format!("{:016x}", fastrand::u64(..));
         // A sender that stalled or dropped mid-body failed; the server did
         // not. Same id and 500, but a warning rather than an error.
-        if e.downcast_ref::<storage::ClientBodyError>().is_some() {
+        if reason == "client_body" {
             tracing::warn!(error_id = %id, kind = "client_body", "client body failed: {e:#}");
         } else {
             tracing::error!(error_id = %id, "{e:#}");
@@ -338,7 +350,27 @@ impl From<anyhow::Error> for Error {
         Error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("internal error (id {id})"),
+            reason,
         )
+    }
+}
+
+/// The `reason` label of `garret_uploads_failed_total`, from the error
+/// chain: a sender that failed mid-body, a refused body, an S3 failure (the
+/// storage layer's context strings; the SDK error type is generic and cannot
+/// be downcast), or anything else.
+fn failure_reason(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<storage::ClientBodyError>().is_some() {
+        "client_body"
+    } else if e.downcast_ref::<storage::BodyOverLimit>().is_some() {
+        "refused"
+    } else if e.chain().any(|c| {
+        let m = c.to_string();
+        m.contains("multipart") || m.contains("S3") || m.starts_with("uploading ")
+    }) {
+        "storage"
+    } else {
+        "internal"
     }
 }
 
@@ -374,21 +406,24 @@ fn exists_response() -> Response {
     (StatusCode::OK, Json(json!({"status": "exists"}))).into_response()
 }
 
-/// Counts an upload in `garret_uploads_in_flight` for as long as it lives, so
-/// a handler future dropped mid-upload (client disconnect, shutdown) still
-/// gives its count back.
-struct UploadGauge;
+/// Holds an upload slot's accounting for as long as it lives: counts in
+/// `garret_uploads_in_flight` and, on drop, adds the slot's hold time to
+/// `garret_upload_slot_milliseconds_total`. A handler future dropped mid-upload
+/// (client disconnect, shutdown) still gives both back.
+struct UploadGauge(std::time::Instant);
 
 impl UploadGauge {
     fn enter() -> Self {
         metrics::gauge!("garret_uploads_in_flight").increment(1.0);
-        Self
+        Self(std::time::Instant::now())
     }
 }
 
 impl Drop for UploadGauge {
     fn drop(&mut self) {
         metrics::gauge!("garret_uploads_in_flight").decrement(1.0);
+        metrics::counter!("garret_upload_slot_milliseconds_total")
+            .increment(self.0.elapsed().as_millis() as u64);
     }
 }
 
@@ -458,7 +493,7 @@ async fn upload(
     // pushes rejected outright while it drains and repairs (spec 05-gc).
     if state.quiescing.load(std::sync::atomic::Ordering::SeqCst) {
         metrics::counter!("garret_upload_skipped_total", "reason" => "quiescing").increment(1);
-        return Err(Error(
+        return Err(Error::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "cache is quiescing for fsck --repair --quiesce".into(),
         ));
@@ -467,7 +502,7 @@ async fn upload(
     // The hash becomes the DB key and the S3 key, so it is checked before
     // either sees it — and before a byte of the body is read.
     if !is_store_hash(&hash) {
-        return Err(Error(
+        return Err(Error::new(
             StatusCode::BAD_REQUEST,
             format!("{hash:?} is not a store path hash"),
         ));
@@ -488,6 +523,7 @@ async fn upload(
             "too many concurrent uploads",
         ));
     };
+    let _gauge = UploadGauge::enter();
     let claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
         Ok(claim) => claim,
         // Second pusher for the same path: first writer wins. The loser is
@@ -520,19 +556,18 @@ async fn upload(
     }
 
     let started = std::time::Instant::now();
-    let result = {
-        let _gauge = UploadGauge::enter();
-        store_upload(&state, &hash, &subject, body, claim).await
-    };
+    let result = store_upload(&state, &hash, &subject, body, claim).await;
 
     match &result {
         Ok(size) => {
             metrics::counter!("garret_uploads_accepted_total").increment(1);
             metrics::histogram!("garret_upload_bytes").record(*size as f64);
-            metrics::histogram!("garret_upload_duration_seconds").record(started.elapsed());
         }
-        Err(_) => metrics::counter!("garret_uploads_failed_total").increment(1),
+        Err(e) => metrics::counter!("garret_uploads_failed_total", "reason" => e.2).increment(1),
     }
+    let outcome = if result.is_ok() { "accepted" } else { "failed" };
+    metrics::histogram!("garret_upload_duration_seconds", "outcome" => outcome)
+        .record(started.elapsed());
     result?;
     Ok((StatusCode::CREATED, Json(json!({"status": "created"}))).into_response())
 }
@@ -553,12 +588,14 @@ async fn store_upload(
             break preamble;
         }
         let Some(chunk) = storage::next_chunk(&mut stream).await? else {
-            return Err(Error(
+            return Err(Error::new(
                 StatusCode::BAD_REQUEST,
                 "body ended before the preamble was complete".into(),
             ));
         };
-        head.extend_from_slice(&chunk.map_err(|e| Error(StatusCode::BAD_REQUEST, e.to_string()))?);
+        head.extend_from_slice(
+            &chunk.map_err(|e| Error::new(StatusCode::BAD_REQUEST, e.to_string()))?,
+        );
     };
 
     // Validated before a byte is stored: a refused preamble leaves no blob.
@@ -584,7 +621,7 @@ async fn store_upload(
         )
         .await;
     if let Some(reason) = nar.refused {
-        return Err(Error(StatusCode::BAD_REQUEST, reason));
+        return Err(Error::new(StatusCode::BAD_REQUEST, reason));
     }
     let (digest, file_size) = stored?;
 
@@ -613,7 +650,7 @@ fn take_preamble(buf: &mut Vec<u8>) -> Result<Option<Preamble>, Error> {
     }
     let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
     if len > MAX_PREAMBLE {
-        return Err(Error(
+        return Err(Error::new(
             StatusCode::BAD_REQUEST,
             "preamble length is implausible".into(),
         ));
@@ -622,7 +659,7 @@ fn take_preamble(buf: &mut Vec<u8>) -> Result<Option<Preamble>, Error> {
         return Ok(None);
     }
     let preamble: Preamble = serde_json::from_slice(&buf[4..4 + len])
-        .map_err(|e| Error(StatusCode::BAD_REQUEST, format!("bad preamble: {e}")))?;
+        .map_err(|e| Error::new(StatusCode::BAD_REQUEST, format!("bad preamble: {e}")))?;
     buf.drain(..4 + len);
     Ok(Some(preamble))
 }
@@ -641,7 +678,7 @@ fn build_object(
     store_dir: &str,
     subject: &Subject,
 ) -> Result<Object, Error> {
-    let bad = |message: String| Error(StatusCode::BAD_REQUEST, message);
+    let bad = |message: String| Error::new(StatusCode::BAD_REQUEST, message);
     let name = store_basename(&preamble.store_path, store_dir)
         .and_then(|base| base.strip_prefix(hash)?.strip_prefix('-'))
         .ok_or_else(|| {
@@ -1098,6 +1135,20 @@ mod tests {
         let log = String::from_utf8(log.0.lock().clone()).unwrap();
         assert!(log.contains("WARN") && log.contains("error_id="), "{log}");
         assert!(!log.contains("ERROR"), "{log}");
+    }
+
+    #[test]
+    fn failure_reason_classifies_the_chain() {
+        let body = anyhow::Error::new(storage::ClientBodyError("stalled".into()));
+        assert_eq!(failure_reason(&body), "client_body");
+        let over = anyhow::Error::new(storage::BodyOverLimit("too big".into()));
+        assert_eq!(failure_reason(&over), "refused");
+        let s3 = anyhow::anyhow!("boom").context("completing multipart upload for k");
+        assert_eq!(failure_reason(&s3), "storage");
+        assert_eq!(failure_reason(&anyhow::anyhow!("disk")), "internal");
+        // A context layer over a client error still classifies by the root.
+        let wrapped = body.context("storing");
+        assert_eq!(failure_reason(&wrapped), "client_body");
     }
 
     /// Auth wraps only the push routes: an unmatched path is a plain 404, and

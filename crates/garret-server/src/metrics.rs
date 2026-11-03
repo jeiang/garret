@@ -94,10 +94,11 @@ pub async fn track_http(request: Request, next: Next) -> Response {
         .unwrap_or_else(|| "unmatched".into());
     let method = method_label(request.method());
 
-    metrics::gauge!("garret_http_requests_in_flight").increment(1.0);
     let started = Instant::now();
-    let response = next.run(request).await;
-    metrics::gauge!("garret_http_requests_in_flight").decrement(1.0);
+    let response = {
+        let _in_flight = InFlight::enter();
+        next.run(request).await
+    };
 
     let status = status_class(response.status().as_u16());
     metrics::counter!(
@@ -111,6 +112,23 @@ pub async fn track_http(request: Request, next: Next) -> Response {
     )
     .record(started.elapsed());
     response
+}
+
+/// Counts a request in `garret_http_requests_in_flight` while it lives, so a
+/// handler future dropped mid-request (client disconnect) still gives it back.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> Self {
+        metrics::gauge!("garret_http_requests_in_flight").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        metrics::gauge!("garret_http_requests_in_flight").decrement(1.0);
+    }
 }
 
 /// Status *class*, not code — one series per class keeps cardinality bounded.
@@ -222,5 +240,33 @@ mod tests {
         let custom = Method::from_bytes(b"BREW").unwrap();
         assert_eq!(method_label(&custom), "OTHER");
         assert_eq!(method_label(&Method::PATCH), "OTHER");
+    }
+
+    /// A request future dropped mid-flight (client gone) leaves the gauge at 0.
+    #[tokio::test]
+    async fn dropped_request_gives_back_in_flight_count() {
+        use tower::ServiceExt;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let app = Router::new()
+            .route("/hang", get(std::future::pending::<&'static str>))
+            .layer(axum::middleware::from_fn(track_http));
+        let request = || {
+            axum::http::Request::get("/hang")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            app.clone().oneshot(request()),
+        )
+        .await;
+        assert!(timed_out.is_err());
+        assert!(
+            handle.render().contains("garret_http_requests_in_flight 0"),
+            "{}",
+            handle.render()
+        );
     }
 }
