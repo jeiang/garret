@@ -28,6 +28,9 @@ JWKS. There is no token-exchange service and no garret-issued token.
   missing the claim is refused (fail closed). Startup is refused when the
   GitHub issuer sets neither `github_owner_id` nor `repository_ids`, since
   any GitHub repository could then mint a token for the audience.
+  A refusal names the gate and the refused value in the log (for example
+  `repository_id "99" is not authorized`); the `iss` and `sub` are not
+  repeated, as GitHub's `sub` already carries the repository and ref.
   - `ref_patterns`: allowed `ref`s (trailing-`*` globs). Applies with or
     without `github_owner_id`.
   - `ref_protected`: the claim must be present and equal; `true` requires a

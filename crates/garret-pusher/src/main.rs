@@ -430,6 +430,7 @@ fn unauthorized(message: &str) -> Response {
 
 async fn missing_paths(
     State(state): State<Arc<AppState>>,
+    axum::Extension(subject): axum::Extension<Subject>,
     Json(hashes): Json<Vec<String>>,
 ) -> Result<Json<Vec<String>>, Error> {
     let batch = hashes.len();
@@ -437,6 +438,7 @@ async fn missing_paths(
         db::missing(conn, &hashes, garret_server::now())
     })
     .await?;
+    tracing::debug!(subject = %subject.0, batch, missing = missing.len(), "negotiation");
     metrics::histogram!("garret_negotiation_batch_size").record(batch as f64);
     if batch > 0 {
         metrics::histogram!("garret_negotiation_missing_ratio")

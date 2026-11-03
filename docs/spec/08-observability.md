@@ -81,6 +81,9 @@ Prefix `garret_`; service distinguished by scrape job.
   or `unknown` when the token names none: never the token's own `iss`)
   and `outcome` (`accepted`, `malformed`, `untrusted_issuer`,
   `unknown_key`, `jwks_unavailable`, `invalid`, `unauthorized`);
+  `garret_auth_unauthorized_total` by `issuer` and `claim` (the failed
+  gate: `owner`, `ref`, `ref_protected`, `repository_id`, `event_name`,
+  `job_workflow_ref`, `group`; claim values never become labels);
   `garret_jwks_refreshes_total` (fetch attempts) and
   `garret_jwks_refresh_failures_total` by `issuer`. A rise in
   `unknown_key` without matching refreshes is either an unknown-kid flood
@@ -132,3 +135,9 @@ watcher's failed list.
 A rejected token's reason is logged escaped and cut at 256 characters: it
 can carry attacker-controlled token text (the `kid`, header fields echoed
 by parse errors), which must not forge log lines or flood the journal.
+An `unauthorized` reason names the refused claim value (`ref "refs/heads/wip"
+is not authorized`) at the front, so the 256-character cut keeps it. The
+Pusher logs the refusal at warn. The Puller logs a rejected browse token at
+debug only, since that surface is public. The Pusher logs each Negotiation
+at debug with the subject, batch size and missing count, to attribute
+wasted negotiation to a token.

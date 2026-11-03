@@ -558,13 +558,26 @@ async fn require_browse_oidc(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    match token {
-        Some(token) if auth.authenticate(token).await.is_ok() => next.run(request).await,
+    let verdict = match token {
+        Some(token) => Some(auth.authenticate(token).await),
+        None => None,
+    };
+    match verdict {
+        Some(Ok(_)) => next.run(request).await,
         other => {
-            let reason = if other.is_none() {
-                "missing_bearer"
-            } else {
-                "token_rejected"
+            let reason = match other {
+                None => "missing_bearer",
+                Some(verdict) => {
+                    // Debug, not warn: browse is a public surface and any
+                    // client can flood this line.
+                    if let Err(e) = verdict {
+                        tracing::debug!(
+                            "rejected browse token: {}",
+                            garret_server::auth::loggable(&e)
+                        );
+                    }
+                    "token_rejected"
+                }
             };
             metrics::counter!("garret_browse_auth_failures_total", "reason" => reason).increment(1);
             (
