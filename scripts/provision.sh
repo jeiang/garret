@@ -96,7 +96,7 @@ secret_access_key = \"$key_secret\"
 # Leaves the public key in $pubkey and the secret at $root/signing.key.
 make_signing_key() {
   say "generating signing key"
-  nix key generate-secret --key-name garret-e2e-1 > "$root/signing.key"
+  (umask 077; nix key generate-secret --key-name garret-e2e-1 > "$root/signing.key")
   pubkey=$(nix key convert-secret-to-public < "$root/signing.key")
   echo "public key: $pubkey"
 }
