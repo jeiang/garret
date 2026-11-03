@@ -18,7 +18,7 @@ use tokio::net::UnixDatagram;
 
 use garret_common::hash_of_store_path;
 
-use crate::push::{PathInfo, Pusher, retain_missing};
+use crate::push::{PathInfo, Pusher, Refused, retain_missing};
 
 /// Paths per poll, drain chunk, and retry chunk: one `nix path-info` and one
 /// Negotiation each, so argv and request bodies stay bounded.
@@ -455,6 +455,12 @@ impl Watcher {
         let hashes = negotiation_hashes(&infos);
         let missing = match pusher.negotiate(&hashes).await {
             Ok(missing) => missing,
+            // The Pusher refuses this identity: requeueing would only repeat
+            // the refusal, so say it once and drop the batch.
+            Err(e) if e.is::<Refused>() => {
+                tracing::error!(paths = infos.len(), "{e:#}; dropping the batch");
+                return failed;
+            }
             Err(e) => {
                 tracing::warn!(paths = infos.len(), "negotiation failed: {e:#}");
                 failed.extend(infos.into_iter().map(|info| info.path));

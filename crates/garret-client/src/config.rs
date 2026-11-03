@@ -204,6 +204,10 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
     if let Ok(endpoint) = std::env::var("GARRET_ENDPOINT") {
         cfg.endpoint = endpoint;
     }
+    crate::discovery::check_url("endpoint", &cfg.endpoint)?;
+    if let Some(issuer) = &cfg.oidc.issuer {
+        crate::discovery::check_url("oidc.issuer", issuer)?;
+    }
     Ok(cfg)
 }
 

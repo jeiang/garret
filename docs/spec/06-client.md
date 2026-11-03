@@ -131,6 +131,12 @@ failure summary goes to stderr):
 Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), idempotent retries. No client metrics endpoint in v1.
 
+Every request carries `User-Agent: garret/<version>`. The configured Pusher
+URL (after any `GARRET_ENDPOINT` override), `oidc.issuer` and the OIDC
+`token_endpoint` and `device_authorization_endpoint` must follow the same
+https rule as discovery (plain `http` only to loopback); a config or issuer
+that breaks it is refused before any token is sent.
+
 **Retries** run on two schedules. A `429` is the server's queue, not a
 fault: the path waits out `Retry-After` (held between 1 s and 15 minutes,
 plus up to as much again in jitter) and tries again, for up to 15 minutes
@@ -193,7 +199,9 @@ its own `exp − iat` declares — for a five-minute GitHub runner token, spec
 mint, which rotating refresh tokens require. A 401 on the Negotiation or an
 upload renews the token once and retries straight away, for what aging
 cannot see (revocation, a token that declares no lifetime); a second 401 is a
-real refusal. `GARRET_TOKEN` is used as given and never renewed.
+real refusal: an upload fails at once, and the watcher logs the Negotiation's
+refusal once at error level and drops the batch instead of queueing its paths
+for another round. `GARRET_TOKEN` is used as given and never renewed.
 
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure

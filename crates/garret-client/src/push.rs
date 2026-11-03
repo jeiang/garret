@@ -415,6 +415,10 @@ impl Pusher {
         // `error_for_status` drops the body, which is where the server explains
         // itself — a bare "401 Unauthorized" says nothing a log can act on.
         let status = response.status();
+        if status == StatusCode::UNAUTHORIZED {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Refused(body.trim().to_owned()).into());
+        }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             bail!("negotiation rejected with {status}: {}", body.trim());
@@ -547,7 +551,11 @@ impl Pusher {
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            bail!("upload rejected with {status}: {}", body.trim());
+            return Err(Rejected {
+                status,
+                body: body.trim().to_owned(),
+            }
+            .into());
         }
 
         #[derive(Deserialize)]
@@ -720,6 +728,44 @@ impl std::fmt::Display for Unauthorized {
 
 impl std::error::Error for Unauthorized {}
 
+/// The Pusher refused an upload with a status other than 401 or 429. Typed so
+/// [`is_retryable`] reads the status instead of searching the message.
+#[derive(Debug)]
+struct Rejected {
+    status: StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "upload rejected with {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// The Negotiation got a 401 even after the token was renewed: the Pusher
+/// refuses this identity. Typed so the watcher logs it once and does not
+/// requeue the paths, which would only repeat the refusal.
+#[derive(Debug)]
+pub struct Refused(
+    /// The Pusher's explanation, as sent.
+    pub String,
+);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "negotiation rejected with {}: {}",
+            StatusCode::UNAUTHORIZED,
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// The server shed the upload (429) and said when to come back. Typed so
 /// [`Backoff`] waits out `Retry-After` instead of parsing the message.
 #[derive(Debug)]
@@ -889,7 +935,9 @@ fn shed_for(retry_after: Option<&str>) -> Duration {
 /// 5xx and dropped, timed-out or stalled connections are retryable; 4xx are
 /// the client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
 fn is_retryable(error: &anyhow::Error) -> bool {
-    error.to_string().contains(" 50")
+    error
+        .downcast_ref::<Rejected>()
+        .is_some_and(|r| r.status.is_server_error())
         || error.is::<Stalled>()
         || error
             .downcast_ref::<reqwest::Error>()
@@ -1031,7 +1079,11 @@ mod tests {
 
     fn rejected(status: u16) -> anyhow::Error {
         let status = StatusCode::from_u16(status).unwrap();
-        anyhow::anyhow!("upload rejected with {status}: nope")
+        Rejected {
+            status,
+            body: "nope".into(),
+        }
+        .into()
     }
 
     /// Six CI legs against sixteen upload slots is the normal load: a path
@@ -1141,6 +1193,17 @@ mod tests {
             references_first(vec![node("a", &["b"]), node("b", &["a"])]).len(),
             2
         );
+    }
+
+    #[test]
+    fn only_a_server_status_is_retryable_never_a_body_that_looks_like_one() {
+        let body_with_50 = Rejected {
+            status: StatusCode::BAD_REQUEST,
+            body: "bad nar 500 bytes".into(),
+        };
+        assert!(!is_retryable(&body_with_50.into()));
+        assert!(is_retryable(&rejected(503)));
+        assert!(!is_retryable(&Refused("no".into()).into()));
     }
 
     #[test]

@@ -143,9 +143,17 @@ in
       serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${issuer}";
     };
 
+    # The client accepts plain http only to loopback, so the watcher reaches
+    # the Pusher through a local forward rather than by the `cache` hostname.
+    systemd.services.garret-test-forward = {
+      wantedBy = [ "multi-user.target" ];
+      before = [ "garret-watcher.service" ];
+      serviceConfig.ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8080,bind=127.0.0.1,fork,reuseaddr TCP:cache:8080";
+    };
+
     services.garret.watcher = {
       enable = true;
-      endpoint = "http://cache:8080";
+      endpoint = "http://127.0.0.1:8080";
       oidc = {
         issuer = issuerUrl;
         clientId = "builder";
