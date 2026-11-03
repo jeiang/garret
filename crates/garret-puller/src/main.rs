@@ -249,6 +249,7 @@ async fn main() -> Result<()> {
         .nth(1)
         .context("usage: garret-puller <config.toml>")?;
     let cfg: PullerConfig = garret_server::config::load(&path)?;
+    cfg.validate()?;
 
     let state = Arc::new(AppState {
         conn: OnceLock::new(),

@@ -160,29 +160,29 @@ in
     };
 
     quotaBytes = mkOption {
-      type = types.nullOr types.int;
+      type = types.nullOr types.ints.positive;
       default = null;
       description = "Storage budget. Null means no quota and no eviction.";
     };
 
     watermarks = {
-      high = mkOption { type = types.float; default = 0.95; description = "Eviction starts here."; };
-      low = mkOption { type = types.float; default = 0.85; description = "And runs until here."; };
+      high = mkOption { type = types.numbers.between 0.0 1.0; default = 0.95; description = "Eviction starts here."; };
+      low = mkOption { type = types.numbers.between 0.0 1.0; default = 0.85; description = "And runs until here."; };
     };
 
-    gcIntervalSeconds = mkOption { type = types.int; default = 300; description = "Seconds between GC ticks."; };
+    gcIntervalSeconds = mkOption { type = types.ints.positive; default = 300; description = "Seconds between GC ticks."; };
 
     orphanGraceSeconds = mkOption {
-      type = types.int;
+      type = types.ints.positive;
       default = 86400;
       description = "How long an unreferenced Blob is kept before GC may delete it. Applies only when quotaBytes is set: GC, including the orphan sweep, runs only with a quota.";
     };
 
     limits = {
-      maxConcurrentUploads = mkOption { type = types.int; default = 16; description = "Past this, uploads are shed with 429."; };
-      maxInFlightBytes = mkOption { type = types.int; default = 268435456; description = "Cap on buffered upload bytes."; };
-      partSize = mkOption { type = types.int; default = 16777216; description = "Multipart part size; also the single-PutObject threshold."; };
-      maxPartsInFlight = mkOption { type = types.int; default = 4; description = "Concurrent parts per upload."; };
+      maxConcurrentUploads = mkOption { type = types.ints.positive; default = 16; description = "Past this, uploads are shed with 429."; };
+      maxInFlightBytes = mkOption { type = types.ints.positive; default = 268435456; description = "Cap on buffered upload bytes."; };
+      partSize = mkOption { type = types.ints.positive; default = 16777216; description = "Multipart part size; also the single-PutObject threshold."; };
+      maxPartsInFlight = mkOption { type = types.ints.positive; default = 4; description = "Concurrent parts per upload."; };
       bodyIdleTimeoutSeconds = mkOption { type = types.ints.positive; default = 60; description = "Seconds an upload body may send nothing before it is abandoned."; };
     };
 

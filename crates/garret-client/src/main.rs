@@ -653,11 +653,13 @@ fn pusher(
     http: &reqwest::Client,
     jobs: Option<usize>,
 ) -> Result<push::Pusher> {
+    let jobs = jobs.unwrap_or(cfg.jobs);
+    anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
     Ok(push::Pusher {
         tokens: auth::TokenSource::for_config(http, cfg)?,
         http: http.clone(),
         endpoint: cfg.endpoint.clone(),
-        jobs: jobs.unwrap_or(cfg.jobs),
+        jobs,
         zstd_level: cfg.zstd_level,
         max_retries: cfg.max_retries,
         upload_idle: std::time::Duration::from_secs(cfg.upload_idle_secs),

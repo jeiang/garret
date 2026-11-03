@@ -295,6 +295,11 @@ impl PusherConfig {
             );
         }
         if let Some(gc) = &self.gc {
+            // A zero quota puts every Blob over the high watermark, so GC would
+            // evict the whole cache.
+            if gc.quota_bytes == 0 {
+                bail!("gc.quota_bytes must be at least 1 (omit [gc] to disable the quota)");
+            }
             if gc.interval_secs == 0 {
                 bail!("gc.interval_secs must be at least 1");
             }
@@ -362,6 +367,34 @@ pub struct PullerConfig {
     /// miss (ticket 25). Measured p99 is ~2.4 ms. Default 250.
     #[serde(default = "presign_budget")]
     pub presign_budget_ms: u64,
+}
+
+impl PullerConfig {
+    /// Rejects values that would break every pull (a zero or over-long presign
+    /// lifetime, a zero budget that degrades every request to a miss) naming
+    /// the key, at startup.
+    pub fn validate(&self) -> Result<()> {
+        // 7 days is the SigV4 presigned-URL maximum.
+        if !(1..=604_800).contains(&self.presign_ttl_secs) {
+            bail!(
+                "presign_ttl_secs must be between 1 and 604800, got {}",
+                self.presign_ttl_secs
+            );
+        }
+        if self.db_read_budget_ms == 0 {
+            bail!("db_read_budget_ms must be at least 1");
+        }
+        if self.presign_budget_ms == 0 {
+            bail!("presign_budget_ms must be at least 1");
+        }
+        if self.bump_debounce_secs < 0 {
+            bail!("bump_debounce_secs must not be negative");
+        }
+        if self.db_wait_timeout_secs == 0 {
+            bail!("db_wait_timeout_secs must be at least 1");
+        }
+        Ok(())
+    }
 }
 
 fn db_wait_timeout() -> u64 {
@@ -468,6 +501,7 @@ mod validate_tests {
             "max_concurrent_uploads",
         );
         rejects(|c| c.limits.max_parts_in_flight = 0, "max_parts_in_flight");
+        rejects(|c| c.gc.as_mut().unwrap().quota_bytes = 0, "quota_bytes");
         rejects(
             |c| c.limits.body_idle_timeout_secs = 0,
             "body_idle_timeout_secs",
@@ -562,5 +596,43 @@ mod strictness_tests {
             toml::from_str::<PusherConfig>(&misplaced).is_err(),
             "a root key inside [limits] must not be silently swallowed"
         );
+    }
+}
+
+#[cfg(test)]
+mod puller_validate_tests {
+    use super::*;
+
+    fn cfg() -> PullerConfig {
+        toml::from_str(
+            r#"
+            db_path = "/tmp/x.db"
+            [s3]
+            bucket = "b"
+        "#,
+        )
+        .unwrap()
+    }
+
+    fn rejects(edit: impl FnOnce(&mut PullerConfig), key: &str) {
+        let mut c = cfg();
+        edit(&mut c);
+        let e = c.validate().unwrap_err();
+        assert!(format!("{e:#}").contains(key), "{e:#}");
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        cfg().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_bad_values() {
+        rejects(|c| c.presign_ttl_secs = 0, "presign_ttl_secs");
+        rejects(|c| c.presign_ttl_secs = 604_801, "presign_ttl_secs");
+        rejects(|c| c.db_read_budget_ms = 0, "db_read_budget_ms");
+        rejects(|c| c.presign_budget_ms = 0, "presign_budget_ms");
+        rejects(|c| c.bump_debounce_secs = -1, "bump_debounce_secs");
+        rejects(|c| c.db_wait_timeout_secs = 0, "db_wait_timeout_secs");
     }
 }

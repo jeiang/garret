@@ -130,6 +130,16 @@ Module options (all under `services.garret.*`; defaults in parentheses):
   `dbWaitTimeoutSeconds` (300), `dbReadBudgetMs` / `presignBudgetMs`
   (pull-path degrade-to-miss budgets, spec 03; 250 ms), `browseOidc.{issuer,
   audience, jwks_url, allowed_groups}` (null: no browse API).
+- Option types reject the values the binaries reject, at evaluation time:
+  the Pusher quota, intervals and `limits.*` are positive integers,
+  watermarks lie in 0 to 1, `presignTtlSeconds` is 1 to 604800 (the SigV4
+  maximum), the Puller budgets and `dbWaitTimeoutSeconds` are positive,
+  `bumpDebounceSeconds` is not negative, and the watcher `jobs`,
+  `pollIntervalSeconds` and `maxAttempts` are positive. The binaries check
+  the same ranges at startup for hand-written configs (`quota_bytes = 0`
+  would evict the whole cache). The Puller never calls S3, so its
+  `s3.operationTimeoutSeconds` has no effect and stays only for
+  compatibility.
 - **watcher** (client machines): `enable`, `package`, `endpoint`,
   `oidc.{issuer, clientId, audience, clientSecretFile}`, `nixDb`,
   `cursorPath`, `pollIntervalSeconds` (30), `jobs` (8), `zstdLevel` (3),

@@ -63,11 +63,11 @@ in
 
     nixDb = mkOption { type = types.str; default = "/nix/var/nix/db/db.sqlite"; description = "The local nix database."; };
     cursorPath = mkOption { type = types.str; default = "/var/lib/garret/watcher-cursor"; description = "Persisted ValidPaths.id cursor."; };
-    pollIntervalSeconds = mkOption { type = types.int; default = 30; description = "Seconds between polls of the nix database."; };
-    jobs = mkOption { type = types.int; default = 8; description = "Concurrent uploads."; };
+    pollIntervalSeconds = mkOption { type = types.ints.positive; default = 30; description = "Seconds between polls of the nix database."; };
+    jobs = mkOption { type = types.ints.positive; default = 8; description = "Concurrent uploads."; };
     zstdLevel = mkOption { type = types.int; default = 3; description = "Client-side zstd level."; };
     maxRetries = mkOption { type = types.int; default = 5; description = "Upload attempts per path beyond the first, for 5xx answers and dropped connections."; };
-    maxAttempts = mkOption { type = types.int; default = 5; description = "Push attempts per path in one watcher process before it leaves the path on the failed list for a restart or drain."; };
+    maxAttempts = mkOption { type = types.ints.positive; default = 5; description = "Push attempts per path in one watcher process before it leaves the path on the failed list for a restart or drain."; };
 
     socketPath = mkOption {
       type = types.str;

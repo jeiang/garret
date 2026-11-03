@@ -50,7 +50,7 @@ pub struct Config {
 }
 
 /// Store watcher settings; only the daemon reads these.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Watch {
     /// The Nix database the watcher polls for newly validated paths.
@@ -79,6 +79,13 @@ pub struct Watch {
     /// after `poll_interval_secs`.
     #[serde(default = "socket_path")]
     pub socket_path: String,
+}
+
+/// An absent `[watch]` table must equal an empty one, not zeroed fields.
+impl Default for Watch {
+    fn default() -> Self {
+        toml::from_str("").expect("every Watch field has a serde default")
+    }
 }
 
 fn nix_db() -> String {
@@ -193,10 +200,28 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         cfg.upload_idle_secs > 0,
         "upload_idle_secs must be at least 1"
     );
+    cfg.validate()?;
     if let Ok(endpoint) = std::env::var("GARRET_ENDPOINT") {
         cfg.endpoint = endpoint;
     }
     Ok(cfg)
+}
+
+impl Config {
+    /// Rejects zero values that would deadlock the uploader or spin the
+    /// watcher, naming the key.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.jobs >= 1, "jobs must be at least 1");
+        anyhow::ensure!(
+            self.watch.poll_interval_secs >= 1,
+            "watch.poll_interval_secs must be at least 1"
+        );
+        anyhow::ensure!(
+            self.watch.max_attempts >= 1,
+            "watch.max_attempts must be at least 1"
+        );
+        Ok(())
+    }
 }
 
 /// TOML-quotes a string. Base64 signing keys carry `+/=` and issuer URLs carry
@@ -288,6 +313,28 @@ mod tests {
                 audience: "garret".into(),
                 client_id: Some("garret-cli".into()),
             }),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_values() {
+        let base = render("https://push.example", &discovery()).unwrap();
+        let ok: Config = toml::from_str(&base).unwrap();
+        ok.validate().unwrap();
+        for (edit, key) in [
+            ("jobs = 0\n", "jobs"),
+            ("[watch]\npoll_interval_secs = 0\n", "poll_interval_secs"),
+            ("[watch]\nmax_attempts = 0\n", "max_attempts"),
+        ] {
+            // Top-level keys must precede the first table.
+            let text = if edit.starts_with('[') {
+                format!("{base}\n{edit}")
+            } else {
+                format!("{edit}{base}")
+            };
+            let c: Config = toml::from_str(&text).unwrap();
+            let e = c.validate().unwrap_err();
+            assert!(format!("{e:#}").contains(key), "{e:#}");
         }
     }
 
