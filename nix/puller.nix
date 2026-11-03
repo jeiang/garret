@@ -35,7 +35,7 @@ let
     };
   } // lib.optionalAttrs (cfg.browseOidc != null) { browse_oidc = cfg.browseOidc; };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" (stripNulls settings);
+  configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
 in
 {
   options.services.garret.puller = {
@@ -45,6 +45,15 @@ in
       type = types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.garret-puller;
       description = "The garret-puller package to run.";
+    };
+
+    extraSettings = mkOption {
+      type = (pkgs.formats.toml { }).type;
+      default = { };
+      description = ''
+        Raw TOML settings merged over the generated config (recursively), for
+        keys that have no typed option here.
+      '';
     };
 
     listen = mkOption { type = types.str; default = "127.0.0.1:8081"; description = "Public substituter listener. Front it with TLS."; };

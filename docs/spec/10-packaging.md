@@ -130,6 +130,11 @@ Module options (all under `services.garret.*`; defaults in parentheses):
   `dbWaitTimeoutSeconds` (300), `dbReadBudgetMs` / `presignBudgetMs`
   (pull-path degrade-to-miss budgets, spec 03; 250 ms), `browseOidc.{issuer,
   audience, jwks_url, allowed_groups}` (null: no browse API).
+- Every module also has `extraSettings` (`{}`): raw TOML merged recursively
+  over the generated config, for keys without a typed option (for example
+  `browse_oidc.extra_audiences` and `browse_oidc.client_id` on the Puller).
+  The watcher adds `oidc.resource` (null: not sent). Enabling the pusher puts
+  `garret-admin` on the system PATH.
 - Option types reject the values the binaries reject, at evaluation time:
   the Pusher quota, intervals and `limits.*` are positive integers,
   watermarks lie in 0 to 1, `presignTtlSeconds` is 1 to 604800 (the SigV4

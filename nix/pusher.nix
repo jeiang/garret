@@ -5,8 +5,8 @@ let
   cfg = config.services.garret.pusher;
   inherit (lib) mkEnableOption mkOption mkIf types;
 
-  # Secrets stay out of the store: the unit renders the config at start-up,
-  # substituting AWS credentials from an EnvironmentFile (agenix/sops-friendly).
+  # The config is generated at build time and holds no secrets: only the AWS
+  # credentials come from an EnvironmentFile (agenix/sops-friendly).
   #
   # `pkgs.formats.toml` has no representation for null, and every nullable
   # option here (`s3.region`, `s3.endpointUrl`, and each issuer's
@@ -55,7 +55,7 @@ let
     };
   };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-pusher.toml" (stripNulls settings);
+  configFile = (pkgs.formats.toml { }).generate "garret-pusher.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
 
   # The Puller runs as its own user in group `garret` (ADR-0009) and must
   # write the database: last-accessed bumps, and every WAL reader writes the
@@ -82,6 +82,15 @@ in
       type = types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.garret-pusher;
       description = "The garret-pusher package to run.";
+    };
+
+    extraSettings = mkOption {
+      type = (pkgs.formats.toml { }).type;
+      default = { };
+      description = ''
+        Raw TOML settings merged over the generated config (recursively), for
+        keys that have no typed option here.
+      '';
     };
 
     listen = mkOption {
@@ -231,6 +240,8 @@ in
   };
 
   config = mkIf cfg.enable {
+    environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.garret-admin ];
+
     assertions = [{
       assertion = cfg.oidc != [ ];
       message = "services.garret.pusher.oidc must list at least one issuer.";

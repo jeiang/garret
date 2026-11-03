@@ -6,6 +6,15 @@ let
   cfg = config.services.garret.watcher;
   inherit (lib) mkEnableOption mkOption mkIf types;
 
+  # `pkgs.formats.toml` cannot represent null: unset nullable options are
+  # dropped (serde defaults them on the Rust side).
+  stripNulls = value:
+    if lib.isAttrs value
+    then lib.mapAttrs (_: stripNulls) (lib.filterAttrs (_: v: v != null) value)
+    else if lib.isList value
+    then map stripNulls value
+    else value;
+
   settings = {
     endpoint = cfg.endpoint;
     jobs = cfg.jobs;
@@ -15,6 +24,7 @@ let
       inherit (cfg.oidc) issuer audience;
       client_id = cfg.oidc.clientId;
       client_secret_file = cfg.oidc.clientSecretFile;
+      inherit (cfg.oidc) resource;
     };
     watch = {
       max_attempts = cfg.maxAttempts;
@@ -27,7 +37,7 @@ let
     };
   };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-watcher.toml" settings;
+  configFile = (pkgs.formats.toml { }).generate "garret-watcher.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
 
   # `post-build-hook` runs a bare program with no arguments (paths arrive in
   # $OUT_PATHS), hence the wrapper. `enqueue` exits 0 unconditionally, so this
@@ -46,6 +56,15 @@ in
       description = "The garret client package to run.";
     };
 
+    extraSettings = mkOption {
+      type = (pkgs.formats.toml { }).type;
+      default = { };
+      description = ''
+        Raw TOML settings merged over the generated config (recursively), for
+        keys that have no typed option here.
+      '';
+    };
+
     endpoint = mkOption { type = types.str; description = "Pusher base URL."; };
 
     oidc = {
@@ -59,6 +78,11 @@ in
         '';
       };
       audience = mkOption { type = types.str; description = "Audience identifying garret."; };
+      resource = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "RFC 8707 resource indicator sent with token requests. Null: not sent.";
+      };
     };
 
     nixDb = mkOption { type = types.str; default = "/nix/var/nix/db/db.sqlite"; description = "The local nix database."; };
