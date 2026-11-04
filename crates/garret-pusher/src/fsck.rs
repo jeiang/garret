@@ -87,9 +87,10 @@ pub async fn run(
     })
 }
 
-/// Splits DB rows into dangling (no blob, past both guards) and
-/// size-mismatched (blob exists, sizes disagree — `verify_sizes` only). A
-/// hash with a size mismatch is never also reported dangling.
+/// Splits DB rows into dangling (no blob) and size-mismatched (blob exists,
+/// sizes disagree — `verify_sizes` only), each only past both guards (not
+/// in flight, older than the grace). A hash with a size mismatch is never
+/// also reported dangling.
 fn classify_rows(
     db_rows: &[(String, String, i64, i64)],
     blobs: &[(String, Duration, i64)],
@@ -106,11 +107,14 @@ fn classify_rows(
     let mut dangling = Vec::new();
     let mut size_mismatches = Vec::new();
     for (hash, name, created_at, file_size) in db_rows {
+        // Both findings get both guards: a row in flight or younger than the
+        // grace may be an upload overwriting an orphan blob of another size
+        // since the S3 listing, not drift.
+        if in_flight.contains(hash) || now - created_at < grace.as_secs() as i64 {
+            continue;
+        }
         match s3_sizes.get(hash.as_str()) {
             None => {
-                if in_flight.contains(hash) || now - created_at < grace.as_secs() as i64 {
-                    continue;
-                }
                 dangling.push(FsckRow {
                     store_path_hash: hash.clone(),
                     name: name.clone(),
@@ -280,6 +284,28 @@ mod tests {
                 db_size: 5,
                 s3_size: 9,
             }]
+        );
+    }
+
+    /// An upload that overwrote an orphan blob of another size since the S3
+    /// listing (review of #72): its fresh row would read as a mismatch and
+    /// `--repair` would delete it, so the guards apply here too.
+    #[test]
+    fn a_young_or_in_flight_row_is_not_reported_as_a_size_mismatch() {
+        let blobs = vec![blob("a", 90000, 9)];
+        let young = vec![row("a", "thing", NOW - 10, 5)];
+        let (_, mismatches) = classify_rows(&young, &blobs, &InFlight::new(), GRACE, NOW, true);
+        assert!(mismatches.is_empty(), "young row reported as a mismatch");
+
+        let old = vec![row("a", "thing", NOW - 2 * 86400, 5)];
+        let in_flight = InFlight::new();
+        let _claim = in_flight
+            .claim("a", garret_server::inflight::Kind::Upload)
+            .unwrap();
+        let (_, mismatches) = classify_rows(&old, &blobs, &in_flight, GRACE, NOW, true);
+        assert!(
+            mismatches.is_empty(),
+            "in-flight row reported as a mismatch"
         );
     }
 
