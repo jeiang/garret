@@ -35,3 +35,24 @@ Speed **low-med** (tail only; medians are already ~0.5 ms) · Ops **low**
 today's load). Revisit if real pull concurrency ever makes the p99
 approach the budget, or if the degraded counter shows budget trips under
 healthy disks.
+
+## Measured (2026-11): built, A/B tested, not adopted
+
+A pool of one read-only connection per CPU (try-lock round robin, the
+ticket-25 budgets unchanged) against the single `Mutex<Connection>`.
+4-vCPU Xeon container, bench client on the same box, corpus seeded once,
+Puller binary swapped between runs, 3 interleaved rounds, 30 000 requests
+per step, keep-alive on (narinfo p99, mean of 3 rounds):
+
+| Concurrency | Single connection | Pool of 4 |
+|---|---|---|
+| 20 | 14.7k req/s, p99 3.95 ms | 14.9k req/s, p99 3.00 ms |
+| 100 | 17.7k req/s, p99 12.2 ms | 17.3k req/s, p99 12.2 ms |
+| 300 | 18.0k req/s, p99 34.9 ms | 16.6k req/s, p99 43.0 ms |
+
+Keep-alive off was within noise at every step. The pool lowers the tail
+at light load and raises it under overload, where four blocking threads
+compete with the Tokio workers for the same CPUs. Throughput is flat:
+the box is CPU-bound, not lock-bound. Neither design wins across the
+range, so the single connection stays. Revisit on a host with more
+cores than the request path can use.
