@@ -651,6 +651,9 @@ async fn store_upload(
             verify::max_compressed_len(object.nar_size),
         )
         .await;
+    if let Some(reason) = nar.failed {
+        return Err(anyhow::anyhow!(reason).into());
+    }
     if let Some(reason) = nar.refused {
         return Err(Error::new(StatusCode::BAD_REQUEST, reason));
     }

@@ -179,6 +179,9 @@ pub struct VerifiedNar<S> {
     finished: bool,
     /// Why the NAR was refused, once it has been: the caller's 400.
     pub refused: Option<String>,
+    /// The check itself failed (its thread panicked or was dropped): a
+    /// server fault, so the caller's 500 and a push it may retry.
+    pub failed: Option<String>,
 }
 
 impl<S> VerifiedNar<S> {
@@ -230,6 +233,7 @@ impl<S> VerifiedNar<S> {
             pending: None,
             finished: false,
             refused: None,
+            failed: None,
         })
     }
 
@@ -246,14 +250,16 @@ impl<S> VerifiedNar<S> {
             unreachable!("only an offloaded check has a verdict to wait for");
         };
         *tx = None;
-        let verdict = ready!(verdict.poll_unpin(cx))
-            .unwrap_or_else(|_| Err("NAR check thread failed".into()));
+        let verdict = ready!(verdict.poll_unpin(cx));
+        self.finished = true;
         match verdict {
-            Ok(()) => {
-                self.finished = true;
-                Poll::Ready(None)
+            Ok(Ok(())) => Poll::Ready(None),
+            Ok(Err(reason)) => self.refuse(reason),
+            Err(_) => {
+                let reason = "NAR check thread failed".to_owned();
+                self.failed = Some(reason.clone());
+                Poll::Ready(Some(Err(anyhow!(reason))))
             }
-            Err(reason) => self.refuse(reason),
         }
     }
 }
@@ -459,5 +465,34 @@ mod tests {
         std::io::Write::write_all(&mut encoder, &nar).unwrap();
         let wide = encoder.finish().unwrap();
         assert_refused(run(&wide, &hash, size).await.1, "not a valid zstd stream");
+    }
+
+    /// A check thread that dies (panic, runtime shutdown) is the server's
+    /// fault: the push must fail with a 500 the client retries, not a 400
+    /// it treats as final.
+    #[tokio::test]
+    async fn a_failed_check_thread_is_a_server_fault_not_a_refusal() {
+        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        let (verdict_tx, verdict) = oneshot::channel();
+        drop((rx, verdict_tx));
+        let chunks = vec![Ok::<_, std::io::Error>(Bytes::from_static(b"nar"))];
+        let mut nar = VerifiedNar {
+            inner: futures::stream::iter(chunks),
+            engine: Engine::Offload {
+                tx: Some(PollSender::new(tx)),
+                verdict,
+            },
+            pending: None,
+            finished: false,
+            refused: None,
+            failed: None,
+        };
+        assert!(nar.next().await.unwrap().is_err());
+        assert_eq!(nar.refused, None);
+        assert!(nar.failed.is_some());
+        assert!(
+            nar.next().await.is_none(),
+            "the stream ends after the failure"
+        );
     }
 }
