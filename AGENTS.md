@@ -16,8 +16,6 @@ the `garret` CLI, over SQLite + S3. Rust workspace under `crates/`.
   `benchmarks/baseline.json`; `just microbench` for the criterion benches
 - `just kani` / `just tla` — Kani proofs (preamble framing, upload budget) and the TLC
   model check of the push/GC protocol ([verification/tla](verification/tla/README.md))
-- `just kani` / `just tla` — Kani proofs (preamble framing, upload budget) and the TLC
-  model check of the push/GC protocol ([verification/tla](verification/tla/README.md))
 
 ## Rules
 
