@@ -19,7 +19,7 @@ just tla
 which is
 
 ```
-cd verification/tla && nix shell nixpkgs#tlaplus --command tlc -workers auto -metadir "$(mktemp -d)" -config main.cfg GarretPush.tla
+cd verification/tla && nix develop --command bash -c 'tlc -workers auto -metadir "$(mktemp -d)" -config main.cfg GarretPush.tla'
 ```
 
 Other runs (same directory, same command with another `-config`):
@@ -27,10 +27,11 @@ Other runs (same directory, same command with another `-config`):
 | Config | Purpose | Expected |
 |---|---|---|
 | `main.cfg` | All invariants, deadlock check, real protocol | pass |
-| `deep.cfg` | Same, `Budget = 5` | pass (about 14 min) |
+| `deep.cfg` | Same, `Budget = 5` | pass (about 12 min) |
 | `liveness.cfg` (add `-deadlock`) | `OrphanTransient` under fairness | pass |
 | `fsck.cfg` | Real protocol plus S3 drift and fsck repairs, `Budget = 5` | pass (about 2 min) |
 | `fsck_race.cfg` | Same, fsck before the fix (`FsckRecheck = FALSE`) | `FsckSafe` fails (finding 1) |
+| `redirect_window.cfg` | `RedirectWindow`: a redirect whose row was deleted since still finds the blob | fails (finding 2, the window exists) |
 | `mutant_no_delete_claims.cfg` | Deleters take no Delete claim | `RowImpliesBlob` fails |
 | `mutant_no_evict_recheck.cfg` | `evict_object` trusts the candidate snapshot | `EvictionSafe` fails |
 | `mutant_no_sweep_recheck.cfg` | Sweep does not re-check for a row | `RowImpliesBlob` fails |
@@ -105,6 +106,15 @@ map: none, Upload, Delete), `recent` (`pushed_at` inside the push grace),
 - Process crashes (the in-memory claim map is lost) are not modeled
   beyond the failure branches above: after a restart nothing is in
   flight, and the sweep and fsck handle the leftovers.
+- Push order (a modeling assumption, not a system property): an upload
+  starts only once its references are rows. The client does not promise
+  this (with `jobs > 1` a referrer can finish before its references, and a
+  failed reference does not hold back its referrers; `push.rs`), and
+  `insert_object` does not check it. `ClosureIntact` therefore holds only
+  for pushes in dependency order.
+- fsck's `--verify-sizes` branch is not modeled: blobs have no sizes here,
+  so `FsRows` never finds a size mismatch. That branch's guards (in flight,
+  younger than the grace) are covered by the unit tests in `fsck.rs`.
 - Bounds: `Budget` limits how many activities start (`Done` is the
   terminal state, which makes TLC's deadlock check meaningful),
   `MaxFaults` limits injected failures.
@@ -117,16 +127,15 @@ spec; the model's name is first.
 | Name | Statement | Source |
 |---|---|---|
 | `RowImpliesBlob` | every row has its blob, in every state | spec 02 "Invariant: row exists => blob exists" |
-| `ReadWindow` | a Puller read that saw a row and whose row was not deleted since finds the blob | spec 03/05 read path |
 | `BlobSurvivesClaim` | while an upload holds the claim after its put, the blob exists and the claim is still its own; at commit the row exists | spec 05 "Deletion claims" |
 | `ClaimExclusive` | at most one upload per hash is past the claim | `inflight.rs` "one claim per path" |
 | `QuotaCounter` | `total_bytes` equals `SUM(file_size)` after every step (every step is a committed transaction) | spec 02, 05 "Trigger and accounting" |
 | `EvictionSafe` | GC never deletes a row that has a surviving referrer (self-edges aside), a live pin or a push inside the grace | spec 05 Eviction, glossary |
 | `PruneSafe` | prune never deletes a recent row, a live pin, or anything a surviving row references | spec 05 Prune |
-| `ClosureIntact` | every reference of a surviving row that is not a row was removed by an explicit operator `delete` (unconditional by design) | glossary Eviction, "closure stays complete" |
-| `GcCountdown` | a pass never evicts at or below the low watermark (and starts only above the high one) | spec 05 Trigger |
+| `ClosureIntact` | every reference of a surviving row that is not a row was removed by an explicit operator `delete` (unconditional by design). Holds only under the modeling assumption that a referrer is pushed after its references are rows (see "What is abstracted away") | glossary Eviction, "closure stays complete" |
+| `GcCountdown` | a pass never evicts at or below the low watermark (and starts only at or above the high one, as `gc.rs` `tick` does) | spec 05 Trigger |
 | `FsckSafe` | fsck repair deletes a row only while its blob is missing | spec 05 fsck |
-| `OrphanTransient` (liveness, `liveness.cfg`) | a blob with no row and no claim is eventually deleted or adopted | spec 05 Orphan sweep |
+| `OrphanTransient` (liveness, `liveness.cfg`) | a blob with no row and no claim is eventually deleted or adopted by a row (`Orphan(h) ~> (h \notin blobs \/ h \in rows)`; being claimed is not enough) | spec 05 Orphan sweep |
 | deadlock | no state with an unfinished activity and nothing enabled | TLC default check |
 
 `TypeOK` and `DelClaimsHeld` check the model itself.
@@ -143,20 +152,22 @@ fsck; `Sizes = {1, 2}`, `High = 1`, `Low = 0`, `Budget = 4`,
 
 ```
 Model checking completed. No error has been found.
-8140458 states generated, 1667703 distinct states found, 0 states left on queue.
+9842399 states generated, 2031386 distinct states found, 0 states left on queue.
 The depth of the complete state graph search is 38.
-Finished in 01min 04s
+Finished in 48s
 ```
 
 All invariants above, plus the deadlock check, pass.
 
-`deep.cfg` (`Budget = 5`): no error, 104,307,805 states generated,
-18,389,648 distinct, depth 44, 14 min 23 s.
+`deep.cfg` (`Budget = 5`): no error, 133,417,223 states generated,
+23,488,699 distinct, depth 44, 11 min 54 s.
 
 `liveness.cfg` (`-deadlock`, one uploader, `Sizes = {1}`, `Budget = 4`,
 periodic sweep, weak fairness on started work, ageing and the sweep, no
-symmetry): `OrphanTransient` holds; 3,860,840 states generated, 733,608
-distinct.
+symmetry): `OrphanTransient` holds; 6,804,190 states generated, 1,291,338
+distinct, depth 38. With the sweep's blob delete made a no-op (a scratch
+mutant), TLC reports the property violated, so it checks deletion and not
+only the claim.
 
 Mutants (each fails as expected, shortest trace by TLC):
 
@@ -185,9 +196,9 @@ the listing is skipped (regression test
 `a_row_pushed_again_since_the_listing_is_not_repaired`). The model's
 `FsckRecheck` constant is that check. `Budget = 5` is the smallest budget
 at which the old code fails (`fsck_race.cfg`, 23 s); at that budget the
-fixed model passes (`fsck.cfg`: 19,445,988 states generated, 3,711,127
-distinct, depth 44, 1 min 44 s), and also at `Budget = 6` (140,848,138
-generated, 23,650,115 distinct, depth 51, 10 min 43 s). The counterexample
+fixed model passes (`fsck.cfg`: 24,928,665 states generated, 4,742,194
+distinct, depth 44, 1 min 27 s), and also at `Budget = 6` (180,924,482
+generated, 30,127,737 distinct, depth 46, 9 min 28 s). The counterexample
 below is the old code's.
 
 Before the fix, in the code: `repair_rows` in `crates/garret-pusher/src/fsck.rs`
@@ -219,13 +230,14 @@ correct, and a Negotiation after the repair reports h missing, so the next
 push restores it. The window needed fsck to run at the same time as a delete and a re-push,
 so it is narrow.
 
-### 2. A Puller redirect can outlive the blob (`ReadWindow`)
+### 2. A Puller redirect can outlive the blob (`redirect_window.cfg`)
 
 Not a violation of the stated invariant, and not acknowledged by the
 specs: the Puller checks that the row exists and then presigns a URL
 (default TTL 1 h). If GC, `delete` or prune removes the row and blob
-after the check, the client's fetch from S3 returns 404. The model keeps
-`ReadWindow` exact: no blob is missing for a reader whose row survives.
+after the check, the client's fetch from S3 returns 404.
+`redirect_window.cfg` shows it: `RedirectWindow` fails in 11 steps. A
+reader whose row survives always finds the blob (`RowImpliesBlob`).
 Nix treats the miss as a cache miss (spec 03, "degrade to a miss").
 Also, `last_accessed_at` is bumped only when 24 h stale, so a path read a
 minute ago can still be the least recently accessed.

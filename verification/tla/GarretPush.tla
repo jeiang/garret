@@ -131,6 +131,11 @@ Init ==
 
 \* A client negotiates the dependencies `rs` (each present, so Negotiation
 \* refreshes pushed_at) and starts uploading h whose references are `rs`.
+\* Modeling assumption, not a system property: a referrer is pushed only
+\* after its references are rows. The client does not guarantee it (with
+\* jobs > 1 a referrer can land first, and a failed reference does not hold
+\* back its referrers; push.rs) and insert_object does not check it, so
+\* ClosureIntact holds only for clients that push in dependency order.
 UpStart(u, h, sz, rs) ==
     /\ up[u].pc = "idle" /\ budget > 0
     /\ (rs \ {h}) \subseteq rows
@@ -267,7 +272,7 @@ S3Lose(h) ==
 \* Timer tick above the high watermark: reconcile stats.total_bytes against
 \* SUM(file_size), then count down from that.
 GcStart ==
-    /\ gc.pc = "idle" /\ budget > 0 /\ total > High
+    /\ gc.pc = "idle" /\ budget > 0 /\ total >= High
     /\ total' = RowBytes
     /\ gc' = [gc EXCEPT !.pc = "snap", !.usage = RowBytes, !.evicted = {},
                         !.cands = {}, !.settled = FALSE]
@@ -522,11 +527,13 @@ TypeOK ==
 \* (Not meaningful with ExternalFaults: that is the drift fsck repairs.)
 RowImpliesBlob == rows \subseteq blobs
 
-\* spec 03/05: the Puller redirects only when the row exists. A read that
-\* saw the row finds the blob unless the row was deleted since: after a row
-\* delete the redirect (or presigned URL) can outlive the blob. The spec
-\* does not mention this window; it ends as a 404 from S3, a cache miss.
-ReadWindow == (rd.pc = "fetch" /\ ~rd.gone) => rd.h \in blobs
+\* spec 03/05: the Puller redirects only when the row exists, but a row
+\* deleted after that check takes its blob with it, so the redirect (or
+\* presigned URL) can outlive the blob. Expected to FAIL
+\* (redirect_window.cfg): it demonstrates that window, which the spec does
+\* not mention and which ends as a 404 from S3, a cache miss. (A read whose
+\* row survives always finds the blob: that is RowImpliesBlob.)
+RedirectWindow == (rd.pc = "fetch" /\ rd.gone) => rd.h \in blobs
 
 \* spec 05 "Deletion claims": nothing deletes the blob of an upload that
 \* holds the claim and can still commit; the claim is exclusive.
@@ -572,7 +579,9 @@ FsckSafe == ~hist.fsckFalse
 \* spec 05: a blob with no row and no claim is transient. The orphan sweep
 \* deletes it once the orphan grace has passed; an upload may also adopt it.
 Orphan(h) == h \in blobs /\ h \notin rows /\ claims[h] = "none"
-OrphanTransient == \A h \in Hashes : [](Orphan(h) => <>~Orphan(h))
+\* Leaving Orphan(h) by being claimed is not enough: the sweep must delete
+\* the blob, or an upload adopt it.
+OrphanTransient == \A h \in Hashes : Orphan(h) ~> (h \notin blobs \/ h \in rows)
 
 \* Symmetry reduction for safety runs (not for the liveness run).
 Sym == Permutations(Hashes) \cup Permutations(Uploaders)
