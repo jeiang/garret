@@ -346,23 +346,38 @@ pub async fn path_info(paths: &[String], recursive: bool) -> Result<Vec<PathInfo
 }
 
 /// Nix has emitted both a list and a path-keyed object over the years; accept
-/// either rather than pinning a nix version.
+/// either rather than pinning a nix version. A path missing from the local
+/// store comes back as a `null` entry (object form) or `"valid": false` (list
+/// form), with nix still exiting 0, so it is named here rather than left to
+/// fail as a missing `narHash`.
 fn parse_path_info(stdout: &[u8]) -> Result<Vec<PathInfo>> {
     let value: serde_json::Value =
         serde_json::from_slice(stdout).context("parsing nix path-info output")?;
-    match value {
-        serde_json::Value::Array(items) => Ok(serde_json::from_value(items.into())?),
-        serde_json::Value::Object(map) => map
-            .into_iter()
-            .map(|(path, mut info)| {
-                if info.get("path").is_none() {
-                    info["path"] = path.into();
-                }
-                Ok(serde_json::from_value(info)?)
-            })
-            .collect(),
+    let entries: Vec<(Option<String>, serde_json::Value)> = match value {
+        serde_json::Value::Array(items) => items.into_iter().map(|i| (None, i)).collect(),
+        serde_json::Value::Object(map) => map.into_iter().map(|(p, i)| (Some(p), i)).collect(),
         other => bail!("unexpected nix path-info output: {other}"),
+    };
+    let mut infos = Vec::new();
+    let mut invalid = Vec::new();
+    for (path, mut info) in entries {
+        if info.is_null() || info.get("valid") == Some(&serde_json::Value::Bool(false)) {
+            let named = info.get("path").and_then(|p| p.as_str()).map(str::to_owned);
+            invalid.push(path.or(named).unwrap_or_default());
+            continue;
+        }
+        if let Some(path) = path.filter(|_| info.get("path").is_none()) {
+            info["path"] = path.into();
+        }
+        infos.push(serde_json::from_value(info)?);
     }
+    if !invalid.is_empty() {
+        bail!(
+            "not valid in the local store (build or fetch them first): {}",
+            invalid.join(" ")
+        );
+    }
+    Ok(infos)
 }
 
 /// The entries of `infos` whose hash is in `missing`, in order. A set lookup
@@ -1002,6 +1017,20 @@ mod tests {
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"
         );
         assert_eq!(infos[0].nar_size, 12);
+    }
+
+    #[test]
+    fn paths_missing_from_the_store_are_named() {
+        let object = br#"{"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x":null,
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y":
+            {"narHash":"sha256:h","narSize":12,"references":[]}}"#;
+        let list = br#"[{"path":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x","valid":false}]"#;
+        for json in [&object[..], &list[..]] {
+            let err = parse_path_info(json).unwrap_err().to_string();
+            assert!(err.contains("not valid in the local store"), "{err}");
+            assert!(err.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"), "{err}");
+            assert!(!err.contains("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-y"), "{err}");
+        }
     }
 
     #[test]
