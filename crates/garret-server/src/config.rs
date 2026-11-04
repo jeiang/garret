@@ -35,6 +35,13 @@ pub struct S3Config {
     /// `operation_timeout_secs`.
     #[serde(default)]
     pub operation_attempt_timeout_secs: Option<u64>,
+    /// SigV4-sign upload bodies (a SHA-256 pass over every stored byte).
+    /// Default off: uploads send `UNSIGNED-PAYLOAD` with a CRC32 checksum
+    /// S3 verifies, and the blob's own SHA-256 is the FileHash nix checks
+    /// on download (spec 03). Turn on for a store that refuses unsigned
+    /// payloads.
+    #[serde(default)]
+    pub sign_payload: bool,
 }
 
 fn yes() -> bool {
@@ -260,10 +267,11 @@ impl PusherConfig {
     /// triggers), naming the key so the operator can fix it at startup.
     pub fn validate(&self) -> Result<()> {
         const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+        const MAX_PART_SIZE: usize = 5 * 1024 * 1024 * 1024;
         let l = &self.limits;
-        if l.part_size < MIN_PART_SIZE {
+        if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&l.part_size) {
             bail!(
-                "limits.part_size must be at least 5 MiB (S3 minimum part size), got {}",
+                "limits.part_size must be between 5 MiB and 5 GiB (S3's part size range), got {}",
                 l.part_size
             );
         }
@@ -492,6 +500,7 @@ mod validate_tests {
         c.validate().unwrap();
 
         rejects(|c| c.limits.part_size = 5 * MIB - 1, "part_size");
+        rejects(|c| c.limits.part_size = 5 * 1024 * MIB + 1, "part_size");
         rejects(
             |c| c.limits.max_in_flight_bytes = c.limits.part_size as u64 - 1,
             "max_in_flight_bytes",

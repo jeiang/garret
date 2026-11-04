@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use async_compression::{Level, tokio::bufread::ZstdEncoder};
+use async_compression::{Level, tokio::bufread::ZstdEncoder, zstd::CParameter};
 use futures::{StreamExt, stream};
 use garret_common::{Preamble, hash_of_store_path};
 use indicatif::{MultiProgress, ProgressBar, ProgressBarIter, ProgressStyle};
@@ -538,7 +538,7 @@ impl Pusher {
         // `nix nar dump-path` → zstd → the wire, never landing whole in memory.
         let mut dump = Command::new("nix");
         dump.args(["nar", "dump-path", &info.path]);
-        let nar = compressed_nar(dump, report, self.zstd_level)?;
+        let nar = compressed_nar(dump, report, self.zstd_level, zstd_workers(info.nar_size))?;
 
         let framed = preamble.to_framed()?;
         let body = stream::once(async move { Ok::<_, std::io::Error>(bytes::Bytes::from(framed)) })
@@ -873,6 +873,20 @@ impl Backoff {
     }
 }
 
+/// NarSize from which a NAR is compressed on several threads. Smaller ones
+/// fit in about one zstd job anyway, and many run side by side (`jobs`).
+const ZSTD_MT_MIN: i64 = 32 * 1024 * 1024;
+
+/// zstd worker threads for a NAR of `nar_size` bytes: 0 (compress on the
+/// calling thread) below [`ZSTD_MT_MIN`], else one per CPU, so one large
+/// NAR at the tail of a push does not run on a single core.
+fn zstd_workers(nar_size: i64) -> u32 {
+    if nar_size < ZSTD_MT_MIN {
+        return 0;
+    }
+    std::thread::available_parallelism().map_or(0, |n| n.get() as u32)
+}
+
 /// Streams `dump`'s stdout through zstd, then fails the stream if `dump` exited
 /// non-zero.
 ///
@@ -886,6 +900,7 @@ fn compressed_nar(
     mut dump: Command,
     report: &Report,
     zstd_level: i32,
+    zstd_workers: u32,
 ) -> Result<impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + use<>> {
     let mut child = dump
         .stdout(Stdio::piped())
@@ -905,9 +920,10 @@ fn compressed_nar(
     });
     // Counted here, before the encoder, so the ticks are in the same units as
     // the bar's total.
-    let encoder = ZstdEncoder::with_quality(
+    let encoder = ZstdEncoder::with_quality_and_params(
         BufReader::with_capacity(256 * 1024, report.wrap(stdout)),
         Level::Precise(zstd_level),
+        &[CParameter::nb_workers(zstd_workers)],
     );
     let exit = stream::once(async move {
         let status = child.wait().await?;
@@ -1358,6 +1374,7 @@ mod tests {
             sh("printf 'partial nar'; echo 'path is not valid' >&2; exit 3"),
             &Report::plain(),
             3,
+            0,
         )
         .unwrap()
         .collect()
@@ -1367,7 +1384,7 @@ mod tests {
         let error = last.as_ref().unwrap_err().to_string();
         assert!(error.contains("path is not valid"), "{error}");
 
-        let items: Vec<_> = compressed_nar(sh("printf nar"), &Report::plain(), 3)
+        let items: Vec<_> = compressed_nar(sh("printf nar"), &Report::plain(), 3, 0)
             .unwrap()
             .collect()
             .await;

@@ -30,6 +30,7 @@ use crate::config::S3Config;
 pub struct Storage {
     client: Client,
     bucket: String,
+    sign_payload: bool,
 }
 
 /// Bounds every upload's memory. The shared semaphore counts bytes in
@@ -45,7 +46,8 @@ pub struct UploadLimits {
     pub body_idle: Duration,
     /// One permit per `unit` bytes of buffer, shared process-wide.
     pub part_slots: Arc<Semaphore>,
-    /// Bytes one permit stands for: `part_size / 256`, at most 64 KiB.
+    /// Bytes one permit stands for: the power of two at or below
+    /// `part_size / 256`, at most 64 KiB.
     unit: usize,
     /// Permits making up one part.
     part_units: usize,
@@ -58,9 +60,7 @@ impl UploadLimits {
     /// than one part's worth so a cap below one part cannot deadlock every
     /// upload.
     pub fn new(part_size: usize, max_parts_in_flight: usize, max_in_flight_bytes: u64) -> Self {
-        let unit = (part_size / 256).clamp(1, 64 * 1024);
-        let part_units = part_size.div_ceil(unit);
-        let total_units = ((max_in_flight_bytes / unit as u64) as usize).max(part_units);
+        let (unit, part_units, total_units) = budget(part_size, max_in_flight_bytes);
         Self {
             part_size,
             max_parts_in_flight,
@@ -85,7 +85,7 @@ impl UploadLimits {
 
     /// Permits covering `bytes` of buffer: at least one, at most a part.
     fn units(&self, bytes: usize) -> usize {
-        bytes.div_ceil(self.unit).clamp(1, self.part_units)
+        units_for(bytes, self.unit, self.part_units)
     }
 
     /// Bytes of buffer currently reserved, process-wide.
@@ -109,6 +109,28 @@ impl UploadLimits {
     async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
         self.acquire_units(self.units(bytes)).await
     }
+}
+
+/// The byte budget in permits: `(unit, part_units, total_units)`. The unit
+/// is the power of two at or below `part_size / 256`, at most 64 KiB, so
+/// every count below is a shift: the Kani proofs then cover every part size
+/// S3 accepts, which they cannot through a general division.
+fn budget(part_size: usize, max_in_flight_bytes: u64) -> (usize, usize, usize) {
+    let shift = (part_size >> 8).clamp(1, 64 * 1024).ilog2();
+    let unit = 1 << shift;
+    let part_units = units_ceil(part_size, shift);
+    let total_units = ((max_in_flight_bytes >> shift) as usize).max(part_units);
+    (unit, part_units, total_units)
+}
+
+/// `bytes / 2^shift`, rounded up.
+fn units_ceil(bytes: usize, shift: u32) -> usize {
+    (bytes >> shift) + usize::from(bytes & ((1 << shift) - 1) != 0)
+}
+
+/// Permits covering `bytes` of buffer: at least one, at most a part.
+fn units_for(bytes: usize, unit: usize, part_units: usize) -> usize {
+    units_ceil(bytes, unit.trailing_zeros()).clamp(1, part_units)
 }
 
 /// Times one S3 request and, on failure, counts it by operation and error
@@ -328,6 +350,7 @@ impl Storage {
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: cfg.bucket.clone(),
+            sign_payload: cfg.sign_payload,
         })
     }
 
@@ -335,18 +358,22 @@ impl Storage {
     /// part; larger uploads go through [`Storage::put_streaming`]).
     pub async fn put(&self, key: &str, body: Bytes) -> Result<()> {
         let bytes = body.len() as u64;
-        timed(
-            "put",
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(ByteStream::from(body))
-                .send(),
-        )
-        .await
-        .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
-        .with_context(|| format!("uploading {key}"))?;
+        let put = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .customize();
+        let put = if self.sign_payload {
+            put
+        } else {
+            put.disable_payload_signing()
+        };
+        timed("put", put.send())
+            .await
+            .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
+            .with_context(|| format!("uploading {key}"))?;
         metrics::counter!("garret_s3_puts_total").increment(1);
         metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
         Ok(())
@@ -583,34 +610,37 @@ impl Storage {
         body: Bytes,
         permit: OwnedSemaphorePermit,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
-        let (client, bucket, key, upload_id) = (
+        let (client, bucket, key, upload_id, sign_payload) = (
             self.client.clone(),
             self.bucket.clone(),
             key.to_owned(),
             upload_id.to_owned(),
+            self.sign_payload,
         );
         async move {
             let bytes = body.len() as u64;
             let started = Instant::now();
-            let output = timed(
-                "upload_part",
-                client
-                    .upload_part()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(ByteStream::from(body))
-                    .customize()
-                    // S4 forbids re-uploading a part, so the SDK must not retry
-                    // one: the caller aborts the whole multipart (spec 03-storage).
-                    .config_override(aws_sdk_s3::config::Config::builder().retry_config(
-                        aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
-                    ))
-                    .send(),
-            )
-            .await
-            .with_context(|| format!("uploading part {part_number} of {key}"))?;
+            let part = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(body))
+                .customize()
+                // S4 forbids re-uploading a part, so the SDK must not retry
+                // one: the caller aborts the whole multipart (spec 03-storage).
+                .config_override(aws_sdk_s3::config::Config::builder().retry_config(
+                    aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+                ));
+            let part = if sign_payload {
+                part
+            } else {
+                part.disable_payload_signing()
+            };
+            let output = timed("upload_part", part.send())
+                .await
+                .with_context(|| format!("uploading part {part_number} of {key}"))?;
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);
@@ -1034,6 +1064,7 @@ mod tests {
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 5,
             operation_attempt_timeout_secs: None,
+            sign_payload: false,
         })
         .await
         .unwrap()
@@ -1153,5 +1184,48 @@ mod tests {
             .expect_err("a per-key failure must fail the delete");
         let err = format!("{err:#}");
         assert!(err.contains(&denied), "{err}");
+    }
+}
+
+/// Kani proofs (`just kani`) of the upload byte budget (spec 03): for every
+/// part size the config accepts and every in-flight cap.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// S3's part-size range, which `PusherConfig::validate` enforces.
+    fn any_part_size() -> usize {
+        kani::any_where(|p: &usize| (5 << 20..=5 << 30).contains(p))
+    }
+
+    /// A buffer of up to one part is always fully paid for by its permits,
+    /// one request never asks for more permits than exist (so it cannot
+    /// wait forever), and the count fits the `u32` the semaphore takes.
+    #[kani::proof]
+    fn every_buffer_is_covered_by_its_permits() {
+        let part_size = any_part_size();
+        let max_in_flight: u64 = kani::any_where(|m| *m >= part_size as u64);
+        let (unit, part_units, total_units) = budget(part_size, max_in_flight);
+        let bytes: usize = kani::any_where(|b| *b <= part_size);
+        let units = units_for(bytes, unit, part_units);
+        assert!(units >= 1 && units * unit >= bytes);
+        assert!(units <= part_units && part_units <= total_units);
+        assert!(u32::try_from(part_units).is_ok());
+        assert!(part_units * unit >= part_size);
+        // tokio's Semaphore::new panics above usize::MAX >> 3 permits.
+        assert!(total_units <= usize::MAX >> 3);
+    }
+
+    /// The whole budget never exceeds the configured cap by more than the
+    /// rounding of one part to whole units: what RSS is measured against.
+    #[kani::proof]
+    fn the_budget_stays_within_the_cap() {
+        let part_size = any_part_size();
+        let max_in_flight: u64 = kani::any_where(|m| *m >= part_size as u64);
+        let (unit, part_units, total_units) = budget(part_size, max_in_flight);
+        let budget_bytes = total_units as u128 * unit as u128;
+        assert!(budget_bytes <= max_in_flight as u128 + unit as u128);
+        assert!(budget_bytes >= part_size as u128);
+        let _ = part_units;
     }
 }

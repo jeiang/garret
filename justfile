@@ -41,3 +41,13 @@ bench-baseline:
 # In-process micro-benchmarks: zstd, sha256, preamble framing
 microbench:
 	cargo bench -p garret-bench
+
+# Model-check the push/GC protocol with TLC (bounded; see verification/tla/README.md)
+tla:
+	cd verification/tla && nix develop --command bash -c 'tlc -workers auto -metadir "$(mktemp -d)" -config main.cfg GarretPush.tla'
+
+# Kani proofs: preamble framing and the upload byte budget. Needs
+# `cargo install --locked kani-verifier && cargo kani setup`.
+kani:
+	cargo kani -p garret-common
+	cargo kani -p garret-server

@@ -35,6 +35,20 @@ impl Preamble {
     }
 }
 
+/// Where a framed preamble ends in `buf`: the 4-byte little-endian length
+/// plus that many bytes of JSON. `Ok(None)` until all of it has arrived;
+/// `Err(len)` for a declared length over `max`, refused before any wait.
+pub fn preamble_end(buf: &[u8], max: usize) -> Result<Option<usize>, usize> {
+    let Some(&[a, b, c, d]) = buf.first_chunk::<4>() else {
+        return Ok(None);
+    };
+    let len = u32::from_le_bytes([a, b, c, d]) as usize;
+    if len > max {
+        return Err(len);
+    }
+    Ok((buf.len() - 4 >= len).then_some(4 + len))
+}
+
 /// `<hash>-<name>` → hash, the object key everything else is keyed by.
 pub fn hash_of_store_path(path: &str) -> &str {
     let base = path.rsplit('/').next().unwrap_or(path);
@@ -152,5 +166,51 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(3 << 30), "3.0 GiB");
+    }
+}
+
+/// Kani proofs (`just kani`): exhaustive over every input up to the bounds.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// The framing never panics, and a frame it reports is exactly the
+    /// declared length, within `max`, wholly inside the buffer.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn preamble_end_is_exact() {
+        let bytes: [u8; 8] = kani::any();
+        let len: usize = kani::any_where(|l| *l <= 8);
+        let max: usize = kani::any();
+        let buf = &bytes[..len];
+        match preamble_end(buf, max) {
+            Ok(Some(end)) => {
+                let declared = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+                assert!(end == 4 + declared && end <= buf.len() && declared <= max);
+            }
+            Ok(None) => {
+                assert!(
+                    buf.len() < 4
+                        || buf.len() - 4
+                            < u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize
+                );
+            }
+            Err(declared) => assert!(declared > max),
+        }
+    }
+
+    /// What `to_framed` writes, the Pusher reads back: the frame ends after
+    /// the declared length whatever NAR bytes follow it.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn preamble_end_round_trips_the_header() {
+        let json_len: u32 = kani::any_where(|l| *l <= 3);
+        let mut buf = [0u8; 8];
+        buf[..4].copy_from_slice(&json_len.to_le_bytes());
+        let total: usize = kani::any_where(|t| *t >= 4 + json_len as usize && *t <= 8);
+        assert_eq!(
+            preamble_end(&buf[..total], 3),
+            Ok(Some(4 + json_len as usize))
+        );
     }
 }

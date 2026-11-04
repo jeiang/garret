@@ -19,7 +19,7 @@ tracing = "0.1"
 tracing-indicatif = "0.3"
 tracing-subscriber = "0.3"
 anyhow = "1"
-async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+async-compression = { version = "0.4", features = ["tokio", "zstd", "zstdmt"] }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }

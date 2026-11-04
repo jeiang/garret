@@ -72,7 +72,15 @@ stored.
   mismatch, a truncated or corrupt stream, or a window over 8 MiB is
   `400`. The check finishes at end of stream, before the store commits
   (the single `PutObject` is never sent, or the multipart is aborted),
-  so nothing is inserted or signed.
+  so nothing is inserted or signed. For a claimed NarSize of 4 MiB or
+  more, the decompress-and-hash runs on its own blocking thread, fed the
+  chunks through a queue of 8, so it overlaps the relay instead of
+  serializing with it; a mismatch it finds mid-stream fails the upload a
+  few chunks later, still before end of stream. Smaller NARs are checked
+  inline, where the thread handoff would cost more than it saves.
+- The client compresses NARs of 32 MiB or more with one zstd worker per
+  CPU (zstd's multithreaded mode), so a large NAR at the tail of a push
+  is not compressed on one core. The frames are ordinary zstd frames.
 - What this proves is that the bytes are the NAR the preamble
   describes, not that they are the real build output: a push token can
   still sign any self-consistent NAR for an input-addressed path, so

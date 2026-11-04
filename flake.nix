@@ -95,6 +95,7 @@
             curl
             lsof
             openssl
+            tlaplus
             (python3.withPackages (ps: [ ps.pyjwt ps.cryptography ]))
           ];
         };
