@@ -67,6 +67,7 @@ framework choice. ([ticket 01](../../.scratch/spec/issues/01-http-framework.md),
 - [09-benchmarks.md](09-benchmarks.md) — harness, scenarios, pass/fail
 - [10-packaging.md](10-packaging.md) — crate layout, NixOS modules, admin CLI
 - [../adr/](../adr/) — architecture decision records
+- [../../verification/tla/README.md](../../verification/tla/README.md) — TLA+ model of the push/GC protocol, checked with TLC
 
 ## Non-goals (v1)
 
