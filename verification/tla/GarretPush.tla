@@ -30,6 +30,7 @@ CONSTANTS
     EvictRecheck,    \* evict_object re-checks the whole predicate in its tx
     SweepRecheck,    \* the orphan sweep re-checks that no row landed
     ExternalFaults,  \* S3 objects may vanish outside the protocol (fsck cases)
+    FsckRecheck,     \* fsck repair deletes only the row it listed (created_at)
     PeriodicSweep    \* the sweep starts without spending Budget (liveness)
 
 None == "none"
@@ -435,8 +436,11 @@ SwStep == SwClaim \/ SwDelOk \/ SwDelFail
 ----------------------------------------------------------------------------
 \* garret-admin fsck --repair (crates/garret-pusher/src/fsck.rs): list S3
 \* first, then DB rows; a dangling row is one with no listed blob, no claim
-\* and older than the grace; repair is db::delete_object, which checks only
-\* that the row still exists.
+\* and older than the grace; repair is db::delete_object on the row only if
+\* it is the one listed (same created_at). A row written since the listing
+\* is young, and stays young for the whole run (fsck is shorter than the
+\* grace), so `h \notin young` is that check. FsckRecheck = FALSE is the
+\* code before the fix: it checked only that a row still exists.
 
 FsStart ==
     /\ fs.pc = "idle" /\ budget > 0
@@ -458,7 +462,7 @@ FsDone ==
 FsRepair(h) ==
     /\ fs.pc = "repair" /\ h \in fs.dang
     /\ fs' = [fs EXCEPT !.dang = @ \ {h}]
-    /\ IF h \in rows
+    /\ IF h \in rows /\ (FsckRecheck => h \notin young)
        THEN /\ hist' = [hist EXCEPT !.fsckFalse = @ \/ h \in blobs]
             /\ DelRows({h})
        ELSE /\ UNCHANGED <<dbv, rd, hist>>

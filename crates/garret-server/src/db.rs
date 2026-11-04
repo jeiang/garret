@@ -364,6 +364,14 @@ pub fn exists(conn: &Connection, hash: &str) -> Result<bool> {
         .is_some())
 }
 
+/// When the object's current row was written (`created_at`), if it has one.
+pub fn created_at(conn: &Connection, hash: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT created_at FROM objects WHERE store_path_hash = ?1")?
+        .query_row(params![hash], |r| r.get(0))
+        .optional()?)
+}
+
 /// Current cache usage from the maintained `stats` counter — a cheap read,
 /// which is what lets every GC tick check quota without summing rows.
 pub fn total_bytes(conn: &Connection) -> Result<i64> {

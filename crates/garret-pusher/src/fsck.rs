@@ -72,7 +72,7 @@ pub async fn run(
     // A timed-out drain means the live signal was never trustworthy enough
     // to delete rows on — report the findings, but repair nothing.
     let repaired = if repair && quiesce_drained {
-        apply_repair(&state.conn, &dangling, &size_mismatches)?
+        apply_repair(&state.conn, &db_rows, &dangling, &size_mismatches)?
     } else {
         0
     };
@@ -132,37 +132,50 @@ fn classify_rows(
 
 /// Deletes every dangling and size-mismatched row (`db::delete_object`,
 /// row+refs+stats in one transaction each — never the S3 object, which is
-/// left for the orphan sweep by design). A row gone since the listing — GC
-/// evicted it, say — is skipped, not counted. Returns the count actually
+/// left for the orphan sweep by design). Only the row the listing saw is
+/// deleted: one gone since (GC evicted it, say) or replaced since (deleted
+/// and pushed again, so its blob is back) is skipped, not counted. `listed`
+/// is the row listing the findings came from. Returns the count actually
 /// deleted.
 fn apply_repair(
     conn: &Arc<Mutex<Connection>>,
+    listed: &[(String, String, i64, i64)],
     dangling: &[FsckRow],
     size_mismatches: &[FsckSizeMismatch],
 ) -> Result<usize> {
+    let listed: HashMap<&str, i64> = listed
+        .iter()
+        .map(|(hash, _, created_at, _)| (hash.as_str(), *created_at))
+        .collect();
+    let listed = &listed;
     let dangling = repair_rows(
         conn,
+        listed,
         dangling.iter().map(|r| r.store_path_hash.as_str()),
         "dangling",
     )?;
     let mismatched = repair_rows(
         conn,
+        listed,
         size_mismatches.iter().map(|r| r.store_path_hash.as_str()),
         "size_mismatch",
     )?;
     Ok(dangling + mismatched)
 }
 
-/// Deletes each row still present, counting the deletions under `reason`.
+/// Deletes each row still exactly as listed, counting the deletions under
+/// `reason`. A re-push rewrites `created_at`, so an unchanged `created_at`
+/// is the listed row (found by the TLA+ model, `verification/tla`).
 fn repair_rows<'a>(
     conn: &Mutex<Connection>,
+    listed: &HashMap<&str, i64>,
     hashes: impl Iterator<Item = &'a str>,
     reason: &'static str,
 ) -> Result<usize> {
     let mut repaired = 0;
     for hash in hashes {
         let mut conn = conn.lock();
-        if db::exists(&conn, hash)? {
+        if db::created_at(&conn, hash)?.is_some_and(|at| listed.get(hash) == Some(&at)) {
             db::delete_object(&mut conn, hash)?;
             repaired += 1;
         }
@@ -299,7 +312,7 @@ mod tests {
         let (dangling, mismatches) = classify_rows(&db_rows, &[], &in_flight, GRACE, NOW, false);
         assert_eq!(dangling.len(), 1);
 
-        let repaired = apply_repair(&conn, &dangling, &mismatches).unwrap();
+        let repaired = apply_repair(&conn, &db_rows, &dangling, &mismatches).unwrap();
         assert_eq!(repaired, 1);
         let c = conn.lock();
         assert!(!db::exists(&c, &hash).unwrap());
@@ -323,11 +336,32 @@ mod tests {
         db::delete_object(&mut conn, &a).unwrap();
         let conn = Arc::new(Mutex::new(conn));
 
-        let repaired = apply_repair(&conn, &dangling, &mismatches).unwrap();
+        let repaired = apply_repair(&conn, &rows, &dangling, &mismatches).unwrap();
         assert_eq!(repaired, 2, "the vanished row counted as repaired");
         let conn = conn.lock();
         assert!(!db::exists(&conn, &b).unwrap());
         assert!(!db::exists(&conn, &c).unwrap());
+    }
+
+    /// The TLA+ model's counterexample (`verification/tla/fsck_race.cfg`):
+    /// a dangling row is deleted and pushed again, blob and all, between
+    /// fsck's listing and its repair. The healthy new row must survive.
+    #[test]
+    fn a_row_pushed_again_since_the_listing_is_not_repaired() {
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let hash = "a".repeat(32);
+        db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
+        let rows = db::all_objects_brief(&conn).unwrap();
+        let (dangling, mismatches) = classify_rows(&rows, &[], &InFlight::new(), GRACE, NOW, false);
+        assert_eq!(dangling.len(), 1);
+        db::delete_object(&mut conn, &hash).unwrap();
+        db::insert_object(&mut conn, &object(&hash), NOW).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let repaired = apply_repair(&conn, &rows, &dangling, &mismatches).unwrap();
+        assert_eq!(repaired, 0);
+        assert!(db::exists(&conn.lock(), &hash).unwrap());
     }
 
     fn object(hash: &str) -> db::Object {

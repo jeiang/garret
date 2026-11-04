@@ -29,7 +29,8 @@ Other runs (same directory, same command with another `-config`):
 | `main.cfg` | All invariants, deadlock check, real protocol | pass |
 | `deep.cfg` | Same, `Budget = 5` | pass (about 14 min) |
 | `liveness.cfg` (add `-deadlock`) | `OrphanTransient` under fairness | pass |
-| `fsck_race.cfg` | Real protocol plus S3 drift and one fsck repair | `FsckSafe` fails (finding) |
+| `fsck.cfg` | Real protocol plus S3 drift and fsck repairs, `Budget = 5` | pass (about 2 min) |
+| `fsck_race.cfg` | Same, fsck before the fix (`FsckRecheck = FALSE`) | `FsckSafe` fails (finding 1) |
 | `mutant_no_delete_claims.cfg` | Deleters take no Delete claim | `RowImpliesBlob` fails |
 | `mutant_no_evict_recheck.cfg` | `evict_object` trusts the candidate snapshot | `EvictionSafe` fails |
 | `mutant_no_sweep_recheck.cfg` | Sweep does not re-check for a row | `RowImpliesBlob` fails |
@@ -174,19 +175,29 @@ Mutants (each fails as expected, shortest trace by TLC):
 ## Findings
 
 Neither finding breaks `RowImpliesBlob`, `BlobSurvivesClaim`,
-`QuotaCounter`, `EvictionSafe` or `PruneSafe`. The Rust code was not
-changed.
+`QuotaCounter`, `EvictionSafe` or `PruneSafe`.
 
-### 1. fsck --repair can delete a healthy, freshly pushed row (`fsck_race.cfg`)
+### 1. fsck --repair could delete a healthy, freshly pushed row (fixed)
 
-Real, in the code: `repair_rows` in `crates/garret-pusher/src/fsck.rs`
+Fixed: `repair_rows` now deletes a row only if its `created_at` is the
+one fsck listed. A re-push rewrites `created_at`, so a row written since
+the listing is skipped (regression test
+`a_row_pushed_again_since_the_listing_is_not_repaired`). The model's
+`FsckRecheck` constant is that check. `Budget = 5` is the smallest budget
+at which the old code fails (`fsck_race.cfg`, 23 s); at that budget the
+fixed model passes (`fsck.cfg`: 19,445,988 states generated, 3,711,127
+distinct, depth 44, 1 min 44 s), and also at `Budget = 6` (140,848,138
+generated, 23,650,115 distinct, depth 51, 10 min 43 s). The counterexample
+below is the old code's.
+
+Before the fix, in the code: `repair_rows` in `crates/garret-pusher/src/fsck.rs`
 re-checks only `db::exists(hash)` and then calls `db::delete_object`,
 without a claim and without repeating the age and blob checks. Spec 05
 says "A row gone since the listing (GC evicted it, say) is skipped", but
 a row that was deleted and then pushed again since the listing is not
 gone, so it is repaired.
 
-Counterexample (21 states, TLC; `u1` uploads, the operator delete stands
+Counterexample (21 states, TLC, found by the original `Budget = 9` run; `u1` uploads, the operator delete stands
 in for a GC eviction, which is equivalent for this race):
 
 1. `u1` uploads h: blob and row exist.
@@ -205,9 +216,7 @@ Effect: a good object disappears from the cache until it is pushed again.
 The blob is left for the orphan sweep (it waits one `orphan_grace_secs`
 because it is young). No row without a blob results, the counter stays
 correct, and a Negotiation after the repair reports h missing, so the next
-push restores it. A fix would re-run the dangling test (blob missing,
-unclaimed, old) inside the repair, or take a Delete claim for the repair.
-The window needs fsck to run at the same time as a delete and a re-push,
+push restores it. The window needed fsck to run at the same time as a delete and a re-push,
 so it is narrow.
 
 ### 2. A Puller redirect can outlive the blob (`ReadWindow`)
