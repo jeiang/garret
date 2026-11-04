@@ -30,6 +30,7 @@ use crate::config::S3Config;
 pub struct Storage {
     client: Client,
     bucket: String,
+    sign_payload: bool,
 }
 
 /// Bounds every upload's memory. The shared semaphore counts bytes in
@@ -328,6 +329,7 @@ impl Storage {
         Ok(Self {
             client: Client::from_conf(builder.build()),
             bucket: cfg.bucket.clone(),
+            sign_payload: cfg.sign_payload,
         })
     }
 
@@ -335,18 +337,22 @@ impl Storage {
     /// part; larger uploads go through [`Storage::put_streaming`]).
     pub async fn put(&self, key: &str, body: Bytes) -> Result<()> {
         let bytes = body.len() as u64;
-        timed(
-            "put",
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(ByteStream::from(body))
-                .send(),
-        )
-        .await
-        .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
-        .with_context(|| format!("uploading {key}"))?;
+        let put = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .customize();
+        let put = if self.sign_payload {
+            put
+        } else {
+            put.disable_payload_signing()
+        };
+        timed("put", put.send())
+            .await
+            .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
+            .with_context(|| format!("uploading {key}"))?;
         metrics::counter!("garret_s3_puts_total").increment(1);
         metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
         Ok(())
@@ -583,34 +589,37 @@ impl Storage {
         body: Bytes,
         permit: OwnedSemaphorePermit,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
-        let (client, bucket, key, upload_id) = (
+        let (client, bucket, key, upload_id, sign_payload) = (
             self.client.clone(),
             self.bucket.clone(),
             key.to_owned(),
             upload_id.to_owned(),
+            self.sign_payload,
         );
         async move {
             let bytes = body.len() as u64;
             let started = Instant::now();
-            let output = timed(
-                "upload_part",
-                client
-                    .upload_part()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .upload_id(&upload_id)
-                    .part_number(part_number)
-                    .body(ByteStream::from(body))
-                    .customize()
-                    // S4 forbids re-uploading a part, so the SDK must not retry
-                    // one: the caller aborts the whole multipart (spec 03-storage).
-                    .config_override(aws_sdk_s3::config::Config::builder().retry_config(
-                        aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
-                    ))
-                    .send(),
-            )
-            .await
-            .with_context(|| format!("uploading part {part_number} of {key}"))?;
+            let part = client
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(body))
+                .customize()
+                // S4 forbids re-uploading a part, so the SDK must not retry
+                // one: the caller aborts the whole multipart (spec 03-storage).
+                .config_override(aws_sdk_s3::config::Config::builder().retry_config(
+                    aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(1),
+                ));
+            let part = if sign_payload {
+                part
+            } else {
+                part.disable_payload_signing()
+            };
+            let output = timed("upload_part", part.send())
+                .await
+                .with_context(|| format!("uploading part {part_number} of {key}"))?;
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);
@@ -1034,6 +1043,7 @@ mod tests {
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 5,
             operation_attempt_timeout_secs: None,
+            sign_payload: false,
         })
         .await
         .unwrap()

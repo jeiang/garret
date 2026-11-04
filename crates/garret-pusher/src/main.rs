@@ -797,6 +797,7 @@ mod tests {
             secret_access_key: Some("x".into()),
             operation_timeout_secs: 1,
             operation_attempt_timeout_secs: None,
+            sign_payload: false,
         })
         .await
         .unwrap()

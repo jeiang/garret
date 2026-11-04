@@ -35,6 +35,13 @@ pub struct S3Config {
     /// `operation_timeout_secs`.
     #[serde(default)]
     pub operation_attempt_timeout_secs: Option<u64>,
+    /// SigV4-sign upload bodies (a SHA-256 pass over every stored byte).
+    /// Default off: uploads send `UNSIGNED-PAYLOAD` with a CRC32 checksum
+    /// S3 verifies, and the blob's own SHA-256 is the FileHash nix checks
+    /// on download (spec 03). Turn on for a store that refuses unsigned
+    /// payloads.
+    #[serde(default)]
+    pub sign_payload: bool,
 }
 
 fn yes() -> bool {

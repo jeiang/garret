@@ -84,6 +84,13 @@ Defaults, all configurable:
   is rejected at startup), and above the time to send `part_size` on the
   slowest uplink, or healthy part uploads are cut off. `UploadPart` is not
   retried, so for it this only shortens the wait for failure.
+- `[s3] sign_payload` (default off): uploads (`PutObject`, `UploadPart`)
+  are sent as `UNSIGNED-PAYLOAD`, so the SDK does not SHA-256 every
+  stored byte a second time for SigV4. The headers stay signed, the
+  SDK's CRC32 checksum still lets S3 refuse a corrupted body, and the
+  blob's FileHash (computed by the Pusher over the same bytes) is what
+  nix checks on download. Turn it on for a store that refuses unsigned
+  payloads.
 - **`UploadPart` is never retried by the SDK** (max attempts 1, set per
   operation): part re-upload is forbidden below, so a failed part aborts
   the multipart at once rather than after retries have burned the
