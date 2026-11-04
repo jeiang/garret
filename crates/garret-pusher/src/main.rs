@@ -676,22 +676,19 @@ async fn store_upload(
 /// Splits the 4-byte-LE-length-prefixed JSON preamble off the front of `buf`,
 /// leaving the compressed NAR bytes behind. `None` means "need more bytes".
 fn take_preamble(buf: &mut Vec<u8>) -> Result<Option<Preamble>, Error> {
-    if buf.len() < 4 {
-        return Ok(None);
-    }
-    let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-    if len > MAX_PREAMBLE {
-        return Err(Error::new(
-            StatusCode::BAD_REQUEST,
-            "preamble length is implausible".into(),
-        ));
-    }
-    if buf.len() < 4 + len {
-        return Ok(None);
-    }
-    let preamble: Preamble = serde_json::from_slice(&buf[4..4 + len])
+    let end = match garret_common::preamble_end(buf, MAX_PREAMBLE) {
+        Ok(Some(end)) => end,
+        Ok(None) => return Ok(None),
+        Err(_) => {
+            return Err(Error::new(
+                StatusCode::BAD_REQUEST,
+                "preamble length is implausible".into(),
+            ));
+        }
+    };
+    let preamble: Preamble = serde_json::from_slice(&buf[4..end])
         .map_err(|e| Error::new(StatusCode::BAD_REQUEST, format!("bad preamble: {e}")))?;
-    buf.drain(..4 + len);
+    buf.drain(..end);
     Ok(Some(preamble))
 }
 

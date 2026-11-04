@@ -31,10 +31,15 @@ Defaults, all configurable:
   per NAR; the global in-flight byte cap (default **256 MiB**, with
   **16** concurrent uploads) bounds the aggregate.
 - **Slots are charged by bytes, not by part.** The global budget is a
-  semaphore counting buffer capacity in units of `part_size / 256` (at
-  most 64 KiB); a buffer holds the units covering its capacity, so the
+  semaphore counting buffer capacity in units of the power of two at or
+  below `part_size / 256` (at most 64 KiB, which the default 16 MiB part
+  gets exactly); a buffer holds the units covering its capacity, so the
   sum of all upload buffers never exceeds `max_in_flight_bytes` (a cap
-  below one part is raised to one part). The first buffer reserves only
+  below one part is raised to one part). Kani proves this accounting for
+  every part size S3 accepts and every cap: a buffer of up to one part is
+  covered by its permits, one request never asks for more permits than
+  exist, and the budget exceeds the cap by at most one unit
+  (`just kani`). The first buffer reserves only
   what the body can reach — the Pusher passes zstd's worst-case
   compressed size for the claimed NarSize plus 64 KiB, which is also
   the most it accepts ([ADR-0010](../adr/0010-pusher-verifies-nar-hash.md))
@@ -106,7 +111,7 @@ promises. One knob, and the promise holds.
 
 S4 constraints the defaults must keep satisfying: parts 1..N-1 must be
 **identical in size** (uniform parts with a short final part — what we
-already do), minimum part size **5 MiB**, and **no part re-upload** — a
+already do), part size **5 MiB to 5 GiB** (the startup check refuses either side), and **no part re-upload** — a
 failed part is unrecoverable, so the whole multipart aborts and the push
 restarts. This matches the no-resume-in-v1 stance in
 [01-push-protocol.md](01-push-protocol.md); part-level retry is not an

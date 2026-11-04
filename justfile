@@ -45,3 +45,9 @@ microbench:
 # Model-check the push/GC protocol with TLC (bounded; see verification/tla/README.md)
 tla:
 	cd verification/tla && nix shell nixpkgs#tlaplus --command tlc -workers auto -metadir "$(mktemp -d)" -config main.cfg GarretPush.tla
+
+# Kani proofs: preamble framing and the upload byte budget. Needs
+# `cargo install --locked kani-verifier && cargo kani setup`.
+kani:
+	cargo kani -p garret-common
+	cargo kani -p garret-server

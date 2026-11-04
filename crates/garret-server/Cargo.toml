@@ -52,3 +52,6 @@ tower = { version = "0.5", features = ["util"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # Paused clocks, so timeout tests don't wait out real minutes.
 tokio = { version = "1", features = ["test-util"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

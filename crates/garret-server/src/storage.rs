@@ -46,7 +46,8 @@ pub struct UploadLimits {
     pub body_idle: Duration,
     /// One permit per `unit` bytes of buffer, shared process-wide.
     pub part_slots: Arc<Semaphore>,
-    /// Bytes one permit stands for: `part_size / 256`, at most 64 KiB.
+    /// Bytes one permit stands for: the power of two at or below
+    /// `part_size / 256`, at most 64 KiB.
     unit: usize,
     /// Permits making up one part.
     part_units: usize,
@@ -59,9 +60,7 @@ impl UploadLimits {
     /// than one part's worth so a cap below one part cannot deadlock every
     /// upload.
     pub fn new(part_size: usize, max_parts_in_flight: usize, max_in_flight_bytes: u64) -> Self {
-        let unit = (part_size / 256).clamp(1, 64 * 1024);
-        let part_units = part_size.div_ceil(unit);
-        let total_units = ((max_in_flight_bytes / unit as u64) as usize).max(part_units);
+        let (unit, part_units, total_units) = budget(part_size, max_in_flight_bytes);
         Self {
             part_size,
             max_parts_in_flight,
@@ -86,7 +85,7 @@ impl UploadLimits {
 
     /// Permits covering `bytes` of buffer: at least one, at most a part.
     fn units(&self, bytes: usize) -> usize {
-        bytes.div_ceil(self.unit).clamp(1, self.part_units)
+        units_for(bytes, self.unit, self.part_units)
     }
 
     /// Bytes of buffer currently reserved, process-wide.
@@ -110,6 +109,28 @@ impl UploadLimits {
     async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
         self.acquire_units(self.units(bytes)).await
     }
+}
+
+/// The byte budget in permits: `(unit, part_units, total_units)`. The unit
+/// is the power of two at or below `part_size / 256`, at most 64 KiB, so
+/// every count below is a shift: the Kani proofs then cover every part size
+/// S3 accepts, which they cannot through a general division.
+fn budget(part_size: usize, max_in_flight_bytes: u64) -> (usize, usize, usize) {
+    let shift = (part_size >> 8).clamp(1, 64 * 1024).ilog2();
+    let unit = 1 << shift;
+    let part_units = units_ceil(part_size, shift);
+    let total_units = ((max_in_flight_bytes >> shift) as usize).max(part_units);
+    (unit, part_units, total_units)
+}
+
+/// `bytes / 2^shift`, rounded up.
+fn units_ceil(bytes: usize, shift: u32) -> usize {
+    (bytes >> shift) + usize::from(bytes & ((1 << shift) - 1) != 0)
+}
+
+/// Permits covering `bytes` of buffer: at least one, at most a part.
+fn units_for(bytes: usize, unit: usize, part_units: usize) -> usize {
+    units_ceil(bytes, unit.trailing_zeros()).clamp(1, part_units)
 }
 
 /// Times one S3 request and, on failure, counts it by operation and error
@@ -1163,5 +1184,48 @@ mod tests {
             .expect_err("a per-key failure must fail the delete");
         let err = format!("{err:#}");
         assert!(err.contains(&denied), "{err}");
+    }
+}
+
+/// Kani proofs (`just kani`) of the upload byte budget (spec 03): for every
+/// part size the config accepts and every in-flight cap.
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// S3's part-size range, which `PusherConfig::validate` enforces.
+    fn any_part_size() -> usize {
+        kani::any_where(|p: &usize| (5 << 20..=5 << 30).contains(p))
+    }
+
+    /// A buffer of up to one part is always fully paid for by its permits,
+    /// one request never asks for more permits than exist (so it cannot
+    /// wait forever), and the count fits the `u32` the semaphore takes.
+    #[kani::proof]
+    fn every_buffer_is_covered_by_its_permits() {
+        let part_size = any_part_size();
+        let max_in_flight: u64 = kani::any_where(|m| *m >= part_size as u64);
+        let (unit, part_units, total_units) = budget(part_size, max_in_flight);
+        let bytes: usize = kani::any_where(|b| *b <= part_size);
+        let units = units_for(bytes, unit, part_units);
+        assert!(units >= 1 && units * unit >= bytes);
+        assert!(units <= part_units && part_units <= total_units);
+        assert!(u32::try_from(part_units).is_ok());
+        assert!(part_units * unit >= part_size);
+        // tokio's Semaphore::new panics above usize::MAX >> 3 permits.
+        assert!(total_units <= usize::MAX >> 3);
+    }
+
+    /// The whole budget never exceeds the configured cap by more than the
+    /// rounding of one part to whole units: what RSS is measured against.
+    #[kani::proof]
+    fn the_budget_stays_within_the_cap() {
+        let part_size = any_part_size();
+        let max_in_flight: u64 = kani::any_where(|m| *m >= part_size as u64);
+        let (unit, part_units, total_units) = budget(part_size, max_in_flight);
+        let budget_bytes = total_units as u128 * unit as u128;
+        assert!(budget_bytes <= max_in_flight as u128 + unit as u128);
+        assert!(budget_bytes >= part_size as u128);
+        let _ = part_units;
     }
 }
