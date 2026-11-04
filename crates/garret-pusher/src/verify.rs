@@ -10,9 +10,11 @@ use std::{
 
 use anyhow::anyhow;
 use bytes::Bytes;
-use futures::Stream;
+use futures::{FutureExt, Stream};
 use garret_server::nix_base32;
 use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::PollSender;
 use zstd::stream::raw::{DParameter, Decoder, InBuffer, Operation, OutBuffer};
 
 /// Largest zstd window accepted: 8 MiB, what level 19 (the highest level
@@ -37,14 +39,19 @@ pub fn max_compressed_len(claimed_size: i64) -> usize {
 /// streaming output size.
 const SCRATCH: usize = 128 * 1024;
 
-/// Passes the compressed NAR through untouched while decompressing and
-/// hashing it. At end of stream it compares against the claimed NarHash and
-/// NarSize and, on a mismatch, yields an error in place of EOF. Every store
-/// path reads to EOF before it commits — the single `PutObject` is sent, or
-/// the multipart completed, only after — so a mismatch fails the store and
-/// `put_streaming` aborts it.
-pub struct VerifiedNar<S> {
-    inner: S,
+/// Claimed NarSize from which the check runs on its own blocking thread,
+/// pipelined with the upload, instead of inline on the request's task.
+/// Below it a NAR is a few milliseconds of work, less than the thread
+/// handoff saves.
+const OFFLOAD_MIN: i64 = 4 * 1024 * 1024;
+
+/// Chunks queued for an offloaded check: enough to keep its thread busy
+/// while the request task reads, bounded so a slow check pushes back on
+/// the body instead of buffering it.
+const OFFLOAD_DEPTH: usize = 8;
+
+/// The NarHash/NarSize check over a compressed NAR, fed chunk by chunk.
+struct Checker {
     decoder: Decoder<'static>,
     scratch: Box<[u8]>,
     hasher: Sha256,
@@ -54,21 +61,15 @@ pub struct VerifiedNar<S> {
     max_compressed: usize,
     /// The last decoder call ended exactly at a frame boundary.
     frame_done: bool,
-    /// End of stream was reached or the NAR refused: never poll again.
-    finished: bool,
     claimed_hash: String,
     claimed_size: i64,
-    /// Why the NAR was refused, once it has been: the caller's 400.
-    pub refused: Option<String>,
 }
 
-impl<S> VerifiedNar<S> {
-    /// `claimed_hash` is the normalised `sha256:<nix-base32>` NarHash.
-    pub fn new(inner: S, claimed_hash: &str, claimed_size: i64) -> std::io::Result<Self> {
+impl Checker {
+    fn new(claimed_hash: &str, claimed_size: i64) -> std::io::Result<Self> {
         let mut decoder = Decoder::new()?;
         decoder.set_parameter(DParameter::WindowLogMax(WINDOW_LOG_MAX))?;
         Ok(Self {
-            inner,
             decoder,
             scratch: vec![0; SCRATCH].into_boxed_slice(),
             hasher: Sha256::new(),
@@ -76,10 +77,8 @@ impl<S> VerifiedNar<S> {
             compressed: 0,
             max_compressed: max_compressed_len(claimed_size),
             frame_done: false,
-            finished: false,
             claimed_hash: claimed_hash.to_owned(),
             claimed_size,
-            refused: None,
         })
     }
 
@@ -148,12 +147,114 @@ impl<S> VerifiedNar<S> {
         }
         Ok(())
     }
+}
+
+/// Where the check runs: inline on the request's task, or on a blocking
+/// thread the chunks are handed to.
+enum Engine {
+    Inline(Box<Checker>),
+    Offload {
+        /// Closed at end of stream, which tells the thread to finish.
+        tx: Option<PollSender<Bytes>>,
+        verdict: oneshot::Receiver<Result<(), String>>,
+    },
+}
+
+/// Passes the compressed NAR through untouched while decompressing and
+/// hashing it. At end of stream it compares against the claimed NarHash and
+/// NarSize and, on a mismatch, yields an error in place of EOF. Every store
+/// path reads to EOF before it commits — the single `PutObject` is sent, or
+/// the multipart completed, only after — so a mismatch fails the store and
+/// `put_streaming` aborts it.
+///
+/// A large NAR is checked on its own thread (pipelined: a mismatch found
+/// mid-stream surfaces a few chunks later, and always before EOF); a small
+/// one inline.
+pub struct VerifiedNar<S> {
+    inner: S,
+    engine: Engine,
+    /// A chunk read from `inner`, waiting for room in the offload queue.
+    pending: Option<Bytes>,
+    /// End of stream was reached or the NAR refused: never poll again.
+    finished: bool,
+    /// Why the NAR was refused, once it has been: the caller's 400.
+    pub refused: Option<String>,
+}
+
+impl<S> VerifiedNar<S> {
+    /// `claimed_hash` is the normalised `sha256:<nix-base32>` NarHash.
+    pub fn new(inner: S, claimed_hash: &str, claimed_size: i64) -> std::io::Result<Self> {
+        Self::with_offload(
+            inner,
+            claimed_hash,
+            claimed_size,
+            claimed_size >= OFFLOAD_MIN,
+        )
+    }
+
+    fn with_offload(
+        inner: S,
+        claimed_hash: &str,
+        claimed_size: i64,
+        offload: bool,
+    ) -> std::io::Result<Self> {
+        let checker = Box::new(Checker::new(claimed_hash, claimed_size)?);
+        let engine = if offload {
+            let (tx, mut rx) = mpsc::channel::<Bytes>(OFFLOAD_DEPTH);
+            let (verdict_tx, verdict) = oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+                let mut checker = checker;
+                let mut verdict = Ok(());
+                while let Some(chunk) = rx.blocking_recv() {
+                    if let Err(reason) = checker.feed(&chunk) {
+                        verdict = Err(reason);
+                        break;
+                    }
+                }
+                // Dropping `rx` here closes the queue: the request task
+                // stops reading and collects this verdict.
+                drop(rx);
+                let verdict = verdict.and_then(|()| checker.finish());
+                let _ = verdict_tx.send(verdict);
+            });
+            Engine::Offload {
+                tx: Some(PollSender::new(tx)),
+                verdict,
+            }
+        } else {
+            Engine::Inline(checker)
+        };
+        Ok(Self {
+            inner,
+            engine,
+            pending: None,
+            finished: false,
+            refused: None,
+        })
+    }
 
     fn refuse(&mut self, reason: String) -> Poll<Option<anyhow::Result<Bytes>>> {
         let error = anyhow!("{reason}");
         self.refused = Some(reason);
         self.finished = true;
         Poll::Ready(Some(Err(error)))
+    }
+
+    /// The offloaded check's verdict, once its thread has finished.
+    fn poll_verdict(&mut self, cx: &mut Context<'_>) -> Poll<Option<anyhow::Result<Bytes>>> {
+        let Engine::Offload { tx, verdict } = &mut self.engine else {
+            unreachable!("only an offloaded check has a verdict to wait for");
+        };
+        *tx = None;
+        let verdict = ready!(verdict.poll_unpin(cx))
+            .unwrap_or_else(|_| Err("NAR check thread failed".into()));
+        match verdict {
+            Ok(()) => {
+                self.finished = true;
+                Poll::Ready(None)
+            }
+            Err(reason) => self.refuse(reason),
+        }
     }
 }
 
@@ -169,18 +270,47 @@ where
         if this.finished {
             return Poll::Ready(None);
         }
+        if let Engine::Offload { tx: Some(tx), .. } = &mut this.engine
+            && let Some(chunk) = this.pending.take()
+        {
+            // Queued before it is passed on, so the check sees every byte
+            // that is stored. A closed queue means the check has already
+            // refused the NAR.
+            match tx.poll_reserve(cx) {
+                Poll::Pending => {
+                    this.pending = Some(chunk);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Ok(())) if tx.send_item(chunk.clone()).is_ok() => {
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                Poll::Ready(_) => return this.poll_verdict(cx),
+            }
+        }
+        if let Engine::Offload { tx: None, .. } = this.engine {
+            return this.poll_verdict(cx);
+        }
         match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
-            Some(Ok(chunk)) => match this.feed(&chunk) {
-                Ok(()) => Poll::Ready(Some(Ok(chunk))),
-                Err(reason) => this.refuse(reason),
+            Some(Ok(chunk)) => match &mut this.engine {
+                Engine::Inline(checker) => match checker.feed(&chunk) {
+                    Ok(()) => Poll::Ready(Some(Ok(chunk))),
+                    Err(reason) => this.refuse(reason),
+                },
+                Engine::Offload { .. } => {
+                    this.pending = Some(chunk);
+                    Pin::new(this).poll_next(cx)
+                }
             },
             Some(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            None => match this.finish() {
-                Ok(()) => {
-                    this.finished = true;
-                    Poll::Ready(None)
-                }
-                Err(reason) => this.refuse(reason),
+            None => match &mut this.engine {
+                Engine::Inline(checker) => match checker.finish() {
+                    Ok(()) => {
+                        this.finished = true;
+                        Poll::Ready(None)
+                    }
+                    Err(reason) => this.refuse(reason),
+                },
+                Engine::Offload { .. } => this.poll_verdict(cx),
             },
         }
     }
@@ -205,12 +335,30 @@ mod tests {
 
     /// Streams `compressed` through the verifier in small chunks; returns
     /// the bytes that came out and whether the stream ended in an error.
+    ///
+    /// Both engines run, and must agree on the verdict.
     async fn run(compressed: &[u8], hash: &str, size: i64) -> (Vec<u8>, Option<String>) {
+        let inline = run_on(compressed, hash, size, false).await;
+        let offloaded = run_on(compressed, hash, size, true).await;
+        assert_eq!(inline.1, offloaded.1, "the engines disagree");
+        if inline.1.is_none() {
+            assert_eq!(inline.0, offloaded.0);
+        }
+        inline
+    }
+
+    async fn run_on(
+        compressed: &[u8],
+        hash: &str,
+        size: i64,
+        offload: bool,
+    ) -> (Vec<u8>, Option<String>) {
         let chunks: Vec<Result<Bytes, std::io::Error>> = compressed
             .chunks(1000)
             .map(|c| Ok(Bytes::copy_from_slice(c)))
             .collect();
-        let mut nar = VerifiedNar::new(futures::stream::iter(chunks), hash, size).unwrap();
+        let mut nar =
+            VerifiedNar::with_offload(futures::stream::iter(chunks), hash, size, offload).unwrap();
         let mut passed = Vec::new();
         while let Some(item) = nar.next().await {
             match item {
