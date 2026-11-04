@@ -13,7 +13,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret whoami` | Subject, audience, expiry, and a live probe that the Pusher accepts the token |
 | `garret doctor [path]` | Layer-by-layer diagnosis (below); with a path, a Negotiation round answers "is this cached" |
 | `garret use [--print]` | Adds the Puller to the user's `nix.conf` as a substituter; exits 1 if nix ignores that file |
-| `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers. With no paths and a non-terminal stdin, reads whitespace-separated paths from stdin (`nix build --print-out-paths \| garret push`) |
+| `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers. With no paths and a non-terminal stdin, reads whitespace-separated paths from stdin until EOF (`nix build --print-out-paths \| garret push`) |
 | `garret watch-store [--full-sync] [--drain] [--cursor <path>] [--socket <path>]` | Watcher daemon (below); `--drain` pushes what it has not yet and exits, for CI; `--cursor`/`--socket` override `[watch] cursor_path`/`socket_path` |
 | `garret enqueue [paths…] [--socket]` | Wake a running `watch-store` to poll now; paths default to `$OUT_PATHS`, for use as nix's `post-build-hook`. Exits 0 unconditionally |
 | `garret list [query] [--limit N]` | Search/filter cache contents (browse API); prints full 32-character hashes |
