@@ -1,5 +1,6 @@
 //! `garret` — the CLI that drives the Pusher (spec 06-client).
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -55,7 +56,8 @@ enum Command {
     },
     /// Push store paths and their closure
     Push {
-        /// Store paths to push, with their closure
+        /// Store paths to push, with their closure; read from stdin,
+        /// whitespace-separated, when none are given and stdin is not a terminal
         paths: Vec<String>,
         /// Concurrent uploads
         #[arg(long, short)]
@@ -226,6 +228,14 @@ async fn main() -> Result<()> {
             dry_run,
             no_upstream_filter,
         } => {
+            let stdin = match paths.is_empty() && !std::io::stdin().is_terminal() {
+                true => Some(
+                    std::io::read_to_string(std::io::stdin())
+                        .context("reading store paths from stdin")?,
+                ),
+                false => None,
+            };
+            let paths = paths_or_fallback(paths, stdin.as_deref());
             if paths.is_empty() {
                 anyhow::bail!("nothing to push");
             }
@@ -399,13 +409,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// CLI paths, or nix's `$OUT_PATHS` (space-separated) when there are none —
-/// `post-build-hook` runs its program with no arguments.
-fn enqueue_paths(args: Vec<String>, out_paths: Option<&str>) -> Vec<String> {
+/// CLI paths, or the whitespace-separated `fallback` when there are none:
+/// nix's `$OUT_PATHS` for enqueue (`post-build-hook` runs its program with no
+/// arguments), stdin for push.
+fn paths_or_fallback(args: Vec<String>, fallback: Option<&str>) -> Vec<String> {
     if !args.is_empty() {
         return args;
     }
-    out_paths
+    fallback
         .unwrap_or_default()
         .split_whitespace()
         .map(str::to_owned)
@@ -416,7 +427,7 @@ fn enqueue_paths(args: Vec<String>, out_paths: Option<&str>) -> Vec<String> {
 /// The wake socket is only an optimization: on any failure the watcher's next
 /// poll still pushes the paths, so a loud stderr line is the whole story.
 async fn enqueue(args: Vec<String>, socket: &str) {
-    let paths = enqueue_paths(args, std::env::var("OUT_PATHS").ok().as_deref());
+    let paths = paths_or_fallback(args, std::env::var("OUT_PATHS").ok().as_deref());
     if paths.is_empty() {
         eprintln!("garret enqueue: no paths given and $OUT_PATHS is empty; nothing to do");
         return;
@@ -702,14 +713,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enqueue_prefers_argv_and_falls_back_to_out_paths() {
+    fn argv_wins_over_the_whitespace_separated_fallback() {
         let argv = vec!["/nix/store/aaa-x".to_owned()];
-        assert_eq!(enqueue_paths(argv.clone(), Some("/nix/store/bbb-y")), argv);
         assert_eq!(
-            enqueue_paths(vec![], Some(" /nix/store/aaa-x  /nix/store/bbb-y ")),
+            paths_or_fallback(argv.clone(), Some("/nix/store/bbb-y")),
+            argv
+        );
+        assert_eq!(
+            paths_or_fallback(vec![], Some(" /nix/store/aaa-x  /nix/store/bbb-y ")),
             ["/nix/store/aaa-x", "/nix/store/bbb-y"]
         );
-        assert!(enqueue_paths(vec![], None).is_empty());
-        assert!(enqueue_paths(vec![], Some("  ")).is_empty());
+        assert_eq!(
+            paths_or_fallback(vec![], Some("/nix/store/aaa-x\n/nix/store/bbb-y\n")),
+            ["/nix/store/aaa-x", "/nix/store/bbb-y"]
+        );
+        assert!(paths_or_fallback(vec![], None).is_empty());
+        assert!(paths_or_fallback(vec![], Some("  ")).is_empty());
     }
 }
