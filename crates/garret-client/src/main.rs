@@ -1,5 +1,6 @@
 //! `garret` — the CLI that drives the Pusher (spec 06-client).
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -55,7 +56,8 @@ enum Command {
     },
     /// Push store paths and their closure
     Push {
-        /// Store paths to push, with their closure
+        /// Store paths to push, with their closure; read from stdin, one per
+        /// line, when none are given and stdin is not a terminal
         paths: Vec<String>,
         /// Concurrent uploads
         #[arg(long, short)]
@@ -226,6 +228,14 @@ async fn main() -> Result<()> {
             dry_run,
             no_upstream_filter,
         } => {
+            let mut paths = paths;
+            if paths.is_empty() && !std::io::stdin().is_terminal() {
+                paths = std::io::read_to_string(std::io::stdin())
+                    .context("reading store paths from stdin")?
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect();
+            }
             if paths.is_empty() {
                 anyhow::bail!("nothing to push");
             }
