@@ -36,9 +36,10 @@ jobs:
             extra-substituters = ${{ vars.GARRET_PULLER }}
             extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
 
-      # clippy -D warnings, then cargo fmt --check.
+      # The flake's clippy (-D warnings) and rustfmt checks, the same gates as
+      # `just check`, over the dependency build `build` pushes as garret-deps.
       - name: Lints and formatting
-        run: nix develop --command just check
+        run: nix build -L .#checks.x86_64-linux.clippy .#checks.x86_64-linux.fmt
 
   # ---------------------------------------------------------------- build ---
   build:
@@ -66,11 +67,16 @@ jobs:
       # consumers actually install (`#garret`) and the NixOS modules run by
       # default (`garret-pusher`, `garret-puller`). Each is its own store path,
       # so a cache holding only garret-all still leaves them to be built.
+      # garret-deps is the compiled third-party dependencies: a build-time
+      # input only, so no package's closure carries it, and it is listed here
+      # to be pushed with the rest. With it cached, a source-only change
+      # compiles just the workspace crates, in this job and in lint and test.
       # garret-all goes first so ./result stays the workspace.
       - name: Build all binaries
         run: |
           nix build --print-build-logs --print-out-paths \
             .#garret-all .#garret .#garret-pusher .#garret-puller .#garret-admin \
+            .#garret-deps \
             > out-paths.txt
 
       - name: Show what was built
@@ -110,11 +116,11 @@ jobs:
             extra-substituters = ${{ vars.GARRET_PULLER }}
             extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
 
-      # buildRustPackage's check phase already runs these inside `build`, but
-      # only there: a green `build` is not a legible test report, and a broken
-      # test is a test failure, not a build failure.
+      # The flake's test check, `cargo test --workspace` as in `just test`.
+      # The package build skips the tests, so this job is where they run: a
+      # broken test is a test failure, not a build failure.
       - name: Application tests
-        run: nix develop --command just test
+        run: nix build -L .#checks.x86_64-linux.test
 
   # ------------------------------------------------------------------ e2e ---
   e2e:

@@ -24,7 +24,8 @@ substituter), colocated on one host over SQLite + S3.
 
 CI builds every commit on `main` and every `v*` tag for x86_64-linux and
 aarch64-darwin, then pushes the flake's packages (`garret`, `garret-pusher`,
-`garret-puller`, `garret-admin`, `garret-all`) to garret's own cache. Trust it
+`garret-puller`, `garret-admin`, `garret-all`, and the `garret-deps`
+dependency build) to garret's own cache. Trust it
 in `nix.conf` (or `nix.settings` on NixOS; on a multi-user install
 `--option` on the command line only works for trusted users):
 

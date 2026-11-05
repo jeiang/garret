@@ -104,11 +104,23 @@ would redirect to missing blobs.
 ## NixOS modules & flake outputs
 
 Flake outputs: `packages.{garret,garret-pusher,garret-puller,garret-admin,garret-bench}`,
+`packages.garret-all` (the workspace derivation the others wrap),
+`packages.garret-deps` (its compiled third-party dependencies),
 `nixosModules.{pusher,puller,watcher}`, `devShells.default`, `checks`
-(`build`; on Linux also `module`, a NixOS VM test: a cache host running the
+(`clippy`, `fmt` and `test`, the gates of `just check` and `just test`;
+`monitoring`; on Linux also `module`, a NixOS VM test: a cache host running the
 pusher and puller modules over Garage, and a builder whose watcher pushes a
 path the Puller then serves back, all under the sandbox below; it also checks
 the service-user boundary).
+
+The workspace is built with crane in two derivations: `garret-deps` compiles
+only the dependencies, from `Cargo.lock` and the manifests, and `garret-all`
+compiles the workspace crates on top of it, as do the `clippy` and `test`
+checks. A source edit therefore reuses the dependency build; only a lockfile
+or manifest change redoes it. The source is the Cargo sources alone, so edits
+to docs, scripts or `nix/` rebuild nothing. `GARRET_REVISION` is set on the
+workspace derivation only: on the dependency build it would change every
+commit. The package build does not run the tests; the `test` check does.
 
 Module options (all under `services.garret.*`; defaults in parentheses):
 
@@ -253,14 +265,17 @@ to it), and with `nix-command` enabled for itself only via `NIX_CONFIG`.
 
 ## Prebuilt outputs
 
-CI builds `garret-all` and the `garret`, `garret-pusher`, `garret-puller`
-and `garret-admin` wrappers on x86_64-linux and aarch64-darwin, and for every
-push to `main` or a `v*` tag pushes their closures (plus the devshell) to
-garret's own deployment. The wrappers are pushed as well as the workspace:
-each is its own store path, and a consumer installing
-`#garret` or a NixOS module running the default `garret-pusher` would
-otherwise still build it. Consumers pin arbitrary `main` revisions, so `main`
-and tag runs are never cancelled by a later push; only pull request runs are.
+CI builds `garret-all`, the `garret`, `garret-pusher`, `garret-puller`
+and `garret-admin` wrappers, and `garret-deps` on x86_64-linux and
+aarch64-darwin, and for every push to `main` or a `v*` tag pushes their
+closures (plus the devshell) to garret's own deployment. The wrappers are
+pushed as well as the workspace: each is its own store path, and a consumer
+installing `#garret` or a NixOS module running the default `garret-pusher`
+would otherwise still build it. `garret-deps` is a build-time input that no
+package's closure references, so it is pushed by name; with it cached, a run
+after a source-only change compiles only the workspace crates. Consumers pin
+arbitrary `main` revisions, so `main` and tag runs are never cancelled by a
+later push; only pull request runs are.
 
 ## Shell completions
 
