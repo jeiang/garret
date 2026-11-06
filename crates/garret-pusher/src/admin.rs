@@ -6,7 +6,7 @@
 
 use std::{collections::HashSet, path::Path, sync::Arc};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use garret_common::admin::{Request, Response};
 use garret_server::{
     db,
@@ -90,7 +90,15 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             }),
         },
         Request::Resign => resign(state).await,
-        Request::Delete { hashes, dry_run } => delete(state, &hashes, dry_run).await,
+        Request::Delete { hashes, dry_run } => {
+            delete(state, &hashes, dry_run)
+                .await
+                .map(|done| Response::Delete {
+                    deleted: done.deleted,
+                    bytes_freed: done.bytes_freed,
+                    missing: done.missing,
+                })
+        }
         Request::Pin {
             name,
             hash,
@@ -148,6 +156,15 @@ async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
     .await
 }
 
+/// What [`delete`] removed (or, on a dry run, would remove).
+#[derive(Debug)]
+struct Deleted {
+    deleted: usize,
+    bytes_freed: i64,
+    /// Hashes with no row, in request order.
+    missing: Vec<String>,
+}
+
 /// Removes objects outright: row first, blob second, exactly as GC does
 /// (spec 05) so a failed blob delete leaves an orphan for the sweep rather
 /// than a row pointing at nothing.
@@ -155,7 +172,7 @@ async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
 /// Deliberately unconditional -- it does not check whether anything still
 /// references the object. GC decides by reachability; this is the operator
 /// saying "remove it regardless", which is the whole reason it exists.
-async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<Response> {
+async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<Deleted> {
     let mut seen = HashSet::new();
     let hashes: Vec<&str> = hashes
         .iter()
@@ -169,40 +186,38 @@ async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<Re
     } else {
         claim_deletions(&state.in_flight, &hashes)?
     };
-    let mut deleted = 0;
-    let mut bytes_freed = 0;
-    let mut missing = Vec::new();
+    let mut done = Deleted {
+        deleted: 0,
+        bytes_freed: 0,
+        missing: Vec::new(),
+    };
     let mut keys = Vec::new();
 
     for hash in hashes {
-        let present = {
-            let conn = state.conn.lock();
-            db::exists(&conn, hash)?
-        };
-        if !present {
-            missing.push(hash.to_owned());
-            continue;
-        }
-        let freed = if dry_run {
-            let conn = state.conn.lock();
-            db::get_object(&conn, hash)?.map_or(0, |object| object.file_size)
-        } else {
+        // One lock hold per path: whether the row exists is decided by the
+        // delete itself, so a row fsck repair removed meanwhile is missing,
+        // not a zero-byte delete.
+        let freed = {
             let mut conn = state.conn.lock();
-            db::delete_object(&mut conn, hash)?
+            if dry_run {
+                db::file_size(&conn, hash)?
+            } else {
+                db::delete_object(&mut conn, hash)?
+            }
         };
-        deleted += 1;
-        bytes_freed += freed;
+        let Some(freed) = freed else {
+            done.missing.push(hash.to_owned());
+            continue;
+        };
+        done.deleted += 1;
+        done.bytes_freed += freed;
         keys.push(garret_server::storage::key_for(hash));
     }
 
     if !dry_run && !keys.is_empty() {
         state.storage.delete_objects(&keys).await?;
     }
-    Ok(Response::Delete {
-        deleted,
-        bytes_freed,
-        missing,
-    })
+    Ok(done)
 }
 
 /// Incident response after a push credential leaks (spec 10-packaging): every
@@ -214,28 +229,12 @@ async fn delete_pushed_by(
     since: Option<i64>,
     dry_run: bool,
 ) -> Result<Response> {
-    let mut matched = {
+    let matched = {
         let conn = state.conn.lock();
         pushed_by(&conn, subject, since)?
     };
-    let bytes_freed = if dry_run {
-        matched.iter().map(|row| row.file_size).sum()
-    } else {
-        let hashes: Vec<String> = matched
-            .iter()
-            .map(|row| row.store_path_hash.clone())
-            .collect();
-        let Response::Delete {
-            bytes_freed,
-            missing,
-            ..
-        } = delete(state, &hashes, false).await?
-        else {
-            bail!("delete answered with something other than Response::Delete");
-        };
-        // Gone between the listing and the delete (GC got there first): not
-        // deleted by this command, so not reported as such.
-        matched.retain(|row| !missing.contains(&row.store_path_hash));
+    let (matched, bytes_freed) = delete_listed(state, matched, dry_run).await?;
+    if !dry_run {
         tracing::info!(
             subject,
             since,
@@ -243,8 +242,7 @@ async fn delete_pushed_by(
             bytes_freed,
             "deleted objects by pusher"
         );
-        bytes_freed
-    };
+    }
     Ok(Response::DeletePushedBy {
         objects: matched
             .into_iter()
@@ -252,6 +250,29 @@ async fn delete_pushed_by(
             .collect(),
         bytes_freed,
     })
+}
+
+/// Deletes the listed objects through [`delete`]; returns those it actually
+/// removed and the bytes freed. On a dry run, all of them and their sizes.
+async fn delete_listed(
+    state: &AppState,
+    mut matched: Vec<db::ObjectBrief>,
+    dry_run: bool,
+) -> Result<(Vec<db::ObjectBrief>, i64)> {
+    if dry_run {
+        let bytes_freed = matched.iter().map(|row| row.file_size).sum();
+        return Ok((matched, bytes_freed));
+    }
+    let hashes: Vec<String> = matched
+        .iter()
+        .map(|row| row.store_path_hash.clone())
+        .collect();
+    let done = delete(state, &hashes, false).await?;
+    // Gone between the listing and the delete (GC or fsck repair got there
+    // first): not deleted by this command, so not reported as such.
+    let missing: HashSet<&str> = done.missing.iter().map(String::as_str).collect();
+    matched.retain(|row| !missing.contains(row.store_path_hash.as_str()));
+    Ok((matched, done.bytes_freed))
 }
 
 /// Every object first pushed by `subject`, at or after `since` when given.
@@ -451,7 +472,7 @@ fn backup_to(source: &str, dest: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{open_db, test_state};
+    use crate::tests::{open_db, storage_at, test_state, test_state_with_storage};
 
     fn object(hash: &str) -> db::Object {
         db::Object {
@@ -666,17 +687,61 @@ mod tests {
         db::insert_object(&mut conn, &object(&a), 100).unwrap();
         let state = test_state(conn).await;
 
-        let Response::Delete {
-            deleted,
-            bytes_freed,
-            missing: gone,
-        } = delete(&state, &[a.clone(), missing.clone()], true)
+        let done = delete(&state, &[a.clone(), missing.clone()], true)
             .await
-            .unwrap()
-        else {
-            panic!("not a delete response");
-        };
-        assert_eq!((deleted, bytes_freed, gone), (1, 5, vec![missing]));
+            .unwrap();
+        assert_eq!(
+            (done.deleted, done.bytes_freed, done.missing),
+            (1, 5, vec![missing])
+        );
         assert!(db::exists(&state.conn.lock(), &a).unwrap());
+    }
+
+    /// An absent hash is reported missing, not counted as a zero-byte delete.
+    #[tokio::test]
+    async fn deleting_an_absent_hash_reports_it_missing() {
+        let missing = "z".repeat(32);
+        let state = test_state(open_db()).await;
+
+        let done = delete(&state, std::slice::from_ref(&missing), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            (done.deleted, done.bytes_freed, done.missing),
+            (0, 0, vec![missing])
+        );
+    }
+
+    /// A listed object whose row goes before the delete runs (GC or fsck
+    /// repair got there first) is neither reported nor counted as freed.
+    #[tokio::test]
+    async fn delete_pushed_by_reports_only_what_it_deleted() {
+        let leaked = "https://issuer#leaked";
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        let mut conn = open_db();
+        push(&mut conn, &a, leaked, 100);
+        push(&mut conn, &b, leaked, 200);
+        let listed = pushed_by(&conn, leaked, None).unwrap();
+        db::delete_object(&mut conn, &a).unwrap();
+        let state = test_state_with_storage(conn, acking_s3().await).await;
+
+        let (deleted, bytes_freed) = delete_listed(&state, listed, false).await.unwrap();
+        let deleted: Vec<&str> = deleted
+            .iter()
+            .map(|row| row.store_path_hash.as_str())
+            .collect();
+        assert_eq!((deleted, bytes_freed), (vec![b.as_str()], 5));
+        assert!(!db::exists(&state.conn.lock(), &b).unwrap());
+    }
+
+    /// An S3 stand-in that acknowledges every `DeleteObjects`.
+    async fn acking_s3() -> garret_server::storage::Storage {
+        let app = axum::Router::new().fallback(|| async {
+            r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        storage_at(&endpoint).await
     }
 }
