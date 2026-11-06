@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use axum::{
     Router,
     extract::{Path, State},
@@ -17,7 +17,7 @@ use axum::{
 };
 use garret_common::wire;
 use garret_server::{
-    auth::Authenticator,
+    auth::{self, Authenticator, Rejection},
     browse,
     config::{IssuerConfig, PullerConfig},
     db, metrics as garret_metrics, narinfo, now,
@@ -246,12 +246,10 @@ fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>>
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    garret_server::runtime::init_tracing();
-    let path = std::env::args()
-        .nth(1)
-        .context("usage: garret-puller <config.toml>")?;
-    let cfg: PullerConfig = garret_server::config::load(&path)?;
-    cfg.validate()?;
+    let garret_server::runtime::Started {
+        config: cfg,
+        listener,
+    } = garret_server::runtime::start::<PullerConfig>("puller").await?;
 
     let state = Arc::new(AppState {
         conn: OnceLock::new(),
@@ -302,19 +300,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    let metrics_handle = garret_metrics::install("puller")?;
-    let metrics_addr: std::net::SocketAddr = cfg
-        .metrics_listen
-        .parse()
-        .context("invalid metrics listen address")?;
-    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-    tracing::info!("metrics listening on {metrics_addr}");
-    tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener, || {}).await {
-            tracing::error!("metrics listener failed: {e:#}");
-        }
-    });
-
     let store_dir = cfg.store_dir.clone();
     let browse_routes = browse_routes(cfg.browse_oidc.as_ref())?;
 
@@ -343,9 +328,6 @@ async fn main() -> Result<()> {
         .layer(axum::middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
 
-    let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("puller listening on {addr}");
     garret_server::runtime::notify_ready();
     garret_server::runtime::serve(listener, app, std::future::pending()).await?;
     Ok(())
@@ -579,50 +561,31 @@ async fn nar_redirect(State(state): State<Arc<AppState>>, Path(file): Path<Strin
 /// Pocket ID only, and only here — narinfo and NAR stay anonymous so any
 /// machine's nix.conf works untouched (spec 04-auth).
 async fn require_browse_oidc(
-    State(auth): State<Arc<Authenticator>>,
-    request: axum::extract::Request,
+    State(authenticator): State<Arc<Authenticator>>,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let token = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let verdict = match token {
-        Some(token) => Some(auth.authenticate(token).await),
-        None => None,
-    };
-    match verdict {
-        Some(Ok(_)) => next.run(request).await,
-        other => {
-            let mut refused = false;
-            let reason = match other {
+    match auth::bearer(&authenticator, request.headers()).await {
+        Ok(subject) => {
+            request.extensions_mut().insert(subject);
+            next.run(request).await
+        }
+        Err(rejection) => {
+            let reason = match rejection.reason() {
                 None => "missing_bearer",
-                Some(verdict) => {
+                Some(logged) => {
                     // Debug, not warn: browse is a public surface and any
                     // client can flood this line.
-                    if let Err(e) = verdict {
-                        tracing::debug!(
-                            "rejected browse token: {}",
-                            garret_server::auth::loggable(&e)
-                        );
-                        refused = e.is::<garret_server::auth::PolicyRefused>();
-                    }
+                    tracing::debug!("rejected browse token: {logged}");
                     "token_rejected"
                 }
             };
             metrics::counter!("garret_browse_auth_failures_total", "reason" => reason).increment(1);
-            // A verified identity that policy refuses is a 403 (spec 04);
-            // every other failure may be transient and stays a 401.
-            if refused {
-                return (StatusCode::FORBIDDEN, "not authorized").into_response();
-            }
-            (
-                StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
-                "unauthorized",
-            )
-                .into_response()
+            let body = match &rejection {
+                Rejection::Refused(_) => "not authorized",
+                Rejection::Missing | Rejection::Invalid(_) => "unauthorized",
+            };
+            rejection.respond(body)
         }
     }
 }
@@ -974,20 +937,7 @@ mod tests {
     #[tokio::test]
     async fn browse_auth_leaves_unmatched_paths_a_plain_404() {
         use tower::ServiceExt;
-        let issuer = IssuerConfig {
-            issuer: "https://issuer.example".into(),
-            audience: "aud".into(),
-            extra_audiences: vec![],
-            client_id: None,
-            jwks_url: None,
-            github_owner_id: None,
-            ref_patterns: vec![],
-            ref_protected: None,
-            repository_ids: vec![],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
-        };
+        let issuer = garret_server::testing::dev_issuer("unused");
         let app = Router::new()
             .route("/{file}", get(narinfo_route))
             .merge(browse_routes(Some(&issuer)).unwrap())
@@ -1008,50 +958,5 @@ mod tests {
         }
         let res = get_status(wire::OBJECTS).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    }
-
-    /// A verified token that a policy gate refuses is a 403; an unverifiable
-    /// one stays a 401 (spec 04).
-    #[tokio::test]
-    async fn browse_answers_403_for_a_policy_refusal_and_401_otherwise() {
-        use tower::ServiceExt;
-        let jwks = std::env::temp_dir().join(format!("garret-puller-jwks-{}", std::process::id()));
-        std::fs::write(&jwks, garret_server::testing::jwks()).unwrap();
-        let issuer = IssuerConfig {
-            issuer: "https://issuer.example".into(),
-            audience: "aud".into(),
-            extra_audiences: vec![],
-            client_id: None,
-            jwks_url: Some(jwks.to_str().unwrap().into()),
-            github_owner_id: None,
-            ref_patterns: vec![],
-            ref_protected: None,
-            repository_ids: vec!["42".into()],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
-        };
-        let app = browse_routes(Some(&issuer))
-            .unwrap()
-            .with_state(state().await);
-        let send = |token: String| {
-            let app = app.clone();
-            async move {
-                let req = axum::http::Request::get(wire::OBJECTS)
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(axum::body::Body::empty())
-                    .unwrap();
-                app.oneshot(req).await.unwrap()
-            }
-        };
-        let signed = garret_server::testing::sign(
-            r#"{"iss": "https://issuer.example", "sub": "ci", "aud": "aud", "exp": 4102444800, "repository_id": "99"}"#,
-        );
-        let res = send(signed).await;
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
-        let res = send("not-a-jwt".into()).await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_file(jwks);
     }
 }

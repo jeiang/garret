@@ -1,16 +1,72 @@
 //! Test-only signing fixtures (feature `test-support`): an RSA key generated
-//! once per test process, its JWKS, and a token signer, so router tests can
-//! send a verified token. No private key is committed.
+//! once per test process, its JWKS, a token signer, and an issuer trusting
+//! it, so router tests can send a verified token. No private key is
+//! committed.
 
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use aws_lc_rs::encoding::AsDer;
 use aws_lc_rs::rsa::{KeyPair, KeySize};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
+use crate::config::IssuerConfig;
+
 /// The `kid` of the fixture key.
 pub const KID: &str = "test-key";
+
+/// The issuer URL of [`dev_issuer`].
+pub const DEV_ISSUER: &str = "https://issuer.example";
+
+/// An issuer at [`DEV_ISSUER`] for audience `garret` with no policy gates,
+/// reading its keys from `jwks_url` (see [`jwks_file`]).
+pub fn dev_issuer(jwks_url: &str) -> IssuerConfig {
+    IssuerConfig {
+        issuer: DEV_ISSUER.into(),
+        audience: "garret".into(),
+        extra_audiences: vec![],
+        client_id: None,
+        jwks_url: Some(jwks_url.into()),
+        github_owner_id: None,
+        ref_patterns: vec![],
+        ref_protected: None,
+        repository_ids: vec![],
+        event_names: vec![],
+        job_workflow_refs: vec![],
+        allowed_groups: vec![],
+    }
+}
+
+/// A JWKS file publishing the fixture key, removed on drop.
+pub struct JwksFile(std::path::PathBuf);
+
+impl JwksFile {
+    /// The file's path, usable as a `jwks_url`.
+    pub fn path(&self) -> &str {
+        self.0.to_str().expect("temp path is UTF-8")
+    }
+}
+
+impl Drop for JwksFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Writes the fixture key's JWKS to a fresh temp file.
+pub fn jwks_file() -> JwksFile {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "garret-jwks-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, jwks()).expect("writing JWKS file");
+    JwksFile(path)
+}
 
 /// The fixture key as PKCS#1 `RSAPrivateKey` DER, plus its public `n` and `e`.
 struct Fixture {
@@ -59,7 +115,7 @@ fn tlv(b: &[u8]) -> (u8, &[u8], &[u8]) {
 }
 
 /// The JWKS an issuer would publish for the fixture key.
-pub fn jwks() -> String {
+fn jwks() -> String {
     let f = fixture();
     format!(
         r#"{{"keys":[{{"kty":"RSA","kid":"{KID}","use":"sig","alg":"RS256","n":"{}","e":"{}"}}]}}"#,
