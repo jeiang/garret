@@ -23,7 +23,7 @@ use axum::{
 };
 use futures::StreamExt;
 use garret_common::{
-    Preamble, is_store_hash,
+    Preamble, is_store_hash, sha256_nix32, store_basename,
     wire::{self, Discovery, Oidc, UploadAck},
 };
 use garret_server::{
@@ -33,7 +33,7 @@ use garret_server::{
     inflight::{self, InFlight},
     metrics as garret_metrics,
     narinfo::{self, SigningKeyFile},
-    nix_base32, now,
+    now,
     storage::{self, Storage, UploadLimits},
 };
 use serde_json::json;
@@ -667,7 +667,7 @@ async fn store_upload(
 
     // Server-computed over exactly the bytes stored — what nix checks the
     // redirected download against (ADR-0005).
-    object.file_hash = format!("sha256:{}", nix_base32::encode(&digest));
+    object.file_hash = sha256_nix32(&digest);
     object.file_size = file_size;
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
     let at = now();
@@ -768,19 +768,6 @@ fn build_object(
         sigs: vec![],
         pushed_by: Some(subject.0.clone()),
     })
-}
-
-/// `{store_dir}/{hash}-{name}` → `{hash}-{name}`, if nix would accept it as a
-/// store path: a 32-character nix-base32 hash, and a name of 1–211
-/// characters from `[A-Za-z0-9+-._?=]`.
-fn store_basename<'a>(path: &'a str, store_dir: &str) -> Option<&'a str> {
-    let base = path.strip_prefix(store_dir)?.strip_prefix('/')?;
-    let (hash, name) = base.split_once('-')?;
-    let name_ok = (1..=211).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+-._?=".contains(&b));
-    (is_store_hash(hash) && name_ok).then_some(base)
 }
 
 #[cfg(test)]
@@ -1091,8 +1078,7 @@ mod tests {
     async fn a_nar_that_does_not_match_its_claim_is_refused_before_it_is_stored() {
         use sha2::{Digest, Sha256};
         let nar = b"nix-archive-1 and then some".repeat(100);
-        let hash_of =
-            |bytes: &[u8]| format!("sha256:{}", nix_base32::encode(&Sha256::digest(bytes)));
+        let hash_of = |bytes: &[u8]| sha256_nix32(&Sha256::digest(bytes));
         let size = nar.len() as i64;
         let claims = [
             ("wrong NarHash", hash_of(b"another NAR"), size, "NarHash is"),

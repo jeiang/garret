@@ -11,7 +11,6 @@ use std::{
 use anyhow::anyhow;
 use bytes::Bytes;
 use futures::{FutureExt, Stream};
-use garret_server::nix_base32;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
@@ -135,10 +134,7 @@ impl Checker {
                 self.nar_size, self.claimed_size
             ));
         }
-        let hash = format!(
-            "sha256:{}",
-            nix_base32::encode(&self.hasher.finalize_reset())
-        );
+        let hash = garret_common::sha256_nix32(&self.hasher.finalize_reset());
         if hash != self.claimed_hash {
             return Err(format!(
                 "NarHash is {hash}, not the claimed {}",
@@ -347,7 +343,7 @@ mod tests {
             .flat_map(|i| (i % 251).to_le_bytes())
             .collect();
         let compressed = zstd::encode_all(nar.as_slice(), 3).unwrap();
-        let hash = format!("sha256:{}", nix_base32::encode(&Sha256::digest(&nar)));
+        let hash = garret_common::sha256_nix32(&Sha256::digest(&nar));
         (nar, compressed, hash, 300_000 * 4)
     }
 
@@ -411,7 +407,7 @@ mod tests {
     async fn an_honest_nar_ending_on_a_buffer_boundary_passes() {
         let nar = vec![b'n'; 4 * SCRATCH];
         let compressed = zstd::encode_all(nar.as_slice(), 3).unwrap();
-        let hash = format!("sha256:{}", nix_base32::encode(&Sha256::digest(&nar)));
+        let hash = garret_common::sha256_nix32(&Sha256::digest(&nar));
         let (passed, outcome) = run(&compressed, &hash, nar.len() as i64).await;
         assert_eq!(outcome, Some(Outcome::Accepted));
         assert_eq!(passed, compressed);
@@ -420,7 +416,7 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_nar_hash_is_refused_at_end_of_stream() {
         let (_, compressed, _, size) = nar();
-        let other = format!("sha256:{}", nix_base32::encode(&Sha256::digest(b"other")));
+        let other = garret_common::sha256_nix32(&Sha256::digest(b"other"));
         let (_, refused) = run(&compressed, &other, size).await;
         assert_refused(refused, "NarHash is");
     }

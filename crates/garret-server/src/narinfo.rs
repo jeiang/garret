@@ -82,27 +82,25 @@ impl SigningKeyFile {
 /// checks the signature. Only input-addressed paths fail, which is why this
 /// survived until the e2e pushed a built derivation.
 pub fn normalize_hash(hash: &str) -> Result<String> {
-    if let Some(rest) = hash.strip_prefix("sha256:") {
-        return Ok(format!("sha256:{}", normalize_digest(rest)?));
-    }
-    if let Some(rest) = hash.strip_prefix("sha256-") {
-        return Ok(format!("sha256:{}", normalize_digest(rest)?));
-    }
-    bail!("unsupported hash format: {hash}")
-}
-
-fn normalize_digest(digest: &str) -> Result<String> {
-    // 52 base32 characters is an already-canonical sha256.
-    if digest.len() == 52 && garret_common::is_nix_base32(digest) {
-        return Ok(digest.to_owned());
+    const SHA256_BYTES: usize = 32;
+    let Some(digest) = hash
+        .strip_prefix("sha256:")
+        .or_else(|| hash.strip_prefix("sha256-"))
+    else {
+        bail!("unsupported hash format: {hash}")
+    };
+    if digest.len() == garret_common::nix_base32_len(SHA256_BYTES)
+        && garret_common::is_nix_base32(digest)
+    {
+        return Ok(format!("sha256:{digest}"));
     }
     let bytes = B64
         .decode(digest)
         .with_context(|| format!("hash is neither nix-base32 nor base64: {digest}"))?;
-    if bytes.len() != 32 {
+    if bytes.len() != SHA256_BYTES {
         bail!("expected a 32-byte sha256, got {} bytes", bytes.len());
     }
-    Ok(crate::nix_base32::encode(&bytes))
+    Ok(garret_common::sha256_nix32(&bytes))
 }
 
 /// Nix's signed fingerprint. References are full store paths, sorted — nix

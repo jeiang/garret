@@ -8,7 +8,6 @@ pub mod db;
 pub mod inflight;
 pub mod metrics;
 pub mod narinfo;
-pub mod nix_base32;
 pub mod runtime;
 pub mod storage;
 #[cfg(feature = "test-support")]

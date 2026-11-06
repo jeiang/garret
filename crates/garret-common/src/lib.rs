@@ -67,10 +67,56 @@ pub fn is_nix_base32(s: &str) -> bool {
     s.bytes().all(|b| NIX_BASE32_ALPHABET.contains(&b))
 }
 
+/// Length of the Nix base32 spelling of `bytes` bytes.
+pub const fn nix_base32_len(bytes: usize) -> usize {
+    if bytes == 0 {
+        0
+    } else {
+        (bytes * 8 - 1) / 5 + 1
+    }
+}
+
+/// Nix's base32 encoding, least-significant group first, as
+/// `nix hash convert --to nix32` does.
+pub fn nix_base32_encode(bytes: &[u8]) -> String {
+    (0..nix_base32_len(bytes.len()))
+        .rev()
+        .map(|n| {
+            let b = n * 5;
+            let (i, j) = (b / 8, b % 8);
+            let lo = bytes[i] >> j;
+            // j == 0 means the group is byte-aligned: no carry, and `<< 8` would overflow.
+            let hi = match (j, bytes.get(i + 1)) {
+                (0, _) | (_, None) => 0,
+                (_, Some(next)) => next << (8 - j),
+            };
+            NIX_BASE32_ALPHABET[usize::from((lo | hi) & 0x1f)] as char
+        })
+        .collect()
+}
+
+/// A sha256 digest as Nix spells it in narinfo: `sha256:<nix-base32>`.
+pub fn sha256_nix32(digest: &[u8]) -> String {
+    format!("sha256:{}", nix_base32_encode(digest))
+}
+
 /// Whether `s` is a store path hash: exactly 32 characters of Nix's base32
 /// alphabet.
 pub fn is_store_hash(s: &str) -> bool {
     s.len() == 32 && is_nix_base32(s)
+}
+
+/// `{store_dir}/{hash}-{name}` → `{hash}-{name}`, if nix would accept it as a
+/// store path: an [`is_store_hash`] hash, and a name of 1–211 characters from
+/// `[A-Za-z0-9+-._?=]`.
+pub fn store_basename<'a>(path: &'a str, store_dir: &str) -> Option<&'a str> {
+    let base = path.strip_prefix(store_dir)?.strip_prefix('/')?;
+    let (hash, name) = base.split_once('-')?;
+    let name_ok = (1..=211).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-._?=".contains(&b));
+    (is_store_hash(hash) && name_ok).then_some(base)
 }
 
 /// A store-path hash, given bare or as a store path (`/nix/store/<hash>-<name>`
@@ -160,6 +206,31 @@ mod tests {
         ] {
             assert_eq!(parse_store_hash(bad), None, "{bad:?} should be rejected");
         }
+    }
+
+    /// Vectors produced by `nix hash convert --to nix32 --hash-algo sha256`
+    /// for the sha256 of `""` and of `"garret"`.
+    #[test]
+    fn nix_base32_matches_nix() {
+        let hex = |s: &str| -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        assert_eq!(
+            nix_base32_encode(&hex(
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )),
+            "0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73"
+        );
+        assert_eq!(
+            nix_base32_encode(&hex(
+                "a2dc98e1f6875dfd2c63d0c8a79616a8848728ff96660326b75bd0d3dae0dfe0"
+            )),
+            "1q6zw3dd7l2vnwk06rlnzwl8g1582sbagj6hccngspc7yvhrip52"
+        );
+        assert_eq!(nix_base32_encode(&[]), "");
     }
 
     #[test]
