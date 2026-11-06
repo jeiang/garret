@@ -105,22 +105,58 @@ fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
     written.with_context(|| format!("writing {}", path.display()))
 }
 
-/// The two OIDC endpoints the client uses, out of everything discovery offers.
-#[derive(Debug, Deserialize)]
+/// The OIDC endpoints the client uses, out of everything discovery offers.
+/// Built only by [`discover`], so every URL here has passed
+/// [`crate::discovery::check_url`] before any credential is posted to it.
+#[derive(Debug)]
 pub struct Endpoints {
-    /// Where the device flow asks for a user code (RFC 8628).
-    pub device_authorization_endpoint: String,
-    /// Where every grant type is exchanged for tokens.
-    pub token_endpoint: String,
+    device_authorization_endpoint: Option<String>,
+    token_endpoint: String,
 }
 
-/// Fetches the issuer's `/.well-known/openid-configuration`.
+/// The discovery document as the issuer sent it, before any check.
+#[derive(Debug, Deserialize)]
+struct RawEndpoints {
+    device_authorization_endpoint: Option<String>,
+    token_endpoint: String,
+}
+
+impl Endpoints {
+    fn checked(raw: RawEndpoints) -> Result<Self> {
+        crate::discovery::check_url("the OIDC token_endpoint", &raw.token_endpoint)?;
+        if let Some(device) = &raw.device_authorization_endpoint {
+            crate::discovery::check_url("the OIDC device_authorization_endpoint", device)?;
+        }
+        Ok(Self {
+            device_authorization_endpoint: raw.device_authorization_endpoint,
+            token_endpoint: raw.token_endpoint,
+        })
+    }
+
+    /// Where every grant type is exchanged for tokens.
+    pub fn token_endpoint(&self) -> &str {
+        &self.token_endpoint
+    }
+
+    /// Where the device flow asks for a user code (RFC 8628); an error when
+    /// the issuer does not offer the device flow.
+    pub fn device_authorization_endpoint(&self) -> Result<&str> {
+        self.device_authorization_endpoint.as_deref().context(
+            "the OIDC issuer advertises no device_authorization_endpoint, so it offers no \
+             device flow",
+        )
+    }
+}
+
+/// Fetches the issuer's `/.well-known/openid-configuration`. The issuer may
+/// come from token.json rather than the checked config, so it is checked here.
 pub async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints> {
+    crate::discovery::check_url("the OIDC issuer", issuer)?;
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    Ok(http
+    let raw: RawEndpoints = http
         .get(&url)
         .timeout(TOKEN_TIMEOUT)
         .send()
@@ -128,7 +164,9 @@ pub async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints>
         .and_then(|r| r.error_for_status())
         .with_context(|| format!("OIDC discovery at {url}"))?
         .json()
-        .await?)
+        .await
+        .with_context(|| format!("parsing OIDC discovery at {url}"))?;
+    Endpoints::checked(raw)
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,7 +280,7 @@ pub async fn device_login(
 ) -> Result<String> {
     let endpoints = discover(http, issuer).await?;
     let response = http
-        .post(&endpoints.device_authorization_endpoint)
+        .post(endpoints.device_authorization_endpoint()?)
         .form(&with_resource(
             vec![("client_id", client_id), ("scope", "openid offline_access")],
             resource,
@@ -269,7 +307,7 @@ pub async fn device_login(
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
         let response: TokenResponse = http
-            .post(&endpoints.token_endpoint)
+            .post(endpoints.token_endpoint())
             .form(&with_resource(
                 vec![
                     ("client_id", client_id),
@@ -324,7 +362,7 @@ async fn refresh(
 ) -> Result<String> {
     let endpoints = discover(http, &stored.issuer).await?;
     let response = http
-        .post(&endpoints.token_endpoint)
+        .post(endpoints.token_endpoint())
         .form(&with_resource(
             vec![
                 ("client_id", &stored.client_id as &str),
@@ -401,7 +439,7 @@ pub async fn client_credentials(
 ) -> Result<String> {
     let endpoints = discover(http, issuer).await?;
     let response = http
-        .post(&endpoints.token_endpoint)
+        .post(endpoints.token_endpoint())
         .form(&with_resource(
             vec![
                 ("client_id", client_id),
@@ -841,5 +879,48 @@ mod tests {
         );
         assert_eq!(describe_body("  plain failure \n"), "plain failure");
         assert!(describe_body(&"x".repeat(1000)).chars().count() <= 301);
+    }
+
+    fn endpoints(json: &str) -> Result<Endpoints> {
+        Endpoints::checked(serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn discovered_endpoints_follow_the_https_rule() {
+        assert!(endpoints(r#"{"token_endpoint":"http://idp.example/token"}"#).is_err());
+        assert!(
+            endpoints(
+                r#"{"token_endpoint":"https://idp.example/token",
+                    "device_authorization_endpoint":"http://idp.example/device"}"#
+            )
+            .is_err()
+        );
+        let local = endpoints(
+            r#"{"token_endpoint":"http://127.0.0.1:1411/token",
+                "device_authorization_endpoint":"http://localhost:1411/device"}"#,
+        )
+        .unwrap();
+        assert_eq!(local.token_endpoint(), "http://127.0.0.1:1411/token");
+        assert_eq!(
+            local.device_authorization_endpoint().unwrap(),
+            "http://localhost:1411/device"
+        );
+    }
+
+    #[test]
+    fn an_issuer_without_a_device_endpoint_serves_every_flow_but_device() {
+        let e = endpoints(r#"{"token_endpoint":"https://idp.example/token"}"#).unwrap();
+        assert_eq!(e.token_endpoint(), "https://idp.example/token");
+        let err = e.device_authorization_endpoint().unwrap_err();
+        assert!(format!("{err:#}").contains("no device flow"));
+    }
+
+    #[tokio::test]
+    async fn a_plain_http_issuer_is_refused_before_discovery() {
+        // Unroutable on purpose: the refusal must come before any request.
+        let err = discover(&reqwest::Client::new(), "http://idp.invalid")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("only https is accepted"));
     }
 }
