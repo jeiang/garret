@@ -288,17 +288,17 @@ fn log_failure(path: &str, spent: u32, max: u32) {
     }
 }
 
-/// Binds the wake socket `garret enqueue` datagrams land on. A stale file from
-/// an unclean shutdown is unlinked first, so the only warning-worthy failure
-/// left is a real one (usually: the directory is not writable by this user).
+/// Binds the wake socket `garret enqueue` datagrams land on. A stale socket
+/// from an unclean shutdown is unlinked first, so the only warning-worthy
+/// failure left is a real one (usually: the directory is not writable by this
+/// user, or something other than a socket sits at `path`).
 fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket directory {parent:?}"))?;
     }
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("unlinking stale socket {path:?}"))?;
-    }
+    garret_common::remove_stale_socket(path)
+        .with_context(|| format!("unlinking stale socket {path:?}"))?;
     let socket =
         UnixDatagram::bind(path).with_context(|| format!("binding wake socket {path:?}"))?;
     // ponytail: 0666 on purpose — the socket carries no authority. A datagram

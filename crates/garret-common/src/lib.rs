@@ -163,9 +163,48 @@ pub fn unix_now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Clears `path` for a Unix socket bind: a socket left behind by a crashed
+/// process is removed, an absent path is fine, anything else is refused.
+pub fn remove_stale_socket(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} exists and is not a socket; refusing to replace it",
+                path.display()
+            ),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remove_stale_socket_removes_only_sockets() {
+        let dir = std::env::temp_dir().join(format!("garret-common-sock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+
+        remove_stale_socket(&path).unwrap();
+
+        std::fs::write(&path, b"x").unwrap();
+        let err = remove_stale_socket(&path).unwrap_err();
+        assert!(err.to_string().contains(&path.display().to_string()));
+        assert!(path.exists());
+        std::fs::remove_file(&path).unwrap();
+
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        remove_stale_socket(&path).unwrap();
+        assert!(!path.exists());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn framing_is_what_preamble_end_reads() {

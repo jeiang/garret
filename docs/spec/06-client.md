@@ -317,7 +317,9 @@ configured key, so a rotation has several live at once.
   bursts coalesce into one early poll. `garret enqueue`, registered as
   nix's `post-build-hook` (which passes paths via `$OUT_PATHS`, not
   argv), is the sender — so pushes start the moment a build finishes
-  instead of up to `poll_interval_secs` later. The socket carries no
+  instead of up to `poll_interval_secs` later. A socket left at the path
+  by an earlier run is replaced; anything else there is refused rather
+  than deleted. The socket carries no
   authority (the cursor decides what pushes), so it is mode `0666` and
   a bind failure only warns: the watcher keeps polling, and `enqueue`
   exits 0 even when nothing listens — a hook must never block or fail

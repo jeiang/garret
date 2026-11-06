@@ -29,18 +29,8 @@ pub fn bind(path: &str) -> Result<UnixListener> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     // A socket left behind by a crashed process would block the bind.
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => {
-            use std::os::unix::fs::FileTypeExt;
-            anyhow::ensure!(
-                meta.file_type().is_socket(),
-                "{path} exists and is not a socket; refusing to replace it"
-            );
-            std::fs::remove_file(path).with_context(|| format!("removing stale socket {path}"))?;
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("checking {path}")),
-    }
+    garret_common::remove_stale_socket(Path::new(path))
+        .with_context(|| format!("removing stale socket {path}"))?;
     let listener = UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
     restrict(path)?;
     tracing::info!("admin socket listening on {path}");
