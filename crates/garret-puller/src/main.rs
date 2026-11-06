@@ -577,12 +577,13 @@ async fn require_browse_oidc(
     }
 }
 
+/// A malformed `cursor` (or `limit`) fails extraction: a `400` (spec 07).
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     q: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
-    cursor: Option<String>,
+    cursor: Option<browse::Cursor>,
 }
 
 fn default_limit() -> usize {
@@ -618,13 +619,7 @@ async fn list_objects(
     axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
     browse(&state, "objects", move |conn| {
-        browse::list(
-            conn,
-            query.q.as_deref(),
-            query.limit,
-            query.cursor.as_deref(),
-        )
-        .map(Some)
+        browse::list(conn, query.q.as_deref(), query.limit, query.cursor.as_ref()).map(Some)
     })
     .await
 }
@@ -948,5 +943,42 @@ mod tests {
         }
         let res = request(&app, wire::OBJECTS).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A cursor the listing never handed out is a 400, not a silent restart
+    /// at page 1 (spec 07).
+    #[tokio::test]
+    async fn a_malformed_browse_cursor_is_a_400() {
+        use garret_server::testing::{DEV_ISSUER, dev_issuer, jwks_file, sign};
+        use tower::ServiceExt;
+
+        let jwks = jwks_file();
+        let state = state().await;
+        let browse_conn = db::open(":memory:", true).unwrap();
+        db::migrate(&browse_conn).unwrap();
+        let db = Db {
+            pull: conn(),
+            bump: conn(),
+            browse: wrap(browse_conn),
+        };
+        assert!(state.db.set(db).is_ok());
+        let app = browse_routes(Some(&dev_issuer(jwks.path())))
+            .unwrap()
+            .with_state(state);
+        let token = sign(&format!(
+            r#"{{"iss":"{DEV_ISSUER}","sub":"me","aud":"garret","exp":4102444800}}"#
+        ));
+        for (cursor, status) in [
+            ("garbage", StatusCode::BAD_REQUEST),
+            ("x:abc", StatusCode::BAD_REQUEST),
+            ("100:abc", StatusCode::OK),
+        ] {
+            let req = axum::http::Request::get(format!("{}?cursor={cursor}", wire::OBJECTS))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), status, "{cursor}");
+        }
     }
 }

@@ -2,9 +2,11 @@
 //! Served entirely by indices: name, creation order, PK, and the reverse-ref
 //! index.
 
-use anyhow::Result;
+use std::{fmt, str::FromStr};
+
+use anyhow::{Context, Result};
 use garret_common::wire::{ObjectDetail, Page, Pin, Summary, TreeNode};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::db;
 
@@ -12,41 +14,70 @@ use crate::db;
 /// page walks the index and stops, instead of sorting every row per request.
 const LIST: &str = "SELECT store_path_hash, name, store_path, nar_size, file_size, created_at
      FROM objects
-     WHERE (?1 IS NULL OR name LIKE ?1)
+     WHERE (?1 IS NULL OR name LIKE ?1 ESCAPE '\\')
        AND (created_at < ?2 OR (created_at = ?2 AND store_path_hash > ?3))
      ORDER BY created_at DESC, store_path_hash ASC
      LIMIT ?4";
 
-/// Keyset pagination, newest first. The cursor is `created_at:hash` so the
-/// pair is strictly ordered even when timestamps collide — offset pagination
-/// would skip or repeat rows as objects are pushed underneath it.
+/// Where the next listing page starts: the last row's `created_at:hash`,
+/// a pair strictly ordered even when timestamps collide. Parsing rejects
+/// anything else, so a malformed cursor is the caller's error rather than
+/// a silent restart at page 1.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct Cursor {
+    created_at: i64,
+    hash: String,
+}
+
+impl FromStr for Cursor {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let malformed = || format!("malformed cursor {s:?}: expected created_at:hash");
+        let (time, hash) = s.split_once(':').with_context(malformed)?;
+        Ok(Self {
+            created_at: time.parse().with_context(malformed)?,
+            hash: hash.to_owned(),
+        })
+    }
+}
+
+impl TryFrom<String> for Cursor {
+    type Error = anyhow::Error;
+
+    fn try_from(s: String) -> Result<Self> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for Cursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.created_at, self.hash)
+    }
+}
+
+/// Keyset pagination, newest first, by [`Cursor`] — offset pagination would
+/// skip or repeat rows as objects are pushed underneath it. `query` matches
+/// a literal substring of the name.
 pub fn list(
     conn: &Connection,
     query: Option<&str>,
     limit: usize,
-    cursor: Option<&str>,
+    cursor: Option<&Cursor>,
 ) -> Result<Page> {
     let limit = limit.clamp(1, 500);
-    let (after_time, after_hash) = match cursor.and_then(|c| c.split_once(':')) {
-        Some((time, hash)) => (time.parse::<i64>().unwrap_or(i64::MAX), hash.to_owned()),
-        None => (i64::MAX, String::new()),
+    let (after_time, after_hash) = match cursor {
+        Some(c) => (c.created_at, c.hash.as_str()),
+        None => (i64::MAX, ""),
     };
-    let pattern = query.map(|q| format!("%{q}%"));
+    let pattern = query.map(|q| format!("%{}%", escape_like(q)));
 
     let mut stmt = conn.prepare(LIST)?;
     let mut objects: Vec<Summary> = stmt
         .query_map(
             params![pattern, after_time, after_hash, limit as i64 + 1],
-            |row| {
-                Ok(Summary {
-                    hash: row.get(0)?,
-                    name: row.get(1)?,
-                    store_path: row.get(2)?,
-                    nar_size: row.get(3)?,
-                    file_size: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            },
+            summary_from_row,
         )?
         .collect::<rusqlite::Result<_>>()?;
 
@@ -54,11 +85,40 @@ pub fn list(
     let next_cursor = (objects.len() > limit).then(|| {
         objects.truncate(limit);
         let last = objects.last().expect("limit is at least 1");
-        format!("{}:{}", last.created_at, last.hash)
+        Cursor {
+            created_at: last.created_at,
+            hash: last.hash.clone(),
+        }
+        .to_string()
     });
     Ok(Page {
         objects,
         next_cursor,
+    })
+}
+
+/// `q` as a literal inside a `LIKE … ESCAPE '\'` pattern.
+fn escape_like(q: &str) -> String {
+    let mut escaped = String::with_capacity(q.len());
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// A [`Summary`] from `hash, name, store_path, nar_size, file_size,
+/// created_at`, the column order every Summary query selects.
+fn summary_from_row(row: &Row) -> rusqlite::Result<Summary> {
+    Ok(Summary {
+        hash: row.get(0)?,
+        name: row.get(1)?,
+        store_path: row.get(2)?,
+        nar_size: row.get(3)?,
+        file_size: row.get(4)?,
+        created_at: row.get(5)?,
     })
 }
 
@@ -176,16 +236,7 @@ pub fn referrers(conn: &Connection, hash: &str) -> Result<Vec<Summary>> {
          ORDER BY o.name",
     )?;
     Ok(stmt
-        .query_map(params![hash], |row| {
-            Ok(Summary {
-                hash: row.get(0)?,
-                name: row.get(1)?,
-                store_path: row.get(2)?,
-                nar_size: row.get(3)?,
-                file_size: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?
+        .query_map(params![hash], summary_from_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 
@@ -252,7 +303,8 @@ mod tests {
         assert_eq!(first.objects[0].hash, h('d'));
         assert!(first.next_cursor.is_some());
 
-        let second = list(&conn, None, 2, first.next_cursor.as_deref()).unwrap();
+        let cursor: Cursor = first.next_cursor.as_deref().unwrap().parse().unwrap();
+        let second = list(&conn, None, 2, Some(&cursor)).unwrap();
         let seen: Vec<&str> = first
             .objects
             .iter()
@@ -296,6 +348,58 @@ mod tests {
                 .objects
                 .is_empty()
         );
+    }
+
+    /// `%`, `_` and `\` in a search are literal characters, not wildcards.
+    #[test]
+    fn search_is_a_literal_substring_match() {
+        let mut conn = db();
+        for (c, name) in [
+            ('a', "50%-off"),
+            ('b', "500-off"),
+            ('c', "a_b"),
+            ('d', "axb"),
+            ('e', r"back\slash"),
+            ('f', "backslash"),
+        ] {
+            db::insert_object(&mut conn, &object(&h(c)).named(name), 100).unwrap();
+        }
+        let names = |q: &str| -> Vec<String> {
+            list(&conn, Some(q), 10, None)
+                .unwrap()
+                .objects
+                .into_iter()
+                .map(|o| o.name)
+                .collect()
+        };
+        assert_eq!(names("0%"), ["50%-off"]);
+        assert_eq!(names("a_"), ["a_b"]);
+        assert_eq!(names(r"k\s"), [r"back\slash"]);
+    }
+
+    /// `GET /objects/{hash}` serves this JSON; pinned so a schema change
+    /// cannot alter the public API unnoticed.
+    #[test]
+    fn object_detail_json_is_stable() {
+        let mut conn = db();
+        let (a, b) = (h('a'), h('b'));
+        let obj = db::Object {
+            deriver: Some(format!("{b}-hello.drv")),
+            sigs: vec!["k:c2ln".into()],
+            pushed_by: Some("https://id.example#me".into()),
+            ..object(&a)
+                .named("hello")
+                .referencing(&[&format!("{b}-dep")])
+        };
+        db::insert_object(&mut conn, &obj, 100).unwrap();
+        let json = serde_json::to_string(&super::object(&conn, &a).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"store_path_hash":"{a}","store_path":"/nix/store/{a}-hello","name":"hello","nar_hash":"sha256:x","nar_size":10,"file_hash":"sha256:y","file_size":5,"deriver":"{b}-hello.drv","ca":null,"references":["{b}-dep"],"sigs":["k:c2ln"],"pushed_by":"https://id.example#me"}}"#
+            )
+        );
+        assert!(super::object(&conn, &b).unwrap().is_none());
     }
 
     #[test]
@@ -465,30 +569,5 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].hash, root);
         assert!(referrers(&conn, &root).unwrap().is_empty());
-    }
-
-    /// `GET /objects/{hash}` serves this JSON; pinned so a schema change
-    /// cannot alter the public API unnoticed.
-    #[test]
-    fn object_detail_json_is_stable() {
-        let mut conn = db();
-        let (a, b) = (h('a'), h('b'));
-        let obj = db::Object {
-            deriver: Some(format!("{b}-hello.drv")),
-            sigs: vec!["k:c2ln".into()],
-            pushed_by: Some("https://id.example#me".into()),
-            ..object(&a)
-                .named("hello")
-                .referencing(&[&format!("{b}-dep")])
-        };
-        db::insert_object(&mut conn, &obj, 100).unwrap();
-        let json = serde_json::to_string(&super::object(&conn, &a).unwrap().unwrap()).unwrap();
-        assert_eq!(
-            json,
-            format!(
-                r#"{{"store_path_hash":"{a}","store_path":"/nix/store/{a}-hello","name":"hello","nar_hash":"sha256:x","nar_size":10,"file_hash":"sha256:y","file_size":5,"deriver":"{b}-hello.drv","ca":null,"references":["{b}-dep"],"sigs":["k:c2ln"],"pushed_by":"https://id.example#me"}}"#
-            )
-        );
-        assert!(super::object(&conn, &b).unwrap().is_none());
     }
 }

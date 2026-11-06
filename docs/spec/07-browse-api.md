@@ -13,7 +13,7 @@ All JSON under `/api/v1`:
 
 | Endpoint | Behavior |
 |---|---|
-| `GET /objects?q=&limit=&cursor=` | List/search by name (substring); keyset pagination; newest-first; `limit` defaults to 50 and is clamped to 1–500 |
+| `GET /objects?q=&limit=&cursor=` | List/search by name (literal substring: `%` and `_` are not wildcards); keyset pagination; newest-first; `limit` defaults to 50 and is clamped to 1–500; `cursor` is a previous page's `next_cursor`, and a malformed one is a `400` |
 | `GET /objects/{hash}` | Object detail: `store_path_hash`, `store_path`, `name`, the narinfo fields (`nar_hash`, `nar_size`, `file_hash`, `file_size`, `deriver`, `ca`, `references` as basenames, `sigs`) and `pushed_by`; no timestamps (the listing carries `created_at`) |
 | `GET /objects/{hash}/tree` | Dependency tree — first occurrence expands, repeats truncate, self-references skipped, references missing from the cache shown but marked; expansion stops 64 levels below the root (nodes at that depth are listed without children) |
 | `GET /objects/{hash}/referrers` | Reverse dependencies (reverse-ref index) |
