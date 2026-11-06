@@ -24,10 +24,14 @@ the listing's exact order, so a page never sorts the table), PK, and
 reverse-ref. Exact response shapes are an implementation detail — keep
 them stable once shipped.
 
-The tree derives each child's hash from its reference basename with the
-shared `hash_of_store_path`; a malformed reference (too short, or
-multibyte text at the hash boundary) yields a hash that matches nothing
-rather than a panic while the browse connection is held.
+The tree expands each node with one indexed query: the node's
+`object_refs` primary-key range, left-joined to `objects` on the
+generated `reference_hash` column referrers and GC also use, so each
+child's hash and whether it is cached come back together, in reference
+order, with self-edges filtered out. A malformed reference (too short,
+or multibyte text at the hash boundary) matches no object and is shown
+as missing; nothing on that path can panic while the browse connection
+is held.
 
 ## Isolation from the pull path
 
