@@ -8,12 +8,11 @@ set -euo pipefail
 root=$(cd "$(mktemp -d)" && pwd -P)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$root"' EXIT
 
-bin=${GARRET_BIN:-./target/release}
 out=${GARRET_BENCH_JSON:-bench-results.json}
 
 source "$(dirname "$0")/provision.sh"
 
-require_free_ports "$s3_port" "$garage_rpc_port" "$pusher_port" "$puller_port" "$pusher_metrics_port" "$puller_metrics_port"
+require_free_ports
 # Room for the corpus (~750 MiB), its serial baseline, and the 2 GiB blob.
 start_garage 20G
 make_signing_key
