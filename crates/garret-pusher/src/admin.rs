@@ -157,7 +157,7 @@ async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
     let (quota_bytes, uploads_in_flight) = (gc.map(Gc::quota_bytes), state.in_flight.uploads());
     crate::db_run(&state.conn, move |conn| {
         Ok(Response::Status {
-            objects: conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?,
+            objects: db::object_count(conn)?,
             total_bytes: db::total_bytes(conn)?,
             quota_bytes,
             uploads_in_flight,
@@ -242,7 +242,7 @@ async fn delete_pushed_by(
 ) -> Result<Response> {
     let matched = {
         let subject = subject.to_owned();
-        crate::db_run(&state.conn, move |conn| pushed_by(conn, &subject, since)).await?
+        crate::db_run(&state.conn, move |conn| db::pushed_by(conn, &subject, since)).await?
     };
     let (matched, bytes_freed) = delete_listed(state, matched, dry_run).await?;
     if !dry_run {
@@ -287,26 +287,6 @@ async fn delete_listed(
     let missing: HashSet<&str> = done.missing.iter().map(String::as_str).collect();
     matched.retain(|row| !missing.contains(row.store_path_hash.as_str()));
     Ok((matched, done.bytes_freed))
-}
-
-/// Every object first pushed by `subject`, at or after `since` when given.
-/// Exact match: a subject is `<issuer>#<sub>`, and a prefix of one GitHub
-/// ref's subject can be another's.
-fn pushed_by(
-    conn: &rusqlite::Connection,
-    subject: &str,
-    since: Option<i64>,
-) -> Result<Vec<db::ObjectBrief>> {
-    let mut stmt = conn.prepare(
-        "SELECT store_path_hash, name, created_at, file_size FROM objects
-         WHERE pushed_by = ?1 AND created_at >= ?2
-         ORDER BY created_at, store_path_hash",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![subject, since.unwrap_or(i64::MIN)],
-        db::ObjectBrief::from_row,
-    )?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
@@ -460,41 +440,6 @@ mod tests {
             ..object(hash)
         };
         db::insert_object(conn, &object, at).unwrap();
-    }
-
-    /// Matches only the exact subject -- never one it is a prefix of -- and
-    /// `since` is inclusive, so the first push after a leak is not missed.
-    #[test]
-    fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
-        let mut conn = open_db();
-        let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
-        let (a, b, c, d) = (
-            "a".repeat(32),
-            "b".repeat(32),
-            "c".repeat(32),
-            "d".repeat(32),
-        );
-        push(&mut conn, &a, leaked, 100);
-        push(&mut conn, &b, leaked, 200);
-        push(&mut conn, &c, &format!("{leaked}-other"), 200);
-        push(&mut conn, &d, "https://issuer#someone-else", 300);
-        // Negotiation refreshes pushed_at, never who pushed first or when.
-        conn.execute("UPDATE objects SET pushed_at = 500", [])
-            .unwrap();
-
-        let hashes = |since| -> Vec<String> {
-            pushed_by(&conn, leaked, since)
-                .unwrap()
-                .into_iter()
-                .map(|row| {
-                    assert_eq!((row.name.as_str(), row.file_size), ("thing", 5));
-                    row.store_path_hash
-                })
-                .collect()
-        };
-        assert_eq!(hashes(None), [a, b.clone()]);
-        assert_eq!(hashes(Some(200)), [b]);
-        assert!(hashes(Some(201)).is_empty());
     }
 
     /// The copy must hold rows that so far live only in the WAL: copying the
@@ -674,7 +619,7 @@ mod tests {
         let mut conn = open_db();
         push(&mut conn, &a, leaked, 100);
         push(&mut conn, &b, leaked, 200);
-        let listed = pushed_by(&conn, leaked, None).unwrap();
+        let listed = db::pushed_by(&conn, leaked, None).unwrap();
         db::delete_object(&mut conn, &a).unwrap();
         let acking = fake_s3(axum::Router::new().fallback(|| async { S3_DELETED })).await;
         let state = test_state_with_storage(conn, acking).await;
