@@ -160,6 +160,18 @@ enum Engine {
     },
 }
 
+/// How a [`VerifiedNar`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// End of stream, and the NAR matched its claim.
+    Accepted,
+    /// The NAR does not match its claim: the caller's 400.
+    Refused(String),
+    /// The check itself failed (its thread panicked or was dropped): a
+    /// server fault, so the caller's 500 and a push it may retry.
+    Failed(String),
+}
+
 /// Passes the compressed NAR through untouched while decompressing and
 /// hashing it. At end of stream it compares against the claimed NarHash and
 /// NarSize and, on a mismatch, yields an error in place of EOF. Every store
@@ -175,13 +187,9 @@ pub struct VerifiedNar<S> {
     engine: Engine,
     /// A chunk read from `inner`, waiting for room in the offload queue.
     pending: Option<Bytes>,
-    /// End of stream was reached or the NAR refused: never poll again.
-    finished: bool,
-    /// Why the NAR was refused, once it has been: the caller's 400.
-    pub refused: Option<String>,
-    /// The check itself failed (its thread panicked or was dropped): a
-    /// server fault, so the caller's 500 and a push it may retry.
-    pub failed: Option<String>,
+    /// How the stream ended, once it has: never poll again. `None` while
+    /// streaming, and after a body error from `inner`.
+    outcome: Option<Outcome>,
 }
 
 impl<S> VerifiedNar<S> {
@@ -231,16 +239,18 @@ impl<S> VerifiedNar<S> {
             inner,
             engine,
             pending: None,
-            finished: false,
-            refused: None,
-            failed: None,
+            outcome: None,
         })
+    }
+
+    /// How the stream ended; `None` if it did not reach a verdict.
+    pub fn into_outcome(self) -> Option<Outcome> {
+        self.outcome
     }
 
     fn refuse(&mut self, reason: String) -> Poll<Option<anyhow::Result<Bytes>>> {
         let error = anyhow!("{reason}");
-        self.refused = Some(reason);
-        self.finished = true;
+        self.outcome = Some(Outcome::Refused(reason));
         Poll::Ready(Some(Err(error)))
     }
 
@@ -251,13 +261,15 @@ impl<S> VerifiedNar<S> {
         };
         *tx = None;
         let verdict = ready!(verdict.poll_unpin(cx));
-        self.finished = true;
         match verdict {
-            Ok(Ok(())) => Poll::Ready(None),
+            Ok(Ok(())) => {
+                self.outcome = Some(Outcome::Accepted);
+                Poll::Ready(None)
+            }
             Ok(Err(reason)) => self.refuse(reason),
             Err(_) => {
                 let reason = "NAR check thread failed".to_owned();
-                self.failed = Some(reason.clone());
+                self.outcome = Some(Outcome::Failed(reason.clone()));
                 Poll::Ready(Some(Err(anyhow!(reason))))
             }
         }
@@ -273,7 +285,7 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.finished {
+        if this.outcome.is_some() {
             return Poll::Ready(None);
         }
         if let Engine::Offload { tx: Some(tx), .. } = &mut this.engine
@@ -311,7 +323,7 @@ where
             None => match &mut this.engine {
                 Engine::Inline(checker) => match checker.finish() {
                     Ok(()) => {
-                        this.finished = true;
+                        this.outcome = Some(Outcome::Accepted);
                         Poll::Ready(None)
                     }
                     Err(reason) => this.refuse(reason),
@@ -340,14 +352,14 @@ mod tests {
     }
 
     /// Streams `compressed` through the verifier in small chunks; returns
-    /// the bytes that came out and whether the stream ended in an error.
+    /// the bytes that came out and how the stream ended.
     ///
     /// Both engines run, and must agree on the verdict.
-    async fn run(compressed: &[u8], hash: &str, size: i64) -> (Vec<u8>, Option<String>) {
+    async fn run(compressed: &[u8], hash: &str, size: i64) -> (Vec<u8>, Option<Outcome>) {
         let inline = run_on(compressed, hash, size, false).await;
         let offloaded = run_on(compressed, hash, size, true).await;
         assert_eq!(inline.1, offloaded.1, "the engines disagree");
-        if inline.1.is_none() {
+        if inline.1 == Some(Outcome::Accepted) {
             assert_eq!(inline.0, offloaded.0);
         }
         inline
@@ -358,7 +370,7 @@ mod tests {
         hash: &str,
         size: i64,
         offload: bool,
-    ) -> (Vec<u8>, Option<String>) {
+    ) -> (Vec<u8>, Option<Outcome>) {
         let chunks: Vec<Result<Bytes, std::io::Error>> = compressed
             .chunks(1000)
             .map(|c| Ok(Bytes::copy_from_slice(c)))
@@ -372,21 +384,23 @@ mod tests {
                 Err(_) => break,
             }
         }
-        (passed, nar.refused)
+        (passed, nar.into_outcome())
     }
 
     /// Asserts the stream was refused, and by the check named in `why`: a
     /// refusal for some other reason must not satisfy a test.
-    fn assert_refused(refused: Option<String>, why: &str) {
-        let reason = refused.expect("the NAR was accepted");
+    fn assert_refused(outcome: Option<Outcome>, why: &str) {
+        let Some(Outcome::Refused(reason)) = outcome else {
+            panic!("not refused: {outcome:?}");
+        };
         assert!(reason.contains(why), "refused for {reason:?}, not {why:?}");
     }
 
     #[tokio::test]
     async fn an_honest_nar_passes_through_untouched() {
         let (_, compressed, hash, size) = nar();
-        let (passed, refused) = run(&compressed, &hash, size).await;
-        assert_eq!(refused, None);
+        let (passed, outcome) = run(&compressed, &hash, size).await;
+        assert_eq!(outcome, Some(Outcome::Accepted));
         assert_eq!(passed, compressed);
     }
 
@@ -398,8 +412,8 @@ mod tests {
         let nar = vec![b'n'; 4 * SCRATCH];
         let compressed = zstd::encode_all(nar.as_slice(), 3).unwrap();
         let hash = format!("sha256:{}", nix_base32::encode(&Sha256::digest(&nar)));
-        let (passed, refused) = run(&compressed, &hash, nar.len() as i64).await;
-        assert_eq!(refused, None);
+        let (passed, outcome) = run(&compressed, &hash, nar.len() as i64).await;
+        assert_eq!(outcome, Some(Outcome::Accepted));
         assert_eq!(passed, compressed);
     }
 
@@ -483,16 +497,36 @@ mod tests {
                 verdict,
             },
             pending: None,
-            finished: false,
-            refused: None,
-            failed: None,
+            outcome: None,
         };
         assert!(nar.next().await.unwrap().is_err());
-        assert_eq!(nar.refused, None);
-        assert!(nar.failed.is_some());
         assert!(
             nar.next().await.is_none(),
             "the stream ends after the failure"
         );
+        assert!(
+            matches!(nar.into_outcome(), Some(Outcome::Failed(_))),
+            "a server fault, not a refusal"
+        );
+    }
+
+    /// A body that breaks off with a client error reached no verdict: it is
+    /// neither accepted nor refused, and the store fails on the error itself.
+    #[tokio::test]
+    async fn a_client_body_error_leaves_no_outcome() {
+        let (_, compressed, hash, size) = nar();
+        for offload in [false, true] {
+            let chunks = vec![
+                Ok(Bytes::copy_from_slice(&compressed[..compressed.len() / 2])),
+                Err(std::io::Error::other("client went away")),
+            ];
+            let mut nar =
+                VerifiedNar::with_offload(futures::stream::iter(chunks), &hash, size, offload)
+                    .unwrap();
+            assert!(nar.next().await.unwrap().is_ok());
+            let error = nar.next().await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("client went away"), "{error}");
+            assert_eq!(nar.into_outcome(), None, "offload: {offload}");
+        }
     }
 }
