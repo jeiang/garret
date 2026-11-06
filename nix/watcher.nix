@@ -6,14 +6,7 @@ let
   cfg = config.services.garret.watcher;
   inherit (lib) mkEnableOption mkOption mkIf types;
 
-  # `pkgs.formats.toml` cannot represent null: unset nullable options are
-  # dropped (serde defaults them on the Rust side).
-  stripNulls = value:
-    if lib.isAttrs value
-    then lib.mapAttrs (_: stripNulls) (lib.filterAttrs (_: v: v != null) value)
-    else if lib.isList value
-    then map stripNulls value
-    else value;
+  common = import ./common.nix { inherit lib pkgs; };
 
   settings = {
     endpoint = cfg.endpoint;
@@ -37,7 +30,7 @@ let
     };
   };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-watcher.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
+  configFile = common.configFile "garret-watcher.toml" settings cfg.extraSettings;
 
   # `post-build-hook` runs a bare program with no arguments (paths arrive in
   # $OUT_PATHS), hence the wrapper. `enqueue` exits 0 unconditionally, so this
@@ -56,14 +49,7 @@ in
       description = "The garret client package to run.";
     };
 
-    extraSettings = mkOption {
-      type = (pkgs.formats.toml { }).type;
-      default = { };
-      description = ''
-        Raw TOML settings merged over the generated config (recursively), for
-        keys that have no typed option here.
-      '';
-    };
+    extraSettings = common.extraSettings;
 
     endpoint = mkOption { type = types.str; description = "Pusher base URL."; };
 
@@ -85,13 +71,16 @@ in
       };
     };
 
-    nixDb = mkOption { type = types.str; default = "/nix/var/nix/db/db.sqlite"; description = "The local nix database."; };
+    # Null options are left out of the config file, so the client applies its
+    # own default (spec 10-packaging). cursorPath and socketPath stay set here:
+    # the unit's StateDirectory and RuntimeDirectory hold them.
+    nixDb = mkOption { type = types.nullOr types.str; default = null; description = "The local nix database. Null: the system database."; };
     cursorPath = mkOption { type = types.str; default = "/var/lib/garret/watcher-cursor"; description = "Persisted ValidPaths.id cursor."; };
-    pollIntervalSeconds = mkOption { type = types.ints.positive; default = 30; description = "Seconds between polls of the nix database."; };
-    jobs = mkOption { type = types.ints.positive; default = 8; description = "Concurrent uploads."; };
-    zstdLevel = mkOption { type = types.int; default = 3; description = "Client-side zstd level."; };
-    maxRetries = mkOption { type = types.int; default = 5; description = "Upload attempts per path beyond the first, for 5xx answers and dropped connections."; };
-    maxAttempts = mkOption { type = types.ints.positive; default = 5; description = "Push attempts per path in one watcher process before it leaves the path on the failed list for a restart or drain."; };
+    pollIntervalSeconds = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Seconds between polls of the nix database."; };
+    jobs = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Concurrent uploads."; };
+    zstdLevel = mkOption { type = types.nullOr types.int; default = null; description = "Client-side zstd level."; };
+    maxRetries = mkOption { type = types.nullOr types.int; default = null; description = "Upload attempts per path beyond the first, for 5xx answers and dropped connections."; };
+    maxAttempts = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Push attempts per path in one watcher process before it leaves the path on the failed list for a restart or drain."; };
 
     socketPath = mkOption {
       type = types.str;
@@ -113,9 +102,9 @@ in
 
     filters = {
       upstreamKeys = mkOption {
-        type = types.listOf types.str;
-        default = [ "cache.nixos.org-1" ];
-        description = "Paths already signed by these keys are served elsewhere; skip them. Written as the `[watch]` override of the client-wide `upstream_keys`.";
+        type = types.nullOr (types.listOf types.str);
+        default = null;
+        description = "Paths already signed by these keys are served elsewhere; skip them. Written as the `[watch]` override of the client-wide `upstream_keys`. Null: no override, so the client-wide list (cache.nixos.org's key unless set) applies.";
       };
       excludePatterns = mkOption {
         type = types.listOf types.str;

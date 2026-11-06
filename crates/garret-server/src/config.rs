@@ -15,8 +15,8 @@ pub struct S3Config {
     pub endpoint_url: Option<String>,
     /// Defaults to `us-east-1`, which S3-compatible stores accept.
     pub region: Option<String>,
-    /// Path-style addressing, default on — S4 and Garage both accept it, and
-    /// it avoids DNS games for dotted buckets.
+    /// Path-style addressing, on unless set — S4 and Garage both accept it,
+    /// and it avoids DNS games for dotted buckets.
     #[serde(default = "yes")]
     pub path_style: bool,
     /// Omitted in production: the NixOS module supplies AWS_* via EnvironmentFile.
@@ -25,18 +25,17 @@ pub struct S3Config {
     pub secret_access_key: Option<String>,
     /// Overall deadline for one S3 call, SDK retries included (ticket 27).
     /// Without it a stalled upstream holds an upload permit and its
-    /// in-flight bytes forever. Default 60; raise on slow uplinks or with
-    /// larger parts.
+    /// in-flight bytes forever. Raise on slow uplinks or with larger parts.
     #[serde(default = "s3_operation_timeout")]
     pub operation_timeout_secs: u64,
-    /// Deadline for each attempt inside the overall one. Unset (default), a
+    /// Deadline for each attempt inside the overall one. Unset, a
     /// hung attempt uses the whole overall deadline and nothing retries. Set
     /// it above the time to send `part_size` on the slowest uplink and below
     /// `operation_timeout_secs`.
     #[serde(default)]
     pub operation_attempt_timeout_secs: Option<u64>,
     /// SigV4-sign upload bodies (a SHA-256 pass over every stored byte).
-    /// Default off: uploads send `UNSIGNED-PAYLOAD` with a CRC32 checksum
+    /// Off unless set: uploads send `UNSIGNED-PAYLOAD` with a CRC32 checksum
     /// S3 verifies, and the blob's own SHA-256 is the FileHash nix checks
     /// on download (spec 03). Turn on for a store that refuses unsigned
     /// payloads.
@@ -45,12 +44,24 @@ pub struct S3Config {
 }
 
 impl S3Config {
-    /// Rejects a half-set credential pair. The S3 client uses explicit
-    /// credentials only when both are present and otherwise falls back to
-    /// the AWS default chain, so one alone would be silently ignored.
-    pub fn validate_credentials(&self) -> Result<()> {
+    /// Rejects a half-set credential pair and timeouts that never fire or
+    /// leave no room for a retry. The S3 client uses explicit credentials
+    /// only when both are present and otherwise falls back to the AWS
+    /// default chain, so one alone would be silently ignored.
+    pub fn validate(&self) -> Result<()> {
         if self.access_key_id.is_some() != self.secret_access_key.is_some() {
             bail!("s3.access_key_id and s3.secret_access_key must be set together or both omitted");
+        }
+        if self.operation_timeout_secs == 0 {
+            bail!("s3.operation_timeout_secs must be at least 1");
+        }
+        if let Some(attempt) = self.operation_attempt_timeout_secs
+            && (attempt == 0 || attempt >= self.operation_timeout_secs)
+        {
+            bail!(
+                "s3.operation_attempt_timeout_secs ({attempt}) must be at least 1 and below s3.operation_timeout_secs ({})",
+                self.operation_timeout_secs
+            );
         }
         Ok(())
     }
@@ -123,60 +134,43 @@ pub struct IssuerConfig {
     pub allowed_groups: Vec<String>,
 }
 
+/// S3's smallest accepted part size; `limits.part_size` must be at least this.
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+/// S3's largest accepted part size; `limits.part_size` must be at most this.
+pub const MAX_PART_SIZE: usize = 5 * 1024 * 1024 * 1024;
+
 /// Backpressure caps (spec 01-push-protocol). Server memory is bounded by
 /// these, not by how many clients show up.
 #[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
-    /// Uploads admitted at once; the rest wait. Default 16.
-    #[serde(default = "max_concurrent_uploads")]
+    /// Uploads admitted at once; the rest wait.
     pub max_concurrent_uploads: usize,
-    /// Global cap on buffered upload bytes across all uploads. Default 256 MiB.
-    #[serde(default = "max_in_flight_bytes")]
+    /// Global cap on buffered upload bytes across all uploads.
     pub max_in_flight_bytes: u64,
-    /// S3 part size, and the single-`PutObject` threshold. Default 16 MiB;
-    /// at least 5 MiB (the S3 minimum).
-    #[serde(default = "part_size")]
+    /// S3 part size, and the single-`PutObject` threshold; within
+    /// [`MIN_PART_SIZE`]..=[`MAX_PART_SIZE`].
     pub part_size: usize,
-    /// Concurrent part uploads per NAR. Default 4.
-    #[serde(default = "max_parts_in_flight")]
+    /// Concurrent part uploads per NAR.
     pub max_parts_in_flight: usize,
     /// Seconds an upload body may send nothing before the upload is
-    /// abandoned. Raising it holds upload slots longer. Default 60.
-    #[serde(default = "body_idle_timeout")]
+    /// abandoned (spec 01). A stalled body holds an upload slot, its
+    /// in-flight claim and, mid-NAR, a part slot, so without a bound a few
+    /// quiet senders starve every other push. Idle, not total: a slow
+    /// sender that keeps moving is fine. Raising it holds upload slots longer.
     pub body_idle_timeout_secs: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_concurrent_uploads: max_concurrent_uploads(),
-            max_in_flight_bytes: max_in_flight_bytes(),
-            part_size: part_size(),
-            max_parts_in_flight: max_parts_in_flight(),
-            body_idle_timeout_secs: body_idle_timeout(),
+            max_concurrent_uploads: 16,
+            max_in_flight_bytes: 256 * 1024 * 1024,
+            part_size: 16 * 1024 * 1024,
+            max_parts_in_flight: 4,
+            body_idle_timeout_secs: 60,
         }
     }
-}
-
-fn body_idle_timeout() -> u64 {
-    crate::storage::BODY_IDLE_TIMEOUT.as_secs()
-}
-
-fn max_concurrent_uploads() -> usize {
-    16
-}
-
-fn max_in_flight_bytes() -> u64 {
-    256 * 1024 * 1024
-}
-
-fn part_size() -> usize {
-    16 * 1024 * 1024
-}
-
-fn max_parts_in_flight() -> usize {
-    4
 }
 
 fn pusher_metrics_listen() -> String {
@@ -193,14 +187,13 @@ fn puller_metrics_listen() -> String {
 pub struct GcConfig {
     /// The Quota: the storage budget eviction defends.
     pub quota_bytes: u64,
-    /// Fraction of quota at which eviction starts. Default 0.95.
+    /// Fraction of quota at which eviction starts.
     #[serde(default = "high_watermark")]
     pub high_watermark: f64,
-    /// Fraction of quota eviction frees down to. Default 0.85.
+    /// Fraction of quota eviction frees down to.
     #[serde(default = "low_watermark")]
     pub low_watermark: f64,
     /// Seconds between GC timer ticks (each tick is a cheap counter check).
-    /// Default 300.
     #[serde(default = "gc_interval")]
     pub interval_secs: u64,
     /// How long a blob with no row, or an idle multipart, must persist before
@@ -241,14 +234,14 @@ fn orphan_grace() -> u64 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PusherConfig {
-    /// Listen address. Default `127.0.0.1:8080`.
+    /// Listen address.
     #[serde(default = "pusher_listen")]
     pub listen: String,
     /// SQLite path. The Pusher creates and migrates it; the Puller waits.
     pub db_path: String,
     /// Blob storage.
     pub s3: S3Config,
-    /// Store prefix used in signed fingerprints. Default `/nix/store`.
+    /// Store prefix used in signed fingerprints.
     #[serde(default = "store_dir")]
     pub store_dir: String,
     /// Nix secret-key files; every object is signed with all of them
@@ -268,7 +261,7 @@ pub struct PusherConfig {
     /// Unix socket for garret-admin, mode 0600 under the Pusher's user. Absent
     /// means no admin surface.
     pub admin_socket: Option<String>,
-    /// Internal metrics listener (spec 08). Default `127.0.0.1:9091`.
+    /// Internal metrics listener (spec 08).
     #[serde(default = "pusher_metrics_listen")]
     pub metrics_listen: String,
 }
@@ -278,8 +271,6 @@ impl PusherConfig {
     /// (a part size S3 refuses, a zero permit count, a watermark that never
     /// triggers), naming the key so the operator can fix it at startup.
     pub fn validate(&self) -> Result<()> {
-        const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
-        const MAX_PART_SIZE: usize = 5 * 1024 * 1024 * 1024;
         let l = &self.limits;
         if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&l.part_size) {
             bail!(
@@ -300,20 +291,9 @@ impl PusherConfig {
         if l.max_parts_in_flight == 0 {
             bail!("limits.max_parts_in_flight must be at least 1");
         }
-        self.s3.validate_credentials()?;
-        if self.s3.operation_timeout_secs == 0 {
-            bail!("s3.operation_timeout_secs must be at least 1");
-        }
+        self.s3.validate()?;
         if l.body_idle_timeout_secs == 0 {
             bail!("limits.body_idle_timeout_secs must be at least 1");
-        }
-        if let Some(attempt) = self.s3.operation_attempt_timeout_secs
-            && (attempt == 0 || attempt >= self.s3.operation_timeout_secs)
-        {
-            bail!(
-                "s3.operation_attempt_timeout_secs ({attempt}) must be at least 1 and below s3.operation_timeout_secs ({})",
-                self.s3.operation_timeout_secs
-            );
         }
         if let Some(gc) = &self.gc {
             // A zero quota puts every Blob over the high watermark, so GC would
@@ -353,20 +333,20 @@ impl PusherConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PullerConfig {
-    /// Listen address. Default `127.0.0.1:8081`.
+    /// Listen address.
     #[serde(default = "puller_listen")]
     pub listen: String,
     /// SQLite path — the same file the Pusher writes.
     pub db_path: String,
     /// Blob storage, used only to presign GETs (ADR-0005).
     pub s3: S3Config,
-    /// Store prefix; advertised in `nix-cache-info`. Default `/nix/store`.
+    /// Store prefix; advertised in `nix-cache-info`.
     #[serde(default = "store_dir")]
     pub store_dir: String,
-    /// Lifetime of presigned NAR URLs. Default 3600.
+    /// Lifetime of presigned NAR URLs.
     #[serde(default = "presign_ttl")]
     pub presign_ttl_secs: u64,
-    /// Internal metrics listener (spec 08). Default `127.0.0.1:9092`.
+    /// Internal metrics listener (spec 08).
     #[serde(default = "puller_metrics_listen")]
     pub metrics_listen: String,
     /// Browse routes require Pocket ID; narinfo/NAR stay anonymous (spec 04).
@@ -381,11 +361,11 @@ pub struct PullerConfig {
     pub db_wait_timeout_secs: u64,
     /// Budget for a pull-path database read before the request degrades to a
     /// miss (ticket 25). Measured p99 is ~1.6 ms, so a trip means something
-    /// is genuinely wrong. Default 250.
+    /// is genuinely wrong.
     #[serde(default = "db_read_budget")]
     pub db_read_budget_ms: u64,
     /// Budget for presigning a NAR redirect before the request degrades to a
-    /// miss (ticket 25). Measured p99 is ~2.4 ms. Default 250.
+    /// miss (ticket 25). Measured p99 is ~2.4 ms.
     #[serde(default = "presign_budget")]
     pub presign_budget_ms: u64,
 }
@@ -395,7 +375,7 @@ impl PullerConfig {
     /// lifetime, a zero budget that degrades every request to a miss) naming
     /// the key, at startup.
     pub fn validate(&self) -> Result<()> {
-        self.s3.validate_credentials()?;
+        self.s3.validate()?;
         // 7 days is the SigV4 presigned-URL maximum.
         if !(1..=604_800).contains(&self.presign_ttl_secs) {
             bail!(
@@ -673,6 +653,10 @@ mod puller_validate_tests {
         rejects(|c| c.presign_budget_ms = 0, "presign_budget_ms");
         rejects(|c| c.bump_debounce_secs = -1, "bump_debounce_secs");
         rejects(|c| c.db_wait_timeout_secs = 0, "db_wait_timeout_secs");
+        rejects(
+            |c| c.s3.operation_timeout_secs = 0,
+            "operation_timeout_secs",
+        );
     }
 
     #[test]
