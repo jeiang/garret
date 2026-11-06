@@ -294,13 +294,18 @@ async fn stop_signal() {
     }
 }
 
+/// Status, caller-facing message, `garret_uploads_failed_total` reason, and
+/// the `Retry-After` seconds to send, if any.
 #[derive(Debug)]
-struct Error(StatusCode, String, &'static str);
+struct Error(StatusCode, String, &'static str, Option<&'static str>);
 
 impl Error {
-    /// 429s carry Retry-After so clients back off on the server's terms.
+    /// A policy answer that tells the client when to come back, so it backs
+    /// off on the server's terms (spec 01).
     fn retry_after(status: StatusCode, message: &str) -> Self {
-        Error::new(status, message.to_owned())
+        let mut error = Error::new(status, message.to_owned());
+        error.3 = Some("1");
+        error
     }
 
     /// An error the handler raised itself: a 400 is a refused upload, and
@@ -311,21 +316,17 @@ impl Error {
         } else {
             "internal"
         };
-        Error(status, message, reason)
+        Error(status, message, reason, None)
     }
 }
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        if self.0 == StatusCode::TOO_MANY_REQUESTS {
-            return (
-                self.0,
-                [(header::RETRY_AFTER, "1")],
-                Json(json!({ "error": self.1 })),
-            )
-                .into_response();
+        let body = Json(json!({ "error": self.1 }));
+        match self.3 {
+            Some(secs) => (self.0, [(header::RETRY_AFTER, secs)], body).into_response(),
+            None => (self.0, body).into_response(),
         }
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
     }
 }
 
@@ -350,6 +351,7 @@ impl From<anyhow::Error> for Error {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("internal error (id {id})"),
             reason,
+            None,
         )
     }
 }
@@ -854,6 +856,32 @@ mod tests {
         .await
         .expect_err("quiescing must reject the push");
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        // Spec 01 promises Retry-After only on 429 and the deleting 503.
+        assert!(
+            !err.into_response()
+                .headers()
+                .contains_key(header::RETRY_AFTER)
+        );
+    }
+
+    /// Past the upload cap the push is shed before its body is read, with a
+    /// Retry-After the client waits out (spec 01 backpressure).
+    #[tokio::test]
+    async fn a_push_past_the_upload_cap_is_shed_with_retry_after() {
+        let state = test_state(open_db()).await;
+        let _held = state.uploads.clone().try_acquire_owned().unwrap();
+
+        let response = upload(
+            State(state),
+            Path("a".repeat(32)),
+            axum::Extension(Subject("test#user".into())),
+            Body::empty(),
+        )
+        .await
+        .expect_err("a push past the cap must be shed")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 
     /// GC, `delete` and prune claim a path from its row delete until its
