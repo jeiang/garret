@@ -57,8 +57,8 @@ quotes or braces, the OIDC audience and client id printable ASCII with no
 whitespace or quotes, and every key `name:base64`. A newline in any of them
 would otherwise become a new nix.conf setting, and an advertised key is
 trusted for every substituter, not just this one. `login` prints the keys it
-wrote; `use` re-checks the URL and keys before writing nix.conf, since the
-config may predate the check or be hand-edited.
+wrote; every command re-checks the URLs and keys when it loads the config,
+since the config may predate the check or be hand-edited.
 
 The written file is a hand-rendered subset with comments, not a serialization
 of the config struct — which would emit every default and the entire `[watch]`
@@ -135,11 +135,13 @@ Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), idempotent retries. No client metrics endpoint in v1.
 
 Every request carries `User-Agent: garret/<version>`. The configured Pusher
-URL (after any `GARRET_ENDPOINT` override), `oidc.issuer` and the OIDC
-`token_endpoint` and `device_authorization_endpoint` must follow the same
-https rule as discovery (plain `http` only to loopback); a config or issuer
-that breaks it is refused before any token is sent. Trailing `/`s on
-`endpoint` (after the override) and `puller_endpoint` are dropped on load.
+URL (after any `GARRET_ENDPOINT` override), `puller_endpoint`, `oidc.issuer`
+and the OIDC `token_endpoint` and `device_authorization_endpoint` must follow
+the same https rule as discovery (plain `http` only to loopback), and every
+configured key must be `name:base64`; a config or issuer that breaks it is
+refused before any token is sent (`list`, `tree` and `pins` send the token to
+the Puller). Trailing `/`s on `endpoint` (after the override) and
+`puller_endpoint` are dropped on load.
 
 **Retries** run on two schedules. A `429` is the server's queue, not a
 fault: the path waits out `Retry-After` (held between 1 s and 15 minutes,

@@ -185,8 +185,14 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
         trim_trailing_slashes(puller);
     }
     crate::discovery::check_url("endpoint", &cfg.endpoint)?;
+    if let Some(puller) = &cfg.puller_endpoint {
+        crate::discovery::check_url("puller_endpoint", puller)?;
+    }
     if let Some(issuer) = &cfg.oidc.issuer {
         crate::discovery::check_url("oidc.issuer", issuer)?;
+    }
+    for key in &cfg.public_keys {
+        crate::discovery::check_key(key)?;
     }
     Ok(cfg)
 }
@@ -427,5 +433,31 @@ mod tests {
             cfg.oidc.client_secret_file.as_deref(),
             Some(std::path::Path::new("/run/secrets/garret"))
         );
+    }
+
+    /// `list`/`tree`/`pins` send the bearer token to the Puller, so a
+    /// hand-edited `http://` Puller must not load; nor a key `use` would
+    /// write into nix.conf broken.
+    #[test]
+    fn load_refuses_an_http_puller_and_a_malformed_key() {
+        let dir = crate::testing::scratch_dir();
+        let path = dir.join("config.toml");
+        let base = render("https://push.example", &discovery()).unwrap();
+        for (text, needle) in [
+            (
+                base.replace("https://cache.example", "http://cache.example"),
+                "puller_endpoint",
+            ),
+            (
+                base.replace("garret-1:AAAA+bb/cc=", "garret-1 AAAA"),
+                "public key",
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let e = load(path.to_str()).unwrap_err();
+            assert!(format!("{e:#}").contains(needle), "{e:#}");
+        }
+        std::fs::write(&path, base).unwrap();
+        load(path.to_str()).unwrap();
     }
 }

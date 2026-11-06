@@ -520,12 +520,6 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
             cfg.endpoint
         );
     }
-    // Checked again here, not only at login: the config may predate the check
-    // or be hand-edited, and this is the write that makes nix trust the values.
-    discovery::check_url("puller_endpoint", puller)?;
-    for key in &cfg.public_keys {
-        discovery::check_key(key)?;
-    }
 
     if print {
         print!("{}", nixconf::lines(puller, &cfg.public_keys));
