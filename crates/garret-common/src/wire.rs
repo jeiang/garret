@@ -11,7 +11,7 @@ pub const NAR_UPLOAD: &str = "/api/v1/nar/{hash}";
 pub const DISCOVERY: &str = "/api/v1/discovery";
 /// Puller: a [`Page`] of objects.
 pub const OBJECTS: &str = "/api/v1/objects";
-/// Puller: one object's detail.
+/// Puller: one object's [`ObjectDetail`].
 pub const OBJECT: &str = "/api/v1/objects/{hash}";
 /// Puller: one object's dependency [`TreeNode`].
 pub const OBJECT_TREE: &str = "/api/v1/objects/{hash}/tree";
@@ -106,6 +106,37 @@ pub struct Summary {
     pub file_size: i64,
     /// Unix time the object was pushed.
     pub created_at: i64,
+}
+
+/// One object's detail, as [`OBJECT`] reports it: the narinfo fields plus
+/// who pushed it. Fields are in the order the document has always been
+/// serialised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectDetail {
+    /// Store path hash — the object key.
+    pub store_path_hash: String,
+    /// Full store path.
+    pub store_path: String,
+    /// Basename after the hash (`hello-1.0`).
+    pub name: String,
+    /// Uncompressed NAR hash, `sha256:<nix-base32>`.
+    pub nar_hash: String,
+    /// Uncompressed NAR size in bytes.
+    pub nar_size: i64,
+    /// Stored (compressed) blob hash.
+    pub file_hash: String,
+    /// Stored (compressed) blob size in bytes.
+    pub file_size: i64,
+    /// Deriving `.drv` store path, if known.
+    pub deriver: Option<String>,
+    /// Content-address string for CA paths.
+    pub ca: Option<String>,
+    /// Reference basenames (`<hash>-<name>`).
+    pub references: Vec<String>,
+    /// Signatures (`<key-name>:<base64>`).
+    pub sigs: Vec<String>,
+    /// OIDC subject that pushed the object.
+    pub pushed_by: Option<String>,
 }
 
 /// One page of listing results.

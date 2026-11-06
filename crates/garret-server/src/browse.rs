@@ -3,8 +3,10 @@
 //! index.
 
 use anyhow::Result;
-use garret_common::wire::{Page, Pin, Summary, TreeNode};
+use garret_common::wire::{ObjectDetail, Page, Pin, Summary, TreeNode};
 use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::db;
 
 /// The listing query. Its order is exactly the `objects_created` index, so a
 /// page walks the index and stops, instead of sorting every row per request.
@@ -58,6 +60,41 @@ pub fn list(
         objects,
         next_cursor,
     })
+}
+
+/// One object's detail. Every [`db::Object`] field is named here, so a
+/// schema change cannot silently change the public API.
+pub fn object(conn: &Connection, hash: &str) -> Result<Option<ObjectDetail>> {
+    Ok(db::get_object(conn, hash)?.map(|object| {
+        let db::Object {
+            store_path_hash,
+            store_path,
+            name,
+            nar_hash,
+            nar_size,
+            file_hash,
+            file_size,
+            deriver,
+            ca,
+            references,
+            sigs,
+            pushed_by,
+        } = object;
+        ObjectDetail {
+            store_path_hash,
+            store_path,
+            name,
+            nar_hash,
+            nar_size,
+            file_hash,
+            file_size,
+            deriver,
+            ca,
+            references,
+            sigs,
+            pushed_by,
+        }
+    }))
 }
 
 /// Dependency tree: first occurrence expands, repeats truncate,
@@ -428,5 +465,30 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].hash, root);
         assert!(referrers(&conn, &root).unwrap().is_empty());
+    }
+
+    /// `GET /objects/{hash}` serves this JSON; pinned so a schema change
+    /// cannot alter the public API unnoticed.
+    #[test]
+    fn object_detail_json_is_stable() {
+        let mut conn = db();
+        let (a, b) = (h('a'), h('b'));
+        let obj = db::Object {
+            deriver: Some(format!("{b}-hello.drv")),
+            sigs: vec!["k:c2ln".into()],
+            pushed_by: Some("https://id.example#me".into()),
+            ..object(&a)
+                .named("hello")
+                .referencing(&[&format!("{b}-dep")])
+        };
+        db::insert_object(&mut conn, &obj, 100).unwrap();
+        let json = serde_json::to_string(&super::object(&conn, &a).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"store_path_hash":"{a}","store_path":"/nix/store/{a}-hello","name":"hello","nar_hash":"sha256:x","nar_size":10,"file_hash":"sha256:y","file_size":5,"deriver":"{b}-hello.drv","ca":null,"references":["{b}-dep"],"sigs":["k:c2ln"],"pushed_by":"https://id.example#me"}}"#
+            )
+        );
+        assert!(super::object(&conn, &b).unwrap().is_none());
     }
 }

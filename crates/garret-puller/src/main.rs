@@ -630,7 +630,7 @@ async fn list_objects(
 }
 
 async fn object_detail(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    browse(&state, "object", move |conn| db::get_object(conn, &hash)).await
+    browse(&state, "object", move |conn| browse::object(conn, &hash)).await
 }
 
 async fn object_tree(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
