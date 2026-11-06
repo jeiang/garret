@@ -42,9 +42,6 @@ impl SigningKeyFile {
         )
     }
 
-    /// Whether `sig` (`<name>:<base64>`) is this key's signature over
-    /// `fingerprint`. A different key name, malformed base64 or a bad
-    /// signature all answer false.
     fn verifies(&self, sig: &str, fingerprint: &str) -> bool {
         let Some((name, b64)) = sig.split_once(':') else {
             return false;
@@ -79,8 +76,7 @@ impl SigningKeyFile {
 /// so everything is normalised here, on the way in.
 ///
 /// Content-addressed paths hide this: nix trusts their hash directly and never
-/// checks the signature. Only input-addressed paths fail, which is why this
-/// survived until the e2e pushed a built derivation.
+/// checks the signature, so only input-addressed paths fail.
 pub fn normalize_hash(hash: &str) -> Result<String> {
     const SHA256_BYTES: usize = 32;
     let Some(digest) = hash

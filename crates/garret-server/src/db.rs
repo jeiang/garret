@@ -299,15 +299,10 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
         let mut stmt =
             tx.prepare_cached("INSERT INTO object_refs (referrer, reference) VALUES (?1, ?2)")?;
         for r in &obj.references {
-            // Self-references are stored, not dropped: the signature covers the
-            // full reference list the pusher was handed, so a narinfo rendered
-            // without them produces a fingerprint nix cannot match, and every
-            // self-referential path -- which is most compiled packages -- fails
-            // verification with "lacks a signature by a trusted key".
-            //
-            // The reason they were dropped (spec 02: a self-edge makes an object
-            // permanently unevictable) is handled where it belongs, in
-            // `evictable`, which ignores self-edges when deciding reachability.
+            // Self-references are stored: the signature covers the full
+            // reference list, so a narinfo rendered without them produces a
+            // fingerprint nix cannot match ("lacks a signature by a trusted
+            // key"). `evictable` ignores self-edges for reachability instead.
             stmt.execute(params![obj.store_path_hash, r])?;
         }
     }
@@ -846,12 +841,6 @@ mod tests {
 
     #[test]
     fn self_references_survive_the_round_trip_and_stay_evictable() {
-        // Replaces an earlier `drops_self_references`, which pinned the
-        // opposite behaviour: the signature covers the reference list as
-        // pushed, self-reference included, so dropping it on write renders a
-        // narinfo whose fingerprint nix cannot reproduce. Most compiled store
-        // paths self-reference, so that failed verification for nearly
-        // everything.
         let mut conn = db();
         let a = "a".repeat(32);
         let own = format!("{a}-thing");
@@ -1065,11 +1054,10 @@ mod tests {
 
     #[test]
     fn pusher_writes_wait_out_another_connections_write_lock() {
-        // The Puller's bumps take the WAL write lock on its own connection.
-        // A read-then-write transaction that began deferred could not wait
-        // for it: SQLite fails the read-to-write upgrade with SQLITE_BUSY at
-        // once, ignoring busy_timeout, so uploads and GC failed under pull
-        // load. Needs a real file: WAL does not apply to `:memory:`.
+        // The Puller's bumps take the WAL write lock on its own connection. A
+        // deferred read-then-write transaction would fail the upgrade with
+        // SQLITE_BUSY at once, ignoring busy_timeout. Needs a real file: WAL
+        // does not apply to `:memory:`.
         let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap();

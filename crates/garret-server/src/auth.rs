@@ -402,7 +402,7 @@ fn loggable(e: &anyhow::Error) -> String {
     }
     out
 }
-/// Fetches and parses an issuer's current key set.
+
 async fn fetch_keys(
     http: &reqwest::Client,
     cfg: &IssuerConfig,

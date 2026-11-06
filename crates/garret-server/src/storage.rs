@@ -82,7 +82,6 @@ impl UploadLimits {
         self.total_units / self.part_units
     }
 
-    /// Permits covering `bytes` of buffer: at least one, at most a part.
     fn units(&self, bytes: usize) -> usize {
         units_for(bytes, self.unit, self.part_units)
     }
@@ -104,7 +103,6 @@ impl UploadLimits {
         Ok(permit)
     }
 
-    /// Reserves room for a buffer of up to `bytes` (capped at one part).
     async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
         self.acquire_units(self.units(bytes)).await
     }
@@ -122,7 +120,6 @@ fn budget(part_size: usize, max_in_flight_bytes: u64) -> (usize, usize, usize) {
     (unit, part_units, total_units)
 }
 
-/// `bytes / 2^shift`, rounded up.
 fn units_ceil(bytes: usize, shift: u32) -> usize {
     (bytes >> shift) + usize::from(bytes & ((1 << shift) - 1) != 0)
 }
@@ -331,7 +328,6 @@ where
         Ok(false)
     }
 
-    /// The sha256 and length of every byte appended.
     fn finish(self) -> (Vec<u8>, i64) {
         (self.hasher.finalize().to_vec(), self.received as i64)
     }
@@ -578,7 +574,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Owns everything it touches, so it can run on its own task.
     fn upload_part(
         &self,
         key: &str,
@@ -953,6 +948,7 @@ mod tests {
         let mut reader = BodyReader::new(body, IDLE);
         assert_eq!(read_part(&mut reader, 1024).await.unwrap().len(), 8);
     }
+
     /// Just enough S3 on a loopback port. Every call succeeds, except that
     /// `DeleteObjects` answers inside a 200 the way S3 and Garage do: keys
     /// containing `denied` fail, and keys containing `gone` come back as
@@ -1006,10 +1002,6 @@ mod tests {
         crate::testing::fake_s3(axum::Router::new().fallback(handle)).await
     }
 
-    /// Uploads that together want more part slots than exist must still all
-    /// finish. When parts were lazy futures polled only by their reader, a
-    /// reader parked on the next slot held slots nobody could free, and this
-    /// hung forever — so the timeout turns a regression into a failure.
     #[tokio::test]
     async fn in_flight_bytes_rises_on_acquire_and_returns_to_zero() {
         let limits = UploadLimits::new(1024, 2, 4096, IDLE);
@@ -1020,6 +1012,8 @@ mod tests {
         assert_eq!(limits.in_flight_bytes(), 0);
     }
 
+    /// Uploads that together want more part slots than exist must still all
+    /// finish; the timeout turns a wedge on the shared budget into a failure.
     #[tokio::test]
     async fn concurrent_multiparts_finish_on_fewer_slots_than_they_want() {
         let storage = fake_s3().await;

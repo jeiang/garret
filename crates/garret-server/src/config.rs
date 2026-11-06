@@ -622,8 +622,7 @@ mod validate_tests {
 mod strictness_tests {
     use super::*;
 
-    /// A misplaced or mistyped key must fail loudly. Silently ignoring one is
-    /// how `admin_socket` ended up inside `[limits]` and did nothing.
+    /// A misplaced or mistyped key must fail loudly, not be ignored.
     #[test]
     fn unknown_keys_are_rejected() {
         let good = r#"
