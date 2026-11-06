@@ -231,41 +231,12 @@ async fn main() -> Result<()> {
                 anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
                 pusher.jobs = jobs;
             }
-            let closure = push::closure(&paths).await?;
-            let closure_len = closure.len();
-            let (own, upstream) = match no_upstream_filter {
-                true => (closure, Vec::new()),
-                false => push::partition_upstream(closure, &cfg.upstream_keys),
+            let upstream_keys: &[String] = match no_upstream_filter {
+                true => &[],
+                false => &cfg.upstream_keys,
             };
-            let missing = pusher.missing(&own).await?;
-
-            if dry_run {
-                push::Report::dry_run(cli.json, &progress, closure_len, &upstream, &missing);
-                return Ok(());
-            }
-
-            let report = push::Report::start(cli.json, &progress, closure_len, &upstream, &missing);
-            let pushed_any = !missing.is_empty();
-            let mut summary = pusher.push_all(missing, &report).await;
-            // A closure is only substitutable whole, and a path the Negotiation
-            // found present can be gone by the end of the run (evicted, deleted,
-            // or another pusher's upload that never finished). One more
-            // Negotiation after a clean run catches it, and pushes it.
-            let mut recheck = Ok(());
-            if pushed_any && summary.failed == 0 {
-                match pusher.missing(&own).await {
-                    Ok(gone) if gone.is_empty() => {}
-                    Ok(gone) => {
-                        report.rechecked(&gone);
-                        summary += pusher.push_all(gone, &report).await;
-                    }
-                    Err(e) => recheck = Err(e.context("re-checking the closure after pushing")),
-                }
-            }
-            report.finish(&summary);
-            // Reported first, so a --json consumer always sees `done`, then the
-            // exit code carries the failure.
-            recheck?;
+            let summary =
+                push::run(&pusher, &paths, upstream_keys, dry_run, cli.json, &progress).await?;
             if summary.failed > 0 {
                 anyhow::bail!("{} path(s) failed to push", summary.failed);
             }
@@ -302,15 +273,20 @@ async fn main() -> Result<()> {
 
         Command::List { query, limit } => {
             let cfg = load()?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::list(&http, &puller, &token, query.as_deref(), limit).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let page: wire::Page =
-                serde_json::from_value(raw).context("parsing the object list")?;
-            print!("{}", browse::render_page(&page));
+            let limit = limit.to_string();
+            let mut params = vec![("limit", limit.as_str())];
+            params.extend(query.as_deref().map(|q| ("q", q)));
+            let render = |page: wire::Page| print!("{}", browse::render_page(&page));
+            show(
+                &cfg,
+                &http,
+                wire::OBJECTS,
+                &params,
+                cli.json,
+                "the object list",
+                render,
+            )
+            .await?;
         }
 
         Command::Tree { hash } => {
@@ -318,33 +294,42 @@ async fn main() -> Result<()> {
             let hash = garret_common::parse_store_hash(&hash).with_context(|| {
                 format!("`{hash}` is not a 32-character store hash or a store path")
             })?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::tree(&http, &puller, &token, hash).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let tree: wire::TreeNode =
-                serde_json::from_value(raw).context("parsing the dependency tree")?;
-            let mut out = String::new();
-            browse::render(&tree, 0, &mut out);
-            print!("{out}");
+            let route = wire::with_hash(wire::OBJECT_TREE, hash);
+            let render = |tree: wire::TreeNode| {
+                let mut out = String::new();
+                browse::render(&tree, 0, &mut out);
+                print!("{out}");
+            };
+            show(
+                &cfg,
+                &http,
+                &route,
+                &[],
+                cli.json,
+                "the dependency tree",
+                render,
+            )
+            .await?;
         }
 
         Command::Pins => {
             let cfg = load()?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::pins(&http, &puller, &token).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let pins: Vec<wire::Pin> =
-                serde_json::from_value(raw).context("parsing the pin list")?;
-            print!("{}", browse::render_pins(&pins, garret_common::unix_now()));
-            if pins.is_empty() {
-                eprintln!("no pins");
-            }
+            let render = |pins: Vec<wire::Pin>| {
+                print!("{}", browse::render_pins(&pins, garret_common::unix_now()));
+                if pins.is_empty() {
+                    eprintln!("no pins");
+                }
+            };
+            show(
+                &cfg,
+                &http,
+                wire::PINS,
+                &[],
+                cli.json,
+                "the pin list",
+                render,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -460,14 +445,10 @@ async fn login(
     Ok(())
 }
 
-/// Proves the token is not merely present but accepted, with the same empty
-/// Negotiation `doctor` sends: it crosses exactly the authentication path
-/// `push` uses.
+/// Proves the token is not merely present but accepted, with the same
+/// [`push::Pusher::authenticate`] `doctor` runs.
 async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> Result<()> {
-    let pusher = push::Pusher::from_config(cfg, http)?;
-    pusher.negotiate(&[]).await?;
-    // After the Negotiation, which may have replaced a rejected token.
-    let claims = auth::peek_claims(&pusher.tokens.get().await?).unwrap_or_default();
+    let claims = push::Pusher::from_config(cfg, http)?.authenticate().await?;
 
     let issuer = cfg.oidc.issuer.as_deref();
     let expires_at = claims.exp.map(|exp| {
@@ -520,12 +501,6 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
             cfg.endpoint
         );
     }
-    // Checked again here, not only at login: the config may predate the check
-    // or be hand-edited, and this is the write that makes nix trust the values.
-    discovery::check_url("puller_endpoint", puller)?;
-    for key in &cfg.public_keys {
-        discovery::check_key(key)?;
-    }
 
     if print {
         print!("{}", nixconf::lines(puller, &cfg.public_keys));
@@ -555,13 +530,34 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
     Ok(())
 }
 
-async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(String, String)> {
+/// `list`/`tree`/`pins`: one GET of `route` on the Puller. `--json` prints
+/// the answer verbatim; otherwise it is parsed as `T` and rendered.
+async fn show<T: serde::de::DeserializeOwned>(
+    cfg: &config::Config,
+    http: &reqwest::Client,
+    route: &str,
+    params: &[(&str, &str)],
+    as_json: bool,
+    what: &str,
+    render: impl FnOnce(T),
+) -> Result<()> {
     let puller = cfg
         .puller_endpoint
-        .clone()
-        .context("set `puller_endpoint` in the config: list/tree query the Puller")?;
+        .as_deref()
+        .context("set `puller_endpoint` in the config: list/tree/pins query the Puller")?;
     let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
-    Ok((puller, token))
+    let mut url = reqwest::Url::parse(&format!("{puller}{route}"))
+        .with_context(|| format!("building the URL for {what}"))?;
+    if !params.is_empty() {
+        url.query_pairs_mut().extend_pairs(params);
+    }
+    let raw = browse::get(http, url, &token, what).await?;
+    if as_json {
+        println!("{raw}");
+        return Ok(());
+    }
+    render(serde_json::from_value(raw).with_context(|| format!("parsing {what}"))?);
+    Ok(())
 }
 
 /// Relative time for a token expiry; the JSON output keeps the raw epoch.

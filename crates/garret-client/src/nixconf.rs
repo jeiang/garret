@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 /// The user's nix.conf: `$XDG_CONFIG_HOME/nix/nix.conf`.
-pub fn path() -> Result<PathBuf> {
+fn path() -> Result<PathBuf> {
     Ok(crate::config::config_home()?.join("nix").join("nix.conf"))
 }
 

@@ -10,65 +10,27 @@ use garret_common::{
 
 use crate::http::ensure_success;
 
-/// Each query returns the server's JSON verbatim, so `--json` passes it
-/// straight through; human rendering deserializes it into the
-/// [`garret_common::wire`] types the server serialises.
-pub async fn list(
+/// One authenticated GET to the Puller's browse API, returning the server's
+/// JSON verbatim, so `--json` passes it straight through; human rendering
+/// deserializes it into the [`garret_common::wire`] types the server
+/// serialises. `what` names the answer in errors ("the pin list").
+pub async fn get(
     http: &reqwest::Client,
-    puller: &str,
+    url: reqwest::Url,
     token: &str,
-    query: Option<&str>,
-    limit: usize,
-) -> Result<serde_json::Value> {
-    let mut request = http
-        .get(format!("{puller}{}", wire::OBJECTS))
-        .bearer_auth(token)
-        .query(&[("limit", limit.to_string())]);
-    if let Some(q) = query {
-        request = request.query(&[("q", q)]);
-    }
-    let response = request.send().await?;
-    ensure_success(response, "listing objects")
-        .await?
-        .json()
-        .await
-        .context("parsing the object list")
-}
-
-/// Fetches an Object's dependency tree, verbatim — see [`list`] for why.
-pub async fn tree(
-    http: &reqwest::Client,
-    puller: &str,
-    token: &str,
-    hash: &str,
+    what: &str,
 ) -> Result<serde_json::Value> {
     let response = http
-        .get(format!(
-            "{puller}{}",
-            wire::with_hash(wire::OBJECT_TREE, hash)
-        ))
+        .get(url)
         .bearer_auth(token)
         .send()
-        .await?;
-    ensure_success(response, "fetching the dependency tree")
+        .await
+        .with_context(|| format!("fetching {what}"))?;
+    ensure_success(response, &format!("fetching {what}"))
         .await?
         .json()
         .await
-        .context("parsing the dependency tree")
-}
-
-/// Fetches the pin listing, verbatim — see [`list`] for why.
-pub async fn pins(http: &reqwest::Client, puller: &str, token: &str) -> Result<serde_json::Value> {
-    let response = http
-        .get(format!("{puller}{}", wire::PINS))
-        .bearer_auth(token)
-        .send()
-        .await?;
-    ensure_success(response, "listing pins")
-        .await?
-        .json()
-        .await
-        .context("parsing the pin list")
+        .with_context(|| format!("parsing {what}"))
 }
 
 /// Renders the tree as indented lines, marking what the cache does not hold

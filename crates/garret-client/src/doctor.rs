@@ -9,7 +9,7 @@ use garret_common::{
     wire::{self, Discovery},
 };
 
-use crate::{auth, config, discovery, push::Pusher};
+use crate::{config, discovery, push::Pusher};
 
 /// The hash probed when no path argument is given: certainly absent, so the
 /// Puller answering 404 for it proves the narinfo route is served without
@@ -83,11 +83,9 @@ impl Check {
 /// caller always gets the whole picture before deciding the exit code.
 pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
-    // One Pusher, so one token provider, for the run. A machine config
-    // (secret file, GitHub Actions) is told apart from a human's stored login
-    // by the same classification the provider uses — `GARRET_TOKEN` says
-    // nothing about it.
-    let pusher = Pusher::from_config(cfg, http);
+    // A machine config (secret file, GitHub Actions) is told apart from a
+    // human's stored login by the same classification the token provider
+    // uses — `GARRET_TOKEN` says nothing about it.
     let device_flow = matches!(
         cfg.credential_kind(config::GithubActions::from_env()),
         config::CredentialKind::DeviceFlow
@@ -138,12 +136,25 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
         }
     }
 
-    let accepted = auth_check(&pusher, &mut checks).await;
+    // One Pusher, so one token provider, for the run; it is asked about the
+    // path only once it has accepted the token.
+    let accepted = match Pusher::from_config(cfg, http) {
+        Ok(pusher) => {
+            let check = auth_check(&pusher).await;
+            let ok = check.status == Status::Pass;
+            checks.push(check);
+            ok.then_some(pusher)
+        }
+        Err(e) => {
+            checks.push(Check::fail("auth", format!("no token: {e:#}")));
+            None
+        }
+    };
 
     checks.push(pull_check(cfg, http, path, device_flow).await);
 
     match (path, accepted) {
-        (Some(path), Some(pusher)) => checks.push(path_check(pusher, path).await),
+        (Some(path), Some(pusher)) => checks.push(path_check(&pusher, path).await),
         (Some(_), None) => checks.push(Check::skip("path")),
         (None, _) => {}
     }
@@ -151,41 +162,18 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
     checks
 }
 
-/// Token acquisition plus the empty Negotiation `whoami` also sends. Returns
-/// the Pusher only when it accepted the token, so the `path` check can ask it.
-async fn auth_check<'a>(
-    pusher: &'a anyhow::Result<Pusher>,
-    checks: &mut Vec<Check>,
-) -> Option<&'a Pusher> {
-    let token = match pusher {
-        Ok(pusher) => pusher.tokens.get().await.map(|_| pusher),
-        Err(e) => Err(anyhow::anyhow!("{e:#}")),
-    };
-    let pusher = match token {
-        Ok(pusher) => pusher,
-        Err(e) => {
-            checks.push(Check::fail("auth", format!("no token: {e:#}")));
-            return None;
-        }
-    };
-
-    if let Err(e) = pusher.negotiate(&[]).await {
-        checks.push(Check::fail("auth", format!("{e:#}")));
-        return None;
-    }
-    // Asked after the Negotiation, which may have replaced a rejected token.
-    let subject = match pusher.tokens.get().await {
-        Ok(token) => auth::peek_claims(&token).ok().and_then(|c| c.sub),
-        Err(_) => None,
-    };
-    checks.push(Check::pass(
-        "auth",
-        format!(
-            "the Pusher accepted the token (subject {})",
-            subject.as_deref().unwrap_or("unknown")
+/// Token acquisition plus the empty Negotiation `whoami` also sends.
+async fn auth_check(pusher: &Pusher) -> Check {
+    match pusher.authenticate().await {
+        Ok(claims) => Check::pass(
+            "auth",
+            format!(
+                "the Pusher accepted the token (subject {})",
+                claims.sub.as_deref().unwrap_or("unknown")
+            ),
         ),
-    ));
-    Some(pusher)
+        Err(e) => Check::fail("auth", format!("{e:#}")),
+    }
 }
 
 /// The substituter side: `/nix-cache-info` must be served, and the narinfo

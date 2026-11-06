@@ -235,6 +235,28 @@ impl FailedList {
             .collect()
     }
 
+    /// Applies one pushed `chunk`: each path in `still_failed` is recorded
+    /// and handed to `on_fail` with the attempts now spent on it, every other
+    /// path comes off the list. Returns how many came off.
+    fn apply(
+        &mut self,
+        chunk: &[String],
+        still_failed: Vec<String>,
+        mut on_fail: impl FnMut(&str, u32),
+    ) -> usize {
+        let still_failed: HashSet<String> = still_failed.into_iter().collect();
+        let mut pushed = 0;
+        for path in chunk {
+            if still_failed.contains(path) {
+                on_fail(path, self.record_failure(path));
+            } else {
+                self.record_success(path);
+                pushed += 1;
+            }
+        }
+        pushed
+    }
+
     /// Persists the list, replaced whole, removing the file once it is empty.
     fn save(&self) -> Result<()> {
         if self.paths.is_empty() {
@@ -401,14 +423,12 @@ impl Watcher {
             return Ok(());
         }
         for chunk in due.chunks(BATCH_SIZE) {
-            let still: HashSet<String> = push_batch(pusher, chunk).await.into_iter().collect();
-            for path in chunk {
-                if still.contains(path) {
-                    log_failure(path, failed.record_failure(path), self.max_attempts);
-                } else {
-                    tracing::info!(path, "pushed on retry");
-                    failed.record_success(path);
-                }
+            let still_failed = push_batch(pusher, chunk).await;
+            let pushed = failed.apply(chunk, still_failed, |path, spent| {
+                log_failure(path, spent, self.max_attempts)
+            });
+            if pushed > 0 {
+                tracing::info!(pushed, "pushed on retry");
             }
         }
         failed.save()
@@ -453,16 +473,10 @@ impl Watcher {
         tracing::info!(cursor, paths = todo.len(), "draining");
 
         for chunk in todo.chunks(BATCH_SIZE) {
-            let still_failed: HashSet<String> =
-                push_batch(pusher, chunk).await.into_iter().collect();
-            for path in chunk {
-                if still_failed.contains(path) {
-                    tracing::error!(path, "push failed");
-                    failed.record_failure(path);
-                } else {
-                    failed.record_success(path);
-                }
-            }
+            let still_failed = push_batch(pusher, chunk).await;
+            failed.apply(chunk, still_failed, |path, _| {
+                tracing::error!(path, "push failed")
+            });
         }
         failed.save()?;
         write_cursor(&self.cursor_path, cursor)?;
@@ -717,6 +731,24 @@ mod tests {
         reloaded.record_success("/nix/store/aaa-x");
         assert!(reloaded.due(5).is_empty());
         assert_eq!(reloaded.record_failure("/nix/store/aaa-x"), 1);
+    }
+
+    /// A pushed chunk takes its successes off the list and spends an attempt
+    /// on each path that failed again, reporting it with the new count.
+    #[test]
+    fn applying_a_chunk_clears_successes_and_counts_failures() {
+        let dir = crate::testing::scratch_dir();
+        let mut list = FailedList::load(&dir.join("watcher-cursor")).unwrap();
+        list.record_failure("/nix/store/aaa-x");
+        list.record_failure("/nix/store/bbb-y");
+        let chunk = ["/nix/store/aaa-x".to_owned(), "/nix/store/bbb-y".to_owned()];
+        let mut reported = Vec::new();
+        let pushed = list.apply(&chunk, vec!["/nix/store/bbb-y".into()], |path, spent| {
+            reported.push((path.to_owned(), spent))
+        });
+        assert_eq!(pushed, 1);
+        assert_eq!(reported, [("/nix/store/bbb-y".to_owned(), 2)]);
+        assert_eq!(list.due(5), ["/nix/store/bbb-y"]);
     }
 
     /// A 403 Negotiation is a policy refusal: the whole batch stays on the
