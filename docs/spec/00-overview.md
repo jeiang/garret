@@ -32,7 +32,7 @@ build machines ── push protocol (OIDC) ──▶ Pusher ──┐
 any machine ──── substituter protocol ───▶ Puller ──┤
                        (anonymous)          │        └── MEGA S4 (S3), remote
                                             │                    ▲
-                          NAR bytes: 302 presigned ──────────────┘
+                          NAR bytes: 307 presigned ──────────────┘
 ```
 
 ## Storage model

@@ -92,7 +92,9 @@ some causes are transient. A token that verifies but that an issuer policy
 gate refuses (`owner`, `ref`, `ref_protected`, `repository_id`,
 `event_name`, `job_workflow_ref`, `group`) is a `403`
 `{"error":"not authorized"}` with no `WWW-Authenticate`: the identity is
-known and stays refused, so retrying cannot help. The Puller's browse
+known and stays refused until the policy changes, so renewing the token
+cannot help and clients never do (the watcher's bounded retry of a refused
+batch exists only to pick up a policy fix, spec 06). The Puller's browse
 routes use the same split (a `403` body of `not authorized`). A missing
 bearer header is a `401`. Older clients treat the `403` as a plain failure.
 

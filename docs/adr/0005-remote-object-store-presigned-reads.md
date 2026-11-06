@@ -21,3 +21,7 @@ multipart) and parts 1..N-1 must be identical in size. Garage remains the
 local dev and benchmark stand-in. Revisit if a CDN fronts the cache, or if
 leaking the backing store ever becomes unacceptable — reinstating the proxy
 is additive.
+
+Note (2026-11-06): the Puller as built answers with `307 Temporary
+Redirect`, not `302`; [spec 03](../spec/03-storage.md#read-path-puller-presigned-redirect)
+is authoritative. The decision is unchanged.
