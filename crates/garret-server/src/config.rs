@@ -274,7 +274,9 @@ impl ServiceConfig for PusherConfig {
         let l = &self.limits;
         if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&l.part_size) {
             bail!(
-                "limits.part_size must be between 5 MiB and 5 GiB (S3's part size range), got {}",
+                "limits.part_size must be between {} MiB and {} GiB (S3's part size range), got {}",
+                MIN_PART_SIZE >> 20,
+                MAX_PART_SIZE >> 30,
                 l.part_size
             );
         }

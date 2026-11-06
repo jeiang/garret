@@ -153,13 +153,7 @@ impl Object {
 /// Quota `quota_bytes` with the default watermarks, interval and orphan
 /// grace.
 pub fn gc_config(quota_bytes: u64) -> GcConfig {
-    GcConfig {
-        quota_bytes,
-        high_watermark: 0.95,
-        low_watermark: 0.85,
-        interval_secs: 300,
-        orphan_grace_secs: 86400,
-    }
+    toml::from_str(&format!("quota_bytes = {quota_bytes}")).expect("gc config")
 }
 
 /// What S3 answers a `DeleteObjects` that deleted every key it named.
