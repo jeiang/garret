@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use garret_client::{auth, browse, config, discovery, doctor, nixconf, push, watcher};
-use garret_common::human_bytes;
+use garret_common::{human_bytes, wire};
 use indicatif::MultiProgress;
 use serde_json::json;
 
@@ -326,7 +326,7 @@ async fn main() -> Result<()> {
                 println!("{raw}");
                 return Ok(());
             }
-            let page: browse::Page =
+            let page: wire::Page =
                 serde_json::from_value(raw).context("parsing the object list")?;
             for object in &page.objects {
                 println!(
@@ -352,7 +352,7 @@ async fn main() -> Result<()> {
                 println!("{raw}");
                 return Ok(());
             }
-            let tree: browse::TreeNode =
+            let tree: wire::TreeNode =
                 serde_json::from_value(raw).context("parsing the dependency tree")?;
             let mut out = String::new();
             browse::render(&tree, 0, &mut out);
@@ -367,7 +367,7 @@ async fn main() -> Result<()> {
                 println!("{raw}");
                 return Ok(());
             }
-            let pins: Vec<browse::Pin> =
+            let pins: Vec<wire::Pin> =
                 serde_json::from_value(raw).context("parsing the pin list")?;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

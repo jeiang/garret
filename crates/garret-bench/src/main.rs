@@ -25,7 +25,10 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
-use garret_common::Preamble;
+use garret_common::{
+    Preamble,
+    wire::{self, UploadAck},
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -539,11 +542,11 @@ async fn pull_step(
             entries.iter().flat_map(|e| {
                 [
                     (
-                        format!("{}/{}.narinfo", args.puller_endpoint, e.hash),
+                        format!("{}/{}", args.puller_endpoint, wire::narinfo_file(&e.hash)),
                         false,
                     ),
                     (
-                        format!("{}/nar/{}.nar.zst", args.puller_endpoint, e.hash),
+                        format!("{}/{}", args.puller_endpoint, wire::nar_url(&e.hash)),
                         true,
                     ),
                 ]
@@ -666,7 +669,7 @@ async fn push(
     let body = bytes::Bytes::from(body);
     put_with_retry(
         http,
-        &format!("{endpoint}/api/v1/nar/{}", entry.hash),
+        &upload_url(endpoint, entry),
         token,
         || Ok(body.clone().into()),
         counters,
@@ -720,7 +723,12 @@ async fn put_with_retry(
                 response.text().await.unwrap_or_default()
             );
         }
-        return Ok(());
+        // Each entry has its own key, so another upload of it means the
+        // corpus is being pushed twice at once: not a push this run made.
+        return match response.json().await.context("parsing upload response")? {
+            UploadAck::Created | UploadAck::Exists => Ok(()),
+            UploadAck::InProgress => bail!("another upload of this path is in progress"),
+        };
     }
     bail!("still shed or dropped after 6 attempts")
 }
@@ -767,10 +775,17 @@ async fn push_streaming(
     };
     put_with_retry(
         http,
-        &format!("{endpoint}/api/v1/nar/{}", entry.hash),
+        &upload_url(endpoint, entry),
         token,
         make_body,
         counters,
     )
     .await
+}
+
+fn upload_url(endpoint: &str, entry: &corpus::Entry) -> String {
+    format!(
+        "{endpoint}{}",
+        wire::with_hash(wire::NAR_UPLOAD, &entry.hash)
+    )
 }

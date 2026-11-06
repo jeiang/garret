@@ -8,6 +8,7 @@ license.workspace = true
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 metrics = "0.24"
+garret-common.workspace = true
 garret-server.workspace = true
 anyhow = "1"
 axum = { version = "0.8", features = ["query"] }

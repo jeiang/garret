@@ -290,7 +290,7 @@ fn q(value: &str) -> String {
 /// poll intervals, all daemon-only — into a laptop's config, with no comments
 /// to say which of them matter. The point is to write a subset, so the subset
 /// is written by hand. `renders_a_parseable_config` guards the drift.
-pub fn render(endpoint: &str, discovery: &crate::discovery::Discovery) -> Result<String> {
+pub fn render(endpoint: &str, discovery: &garret_common::wire::Discovery) -> Result<String> {
     let oidc = discovery.oidc.as_ref().context(
         "the server's discovery document has no oidc section: no issuer sets a \
          `client_id`, so the device flow has nothing to identify itself as",
@@ -354,7 +354,7 @@ pub fn create_private_dir(dir: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{Discovery, Oidc};
+    use garret_common::wire::{Discovery, Oidc};
 
     fn discovery() -> Discovery {
         Discovery {
