@@ -1559,70 +1559,13 @@ mod tests {
         );
     }
 
-    /// Serves `status` with `body` to every request, counting them. Each
-    /// request is read whole (headers, then a `Content-Length` body) before
-    /// the reply, so nothing hinges on how the client's writes are split.
-    async fn answering(
-        status: u16,
-        body: &'static str,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = hits.clone();
-        tokio::spawn(async move {
-            loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut socket = BufReader::new(socket);
-                let mut content_length = 0;
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    socket.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        content_length = value.trim().parse().unwrap();
-                    }
-                }
-                let mut request_body = vec![0; content_length];
-                socket.read_exact(&mut request_body).await.unwrap();
-                counter.fetch_add(1, Ordering::SeqCst);
-                let reply = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.get_mut().write_all(reply.as_bytes()).await;
-            }
-        });
-        (endpoint, hits)
-    }
-
-    fn pusher(endpoint: String) -> (Pusher, Arc<std::sync::atomic::AtomicUsize>) {
-        let (tokens, mints) = crate::auth::TokenSource::counting();
-        let pusher = Pusher {
-            http: reqwest::Client::new(),
-            endpoint,
-            tokens,
-            jobs: 1,
-            zstd_level: 3,
-            max_retries: 0,
-            upload_idle: Duration::from_secs(5),
-        };
-        (pusher, mints)
-    }
-
     /// 403 is a permanent refusal: no renewal, one request, typed `Refused`.
     #[tokio::test]
     async fn a_403_negotiation_is_refused_without_renewing_the_token() {
         use std::sync::atomic::Ordering;
-        let (endpoint, requests) = answering(403, r#"{"error":"not authorized"}"#).await;
-        let (pusher, mints) = pusher(endpoint);
+        let (endpoint, requests) =
+            crate::testing::answering(403, r#"{"error":"not authorized"}"#).await;
+        let (pusher, mints) = crate::testing::pusher(endpoint);
         let error = pusher.negotiate(&["h"]).await.unwrap_err();
         let refused = error.downcast_ref::<Refused>().expect("typed Refused");
         assert!(refused.0.contains("not authorized"), "{}", refused.0);
@@ -1635,8 +1578,9 @@ mod tests {
     #[tokio::test]
     async fn a_persistent_401_renews_once_and_is_not_a_refusal() {
         use std::sync::atomic::Ordering;
-        let (endpoint, requests) = answering(401, r#"{"error":"invalid token"}"#).await;
-        let (pusher, mints) = pusher(endpoint);
+        let (endpoint, requests) =
+            crate::testing::answering(401, r#"{"error":"invalid token"}"#).await;
+        let (pusher, mints) = crate::testing::pusher(endpoint);
         let error = pusher.negotiate(&["h"]).await.unwrap_err();
         assert!(!error.is::<Refused>());
         assert!(format!("{error:#}").contains("401"), "{error:#}");

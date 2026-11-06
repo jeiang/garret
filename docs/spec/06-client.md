@@ -350,9 +350,10 @@ configured key, so a rotation has several live at once.
   failures are on the list. If `nix path-info` rejects a batch, its paths
   are described one by one, so a single bad path cannot fail the rest; a
   failed Negotiation puts the whole batch on the list. The daemon retries the list whenever a poll finds nothing
-  new, up to `max_attempts` (default 5) per path, then logs loudly and
-  leaves the path on the list for a restart (which starts every path's
-  count afresh) or a drain. Paths nix-GC'd before push are dropped
+  new, up to `max_attempts` (default 5) attempts per path, the first push
+  included; the failure that spends the last one logs loudly (with
+  `max_attempts = 1`, the first) and leaves the path on the list for a
+  restart (which starts every path's count afresh) or a drain. Paths nix-GC'd before push are dropped
   silently. The cursor and the list are each replaced whole by a rename,
   so a kill mid-write cannot lose the backlog. A cursor or list that exists
   but cannot be read (or a cursor that is not a number) stops the watcher
