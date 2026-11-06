@@ -80,6 +80,8 @@ impl Gc {
     /// is retried on the next tick.
     pub async fn run_forever(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
+        // A slow pass or a retried sweep must not be followed by a burst of missed ticks.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_sweep: Option<Instant> = None;
         loop {
             if last_sweep.is_none_or(|at| at.elapsed() >= SWEEP_INTERVAL) {
