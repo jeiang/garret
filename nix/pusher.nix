@@ -75,6 +75,10 @@ let
   '';
 in
 {
+  # The Puller module imports this one; the key lets a host import both
+  # without declaring every option twice.
+  key = toString ./pusher.nix;
+
   options.services.garret.pusher = {
     enable = mkEnableOption "the garret Pusher";
 

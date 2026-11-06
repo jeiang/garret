@@ -3,10 +3,13 @@ self: { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.garret.puller;
+  # The database, store directory and bucket are the Pusher's on this host
+  # (ADR-0001, ADR-0009); the Puller takes them rather than repeating them.
+  pusher = config.services.garret.pusher;
   inherit (lib) mkEnableOption mkOption mkIf types;
 
   # `pkgs.formats.toml` has no representation for null, and every nullable
-  # option here (`s3.region`, `s3.endpointUrl`, `browseOidc.jwks_url`) reaches
+  # value here (the Pusher's `s3.region` and `s3.endpointUrl`, `browseOidc.jwks_url`) reaches
   # this attrset as `null` when unset -- which fails the build with
   # "unsupported unit type" rather than being omitted. Serde already defaults
   # every one of these on the Rust side, so dropping the key is exactly right.
@@ -20,17 +23,17 @@ let
   settings = {
     listen = cfg.listen;
     metrics_listen = cfg.metricsListen;
-    db_path = cfg.dbPath;
-    store_dir = cfg.storeDir;
+    db_path = pusher.dbPath;
+    store_dir = pusher.storeDir;
     presign_ttl_secs = cfg.presignTtlSeconds;
     bump_debounce_secs = cfg.bumpDebounceSeconds;
     db_wait_timeout_secs = cfg.dbWaitTimeoutSeconds;
     db_read_budget_ms = cfg.dbReadBudgetMs;
     presign_budget_ms = cfg.presignBudgetMs;
     s3 = {
-      inherit (cfg.s3) bucket region;
-      endpoint_url = cfg.s3.endpointUrl;
-      path_style = cfg.s3.pathStyle;
+      inherit (pusher.s3) bucket region;
+      endpoint_url = pusher.s3.endpointUrl;
+      path_style = pusher.s3.pathStyle;
       operation_timeout_secs = cfg.s3.operationTimeoutSeconds;
     };
   } // lib.optionalAttrs (cfg.browseOidc != null) { browse_oidc = cfg.browseOidc; };
@@ -38,6 +41,10 @@ let
   configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
 in
 {
+  # The Pusher's option declarations, so this module evaluates on its own;
+  # its config stays off unless services.garret.pusher.enable is set.
+  imports = [ (import ./pusher.nix self) ];
+
   options.services.garret.puller = {
     enable = mkEnableOption "the garret Puller";
 
@@ -58,8 +65,6 @@ in
 
     listen = mkOption { type = types.str; default = "127.0.0.1:8081"; description = "Public substituter listener. Front it with TLS."; };
     metricsListen = mkOption { type = types.str; default = "127.0.0.1:9092"; description = "Internal metrics listener. Never expose this publicly."; };
-    dbPath = mkOption { type = types.str; default = "/var/lib/garret/garret.db"; description = "The Pusher's database."; };
-    storeDir = mkOption { type = types.str; default = "/nix/store"; description = "Reported in nix-cache-info."; };
 
     presignTtlSeconds = mkOption {
       type = types.ints.between 1 604800;
@@ -92,10 +97,7 @@ in
     };
 
     s3 = {
-      bucket = mkOption { type = types.str; description = "Bucket name."; };
-      endpointUrl = mkOption { type = types.nullOr types.str; default = null; description = "S3 endpoint."; };
-      region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
-      pathStyle = mkOption { type = types.bool; default = true; description = "Path-style addressing."; };
+      # Bucket, endpoint, region and addressing come from the Pusher.
       operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Has no effect on the Puller (presigning is local, no S3 request is made). Kept for compatibility."; };
       credentialsFile = mkOption {
         type = types.path;
@@ -127,6 +129,11 @@ in
   };
 
   config = mkIf cfg.enable {
+    assertions = [{
+      assertion = pusher.enable;
+      message = "services.garret.puller needs services.garret.pusher on the same host: the Puller serves the Pusher's database and bucket, and takes dbPath, storeDir and s3 from it.";
+    }];
+
     systemd.services.garret-puller = {
       description = "garret Puller";
       wantedBy = [ "multi-user.target" ];
@@ -153,7 +160,7 @@ in
         # directory is the Pusher's, and systemd would chown it to this user.
         User = "garret-puller";
         Group = "garret";
-        ReadWritePaths = [ (builtins.dirOf cfg.dbPath) ];
+        ReadWritePaths = [ (builtins.dirOf pusher.dbPath) ];
       };
     };
 

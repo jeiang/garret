@@ -128,7 +128,7 @@ in
       };
       puller = {
         enable = true;
-        inherit s3;
+        s3.credentialsFile = s3.credentialsFile;
       };
     };
   };

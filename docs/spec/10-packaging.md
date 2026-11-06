@@ -138,11 +138,17 @@ Module options (all under `services.garret.*`; defaults in parentheses):
   (`/run/garret/admin.sock`), `fsck.{calendar (null: no scheduled fsck),
   extraArgs ([])}`.
 - **puller**: `enable`, `package`, `listen` (`127.0.0.1:8081` — front it with
-  TLS), `metricsListen` (`127.0.0.1:9092`), `dbPath`, `storeDir`, `s3.*`
-  (same), `presignTtlSeconds` (3600), `bumpDebounceSeconds` (86400),
-  `dbWaitTimeoutSeconds` (300), `dbReadBudgetMs` / `presignBudgetMs`
-  (pull-path degrade-to-miss budgets, spec 03; 250 ms), `browseOidc.{issuer,
-  audience, jwks_url, allowed_groups}` (null: no browse API).
+  TLS), `metricsListen` (`127.0.0.1:9092`), `s3.{credentialsFile,
+  operationTimeoutSeconds (60)}`, `presignTtlSeconds` (3600),
+  `bumpDebounceSeconds` (86400), `dbWaitTimeoutSeconds` (300),
+  `dbReadBudgetMs` / `presignBudgetMs` (pull-path degrade-to-miss budgets,
+  spec 03; 250 ms), `browseOidc.{issuer, audience, jwks_url, allowed_groups}`
+  (null: no browse API). The Puller has no `dbPath`, `storeDir` or
+  `s3.{bucket, endpointUrl, region, pathStyle}` of its own: it serves the
+  Pusher's database and bucket on the same host (ADR-0001, ADR-0009), so its
+  config takes them from `services.garret.pusher`. Enabling the puller
+  without the pusher fails evaluation with an assertion. The puller module
+  imports the pusher module's options, so importing it alone evaluates.
 - Every module also has `extraSettings` (`{}`): raw TOML merged recursively
   over the generated config, for keys without a typed option (for example
   `browse_oidc.extra_audiences` and `browse_oidc.client_id` on the Puller).
