@@ -162,7 +162,8 @@ that it is `400`.
 ## Errors, retry, versioning
 
 `5xx` and `429` are retryable; other `4xx` are not. So is `in-progress`,
-which is waited out on the same deadline as a `429`. Error bodies are
+which is waited out on the same deadline as a `429`, as is a `503` that
+carries `Retry-After` (its value honored like a `429`'s). Error bodies are
 JSON (`{"error": "…"}`). A `4xx` body explains what the request got
 wrong. An unexpected `500` says only `internal error (id …)`: the error
 chain (S3, SQLite, filesystem detail) is logged by the Pusher under that
