@@ -170,6 +170,24 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .filter(|h| !h.is_empty())
 }
 
+/// One blob from [`Storage::list_blobs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob {
+    /// The store-path hash its key encodes ([`hash_for`]).
+    pub hash: String,
+    /// Time since S3 last modified it.
+    pub age: Duration,
+    /// Its size in bytes.
+    pub size: i64,
+}
+
+/// Time since an S3 timestamp; zero when it is missing or in the future.
+fn age(at: Option<&aws_sdk_s3::primitives::DateTime>) -> Duration {
+    at.and_then(|t| SystemTime::try_from(*t).ok())
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
 /// The client's request body stalled or broke mid-upload: a failure on the
 /// sender's side, not the server's. Handlers downcast to it to log such
 /// failures as warnings rather than server errors.
@@ -627,7 +645,8 @@ impl Storage {
 
     /// Every blob under `nar/`, with its age and size. Paginated — the
     /// bucket outgrows one response long before the cache is interesting.
-    pub async fn list_blobs(&self) -> Result<Vec<(String, Duration, i64)>> {
+    /// Keys outside the `nar/<hash>.nar.zst` layout are skipped.
+    pub async fn list_blobs(&self) -> Result<Vec<Blob>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -645,15 +664,15 @@ impl Storage {
 
             for object in page.contents() {
                 let Some(key) = object.key() else { continue };
-                let age = object
-                    .last_modified()
-                    .and_then(|t| SystemTime::try_from(*t).ok())
-                    .and_then(|t| SystemTime::now().duration_since(t).ok())
-                    .unwrap_or(Duration::ZERO);
+                let Some(hash) = hash_for(key) else { continue };
                 let size = object
                     .size()
                     .with_context(|| format!("listing blobs: no size for {key}"))?;
-                out.push((key.to_owned(), age, size));
+                out.push(Blob {
+                    hash: hash.to_owned(),
+                    age: age(object.last_modified()),
+                    size,
+                });
             }
 
             token = page.next_continuation_token().map(str::to_owned);
@@ -718,50 +737,60 @@ impl Storage {
 
     /// Aborts multipart uploads older than `grace` that no live upload owns.
     /// Consulting the in-flight set is why GC lives inside the Pusher (spec 05).
+    /// Paginated, like [`Storage::list_blobs`]: one listing returns at most
+    /// 1,000 uploads.
     pub async fn abort_stale_multiparts(
         &self,
         grace: Duration,
         in_flight: &crate::inflight::InFlight,
     ) -> Result<usize> {
-        let uploads = timed(
-            "list",
-            self.client
-                .list_multipart_uploads()
-                .bucket(&self.bucket)
-                .send(),
-        )
-        .await
-        .context("listing multipart uploads")?;
-
         let mut aborted = 0;
-        for upload in uploads.uploads() {
-            let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
-                continue;
-            };
-            let hash = hash_for(key).unwrap_or_default();
-            if in_flight.contains(hash) {
-                continue;
-            }
-            let age = upload
-                .initiated()
-                .and_then(|t| SystemTime::try_from(*t).ok())
-                .and_then(|t| SystemTime::now().duration_since(t).ok())
-                .unwrap_or(Duration::ZERO);
-            if age < grace {
-                continue;
-            }
-            timed(
-                "abort_mpu",
+        let (mut key_marker, mut upload_id_marker) = (None, None);
+        loop {
+            let page = timed(
+                "list",
                 self.client
-                    .abort_multipart_upload()
+                    .list_multipart_uploads()
                     .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
+                    .set_key_marker(key_marker.take())
+                    .set_upload_id_marker(upload_id_marker.take())
                     .send(),
             )
             .await
-            .with_context(|| format!("aborting stale multipart for {key}"))?;
-            aborted += 1;
+            .context("listing multipart uploads")?;
+
+            for upload in page.uploads() {
+                let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
+                    continue;
+                };
+                let hash = hash_for(key).unwrap_or_default();
+                if in_flight.contains(hash) || age(upload.initiated()) < grace {
+                    continue;
+                }
+                timed(
+                    "abort_mpu",
+                    self.client
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .send(),
+                )
+                .await
+                .with_context(|| format!("aborting stale multipart for {key}"))?;
+                aborted += 1;
+            }
+
+            if page.is_truncated() != Some(true) {
+                break;
+            }
+            key_marker = page.next_key_marker().map(str::to_owned);
+            upload_id_marker = page.next_upload_id_marker().map(str::to_owned);
+            // A truncated page without a marker to continue from would list
+            // the first page forever.
+            if key_marker.is_none() {
+                bail!("listing multipart uploads: truncated page without a next marker");
+            }
         }
         Ok(aborted)
     }
@@ -1166,6 +1195,58 @@ mod tests {
             .expect_err("a per-key failure must fail the delete");
         let err = format!("{err:#}");
         assert!(err.contains(&denied), "{err}");
+    }
+
+    /// A listing returns at most 1,000 uploads: the abort follows the
+    /// markers of a truncated page to the next one.
+    #[tokio::test]
+    async fn stale_multiparts_on_a_later_page_are_aborted_too() {
+        use axum::{extract::Request, http::Method};
+
+        let aborted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let storage = crate::testing::fake_s3(axum::Router::new().fallback({
+            let aborted = aborted.clone();
+            move |req: Request| {
+                let aborted = aborted.clone();
+                async move {
+                    let query = req.uri().query().unwrap_or_default().to_owned();
+                    if req.method() == Method::DELETE {
+                        aborted.lock().unwrap().push(req.uri().path().to_owned());
+                        return String::new();
+                    }
+                    let upload = |key: &str| {
+                        format!(
+                            "<Upload><Key>{key}</Key><UploadId>u-{key}</UploadId>\
+                             <Initiated>2000-01-01T00:00:00.000Z</Initiated></Upload>"
+                        )
+                    };
+                    let page = if query.contains("key-marker=") {
+                        format!("<IsTruncated>false</IsTruncated>{}", upload("nar/b.nar.zst"))
+                    } else {
+                        format!(
+                            "<IsTruncated>true</IsTruncated><NextKeyMarker>nar/a.nar.zst\
+                             </NextKeyMarker><NextUploadIdMarker>u-nar/a.nar.zst\
+                             </NextUploadIdMarker>{}",
+                            upload("nar/a.nar.zst")
+                        )
+                    };
+                    format!(
+                        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket>{page}</ListMultipartUploadsResult>"#
+                    )
+                }
+            }
+        }))
+        .await;
+
+        let count = storage
+            .abort_stale_multiparts(Duration::ZERO, &crate::inflight::InFlight::new())
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            *aborted.lock().unwrap(),
+            ["/test/nar/a.nar.zst", "/test/nar/b.nar.zst"]
+        );
     }
 }
 

@@ -109,7 +109,7 @@ enum Drift {
 /// in flight, older than the grace).
 fn classify_rows<'a>(
     db_rows: &'a [db::ObjectBrief],
-    blobs: &[(String, Duration, i64)],
+    blobs: &[storage::Blob],
     in_flight: &InFlight,
     grace: Duration,
     now: i64,
@@ -117,7 +117,7 @@ fn classify_rows<'a>(
 ) -> Vec<Finding<'a>> {
     let s3_sizes: HashMap<&str, i64> = blobs
         .iter()
-        .filter_map(|(key, _age, size)| storage::hash_for(key).map(|h| (h, *size)))
+        .map(|blob| (blob.hash.as_str(), blob.size))
         .collect();
 
     db_rows
@@ -212,13 +212,17 @@ mod tests {
         }
     }
 
-    fn blob(hash: &str, age_secs: u64, size: i64) -> (String, Duration, i64) {
-        (storage::key_for(hash), Duration::from_secs(age_secs), size)
+    fn blob(hash: &str, age_secs: u64, size: i64) -> storage::Blob {
+        storage::Blob {
+            hash: hash.into(),
+            age: Duration::from_secs(age_secs),
+            size,
+        }
     }
 
     fn classified(
         rows: &[db::ObjectBrief],
-        blobs: &[(String, Duration, i64)],
+        blobs: &[storage::Blob],
         in_flight: &InFlight,
         verify_sizes: bool,
     ) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
