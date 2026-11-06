@@ -40,8 +40,9 @@ pub async fn start<C: ServiceConfig>(service: &str) -> Result<Started<C>> {
     let metrics = crate::metrics::install(service)?;
     let metrics_listener = bind(config.metrics_listen(), "metrics").await?;
     let listener = bind(config.listen(), service).await?;
+    let metrics_app = crate::metrics::router(metrics);
     tokio::spawn(async move {
-        if let Err(e) = crate::metrics::serve(metrics, metrics_listener).await {
+        if let Err(e) = serve(metrics_listener, metrics_app, std::future::pending()).await {
             tracing::error!("metrics listener failed: {e:#}");
         }
     });

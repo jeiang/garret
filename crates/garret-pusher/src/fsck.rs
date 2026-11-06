@@ -18,10 +18,7 @@ use garret_server::{db, inflight::InFlight, storage};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::{
-    gc,
-    state::{AppState, db_run},
-};
+use crate::state::{AppState, db_run};
 
 /// Ceiling on how long `--quiesce` waits for in-flight uploads to drain.
 /// ponytail: fixed timeout, add a CLI/config knob if an operator ever needs
@@ -64,7 +61,7 @@ pub async fn run(
     );
     let (dangling, size_mismatches) = to_wire(&findings);
     let known: HashSet<String> = db_rows.iter().map(|r| r.store_path_hash.clone()).collect();
-    let orphans: Vec<String> = gc::orphan_hashes(&blobs, &known, &state.in_flight, grace)
+    let orphans: Vec<String> = storage::orphan_hashes(&blobs, &known, &state.in_flight, grace)
         .into_iter()
         .map(storage::key_for)
         .collect();

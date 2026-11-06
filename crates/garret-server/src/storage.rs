@@ -193,6 +193,25 @@ pub struct Blob {
     pub size: i64,
 }
 
+/// Store path hashes of blobs with no DB row, past both guards: an upload in
+/// the in-flight set, or younger than `grace` — a row lands only after its
+/// blob completes, so a rowless blob might just be mid-push. Shared by the
+/// GC orphan sweep and `garret-admin fsck`'s read-only mirror-image check.
+pub fn orphan_hashes<'a>(
+    blobs: &'a [Blob],
+    known: &std::collections::HashSet<String>,
+    in_flight: &crate::inflight::InFlight,
+    grace: Duration,
+) -> Vec<&'a str> {
+    blobs
+        .iter()
+        .filter(|blob| {
+            !known.contains(&blob.hash) && !in_flight.contains(&blob.hash) && blob.age >= grace
+        })
+        .map(|blob| blob.hash.as_str())
+        .collect()
+}
+
 /// Time since an S3 timestamp; zero when it is missing or in the future.
 fn age(at: Option<&aws_sdk_s3::primitives::DateTime>) -> Duration {
     at.and_then(|t| SystemTime::try_from(*t).ok())
@@ -826,6 +845,30 @@ mod tests {
     use super::*;
 
     const IDLE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
+        let grace = Duration::from_secs(86400);
+        let blob = |hash: &str, age_secs| Blob {
+            hash: hash.into(),
+            age: Duration::from_secs(age_secs),
+            size: 1,
+        };
+        let blobs = vec![
+            blob("known", 90000),
+            blob("uploading", 90000),
+            blob("young", 10),
+            blob("stale", 90000),
+        ];
+        let known: std::collections::HashSet<String> = ["known".to_string()].into();
+        let in_flight = crate::inflight::InFlight::new();
+        let _claim = in_flight.claim("uploading").unwrap();
+
+        assert_eq!(
+            orphan_hashes(&blobs, &known, &in_flight, grace),
+            vec!["stale"]
+        );
+    }
 
     #[test]
     fn key_layout_is_flat_and_derivable() {
