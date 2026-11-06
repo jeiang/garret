@@ -145,7 +145,7 @@ struct Meta {
     seed: u64,
     corpus_version: u32,
     version: &'static str,
-    timestamp_unix: u64,
+    timestamp_unix: i64,
 }
 
 #[derive(Debug, Default)]
@@ -238,10 +238,7 @@ struct Counters {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let timestamp = garret_common::unix_now();
     let meta = Meta {
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -281,23 +278,17 @@ async fn main() -> Result<()> {
         output.push = Some(run_push(&cli, args, &http, &token).await?);
     }
     if let Some(args) = stream_args {
-        output.stream = Some(run_stream(&cli, args, &http, &token, timestamp).await?);
+        output.stream = Some(run_stream(&cli, args, &http, &token, timestamp as u64).await?);
     }
     if let Some(args) = pull_args {
         output.pull = Some(run_pull(&cli, args).await?);
     }
 
-    // A single-step pull serializes as the same flat object as always, so the
-    // checked-in baseline keeps its keys; only a sweep emits an array.
-    let pull_json = match output.pull.as_deref() {
-        Some([one]) => serde_json::to_value(one)?,
-        other => serde_json::to_value(other)?,
-    };
     let report = serde_json::json!({
         "meta": meta,
         "push": output.push,
         "stream": output.stream,
-        "pull": pull_json,
+        "pull": output.pull,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(path) = &cli.json {
@@ -689,47 +680,42 @@ async fn put_with_retry(
 ) -> Result<()> {
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
-        let response = match http
+        let retried = match http
             .put(url)
             .bearer_auth(token)
             .body(make_body()?)
             .send()
             .await
         {
-            Ok(response) => response,
+            Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                &counters.shed
+            }
+            Ok(response) => {
+                if !response.status().is_success() {
+                    bail!(
+                        "{}: {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    );
+                }
+                // Each entry has its own key, so another upload of it means the
+                // corpus is being pushed twice at once: not a push this run made.
+                return match response.json().await.context("parsing upload response")? {
+                    UploadAck::Created | UploadAck::Exists => Ok(()),
+                    UploadAck::InProgress => bail!("another upload of this path is in progress"),
+                };
+            }
             // The server answers `exists` and 429 sheds before reading the
             // body, then closes the connection (spec 01) — a client still
             // writing sometimes gets the RST before the response and sees a
             // broken pipe instead. Idempotent by negotiation, so retried on
             // the same schedule as an explicit shed.
-            Err(e) if garret_client::push::connection_dropped(&e) => {
-                counters.dropped.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
-                delay *= 2;
-                continue;
-            }
+            Err(e) if garret_client::push::connection_dropped(&e) => &counters.dropped,
             Err(e) => return Err(e).context("sending the upload"),
         };
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            counters.shed.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
-            delay *= 2;
-            continue;
-        }
-        if !response.status().is_success() {
-            bail!(
-                "{}: {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
-            );
-        }
-        // Each entry has its own key, so another upload of it means the
-        // corpus is being pushed twice at once: not a push this run made.
-        return match response.json().await.context("parsing upload response")? {
-            UploadAck::Created | UploadAck::Exists => Ok(()),
-            UploadAck::InProgress => bail!("another upload of this path is in progress"),
-        };
+        retried.fetch_add(1, Ordering::Relaxed);
+        tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
+        delay *= 2;
     }
     bail!("still shed or dropped after 6 attempts")
 }
