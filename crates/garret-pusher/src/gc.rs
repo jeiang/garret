@@ -216,7 +216,7 @@ impl Gc {
             let in_flight = self.in_flight.clone();
             db_run(&self.conn, move |conn| {
                 let mut deletion = Deletion::default();
-                for hash in orphan_hashes(&blobs, &known, &in_flight, grace) {
+                for hash in storage::orphan_hashes(&blobs, &known, &in_flight, grace) {
                     let Ok(claim) = in_flight.claim_delete(hash) else {
                         continue;
                     };
@@ -255,55 +255,12 @@ fn counted<T>(phase: &'static str, result: Result<T>) -> Result<T> {
     result
 }
 
-/// Store path hashes of blobs with no DB row, past both guards: an upload in
-/// the in-flight set, or younger than `grace` — a row lands only after its
-/// blob completes, so a rowless blob might just be mid-push. Shared with
-/// `garret-admin fsck`'s read-only mirror-image check.
-pub(crate) fn orphan_hashes<'a>(
-    blobs: &'a [storage::Blob],
-    known: &std::collections::HashSet<String>,
-    in_flight: &InFlight,
-    grace: Duration,
-) -> Vec<&'a str> {
-    blobs
-        .iter()
-        .filter(|blob| {
-            !known.contains(&blob.hash) && !in_flight.contains(&blob.hash) && blob.age >= grace
-        })
-        .map(|blob| blob.hash.as_str())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::testing::open_db;
     use garret_server::inflight;
     use garret_server::testing::{S3_DELETED, fake_s3, gc_config, object, unreachable_storage};
-
-    #[test]
-    fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
-        let grace = Duration::from_secs(86400);
-        let blob = |hash: &str, age_secs| storage::Blob {
-            hash: hash.into(),
-            age: Duration::from_secs(age_secs),
-            size: 1,
-        };
-        let blobs = vec![
-            blob("known", 90000),
-            blob("uploading", 90000),
-            blob("young", 10),
-            blob("stale", 90000),
-        ];
-        let known: std::collections::HashSet<String> = ["known".to_string()].into();
-        let in_flight = InFlight::new();
-        let _claim = in_flight.claim("uploading").unwrap();
-
-        assert_eq!(
-            orphan_hashes(&blobs, &known, &in_flight, grace),
-            vec!["stale"]
-        );
-    }
 
     /// An S3 stand-in that acknowledges every `DeleteObjects`, holding the
     /// first until the returned sender fires: it parks a GC pass between its
@@ -463,49 +420,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_sweep_is_retried_on_the_next_tick() {
-        use axum::response::IntoResponse;
-        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (retried_tx, retried_rx) = tokio::sync::oneshot::channel();
-        let retried = Arc::new(Mutex::new(Some(retried_tx)));
-        let storage = fake_s3(axum::Router::new().fallback({
-            let lists = lists.clone();
-            move |uri: axum::http::Uri| {
-                let query = uri.query().unwrap_or_default().to_owned();
-                let (lists, retried) = (lists.clone(), retried.clone());
-                async move {
-                    if query.contains("uploads") {
-                        return r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"#.into_response();
-                    }
-                    if lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
-                        return axum::http::StatusCode::FORBIDDEN.into_response();
-                    }
-                    if let Some(tx) = retried.lock().take() {
-                        let _ = tx.send(());
-                    }
-                    r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><Prefix>nar/</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#.into_response()
-                }
-            }
-        }))
-        .await;
-        let gc = Arc::new(Gc::new(
-            Arc::new(Mutex::new(open_db())),
-            storage,
-            InFlight::new(),
-            gc_config(100),
-        ));
-
-        let timer = tokio::spawn(gc.run_forever());
-        // The first tick fires at once; the next sweep comes right after it,
-        // well before the configured interval.
-        tokio::time::timeout(Duration::from_secs(10), retried_rx)
-            .await
-            .expect("the failed startup sweep was not retried")
-            .unwrap();
-        timer.abort();
-    }
-
-    #[tokio::test]
     async fn an_orphan_stays_claimed_until_its_blob_is_deleted() {
         // Between the orphan check and the blob delete, an upload re-pushing
         // the path would land a row whose blob the pending delete removes.
@@ -554,6 +468,49 @@ mod tests {
 
         assert_eq!(gc.sweep_orphans().await.unwrap(), 0);
         assert!(held.try_recv().is_err(), "the blob was deleted");
+    }
+
+    #[tokio::test]
+    async fn a_failed_sweep_is_retried_on_the_next_tick() {
+        use axum::response::IntoResponse;
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (retried_tx, retried_rx) = tokio::sync::oneshot::channel();
+        let retried = Arc::new(Mutex::new(Some(retried_tx)));
+        let storage = fake_s3(axum::Router::new().fallback({
+            let lists = lists.clone();
+            move |uri: axum::http::Uri| {
+                let query = uri.query().unwrap_or_default().to_owned();
+                let (lists, retried) = (lists.clone(), retried.clone());
+                async move {
+                    if query.contains("uploads") {
+                        return r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"#.into_response();
+                    }
+                    if lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        return axum::http::StatusCode::FORBIDDEN.into_response();
+                    }
+                    if let Some(tx) = retried.lock().take() {
+                        let _ = tx.send(());
+                    }
+                    r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><Prefix>nar/</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#.into_response()
+                }
+            }
+        }))
+        .await;
+        let gc = Arc::new(Gc::new(
+            Arc::new(Mutex::new(open_db())),
+            storage,
+            InFlight::new(),
+            gc_config(100),
+        ));
+
+        let timer = tokio::spawn(gc.run_forever());
+        // The first tick fires at once; the next sweep comes right after it,
+        // well before the configured interval.
+        tokio::time::timeout(Duration::from_secs(10), retried_rx)
+            .await
+            .expect("the failed startup sweep was not retried")
+            .unwrap();
+        timer.abort();
     }
 
     #[tokio::test]
