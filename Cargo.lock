@@ -1402,6 +1402,7 @@ dependencies = [
  "garret-common",
  "garret-server",
  "metrics",
+ "metrics-exporter-prometheus",
  "parking_lot",
  "reqwest",
  "rusqlite",
