@@ -29,7 +29,13 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      # Every job installs Nix through this step or the importer variant below
+      # (YAML aliases, so the substituter config has one owner). `garret`
+      # itself is the cache once it is running: when the repository variables
+      # below are set, every job substitutes from it instead of rebuilding.
+      # Empty values are simply inert lines in nix.conf.
+      - &nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -53,15 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          # `garret` itself is the cache once it is running: when the repository
-          # variables below are set, every job substitutes from it instead of
-          # rebuilding. Empty values are simply inert lines in nix.conf.
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            extra-substituters = ${{ vars.GARRET_PULLER }}
-            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+      - *nix
 
       # garret-all is the workspace; the others are the per-binary wrappers
       # consumers actually install (`#garret`) and the NixOS modules run by
@@ -109,12 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            extra-substituters = ${{ vars.GARRET_PULLER }}
-            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
+      - *nix
 
       # The flake's test check, `cargo test --workspace` as in `just test`.
       # The package build skips the tests, so this job is where they run: a
@@ -130,7 +123,9 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      # The same Nix setup for jobs that import the build job's closure.
+      - &nix-importer
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -140,7 +135,8 @@ jobs:
             # only a trusted user may add such a path to the store.
             trusted-users = root runner
 
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      - &linux-closure
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: garret-closure-ubuntu-latest
 
@@ -169,19 +165,9 @@ jobs:
 
       # enable_kvm (on by default) is what lets the test driver boot its VM
       # with hardware acceleration rather than timing out under emulation.
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            extra-substituters = ${{ vars.GARRET_PULLER }}
-            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
-            # The imported closure is locally built and therefore unsigned;
-            # only a trusted user may add such a path to the store.
-            trusted-users = root runner
+      - *nix-importer
 
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: garret-closure-ubuntu-latest
+      - *linux-closure
 
       # The VM runs the packages this closure already holds, so what gets
       # built below is the test, not garret.
@@ -216,19 +202,9 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-            extra-substituters = ${{ vars.GARRET_PULLER }}
-            extra-trusted-public-keys = ${{ vars.GARRET_PUBLIC_KEY }}
-            # The imported closure is locally built and therefore unsigned;
-            # only a trusted user may add such a path to the store.
-            trusted-users = root runner
+      - *nix-importer
 
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
-        with:
-          name: garret-closure-ubuntu-latest
+      - *linux-closure
 
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
