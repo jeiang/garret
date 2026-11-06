@@ -81,12 +81,12 @@ impl Check {
 pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
     // One provider for the run. A machine config (secret file, GitHub
-    // Actions) is told apart from a human's stored login by the config on
-    // disk — `GARRET_TOKEN` in the environment alone says nothing about it.
+    // Actions) is told apart from a human's stored login by the same
+    // classification the provider uses — `GARRET_TOKEN` says nothing about it.
     let tokens = auth::TokenSource::for_config(http, cfg);
-    let device_flow = is_device_flow(
-        cfg,
-        std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some(),
+    let device_flow = matches!(
+        cfg.credential_kind(config::GithubActions::from_env()),
+        config::CredentialKind::DeviceFlow
     );
 
     let discovered = match discovery::fetch(http, &cfg.endpoint).await {
@@ -397,14 +397,6 @@ fn cache_info_ok(body: &str) -> bool {
     body.lines().any(|l| l.starts_with("StoreDir:"))
 }
 
-/// Whether this config is a human's `garret login` config, as opposed to a
-/// machine's (a client secret file, or a GitHub Actions runner). Decided by
-/// the config and runner, never by `GARRET_TOKEN`, which a login config can
-/// be run under too.
-fn is_device_flow(cfg: &config::Config, github_actions: bool) -> bool {
-    cfg.oidc.client_secret_file.is_none() && !github_actions
-}
-
 /// The `keys` check runs for any config that has keys to verify, and for a
 /// device-flow config even without (that is itself a failure). Only a machine
 /// config with no keys — a build host that never substitutes — skips it.
@@ -540,15 +532,26 @@ mod tests {
         assert!(fix_hint(true).contains("garret login --force"));
     }
 
-    /// The classification reads the config, not the environment: a config
-    /// `garret login` wrote stays a login config under `GARRET_TOKEN`.
+    /// Only a secret file or a full GitHub Actions pair makes a machine
+    /// config; a request URL alone does not, matching the token provider.
     #[test]
     fn a_config_is_a_machine_config_only_by_secret_file_or_github_actions() {
-        assert!(is_device_flow(&cfg(), false));
-        assert!(!is_device_flow(&cfg(), true));
+        use config::{CredentialKind, GithubActions};
+        let url = || Some("https://actions.example".to_owned());
+        let device_flow = |c: &config::Config, token: Option<&str>| {
+            matches!(
+                c.credential_kind(GithubActions::from_vars(url(), token.map(str::to_owned))),
+                CredentialKind::DeviceFlow
+            )
+        };
+        assert!(
+            device_flow(&cfg(), None),
+            "a URL without its token is no runner"
+        );
+        assert!(!device_flow(&cfg(), Some("rt")));
         let mut machine = cfg();
         machine.oidc.client_secret_file = Some("/run/secrets/garret".into());
-        assert!(!is_device_flow(&machine, false));
+        assert!(!device_flow(&machine, None));
     }
 
     #[test]

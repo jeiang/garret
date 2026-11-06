@@ -74,14 +74,16 @@ first match wins:
    client id is `oidc.client_id`; both, and `oidc.issuer`, are required with
    it). The `client_credentials` grant, re-minted on expiry. A warning goes to
    stderr when the file is readable by group or others (mode & `0o077`).
-3. A GitHub Actions runner (`ACTIONS_ID_TOKEN_REQUEST_*`).
+3. A GitHub Actions runner: both `ACTIONS_ID_TOKEN_REQUEST_URL` and
+   `ACTIONS_ID_TOKEN_REQUEST_TOKEN` set (either alone falls through to 4).
 4. The refresh token `garret login` stored (device flow).
 
 `oidc.issuer` is optional in the config: only `login` and
 `client_secret_file` need it, and each says so where it is used.
 `doctor` runs its `keys` check and the `[oidc]` drift comparison, and
-suggests `garret login --force`, only for a device-flow config (rule 4) — a
-machine config is never told to log in.
+suggests `garret login --force`, only for a device-flow config (rule 4, judged
+by rules 2-4 alone: `GARRET_TOKEN` does not change it) — a machine config is
+never told to log in.
 
 A non-2xx answer from the issuer or the cache is reported with the response
 body (the issuer's `error`/`error_description`), not just the status. A
