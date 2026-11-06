@@ -134,6 +134,50 @@ pub struct IssuerConfig {
     pub allowed_groups: Vec<String>,
 }
 
+/// The GitHub Actions OIDC issuer, which any repository can mint tokens from.
+pub(crate) const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+impl IssuerConfig {
+    /// Rejects an issuer that could never verify a token or that would trust
+    /// too much (spec 04), naming the issuer.
+    pub fn validate(&self) -> Result<()> {
+        let issuer = &self.issuer;
+        if self.audience.is_empty() {
+            bail!("issuer {issuer}: audience must not be empty");
+        }
+        if *issuer == GITHUB_ISSUER
+            && self.github_owner_id.is_none()
+            && self.repository_ids.is_empty()
+        {
+            bail!(
+                "issuer {GITHUB_ISSUER} needs github_owner_id or repository_ids: \
+                 any GitHub repository can mint a token for this audience"
+            );
+        }
+        match &self.jwks_url {
+            Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                check_remote_url(url)
+            }
+            // A local JWKS file: the sanctioned dev-issuer override.
+            Some(_) => Ok(()),
+            // Discovery is fetched from the issuer URL itself.
+            None => check_remote_url(issuer),
+        }
+        .with_context(|| format!("issuer {issuer}"))
+    }
+}
+
+/// Remote JWKS and discovery URLs must be https; plain http is for a local
+/// dev issuer on a loopback host only.
+pub(crate) fn check_remote_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
+    match (parsed.scheme(), parsed.host_str()) {
+        ("https", Some(_)) => Ok(()),
+        ("http", Some("localhost" | "127.0.0.1" | "[::1]")) => Ok(()),
+        _ => bail!("{url} must be https (http only for loopback hosts)"),
+    }
+}
+
 /// S3's smallest accepted part size; `limits.part_size` must be at least this.
 pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 /// S3's largest accepted part size; `limits.part_size` must be at most this.
@@ -274,7 +318,9 @@ impl ServiceConfig for PusherConfig {
         let l = &self.limits;
         if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&l.part_size) {
             bail!(
-                "limits.part_size must be between 5 MiB and 5 GiB (S3's part size range), got {}",
+                "limits.part_size must be between {} MiB and {} GiB (S3's part size range), got {}",
+                MIN_PART_SIZE >> 20,
+                MAX_PART_SIZE >> 30,
                 l.part_size
             );
         }
@@ -324,6 +370,14 @@ impl ServiceConfig for PusherConfig {
                     gc.high_watermark
                 );
             }
+        }
+        if self.oidc.is_empty() {
+            bail!(
+                "oidc: at least one issuer is required; garret has no auth-disable mode (spec 04)"
+            );
+        }
+        for issuer in &self.oidc {
+            issuer.validate().context("oidc")?;
         }
         Ok(())
     }
@@ -402,6 +456,9 @@ impl ServiceConfig for PullerConfig {
         }
         if self.db_wait_timeout_secs == 0 {
             bail!("db_wait_timeout_secs must be at least 1");
+        }
+        if let Some(issuer) = &self.browse_oidc {
+            issuer.validate().context("browse_oidc")?;
         }
         Ok(())
     }
@@ -561,6 +618,53 @@ mod validate_tests {
         c.s3.secret_access_key = Some("secret".into());
         c.validate().unwrap();
     }
+
+    /// Issuer mistakes fail at startup, not at the first token (spec 04).
+    #[test]
+    fn issuers_are_validated_at_load() {
+        rejects(|c| c.oidc.clear(), "no auth-disable mode");
+        rejects(|c| c.oidc[0].audience.clear(), "audience");
+        rejects(
+            |c| c.oidc[0].issuer = "http://id.example".into(),
+            "must be https",
+        );
+        rejects(
+            |c| c.oidc[0].jwks_url = Some("http://id.example/jwks".into()),
+            "must be https",
+        );
+        rejects(
+            |c| c.oidc[0].issuer = GITHUB_ISSUER.into(),
+            "github_owner_id",
+        );
+
+        let mut c = cfg();
+        c.oidc[0].issuer = GITHUB_ISSUER.into();
+        c.oidc[0].repository_ids = vec!["42".into()];
+        c.validate().unwrap();
+        c.oidc[0].repository_ids.clear();
+        c.oidc[0].github_owner_id = Some("1234".into());
+        c.validate().unwrap();
+
+        // The dev overrides: a JWKS file under any issuer URL, or http on a
+        // loopback host.
+        let mut c = cfg();
+        c.oidc[0].issuer = "http://dev.garret.test".into();
+        c.oidc[0].jwks_url = Some("/etc/garret/jwks.json".into());
+        c.validate().unwrap();
+        c.oidc[0].jwks_url = Some("http://127.0.0.1:8090/jwks".into());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn remote_jwks_urls_must_be_https_or_loopback() {
+        assert!(check_remote_url("https://id.example/jwks").is_ok());
+        assert!(check_remote_url("http://127.0.0.1:8080/jwks").is_ok());
+        assert!(check_remote_url("http://localhost/jwks").is_ok());
+        assert!(check_remote_url("http://[::1]/jwks").is_ok());
+        assert!(check_remote_url("http://id.example/jwks").is_err());
+        assert!(check_remote_url("http://127.0.0.1.evil.example/jwks").is_err());
+        assert!(check_remote_url("ftp://id.example/jwks").is_err());
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +735,23 @@ mod puller_validate_tests {
         rejects(
             |c| c.s3.operation_timeout_secs = 0,
             "operation_timeout_secs",
+        );
+    }
+
+    #[test]
+    fn browse_oidc_is_validated_at_load() {
+        let issuer = |c: &mut PullerConfig| {
+            c.browse_oidc = Some(crate::testing::dev_issuer("/etc/garret/jwks.json"));
+        };
+        let mut c = cfg();
+        issuer(&mut c);
+        c.validate().unwrap();
+        rejects(
+            |c| {
+                issuer(c);
+                c.browse_oidc.as_mut().unwrap().audience.clear();
+            },
+            "browse_oidc",
         );
     }
 }

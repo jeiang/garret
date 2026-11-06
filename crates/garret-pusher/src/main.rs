@@ -59,8 +59,8 @@ async fn main() -> Result<()> {
     // Bound before anything serves, like the listeners, so an unusable socket
     // path fails startup instead of leaving a half-up Pusher.
     let admin_listener = cfg.admin_socket.as_deref().map(admin::bind).transpose()?;
-    // Authenticator::new refuses an empty issuer list, so this cannot start
-    // unauthenticated (spec 04: no auth-disable flag).
+    // config::load refuses an empty or invalid issuer list, so this cannot
+    // start unauthenticated (spec 04: no auth-disable flag).
     let auth = Authenticator::new(cfg.oidc.clone())?;
 
     let conn = db::open(&cfg.db_path, true)?;

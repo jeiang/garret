@@ -7,7 +7,7 @@ use rusqlite::{
 
 /// One cached store path: the unit of content in the cache, keyed by its
 /// store path hash. A row exists if and only if its blob does (spec 02).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
     /// 32-char nix-base32 store path hash — the object key, and the blob key
     /// via [`crate::storage::key_for`].
