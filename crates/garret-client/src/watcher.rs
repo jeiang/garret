@@ -18,7 +18,7 @@ use tokio::net::UnixDatagram;
 
 use garret_common::hash_of_store_path;
 
-use crate::push::{PathInfo, Pusher, Refused, retain_missing};
+use crate::push::{PathInfo, Pusher, Refused, key_name, retain_missing, signed_by};
 
 /// Paths per poll, drain chunk, and retry chunk: one `nix path-info` and one
 /// Negotiation each, so argv and request bodies stay bounded.
@@ -76,17 +76,12 @@ impl Filters {
         if self.exclude_patterns.iter().any(|p| path.path.contains(p)) {
             return Some("excluded");
         }
-        if crate::push::signed_upstream(&path.sigs, &self.upstream_keys) {
+        if signed_by(&path.sigs, self.upstream_keys.iter().map(String::as_str)) {
             return Some("upstream");
         }
         // Our own signature means this path came from the cache (or was
         // already pushed to it): CI needs no upstream_keys entry for that.
-        if path.sigs.iter().any(|sig| {
-            let signer = sig.split(':').next().unwrap_or_default();
-            self.own_keys
-                .iter()
-                .any(|key| key.split(':').next().unwrap_or_default() == signer)
-        }) {
+        if signed_by(&path.sigs, self.own_keys.iter().map(|key| key_name(key))) {
             return Some("own");
         }
         None
@@ -246,6 +241,36 @@ pub async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
 }
 
 impl Watcher {
+    /// The Watcher `cfg`'s `[watch]` table describes; `cursor_path` and
+    /// `socket_path` override it, as the `--cursor` and `--socket` flags do.
+    pub fn from_config(
+        cfg: &crate::config::Config,
+        cursor_path: Option<String>,
+        socket_path: Option<String>,
+    ) -> Self {
+        let watch = &cfg.watch;
+        Self {
+            nix_db: watch.nix_db.clone(),
+            cursor_path: cursor_path
+                .unwrap_or_else(|| watch.cursor_path.clone())
+                .into(),
+            poll_interval: Duration::from_secs(watch.poll_interval_secs),
+            filters: Filters {
+                // `[watch]` may override the client-wide upstream list.
+                upstream_keys: watch
+                    .upstream_keys
+                    .clone()
+                    .unwrap_or_else(|| cfg.upstream_keys.clone()),
+                exclude_patterns: watch.exclude_patterns.clone(),
+                own_keys: cfg.public_keys.clone(),
+            },
+            max_attempts: watch.max_attempts,
+            socket_path: socket_path
+                .unwrap_or_else(|| watch.socket_path.clone())
+                .into(),
+        }
+    }
+
     /// Runs until killed. The cursor always advances: one poison path must
     /// never wedge the pipeline, so a failed push goes on the failed list and
     /// the watcher moves on, retrying it on idle polls up to `max_attempts`

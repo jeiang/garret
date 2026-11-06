@@ -42,11 +42,8 @@ pub async fn fetch(http: &reqwest::Client, endpoint: &str) -> Result<Discovery> 
              Upgrade the server, or write the config by hand."
         );
     }
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("discovery failed with {status}: {}", body.trim());
-    }
-    let discovery: Discovery = response
+    let discovery: Discovery = crate::http::ensure_success(response, "discovery failed")
+        .await?
         .json()
         .await
         .context("parsing the discovery document")?;

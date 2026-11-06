@@ -7,6 +7,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
+use crate::http::{ensure_success, error_detail};
+
 /// What `garret login` persists: enough to mint fresh access tokens without
 /// re-running the device flow. Never the access token itself — that is
 /// short-lived by design and re-minted as it ages (see [`TokenSource`]).
@@ -178,60 +180,6 @@ fn missing_token() -> anyhow::Error {
     anyhow!("token response contained no access_token")
 }
 
-/// The part of an error body worth showing: an OAuth `error` (and its
-/// description) when the body is that JSON, otherwise the body itself, cut
-/// short so a proxy's HTML error page cannot flood the terminal.
-fn describe_body(body: &str) -> String {
-    #[derive(Deserialize)]
-    struct OauthError {
-        error: String,
-        error_description: Option<String>,
-    }
-    if let Ok(e) = serde_json::from_str::<OauthError>(body) {
-        return match e.error_description {
-            Some(d) => format!("{}: {d}", e.error),
-            None => e.error,
-        };
-    }
-    let body = body.trim();
-    match body.char_indices().nth(300) {
-        Some((end, _)) => format!("{}…", &body[..end]),
-        None => body.to_owned(),
-    }
-}
-
-/// Passes a 2xx response through; turns anything else into an error that
-/// carries the response body, which is where servers and issuers say *why*
-/// (`error_for_status` discards it).
-pub async fn ensure_success(response: reqwest::Response, what: &str) -> Result<reqwest::Response> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(response);
-    }
-    let body = response.text().await.unwrap_or_default();
-    let detail = describe_body(&body);
-    match detail.is_empty() {
-        true => bail!("{what}: {status}"),
-        false => bail!("{what}: {status}: {detail}"),
-    }
-}
-
-/// The liveness probe `whoami` and `doctor` share: an empty Negotiation batch
-/// is a valid, near-free request that crosses exactly the authentication path
-/// `push` uses, so success proves the Pusher accepts `token`.
-pub async fn probe_pusher(http: &reqwest::Client, endpoint: &str, token: &str) -> Result<()> {
-    let response = http
-        .post(format!("{endpoint}{}", garret_common::wire::MISSING_PATHS))
-        .bearer_auth(token)
-        .json(&Vec::<String>::new())
-        .send()
-        .await
-        .context("probing the Pusher")?;
-    ensure_success(response, "the Pusher rejected this token")
-        .await
-        .map(drop)
-}
-
 /// Appends the RFC 8707 `resource` parameter only when one is configured.
 /// Always sending it breaks issuers that require each resource to be
 /// registered in advance (Pocket ID answers `invalid_target`), and the
@@ -247,13 +195,14 @@ fn with_resource<'a>(
 }
 
 /// Device flow: the human approves in a browser (passkey, in Pocket ID's case)
-/// while this polls. Returns the access token and stores the refresh token.
+/// while this polls. Returns whether the issuer handed out a refresh token,
+/// now stored; without one there is nothing for later runs to mint from.
 pub async fn device_login(
     http: &reqwest::Client,
     issuer: &str,
     client_id: &str,
     resource: Option<&str>,
-) -> Result<String> {
+) -> Result<bool> {
     let endpoints = discover(http, issuer).await?;
     let response = http
         .post(endpoints.device_authorization_endpoint()?)
@@ -312,21 +261,7 @@ pub async fn device_login(
             // No error and no token is not success -- keep polling rather than
             // reporting a login that did not happen.
             None if response.access_token.is_none() => continue,
-            None => {
-                let TokenResponse {
-                    access_token,
-                    refresh_token,
-                    ..
-                } = response;
-                if let Some(refresh_token) = refresh_token {
-                    save_token(&StoredToken {
-                        refresh_token,
-                        issuer: issuer.to_owned(),
-                        client_id: client_id.to_owned(),
-                    })?;
-                }
-                return access_token.ok_or_else(missing_token);
-            }
+            None => return store_refresh_token(response.refresh_token, issuer, client_id),
         }
     }
 }
@@ -353,28 +288,34 @@ async fn refresh(
     // The issuer answers 400 `invalid_grant` (or 401) for a refresh token that
     // expired, was revoked or was already rotated: only a new login fixes it.
     if matches!(response.status().as_u16(), 400 | 401) {
-        let detail = describe_body(&response.text().await.unwrap_or_default());
+        let detail = error_detail(response).await;
         bail!("stored login expired or revoked; run `garret login` ({detail})");
     }
     let response: TokenResponse = ensure_success(response, "refreshing the stored token")
         .await?
         .json()
         .await?;
+    store_refresh_token(response.refresh_token, &stored.issuer, &stored.client_id)?;
+    response.access_token.ok_or_else(missing_token)
+}
 
-    // Rotating refresh tokens: persist the new one or the next run is locked out.
-    let TokenResponse {
-        access_token,
+/// Persists the refresh token a grant returned, if it returned one; whether
+/// it did. Refresh tokens rotate: a returned one must replace the stored one
+/// or the next run is locked out.
+fn store_refresh_token(
+    refresh_token: Option<String>,
+    issuer: &str,
+    client_id: &str,
+) -> Result<bool> {
+    let Some(refresh_token) = refresh_token else {
+        return Ok(false);
+    };
+    save_token(&StoredToken {
         refresh_token,
-        ..
-    } = response;
-    if let Some(refresh_token) = refresh_token {
-        save_token(&StoredToken {
-            refresh_token,
-            issuer: stored.issuer.clone(),
-            client_id: stored.client_id.clone(),
-        })?;
-    }
-    access_token.ok_or_else(missing_token)
+        issuer: issuer.to_owned(),
+        client_id: client_id.to_owned(),
+    })?;
+    Ok(true)
 }
 
 #[derive(Debug, Deserialize)]
@@ -864,20 +805,6 @@ mod tests {
         let no_id = cfg("issuer = \"https://id.example\"\nclient_secret_file = \"/x\"\n");
         let err = select(&no_id, None, false).err().unwrap();
         assert!(format!("{err:#}").contains("`oidc.client_id` is required"));
-    }
-
-    #[test]
-    fn error_bodies_show_the_issuers_reason() {
-        assert_eq!(
-            describe_body(r#"{"error":"invalid_grant","error_description":"token revoked"}"#),
-            "invalid_grant: token revoked"
-        );
-        assert_eq!(
-            describe_body(r#"{"error":"invalid_client"}"#),
-            "invalid_client"
-        );
-        assert_eq!(describe_body("  plain failure \n"), "plain failure");
-        assert!(describe_body(&"x".repeat(1000)).chars().count() <= 301);
     }
 
     fn endpoints(json: &str) -> Result<Endpoints> {

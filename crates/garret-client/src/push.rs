@@ -29,6 +29,8 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 
+use crate::http::{ensure_success, error_detail};
+
 /// Where push output goes.
 ///
 /// The bar draws to stderr (via the shared `MultiProgress`, which also carries
@@ -61,7 +63,7 @@ impl Report {
         upstream: &[PathInfo],
         missing: &[PathInfo],
     ) -> Self {
-        let nar_bytes: u64 = missing.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        let nar_bytes = nar_bytes(missing);
         let mut report = Self {
             json,
             mp: mp.clone(),
@@ -69,16 +71,7 @@ impl Report {
             started: Instant::now(),
         };
         if json {
-            report.event(json!({
-                "event": "negotiated",
-                "closure": closure,
-                "upstream": upstream.len(),
-                "missing": missing.len(),
-                "nar_bytes": nar_bytes,
-            }));
-            for info in upstream {
-                report.path(info, &Outcome::Upstream);
-            }
+            report.negotiated(closure, upstream, missing.len(), nar_bytes);
             return report;
         }
         report.out(&Self::negotiated_line(
@@ -107,10 +100,68 @@ impl Report {
         report
     }
 
-    /// The human Negotiation summary, shared with `--dry-run`. The upstream
-    /// count appears only when the filter dropped something — the common case
-    /// has nothing to say.
-    pub fn negotiated_line(closure: usize, upstream: usize, missing: usize) -> String {
+    /// `--dry-run`'s whole output: the Negotiation result, what would be
+    /// uploaded, and, under `--json`, the same `negotiated`/`path`/`done`
+    /// events a push emits, with status `would-push`.
+    pub fn dry_run(
+        json: bool,
+        mp: &MultiProgress,
+        closure: usize,
+        upstream: &[PathInfo],
+        missing: &[PathInfo],
+    ) {
+        let nar_bytes = nar_bytes(missing);
+        let report = Self {
+            json,
+            mp: mp.clone(),
+            bar: None,
+            started: Instant::now(),
+        };
+        if json {
+            report.negotiated(closure, upstream, missing.len(), nar_bytes);
+            for info in missing {
+                report.path(info, &Outcome::WouldPush);
+            }
+            report.finish(&Summary {
+                nar_bytes,
+                ..Summary::default()
+            });
+            return;
+        }
+        report.out(&Self::negotiated_line(
+            closure,
+            upstream.len(),
+            missing.len(),
+        ));
+        for info in upstream {
+            report.out(&format!("  upstream   {}", info.path));
+        }
+        for info in missing {
+            report.out(&format!("  would-push {}", info.path));
+        }
+        report.out(&format!(
+            "{} to upload (uncompressed)",
+            garret_common::human_bytes(nar_bytes.min(i64::MAX as u64) as i64)
+        ));
+    }
+
+    /// The `negotiated` event, then a `path` event per upstream-filtered path.
+    fn negotiated(&self, closure: usize, upstream: &[PathInfo], missing: usize, nar_bytes: u64) {
+        self.event(json!({
+            "event": "negotiated",
+            "closure": closure,
+            "upstream": upstream.len(),
+            "missing": missing,
+            "nar_bytes": nar_bytes,
+        }));
+        for info in upstream {
+            self.path(info, &Outcome::Upstream);
+        }
+    }
+
+    /// The human Negotiation summary. The upstream count appears only when
+    /// the filter dropped something — the common case has nothing to say.
+    fn negotiated_line(closure: usize, upstream: usize, missing: usize) -> String {
         match upstream {
             0 => format!("{closure} path(s) in closure, {missing} missing"),
             u => format!("{closure} path(s) in closure, {u} served upstream, {missing} missing"),
@@ -153,7 +204,7 @@ impl Report {
     /// The closing Negotiation found `gone` missing again after a clean run;
     /// they are pushed next and their events follow this one.
     pub fn rechecked(&self, gone: &[PathInfo]) {
-        let nar_bytes: u64 = gone.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        let nar_bytes = nar_bytes(gone);
         if let Some(bar) = &self.bar {
             bar.inc_length(nar_bytes);
         }
@@ -228,6 +279,11 @@ fn path_event(info: &PathInfo, outcome: &Outcome) -> serde_json::Value {
     event
 }
 
+/// Uncompressed NAR bytes across `paths`, the bar's and the events' unit.
+fn nar_bytes(paths: &[PathInfo]) -> u64 {
+    paths.iter().map(|p| p.nar_size.max(0) as u64).sum()
+}
+
 /// How one path ended up. The status strings are the NDJSON `path` event
 /// contract (spec 06).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +294,8 @@ enum Outcome {
     Failed(String),
     /// Signed by an upstream key, so never negotiated or uploaded.
     Upstream,
+    /// Missing from the cache, under `--dry-run`, which uploads nothing.
+    WouldPush,
 }
 
 impl Outcome {
@@ -247,6 +305,7 @@ impl Outcome {
             Self::Deduped => "deduped",
             Self::Failed(_) => "failed",
             Self::Upstream => "upstream",
+            Self::WouldPush => "would-push",
         }
     }
 }
@@ -266,7 +325,7 @@ fn tally(outcomes: Vec<(String, Outcome)>, nar_bytes: u64) -> (Summary, Vec<Stri
                 summary.failed += 1;
                 failed.push(path);
             }
-            Outcome::Upstream => {}
+            Outcome::Upstream | Outcome::WouldPush => {}
         }
     }
     (summary, failed)
@@ -346,13 +405,21 @@ pub struct PathInfo {
     pub signatures: Vec<String>,
 }
 
-/// True when any signature's key name (the part before `:`) is one of the
-/// configured upstream keys. Exact name equality, not substring: a key merely
-/// *containing* `cache.nixos.org-1` must not match.
-pub fn signed_upstream(signatures: &[String], upstream_keys: &[String]) -> bool {
+/// The key name of a signature or public key: the part before `:`.
+pub fn key_name(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(name, _)| name)
+}
+
+/// True when any signature's key name is one of `key_names`. Exact name
+/// equality, not substring: a key merely *containing* `cache.nixos.org-1`
+/// must not match.
+pub fn signed_by<'a>(
+    signatures: &[String],
+    key_names: impl Iterator<Item = &'a str> + Clone,
+) -> bool {
     signatures.iter().any(|sig| {
-        let key = sig.split(':').next().unwrap_or_default();
-        upstream_keys.iter().any(|u| u == key)
+        let signer = key_name(sig);
+        key_names.clone().any(|name| name == signer)
     })
 }
 
@@ -366,7 +433,7 @@ pub fn partition_upstream(
 ) -> (Vec<PathInfo>, Vec<PathInfo>) {
     closure
         .into_iter()
-        .partition(|p| !signed_upstream(&p.signatures, upstream_keys))
+        .partition(|p| !signed_by(&p.signatures, upstream_keys.iter().map(String::as_str)))
 }
 
 /// Whole closure of the given installables, roots included.
@@ -443,6 +510,19 @@ pub fn retain_missing(infos: &[PathInfo], missing: &HashSet<String>) -> Vec<Path
 }
 
 impl Pusher {
+    /// The Pusher `cfg` describes, with its token provider.
+    pub fn from_config(cfg: &crate::config::Config, http: &reqwest::Client) -> Result<Self> {
+        Ok(Self {
+            tokens: crate::auth::TokenSource::for_config(http, cfg)?,
+            http: http.clone(),
+            endpoint: cfg.endpoint.clone(),
+            jobs: cfg.jobs,
+            zstd_level: cfg.zstd_level,
+            max_retries: cfg.max_retries,
+            upload_idle: Duration::from_secs(cfg.upload_idle_secs),
+        })
+    }
+
     /// The one pre-upload round-trip (spec 01): the subset of `closure` the
     /// cache does not hold.
     pub async fn missing(&self, closure: &[PathInfo]) -> Result<Vec<PathInfo>> {
@@ -453,7 +533,9 @@ impl Pusher {
         Ok(retain_missing(closure, &self.negotiate(&hashes).await?))
     }
 
-    /// One Negotiation over `hashes`: the subset the cache does not hold.
+    /// One Negotiation over `hashes`: the subset the cache does not hold. An
+    /// empty `hashes` asks nothing, and so only proves the Pusher accepts the
+    /// token.
     pub async fn negotiate(&self, hashes: &[&str]) -> Result<HashSet<String>> {
         let send = |token: &str| {
             self.http
@@ -479,17 +561,11 @@ impl Pusher {
             response = send(&token).await.context("negotiating missing paths")?;
         }
 
-        // `error_for_status` drops the body, which is where the server explains
-        // itself; a bare "403 Forbidden" says nothing a log can act on.
-        let status = response.status();
-        if status == StatusCode::FORBIDDEN {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Refused(body.trim().to_owned()).into());
+        // A 403 is typed so the watcher can drop the batch instead of retrying.
+        if response.status() == StatusCode::FORBIDDEN {
+            return Err(Refused(error_detail(response).await).into());
         }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("negotiation rejected with {status}: {}", body.trim());
-        }
+        let response = ensure_success(response, "negotiation rejected").await?;
         let missing: HashSet<String> = response
             .json()
             .await
@@ -514,7 +590,7 @@ impl Pusher {
         paths: Vec<PathInfo>,
         report: &Report,
     ) -> (Summary, Vec<String>) {
-        let nar_bytes: u64 = paths.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        let nar_bytes = nar_bytes(&paths);
         let outcomes = stream::iter(references_first(paths))
             .map(|info| async move {
                 let outcome = match self.push_one(&info, report).await {
@@ -609,16 +685,11 @@ impl Pusher {
             return Err(Shed(after).into());
         }
         if status == StatusCode::UNAUTHORIZED {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Unauthorized(body.trim().to_owned()).into());
+            return Err(Unauthorized(error_detail(response).await).into());
         }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Rejected {
-                status,
-                body: body.trim().to_owned(),
-            }
-            .into());
+            let body = error_detail(response).await;
+            return Err(Rejected { status, body }.into());
         }
 
         parse_ack(&response.bytes().await.context("reading upload response")?)
@@ -1205,6 +1276,7 @@ mod tests {
             (Outcome::Pushed, "pushed"),
             (Outcome::Deduped, "deduped"),
             (Outcome::Upstream, "upstream"),
+            (Outcome::WouldPush, "would-push"),
         ] {
             let event = path_event(&path, &outcome);
             assert_eq!(event["status"], status);

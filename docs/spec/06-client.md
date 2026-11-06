@@ -8,7 +8,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 
 | Command | Behavior |
 |---|---|
-| `garret login [pusher-url] [--force]` | Writes the config from server discovery, then device flow against Pocket ID; stores rotating refresh token |
+| `garret login [pusher-url] [--force]` | Writes the config from server discovery, then device flow against Pocket ID; stores rotating refresh token, or warns that nothing was stored when the issuer returns none |
 | `garret logout` | Deletes the stored refresh token; the config stays |
 | `garret whoami` | Subject, audience, expiry, and a live probe that the Pusher accepts the token |
 | `garret doctor [path]` | Layer-by-layer diagnosis (below); with a path, a Negotiation round answers "is this cached" |
@@ -110,15 +110,16 @@ non-zero if any check failed:
 | `discovery` | `GET /api/v1/discovery` on the Pusher — the server is reachable at all, and its document passes the checks `login` applies |
 | `config` | The local config against the discovery document — drift in `puller_endpoint`, and (device-flow configs only) `[oidc]`, since `garret login` wrote it. Fields the server does not advertise are sparse, not drifted |
 | `keys` | Device-flow configs only: configured `public_keys` against discovery's — a configured key the server no longer signs with fails; *extra* server keys pass with a re-login nudge (rotation in progress) |
-| `auth` | Token acquisition plus the empty-Negotiation liveness probe `whoami` uses (one shared helper) — the token is not merely present but accepted |
+| `auth` | Token acquisition plus the empty Negotiation `whoami` also sends, through the same Negotiation client `push` uses (a 401 renews the token once) — the token is not merely present but accepted |
 | `pull` | The Puller's `/nix-cache-info`, then one narinfo probe. Hit and miss both pass: the question is whether the substituter protocol is served, not whether a given path is cached |
 | `path` | Only with a path argument: one Negotiation round for its hash. Not cached is a `fail`, so the exit code carries the answer for scripts |
 
 A check whose prerequisite failed reports `skip` rather than guessing:
 no discovery document leaves `config` and `keys` nothing to compare
 against, and without an accepted token `path` cannot be asked. Every probe
-runs under a hard timeout — a diagnostic that hangs is a diagnostic that
-failed.
+runs under a hard timeout — 15 s, or the push path's Negotiation timeout
+for the two Negotiations — since a diagnostic that hangs is a diagnostic
+that failed.
 
 Under `--json`, `doctor` emits one object (the checks are the data; the
 failure summary goes to stderr):

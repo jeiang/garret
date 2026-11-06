@@ -9,6 +9,7 @@ pub mod config;
 pub mod discovery;
 pub mod doctor;
 pub mod files;
+mod http;
 pub mod nixconf;
 pub mod push;
 pub mod watcher;
