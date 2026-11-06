@@ -57,10 +57,7 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
     .set(1.0);
     // Captured here, not read from `/proc` (`/proc/stat` is hidden under
     // `ProcSubset=pid`), so it is exported on every platform.
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64());
-    metrics::gauge!("process_start_time_seconds").set(started);
+    metrics::gauge!("process_start_time_seconds").set(garret_common::unix_now() as f64);
     Ok(handle)
 }
 

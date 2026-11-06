@@ -5,7 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-# Token-signing fixtures for router tests in the binaries.
+# Test fixtures for the binaries: tokens/JWKS, objects, S3 stand-ins,
+# scratch dirs.
 test-support = ["dep:aws-lc-rs"]
 
 [dependencies]

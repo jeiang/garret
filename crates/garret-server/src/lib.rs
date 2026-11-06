@@ -1,4 +1,5 @@
-//! Shared server internals: config, DB, S3 storage, narinfo/signing.
+//! Shared server internals: config, DB, S3 storage, narinfo/signing, auth,
+//! browse queries, runtime, metrics, in-flight claims.
 #![warn(missing_docs)]
 
 pub mod auth;
