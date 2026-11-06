@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use garret_common::wire::{self, TreeNode};
 
-use crate::auth::ensure_success;
+use crate::http::ensure_success;
 
 /// Each query returns the server's JSON verbatim, so `--json` passes it
 /// straight through; human rendering deserializes it into the

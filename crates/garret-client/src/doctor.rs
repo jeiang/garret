@@ -9,7 +9,7 @@ use garret_common::{
     wire::{self, Discovery},
 };
 
-use crate::{auth, config, discovery};
+use crate::{auth, config, discovery, push::Pusher};
 
 /// The hash probed when no path argument is given: certainly absent, so the
 /// Puller answering 404 for it proves the narinfo route is served without
@@ -83,10 +83,11 @@ impl Check {
 /// caller always gets the whole picture before deciding the exit code.
 pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
-    // One provider for the run. A machine config (secret file, GitHub
-    // Actions) is told apart from a human's stored login by the same
-    // classification the provider uses — `GARRET_TOKEN` says nothing about it.
-    let tokens = auth::TokenSource::for_config(http, cfg);
+    // One Pusher, so one token provider, for the run. A machine config
+    // (secret file, GitHub Actions) is told apart from a human's stored login
+    // by the same classification the provider uses — `GARRET_TOKEN` says
+    // nothing about it.
+    let pusher = Pusher::from_config(cfg, http);
     let device_flow = matches!(
         cfg.credential_kind(config::GithubActions::from_env()),
         config::CredentialKind::DeviceFlow
@@ -140,12 +141,12 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
         }
     }
 
-    let token = auth_check(cfg, http, tokens, &mut checks).await;
+    let accepted = auth_check(&pusher, &mut checks).await;
 
     checks.push(pull_check(cfg, http, path, device_flow).await);
 
-    match (path, token) {
-        (Some(path), Some(token)) => checks.push(path_check(cfg, http, &token, path).await),
+    match (path, accepted) {
+        (Some(path), Some(pusher)) => checks.push(path_check(pusher, path).await),
         (Some(_), None) => checks.push(Check::skip("path")),
         (None, _) => {}
     }
@@ -153,44 +154,41 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
     checks
 }
 
-/// Token acquisition plus the liveness probe `whoami` uses
-/// ([`auth::probe_pusher`]). Returns the token — only when the Pusher
-/// accepted it — so the `path` check can reuse it.
-async fn auth_check(
-    cfg: &config::Config,
-    http: &reqwest::Client,
-    tokens: anyhow::Result<auth::TokenSource>,
+/// Token acquisition plus the empty Negotiation `whoami` also sends. Returns
+/// the Pusher only when it accepted the token, so the `path` check can ask it.
+async fn auth_check<'a>(
+    pusher: &'a anyhow::Result<Pusher>,
     checks: &mut Vec<Check>,
-) -> Option<String> {
-    let token = match tokens {
-        Ok(tokens) => tokens.get().await,
-        Err(e) => Err(e),
+) -> Option<&'a Pusher> {
+    let token = match pusher {
+        Ok(pusher) => pusher.tokens.get().await.map(|_| pusher),
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
-    let token = match token {
-        Ok(token) => token,
+    let pusher = match token {
+        Ok(pusher) => pusher,
         Err(e) => {
             checks.push(Check::fail("auth", format!("no token: {e:#}")));
             return None;
         }
     };
 
-    match auth::probe_pusher(http, &cfg.endpoint, &token).await {
-        Ok(()) => {
-            let subject = auth::peek_claims(&token)
-                .ok()
-                .and_then(|c| c.sub)
-                .unwrap_or_else(|| "unknown".into());
-            checks.push(Check::pass(
-                "auth",
-                format!("the Pusher accepted the token (subject {subject})"),
-            ));
-            Some(token)
-        }
-        Err(e) => {
-            checks.push(Check::fail("auth", format!("{e:#}")));
-            None
-        }
+    if let Err(e) = pusher.negotiate(&[]).await {
+        checks.push(Check::fail("auth", format!("{e:#}")));
+        return None;
     }
+    // Asked after the Negotiation, which may have replaced a rejected token.
+    let subject = match pusher.tokens.get().await {
+        Ok(token) => auth::peek_claims(&token).ok().and_then(|c| c.sub),
+        Err(_) => None,
+    };
+    checks.push(Check::pass(
+        "auth",
+        format!(
+            "the Pusher accepted the token (subject {})",
+            subject.as_deref().unwrap_or("unknown")
+        ),
+    ));
+    Some(pusher)
 }
 
 /// The substituter side: `/nix-cache-info` must be served, and the narinfo
@@ -250,12 +248,7 @@ async fn pull_check(
 /// One Negotiation round for a single hash: the authoritative answer to
 /// "is this path cached", straight from the Pusher. An uncached path is a
 /// `Fail` so the exit code carries the answer for scripts.
-async fn path_check(
-    cfg: &config::Config,
-    http: &reqwest::Client,
-    token: &str,
-    path: &str,
-) -> Check {
+async fn path_check(pusher: &Pusher, path: &str) -> Check {
     let Some(hash) = parse_store_hash(path) else {
         return Check::fail(
             "path",
@@ -263,32 +256,12 @@ async fn path_check(
         );
     };
 
-    let response = match http
-        .post(format!("{}{}", cfg.endpoint, wire::MISSING_PATHS))
-        .bearer_auth(token)
-        .json(&vec![hash])
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return Check::fail("path", format!("Negotiation failed: {e:#}")),
-    };
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Check::fail(
-            "path",
-            format!("Negotiation rejected with {status}: {}", body.trim()),
-        );
-    }
-    let missing: Vec<String> = match response.json().await {
+    let missing = match pusher.negotiate(&[hash]).await {
         Ok(missing) => missing,
-        Err(e) => {
-            return Check::fail("path", format!("parsing the Negotiation response: {e:#}"));
-        }
+        Err(e) => return Check::fail("path", format!("{e:#}")),
     };
 
-    match missing.iter().any(|h| h == hash) {
+    match missing.contains(hash) {
         true => Check::fail(
             "path",
             format!(

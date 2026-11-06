@@ -227,7 +227,12 @@ async fn main() -> Result<()> {
             if paths.is_empty() {
                 anyhow::bail!("nothing to push");
             }
-            let pusher = pusher(&cfg, &http, jobs)?;
+            let mut pusher = push::Pusher::from_config(&cfg, &http)?;
+            // The config's `jobs` is validated on load; the flag only here.
+            if let Some(jobs) = jobs {
+                anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
+                pusher.jobs = jobs;
+            }
             let closure = push::closure(&paths).await?;
             let closure_len = closure.len();
             // Paths an upstream cache already signs never enter the
@@ -239,7 +244,8 @@ async fn main() -> Result<()> {
             let missing = pusher.missing(&own).await?;
 
             if dry_run {
-                return dry_run_report(cli.json, closure_len, &upstream, &missing);
+                push::Report::dry_run(cli.json, &progress, closure_len, &upstream, &missing);
+                return Ok(());
             }
 
             let report = push::Report::start(cli.json, &progress, closure_len, &upstream, &missing);
@@ -276,31 +282,11 @@ async fn main() -> Result<()> {
             socket,
         } => {
             let cfg = load()?;
-            let pusher = pusher(&cfg, &http, None)?;
+            let pusher = push::Pusher::from_config(&cfg, &http)?;
             // Minted once up front so a daemon that cannot authenticate exits
             // saying so, rather than failing every path it sees.
             pusher.tokens.get().await?;
-            let watcher = watcher::Watcher {
-                nix_db: cfg.watch.nix_db.clone(),
-                cursor_path: cursor
-                    .unwrap_or_else(|| cfg.watch.cursor_path.clone())
-                    .into(),
-                poll_interval: Duration::from_secs(cfg.watch.poll_interval_secs),
-                filters: watcher::Filters {
-                    // `[watch]` may override the client-wide upstream list.
-                    upstream_keys: cfg
-                        .watch
-                        .upstream_keys
-                        .clone()
-                        .unwrap_or_else(|| cfg.upstream_keys.clone()),
-                    exclude_patterns: cfg.watch.exclude_patterns.clone(),
-                    own_keys: cfg.public_keys.clone(),
-                },
-                max_attempts: cfg.watch.max_attempts,
-                socket_path: socket
-                    .unwrap_or_else(|| cfg.watch.socket_path.clone())
-                    .into(),
-            };
+            let watcher = watcher::Watcher::from_config(&cfg, cursor, socket);
             if !drain {
                 watcher.run(&pusher, full_sync).await?;
             } else {
@@ -499,21 +485,29 @@ async fn login(
         .issuer
         .as_deref()
         .context("`oidc.issuer` is required to log in")?;
-    auth::device_login(http, issuer, client_id, cfg.oidc.resource.as_deref()).await?;
-    println!(
-        "Logged in; refresh token stored at {}",
-        auth::token_path()?.display()
-    );
+    let stored = auth::device_login(http, issuer, client_id, cfg.oidc.resource.as_deref()).await?;
+    match stored {
+        true => println!(
+            "Logged in; refresh token stored at {}",
+            auth::token_path()?.display()
+        ),
+        false => eprintln!(
+            "warning: logged in, but the issuer returned no refresh token, so nothing was \
+             stored and later commands cannot get a token; let client `{client_id}` use \
+             refresh tokens (the `offline_access` scope) at the issuer"
+        ),
+    }
     Ok(())
 }
 
-/// Proves the token is not merely present but accepted — the same probe
-/// `doctor` runs ([`auth::probe_pusher`]), which exercises exactly the
-/// authentication path `push` uses.
+/// Proves the token is not merely present but accepted, with the same empty
+/// Negotiation `doctor` sends: it crosses exactly the authentication path
+/// `push` uses.
 async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> Result<()> {
-    let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
-    let claims = auth::peek_claims(&token).unwrap_or_default();
-    auth::probe_pusher(http, &cfg.endpoint, &token).await?;
+    let pusher = push::Pusher::from_config(cfg, http)?;
+    pusher.negotiate(&[]).await?;
+    // After the Negotiation, which may have replaced a rejected token.
+    let claims = auth::peek_claims(&pusher.tokens.get().await?).unwrap_or_default();
 
     let issuer = cfg.oidc.issuer.as_deref();
     let expires_at = claims.exp.map(|exp| {
@@ -599,71 +593,6 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// `--dry-run` reuses the push schema exactly — same events, same field names —
-/// so a consumer needs one parser rather than two. Upstream-filtered paths keep
-/// their real `upstream` status: the filter runs identically either way.
-fn dry_run_report(
-    as_json: bool,
-    closure: usize,
-    upstream: &[push::PathInfo],
-    missing: &[push::PathInfo],
-) -> Result<()> {
-    let nar_bytes: u64 = missing.iter().map(|p| p.nar_size.max(0) as u64).sum();
-    if as_json {
-        println!(
-            "{}",
-            json!({"event":"negotiated","closure":closure,"upstream":upstream.len(),"missing":missing.len(),"nar_bytes":nar_bytes})
-        );
-        for info in upstream {
-            println!(
-                "{}",
-                json!({"event":"path","path":info.path,"status":"upstream","nar_size":info.nar_size})
-            );
-        }
-        for info in missing {
-            println!(
-                "{}",
-                json!({"event":"path","path":info.path,"status":"would-push","nar_size":info.nar_size})
-            );
-        }
-        println!(
-            "{}",
-            json!({"event":"done","pushed":0,"deduped":0,"failed":0,"nar_bytes":nar_bytes})
-        );
-        return Ok(());
-    }
-    println!(
-        "{}",
-        push::Report::negotiated_line(closure, upstream.len(), missing.len())
-    );
-    for info in upstream {
-        println!("  upstream   {}", info.path);
-    }
-    for info in missing {
-        println!("  would-push {}", info.path);
-    }
-    println!("{} to upload (uncompressed)", human_bytes(nar_bytes as i64));
-    Ok(())
-}
-
-fn pusher(
-    cfg: &config::Config,
-    http: &reqwest::Client,
-    jobs: Option<usize>,
-) -> Result<push::Pusher> {
-    let jobs = jobs.unwrap_or(cfg.jobs);
-    anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
-    Ok(push::Pusher {
-        tokens: auth::TokenSource::for_config(http, cfg)?,
-        http: http.clone(),
-        endpoint: cfg.endpoint.clone(),
-        jobs,
-        zstd_level: cfg.zstd_level,
-        max_retries: cfg.max_retries,
-        upload_idle: std::time::Duration::from_secs(cfg.upload_idle_secs),
-    })
 }
 
 async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(String, String)> {
