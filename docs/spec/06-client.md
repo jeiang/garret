@@ -246,8 +246,9 @@ then does the process exit non-zero.
 `--json` is global. It sends everything human to stderr, so stdout carries only
 data.
 
-- `list` and `tree` emit the browse API's JSON verbatim. The server already has
-  a schema (spec 07); mirroring it client-side would create a second one.
+- `list` and `tree` emit the browse API's JSON verbatim. The human output
+  parses it into the shared `garret_common::wire` types, so spec 07's schema
+  has one definition.
 - `whoami` and `doctor` each emit one object.
 - `push` emits NDJSON, one event per line:
 

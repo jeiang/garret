@@ -7,8 +7,9 @@ the design in [01-push-protocol](../../docs/spec/01-push-protocol.md),
 [03-storage](../../docs/spec/03-storage.md) and
 [05-gc](../../docs/spec/05-gc.md), and the code in
 `crates/garret-server/src/{inflight,db}.rs` and
-`crates/garret-pusher/src/{main,gc,admin,fsck}.rs`. Each action in the
-spec cites the function it mirrors.
+`crates/garret-pusher/src/{main,gc,admin,fsck,deletion}.rs`. Each action in
+the spec cites the function it mirrors; `TakeDel`/`ReleaseDel` are the
+Delete claims of `deletion.rs`, shared by GC, `delete` and `prune`.
 
 ## Run
 
