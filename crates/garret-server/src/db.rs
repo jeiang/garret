@@ -205,7 +205,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 /// returned at once. Gives up after `timeout` so a typo'd `db_path` still
 /// fails loudly.
 pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result<Connection> {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(250);
@@ -868,10 +869,7 @@ mod tests {
         let a = "a".repeat(32);
         insert_object(&mut conn, &object(&a), 100).unwrap();
         insert_object(&mut conn, &object(&a), 200).unwrap();
-        let total: i64 = conn
-            .query_row("SELECT total_bytes FROM stats", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 5);
+        assert_eq!(total_bytes(&conn).unwrap(), 5);
     }
 
     #[test]
@@ -1211,12 +1209,7 @@ mod tests {
     }
 
     fn last_accessed(conn: &Connection, hash: &str) -> i64 {
-        conn.query_row(
-            "SELECT last_accessed_at FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |r| r.get(0),
-        )
-        .unwrap()
+        get_object_and_last_accessed(conn, hash).unwrap().unwrap().1
     }
 
     #[test]
@@ -1242,26 +1235,6 @@ mod tests {
     }
 
     #[test]
-    fn reverse_lookup_finds_referrers_by_hash() {
-        let mut conn = db();
-        let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(
-            &mut conn,
-            &object(&a).referencing(&[&format!("{b}-dep")]),
-            100,
-        )
-        .unwrap();
-        let referrers: Vec<String> = conn
-            .prepare("SELECT referrer FROM object_refs WHERE reference_hash = ?1")
-            .unwrap()
-            .query_map(params![b], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(referrers, vec![a]);
-    }
-
-    #[test]
     fn closing_leaves_the_wal_sidecars_for_the_puller() {
         let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
@@ -1280,7 +1253,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn open_when_ready_waits_for_the_pusher_to_create_the_schema() {
         let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
@@ -1290,11 +1263,12 @@ mod tests {
             let path = path.clone();
             async move { open_when_ready(&path, std::time::Duration::from_secs(30)).await }
         });
-        // Not ready while the file is absent, nor while it exists unmigrated.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Not ready while the file is absent, nor while it exists unmigrated;
+        // each sleep spans at least one retry.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(!waiter.is_finished());
         let created = open(&path, true).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(!waiter.is_finished(), "an empty database is not ready");
 
         migrate(&created).unwrap();
@@ -1306,11 +1280,11 @@ mod tests {
         assert!(!exists(&conn, "nope").unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn open_when_ready_gives_up_on_a_database_that_never_appears() {
         let err = open_when_ready(
             "/nonexistent-dir/garret.sqlite",
-            std::time::Duration::from_millis(600),
+            std::time::Duration::from_secs(60),
         )
         .await
         .unwrap_err();

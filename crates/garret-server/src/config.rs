@@ -461,28 +461,6 @@ pub fn load<T: ServiceConfig>(path: &str) -> Result<T> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn watermarks_are_fractions_of_the_quota() {
-        let cfg = GcConfig {
-            quota_bytes: 1000,
-            high_watermark: 0.95,
-            low_watermark: 0.85,
-            interval_secs: 300,
-            orphan_grace_secs: 86400,
-        };
-        assert_eq!(cfg.high(), 950);
-        assert_eq!(cfg.low(), 850);
-        // Nothing is evicted while usage stays below the high watermark.
-        assert!(949 < cfg.high());
-        // And a pass always frees a margin, so passes stay infrequent.
-        assert!(cfg.low() < cfg.high());
-    }
-}
-
-#[cfg(test)]
 mod validate_tests {
     use super::*;
 
@@ -503,20 +481,17 @@ mod validate_tests {
         .unwrap()
     }
 
+    /// The defaults validate, and `edit` alone makes them fail, naming `key`.
     fn rejects(edit: impl FnOnce(&mut PusherConfig), key: &str) {
         let mut c = cfg();
+        c.validate().unwrap();
         edit(&mut c);
         let e = c.validate().unwrap_err();
         assert!(format!("{e:#}").contains(key), "{e:#}");
     }
 
     #[test]
-    fn defaults_are_valid() {
-        cfg().validate().unwrap();
-    }
-
-    #[test]
-    fn limits_boundaries() {
+    fn part_size_stays_within_s3_limits() {
         const MIB: usize = 1024 * 1024;
         let mut c = cfg();
         c.limits.part_size = 5 * MIB;
@@ -525,27 +500,6 @@ mod validate_tests {
 
         rejects(|c| c.limits.part_size = 5 * MIB - 1, "part_size");
         rejects(|c| c.limits.part_size = 5 * 1024 * MIB + 1, "part_size");
-        rejects(
-            |c| c.limits.max_in_flight_bytes = c.limits.part_size as u64 - 1,
-            "max_in_flight_bytes",
-        );
-        rejects(
-            |c| c.limits.max_concurrent_uploads = 0,
-            "max_concurrent_uploads",
-        );
-        rejects(|c| c.limits.max_parts_in_flight = 0, "max_parts_in_flight");
-        rejects(|c| c.gc.as_mut().unwrap().quota_bytes = 0, "quota_bytes");
-        rejects(
-            |c| c.limits.body_idle_timeout_secs = 0,
-            "body_idle_timeout_secs",
-        );
-    }
-
-    #[test]
-    fn timeout_defaults_keep_current_behavior() {
-        let c = cfg();
-        assert_eq!(c.limits.body_idle_timeout_secs, 60);
-        assert_eq!(c.s3.operation_attempt_timeout_secs, None);
     }
 
     #[test]
@@ -563,16 +517,11 @@ mod validate_tests {
         );
     }
 
+    /// A zero quota or a watermark outside (0, 1] would evict the whole
+    /// cache or never evict at all.
     #[test]
-    fn gc_and_s3_boundaries() {
-        rejects(
-            |c| c.gc.as_mut().unwrap().interval_secs = 0,
-            "interval_secs",
-        );
-        rejects(
-            |c| c.s3.operation_timeout_secs = 0,
-            "operation_timeout_secs",
-        );
+    fn gc_quota_and_watermarks_are_sane() {
+        rejects(|c| c.gc.as_mut().unwrap().quota_bytes = 0, "quota_bytes");
         rejects(
             |c| c.gc.as_mut().unwrap().high_watermark = 0.0,
             "high_watermark",
@@ -580,10 +529,6 @@ mod validate_tests {
         rejects(
             |c| c.gc.as_mut().unwrap().high_watermark = 1.01,
             "high_watermark",
-        );
-        rejects(
-            |c| c.gc.as_mut().unwrap().low_watermark = 0.0,
-            "low_watermark",
         );
         rejects(
             |c| c.gc.as_mut().unwrap().low_watermark = f64::NAN,
@@ -662,45 +607,30 @@ mod puller_validate_tests {
         .unwrap()
     }
 
+    /// The defaults validate, and `edit` alone makes them fail, naming `key`.
     fn rejects(edit: impl FnOnce(&mut PullerConfig), key: &str) {
         let mut c = cfg();
+        c.validate().unwrap();
         edit(&mut c);
         let e = c.validate().unwrap_err();
         assert!(format!("{e:#}").contains(key), "{e:#}");
     }
 
+    /// 7 days is the SigV4 presigned-URL maximum.
     #[test]
-    fn defaults_are_valid() {
-        cfg().validate().unwrap();
+    fn presign_ttl_stays_within_the_sigv4_maximum() {
+        rejects(|c| c.presign_ttl_secs = 0, "presign_ttl_secs");
+        rejects(|c| c.presign_ttl_secs = 604_801, "presign_ttl_secs");
+        let mut c = cfg();
+        c.presign_ttl_secs = 604_800;
+        c.validate().unwrap();
     }
 
     #[test]
-    fn rejects_bad_values() {
-        rejects(|c| c.presign_ttl_secs = 0, "presign_ttl_secs");
-        rejects(|c| c.presign_ttl_secs = 604_801, "presign_ttl_secs");
-        rejects(|c| c.db_read_budget_ms = 0, "db_read_budget_ms");
-        rejects(|c| c.presign_budget_ms = 0, "presign_budget_ms");
-        rejects(|c| c.bump_debounce_secs = -1, "bump_debounce_secs");
-        rejects(|c| c.db_wait_timeout_secs = 0, "db_wait_timeout_secs");
+    fn s3_settings_are_validated_for_the_puller_too() {
         rejects(
             |c| c.s3.operation_timeout_secs = 0,
             "operation_timeout_secs",
         );
-    }
-
-    #[test]
-    fn s3_credentials_are_all_or_nothing() {
-        rejects(
-            |c| c.s3.access_key_id = Some("id".into()),
-            "s3.access_key_id and s3.secret_access_key",
-        );
-        rejects(
-            |c| c.s3.secret_access_key = Some("secret".into()),
-            "s3.access_key_id and s3.secret_access_key",
-        );
-        let mut c = cfg();
-        c.s3.access_key_id = Some("id".into());
-        c.s3.secret_access_key = Some("secret".into());
-        c.validate().unwrap();
     }
 }

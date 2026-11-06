@@ -218,22 +218,34 @@ fn record_process_metrics() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn statuses_collapse_to_classes() {
-        assert_eq!(status_class(200), "2xx");
-        assert_eq!(status_class(307), "3xx");
-        assert_eq!(status_class(429), "4xx");
-        assert_eq!(status_class(503), "5xx");
-    }
-
-    #[test]
-    fn buckets_span_the_ranges_the_spec_asks_for() {
-        let bytes = byte_buckets();
-        assert_eq!(bytes.first(), Some(&(64.0 * 1024.0)));
-        assert_eq!(bytes.last(), Some(&(8.0 * 1024.0 * 1024.0 * 1024.0)));
-        let latency = latency_buckets();
-        assert_eq!(latency.first(), Some(&0.0001));
-        assert_eq!(latency.last(), Some(&900.0));
+    /// Labels stay bounded: the route template, not the path; the
+    /// status class, not the code; `OTHER` for an extension method.
+    #[tokio::test]
+    async fn request_labels_are_bounded() {
+        use tower::ServiceExt;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let app = Router::new()
+            .route(
+                "/item/{id}",
+                axum::routing::any(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .layer(axum::middleware::from_fn(track_http));
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::from_bytes(b"BREW").unwrap())
+            .uri("/item/0123456789abcdef")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap();
+        let out = handle.render();
+        assert!(
+            out.contains(
+                r#"garret_http_requests_total{route="/item/{id}",method="OTHER",status="5xx"} 1"#
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("0123456789abcdef"), "{out}");
     }
 
     #[test]
@@ -246,16 +258,6 @@ mod tests {
         assert!(out.contains("garret_x_duration_seconds_bucket{le=\"900\"}"));
         assert!(out.contains("garret_negotiation_batch_size_bucket{le=\"10000\"}"));
         assert!(out.contains("garret_negotiation_missing_ratio_bucket{le=\"0.75\"}"));
-    }
-
-    #[test]
-    fn extension_methods_collapse_to_other() {
-        use axum::http::Method;
-        assert_eq!(method_label(&Method::GET), "GET");
-        assert_eq!(method_label(&Method::DELETE), "DELETE");
-        let custom = Method::from_bytes(b"BREW").unwrap();
-        assert_eq!(method_label(&custom), "OTHER");
-        assert_eq!(method_label(&Method::PATCH), "OTHER");
     }
 
     /// A request future dropped mid-flight (client gone) leaves the gauge at 0.
