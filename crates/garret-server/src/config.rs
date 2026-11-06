@@ -155,9 +155,7 @@ impl IssuerConfig {
             );
         }
         match &self.jwks_url {
-            Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
-                check_remote_url(url)
-            }
+            Some(url) if is_remote_url(url) => check_remote_url(url),
             // A local JWKS file: the sanctioned dev-issuer override.
             Some(_) => Ok(()),
             // Discovery is fetched from the issuer URL itself.
@@ -165,6 +163,11 @@ impl IssuerConfig {
         }
         .with_context(|| format!("issuer {issuer}"))
     }
+}
+
+/// Whether a JWKS location is a URL to fetch rather than a local file path.
+pub(crate) fn is_remote_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
 }
 
 /// Remote JWKS and discovery URLs must be https; plain http is for a local

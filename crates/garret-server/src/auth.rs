@@ -23,7 +23,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 
-use crate::config::{IssuerConfig, check_remote_url};
+use crate::config::{IssuerConfig, check_remote_url, is_remote_url};
 
 /// Clock skew allowance, per spec 04-auth.
 const LEEWAY_SECS: u64 = 60;
@@ -380,8 +380,7 @@ async fn fetch_keys(
     cfg: &IssuerConfig,
 ) -> Result<HashMap<String, DecodingKey>> {
     let url = jwks_url(http, cfg).await?;
-    let is_remote = url.starts_with("http://") || url.starts_with("https://");
-    let body = if is_remote {
+    let body = if is_remote_url(&url) {
         check_remote_url(&url)?;
         http.get(&url)
             .send()
