@@ -45,7 +45,7 @@ pub struct UploadLimits {
     /// How long a body may send nothing before the upload is abandoned.
     pub body_idle: Duration,
     /// One permit per `unit` bytes of buffer, shared process-wide.
-    pub part_slots: Arc<Semaphore>,
+    part_slots: Arc<Semaphore>,
     /// Bytes one permit stands for: the power of two at or below
     /// `part_size / 256`, at most 64 KiB.
     unit: usize,
@@ -82,16 +82,14 @@ impl UploadLimits {
         self.total_units / self.part_units
     }
 
-    fn units(&self, bytes: usize) -> usize {
-        units_for(bytes, self.unit, self.part_units)
-    }
-
     /// Bytes of buffer currently reserved, process-wide.
-    pub fn in_flight_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn in_flight_bytes(&self) -> u64 {
         (self.total_units - self.part_slots.available_permits()) as u64 * self.unit as u64
     }
 
-    async fn acquire_units(&self, units: usize) -> Result<Reservation> {
+    async fn acquire(&self, bytes: usize) -> Result<Reservation> {
+        let units = units_for(bytes, self.unit, self.part_units);
         let started = std::time::Instant::now();
         let permit = self
             .part_slots
@@ -106,10 +104,6 @@ impl UploadLimits {
             _permit: permit,
             bytes,
         })
-    }
-
-    async fn acquire(&self, bytes: usize) -> Result<Reservation> {
-        self.acquire_units(self.units(bytes)).await
     }
 }
 
