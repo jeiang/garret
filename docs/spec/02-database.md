@@ -20,6 +20,11 @@ SQLite, one file, WAL mode, shared by both services on the same host.
     1 s busy timeout. A flush never touches the pull-path connection.
   - A failed flush drops its batch. Those rows are still stale, so their
     next hit queues them again.
+  - The Pusher creates and migrates the database, so a Puller started
+    first waits for it (answering 503 meanwhile): while the file is
+    absent or empty, or has no schema yet, up to `db_wait_timeout_secs`.
+    Any other open failure (permissions, a corrupt file) ends the wait at
+    once.
 - Pull-path reads (narinfo, exists, usage counter) and the Negotiation,
   eviction and bump statements are prepared once per connection and
   cached, not re-parsed per request. Each statement family's latency is

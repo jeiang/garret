@@ -81,7 +81,9 @@ async fn main() -> Result<()> {
 
     let conn = db::open(&cfg.db_path, true)?;
     db::migrate(&conn)?;
-    conn.pragma_update(None, "wal_checkpoint", "TRUNCATE").ok();
+    if let Err(e) = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE") {
+        tracing::warn!("startup WAL checkpoint failed: {e}");
+    }
 
     let state = Arc::new(AppState {
         conn: Arc::new(Mutex::new(conn)),

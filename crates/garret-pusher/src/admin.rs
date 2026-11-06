@@ -19,10 +19,22 @@ use crate::{AppState, deletion::Deletion, fsck, gc::Gc};
 /// Binds the admin socket (0600), replacing a stale one, so a bind failure
 /// fails startup instead of a background task.
 pub fn bind(path: &str) -> Result<UnixListener> {
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
     // A socket left behind by a crashed process would block the bind.
-    let _ = std::fs::remove_file(path);
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).ok();
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            use std::os::unix::fs::FileTypeExt;
+            anyhow::ensure!(
+                meta.file_type().is_socket(),
+                "{path} exists and is not a socket; refusing to replace it"
+            );
+            std::fs::remove_file(path).with_context(|| format!("removing stale socket {path}"))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("checking {path}")),
     }
     let listener = UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
     restrict(path)?;
@@ -48,7 +60,6 @@ pub async fn serve(
 }
 
 /// 0600: the file mode *is* the authorization for this socket.
-#[cfg(unix)]
 fn restrict(path: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

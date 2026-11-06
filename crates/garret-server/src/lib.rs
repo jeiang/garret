@@ -26,13 +26,12 @@ pub fn now() -> i64 {
 
 /// Reads and parses every configured signing key file, failing on the first
 /// unreadable or malformed one — a partial key set would sign with fewer keys
-/// than the rotation plan expects. On Unix a key readable by group or other is
+/// than the rotation plan expects. A key readable by group or other is
 /// refused too (ADR-0009): the Puller's user must not be able to read it.
 pub fn load_signing_keys(paths: &[String]) -> Result<Vec<narinfo::SigningKeyFile>> {
     paths
         .iter()
         .map(|p| {
-            #[cfg(unix)]
             if let Ok(meta) = std::fs::metadata(p) {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = meta.permissions().mode() & 0o777;
@@ -65,7 +64,6 @@ mod tests {
     }
 
     /// A group- or other-readable key is refused, naming the file, mode and fix.
-    #[cfg(unix)]
     #[test]
     fn group_readable_signing_key_is_refused() {
         let (path, keys) = key_with_mode(0o640);
@@ -75,7 +73,6 @@ mod tests {
     }
 
     /// Owner-only keys load.
-    #[cfg(unix)]
     #[test]
     fn owner_only_signing_key_loads() {
         for mode in [0o400, 0o600] {

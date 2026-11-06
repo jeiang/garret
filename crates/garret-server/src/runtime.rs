@@ -91,7 +91,6 @@ pub fn notify_ready() {
     }
 }
 
-#[cfg(unix)]
 fn send_notify(path: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixDatagram;
@@ -112,11 +111,6 @@ fn send_notify(path: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()> {
         }
     }
     socket.send_to(message, path)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn send_notify(_: &std::ffi::OsStr, _: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 

@@ -179,10 +179,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA).context("applying schema")?;
     // Databases created before `pushed_at` existed: the best record of when
     // those objects were last pushed is when they were first stored.
-    if conn
-        .prepare("SELECT pushed_at FROM objects LIMIT 0")
-        .is_err()
-    {
+    let has_pushed_at: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('objects') WHERE name = 'pushed_at')",
+            [],
+            |row| row.get(0),
+        )
+        .context("checking for objects.pushed_at")?;
+    if !has_pushed_at {
         conn.execute_batch(
             "BEGIN;
              ALTER TABLE objects ADD COLUMN pushed_at INTEGER NOT NULL DEFAULT 0;
@@ -195,28 +199,41 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 }
 
 /// The Pusher creates the database, so a Puller started first would otherwise
-/// die on a missing file. Wait instead — including for the schema, since the
-/// file appears (WAL, journal) before the Pusher has finished migrating.
-/// Gives up after `timeout` so a typo'd `db_path` still fails loudly.
+/// die on a missing file. Wait instead — for the file, and for the schema,
+/// since the file appears (empty, then unmigrated) before the Pusher has
+/// finished migrating. Any other failure (permissions, corruption) is
+/// returned at once. Gives up after `timeout` so a typo'd `db_path` still
+/// fails loudly.
 pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result<Connection> {
     use std::time::{Duration, Instant};
 
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(250);
     loop {
-        match open(path, false).and_then(|conn| {
-            conn.query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'objects'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .context("checking for schema")
-            .map(|found| (conn, found.is_some()))
-        }) {
-            Ok((conn, true)) => return Ok(conn),
-            Ok((_, false)) => tracing::info!("waiting for {path}: pusher has not migrated it yet"),
-            Err(e) => tracing::info!("waiting for database: {e:#}"),
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!("waiting for {path}: pusher has not created it yet");
+            }
+            Err(e) => return Err(e).with_context(|| format!("checking database {path}")),
+            Ok(meta) if meta.len() == 0 => {
+                tracing::info!("waiting for {path}: pusher has not initialized it yet");
+            }
+            Ok(_) => {
+                let conn = open(path, false)?;
+                let migrated = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'objects'",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .context("checking for schema")?
+                    .is_some();
+                if migrated {
+                    return Ok(conn);
+                }
+                tracing::info!("waiting for {path}: pusher has not migrated it yet");
+            }
         }
         let now = Instant::now();
         anyhow::ensure!(
@@ -333,8 +350,15 @@ pub fn get_object_and_last_accessed(
                 deriver: row.get(6)?,
                 ca: row.get(7)?,
                 references: Vec::new(),
-                sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
-                    .unwrap_or_default(),
+                sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?).map_err(
+                    |e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    },
+                )?,
                 pushed_by: row.get(9)?,
             };
             Ok((obj, row.get(10)?))
@@ -1165,6 +1189,16 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_sigs_are_an_error_not_an_unsigned_object() {
+        let mut conn = db();
+        let a = "a".repeat(32);
+        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        conn.execute("UPDATE objects SET sigs = 'not json'", [])
+            .unwrap();
+        assert!(get_object(&conn, &a).is_err());
+    }
+
+    #[test]
     fn last_accessed_bumps_are_debounced() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
@@ -1295,5 +1329,21 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("was not created"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn open_when_ready_fails_at_once_on_a_file_that_is_not_a_database() {
+        let path = std::env::temp_dir().join("garret-open-when-ready-garbage.sqlite");
+        let path = path.to_str().unwrap().to_owned();
+        remove_db(&path);
+        std::fs::write(&path, b"not a sqlite database, just bytes").unwrap();
+        let opened = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            open_when_ready(&path, std::time::Duration::from_secs(300)),
+        )
+        .await
+        .expect("a corrupt database must not be waited on");
+        remove_db(&path);
+        assert!(opened.is_err());
     }
 }

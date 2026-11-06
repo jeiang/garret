@@ -651,7 +651,10 @@ impl Storage {
                     .and_then(|t| SystemTime::try_from(*t).ok())
                     .and_then(|t| SystemTime::now().duration_since(t).ok())
                     .unwrap_or(Duration::ZERO);
-                out.push((key.to_owned(), age, object.size().unwrap_or(0)));
+                let size = object
+                    .size()
+                    .with_context(|| format!("listing blobs: no size for {key}"))?;
+                out.push((key.to_owned(), age, size));
             }
 
             token = page.next_continuation_token().map(str::to_owned);
@@ -673,13 +676,10 @@ impl Storage {
     pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
         let (mut failed, mut first_failure) = (0, None);
         for batch in keys.chunks(1000) {
-            let objects: Vec<ObjectIdentifier> = batch
+            let objects = batch
                 .iter()
-                .filter_map(|k| ObjectIdentifier::builder().key(k).build().ok())
-                .collect();
-            if objects.is_empty() {
-                continue;
-            }
+                .map(|k| ObjectIdentifier::builder().key(k).build())
+                .collect::<Result<Vec<_>, _>>()?;
             let requested = objects.len();
             let output = timed(
                 "delete",
@@ -1233,10 +1233,9 @@ mod proofs {
     fn the_budget_stays_within_the_cap() {
         let part_size = any_part_size();
         let max_in_flight: u64 = kani::any_where(|m| *m >= part_size as u64);
-        let (unit, part_units, total_units) = budget(part_size, max_in_flight);
+        let (unit, _, total_units) = budget(part_size, max_in_flight);
         let budget_bytes = total_units as u128 * unit as u128;
         assert!(budget_bytes <= max_in_flight as u128 + unit as u128);
         assert!(budget_bytes >= part_size as u128);
-        let _ = part_units;
     }
 }
