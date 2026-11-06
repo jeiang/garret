@@ -22,8 +22,7 @@ in
   # It writes its own $out too, so the root *self-references*. Most compiled
   # store paths do, and a self-reference is covered by the signature — a server
   # that stores or renders it inconsistently produces a narinfo whose
-  # fingerprint nix cannot reproduce. Without this the whole suite passed while
-  # every real-world push was unverifiable.
+  # fingerprint nix cannot reproduce.
   closure = pkgs.runCommand "garret-e2e-root" { } "echo ${leaf} $out > $out";
 
   # A path the watcher should notice and push without being asked.

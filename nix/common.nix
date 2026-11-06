@@ -33,8 +33,6 @@ in
   # The sandbox plus what only the server daemons add.
   daemonServiceConfig = import ./sandbox.nix // {
     Restart = "on-failure";
-    # Server daemons only (the watcher shares the rest of the sandbox): hide
-    # other processes and SysV IPC.
     ProtectProc = "invisible";
     ProcSubset = "pid";
     PrivateIPC = true;

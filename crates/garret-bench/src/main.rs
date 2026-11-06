@@ -665,7 +665,6 @@ async fn push(
     counters
         .wire
         .fetch_add(body.len() as u64, Ordering::Relaxed);
-    // A refcounted handle, so each attempt shares the one buffer.
     let body = bytes::Bytes::from(body);
     put_with_retry(
         http,

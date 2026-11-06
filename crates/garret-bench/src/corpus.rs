@@ -25,7 +25,6 @@ impl Rng {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
-    /// Uniform in `[0, n)`.
     pub fn below(&mut self, n: u64) -> u64 {
         if n == 0 { 0 } else { self.next_u64() % n }
     }

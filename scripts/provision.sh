@@ -4,7 +4,7 @@
 # build_binaries sets $bin; everything that runs a garret binary comes after it.
 #
 # Callers:
-#   scripts/e2e.sh              — the M1 end-to-end gate
+#   scripts/e2e.sh              — the end-to-end gate
 #   scripts/bench-local.sh      — the self-provisioned benchmark run (spec 09)
 #   scripts/bench-pull-sweep.sh — the stepped-concurrency pull sweep (spec 09)
 # shellcheck shell=bash
