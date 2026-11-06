@@ -1,24 +1,30 @@
 # Shared provisioning for the e2e gate and the bench harness: a throwaway
 # Garage, a dev OIDC issuer, signing keys, service configs, and both services
-# running. Sourced, not executed; the caller owns $root, $bin and the cleanup
-# trap.
+# running. Sourced, not executed; the caller owns $root and the cleanup trap.
+# build_binaries sets $bin; everything that runs a garret binary comes after it.
 #
 # Callers:
-#   scripts/e2e.sh         — the M1 end-to-end gate
-#   scripts/bench-local.sh — the self-provisioned benchmark run (spec 09)
+#   scripts/e2e.sh              — the M1 end-to-end gate
+#   scripts/bench-local.sh      — the self-provisioned benchmark run (spec 09)
+#   scripts/bench-pull-sweep.sh — the stepped-concurrency pull sweep (spec 09)
 # shellcheck shell=bash
 
 say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 
-# Parallel runs (git worktrees, agents sharing a machine) must not collide on
-# ports: each run gets a random free block of six consecutive ports unless the
-# caller pins GARRET_E2E_PORT_BASE.
+# The ports one run uses: $port_base and the next port_count - 1, assigned
+# below. Parallel runs (git worktrees, agents sharing a machine) must not
+# collide: each run gets a random free block unless the caller pins
+# GARRET_E2E_PORT_BASE.
+port_count=6
+
+port_in_use() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+
 pick_port_base() {
   local base p
   while :; do
     base=$(( (RANDOM % 40000) + 20000 ))
-    for p in $(seq "$base" $((base + 5))); do
-      lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && continue 2
+    for p in $(seq "$base" $((base + port_count - 1))); do
+      port_in_use "$p" && continue 2
     done
     echo "$base"
     return
@@ -40,8 +46,8 @@ puller_url="http://127.0.0.1:$puller_port"
 # instead. (With random ports this mostly guards a pinned GARRET_E2E_PORT_BASE.)
 require_free_ports() {
   local port
-  for port in "$@"; do
-    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+  for port in $(seq "$port_base" $((port_base + port_count - 1))); do
+    if port_in_use "$port"; then
       echo "port $port is already in use — kill the leftover process and retry" >&2
       exit 1
     fi
@@ -192,11 +198,14 @@ $s3_block
 EOF
 }
 
-# $1: debug|release (must match the caller's $bin); rest: the binaries this
-# caller actually runs.
+# Sets $bin to the binaries' directory and checks each is there. GARRET_BIN
+# points at already-built binaries (CI passes the nix build's result/bin), so
+# nothing is compiled; unset, cargo builds them into its target dir.
+# $1: debug|release; rest: the binaries this caller actually runs.
 build_binaries() {
   local profile=$1 exe
   shift
+  bin=${GARRET_BIN:-${CARGO_TARGET_DIR:-./target}/$profile}
   say "starting garret"
   if [ -z "${GARRET_BIN:-}" ]; then
     local crates=()

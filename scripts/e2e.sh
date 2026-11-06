@@ -8,14 +8,9 @@ set -euo pipefail
 root=$(cd "$(mktemp -d)" && pwd -P)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$root"' EXIT
 
-# GARRET_BIN points at a directory of already-built binaries (CI passes the nix
-# build's result/bin), so the run does not compile the workspace a second time.
-# Unset means the usual local flow: build the workspace in debug below.
-bin=${GARRET_BIN:-./target/debug}
-
 source "$(dirname "$0")/provision.sh"
 
-require_free_ports "$s3_port" "$garage_rpc_port" "$pusher_port" "$puller_port" "$pusher_metrics_port" "$puller_metrics_port"
+require_free_ports
 start_garage 1G
 make_signing_key
 mint_dev_tokens

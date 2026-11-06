@@ -9,11 +9,9 @@ set -euo pipefail
 root=$(cd "$(mktemp -d)" && pwd -P)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$root"' EXIT
 
-bin=${GARRET_BIN:-./target/release}
-
 source "$(dirname "$0")/provision.sh"
 
-require_free_ports "$s3_port" "$garage_rpc_port" "$pusher_port" "$puller_port" "$pusher_metrics_port" "$puller_metrics_port"
+require_free_ports
 # Corpus (~750 MiB) plus its serial baseline; no 2 GiB streaming blob here.
 start_garage 5G
 make_signing_key
