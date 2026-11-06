@@ -52,7 +52,6 @@ pub async fn serve(
 }
 
 /// 0600: the file mode *is* the authorization for this socket.
-#[cfg(unix)]
 fn restrict(path: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

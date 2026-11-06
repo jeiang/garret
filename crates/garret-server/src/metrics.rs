@@ -163,10 +163,10 @@ fn method_label(method: &axum::http::Method) -> &'static str {
     }
 }
 
-/// Refreshes the standard `process_*` metrics from `/proc` (Linux only; a
-/// no-op elsewhere). Called on every `/metrics` render, so there is no
-/// background task. Anything unreadable is skipped, never an error.
-#[cfg(target_os = "linux")]
+/// Refreshes the standard `process_*` metrics from `/proc` (Linux; elsewhere
+/// nothing is readable, so nothing is recorded). Called on every `/metrics`
+/// render, so there is no background task. Anything unreadable is skipped,
+/// never an error.
 fn record_process_metrics() {
     // USER_HZ is 100 on every Linux target this runs on.
     const TICKS_PER_SEC: f64 = 100.0;
@@ -202,9 +202,6 @@ fn record_process_metrics() {
         metrics::gauge!("process_max_fds").set(max);
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-fn record_process_metrics() {}
 
 #[cfg(test)]
 mod tests {

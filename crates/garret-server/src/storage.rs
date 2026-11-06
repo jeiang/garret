@@ -1233,10 +1233,9 @@ mod proofs {
     fn the_budget_stays_within_the_cap() {
         let part_size = any_part_size();
         let max_in_flight: u64 = kani::any_where(|m| *m >= part_size as u64);
-        let (unit, part_units, total_units) = budget(part_size, max_in_flight);
+        let (unit, _, total_units) = budget(part_size, max_in_flight);
         let budget_bytes = total_units as u128 * unit as u128;
         assert!(budget_bytes <= max_in_flight as u128 + unit as u128);
         assert!(budget_bytes >= part_size as u128);
-        let _ = part_units;
     }
 }

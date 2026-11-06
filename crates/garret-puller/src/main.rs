@@ -78,6 +78,7 @@ impl Bumps {
             return;
         }
         let mut pending = self.0.lock();
+        // Not a bare insert: that would allocate the owned key on every repeat hit.
         if !pending.contains(hash) {
             pending.insert(hash.to_owned());
         }
