@@ -260,12 +260,8 @@ impl FailedList {
     /// Persists the list, replaced whole, removing the file once it is empty.
     fn save(&self) -> Result<()> {
         if self.paths.is_empty() {
-            return match std::fs::remove_file(&self.file) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    Err(e).with_context(|| format!("removing {:?}", self.file))
-                }
-                _ => Ok(()),
-            };
+            return crate::files::remove_optional(&self.file)
+                .with_context(|| format!("removing {:?}", self.file));
         }
         let text: String = self.paths.iter().map(|p| format!("{p}\n")).collect();
         crate::files::write_atomic(&self.file, text.as_bytes(), 0o666)

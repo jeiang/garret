@@ -17,6 +17,14 @@ pub fn read_optional(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Removes `path`; already absent counts as removed.
+pub fn remove_optional(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    }
+}
+
 /// Replaces `path` whole with `contents`, creating its directory if missing.
 ///
 /// The bytes go to a fresh sibling created with `mode` (less the umask) in the
@@ -36,10 +44,7 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         }
         // Left by a killed process that had this pid; `create_new` would
         // otherwise refuse every write from now on.
-        match std::fs::remove_file(&tmp) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
+        remove_optional(&tmp)?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -50,7 +55,7 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
         std::fs::rename(&tmp, path)
     })();
     if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = remove_optional(&tmp);
     }
     written.with_context(|| format!("writing {}", path.display()))
 }

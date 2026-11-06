@@ -78,6 +78,29 @@ impl Check {
     }
 }
 
+/// The verdicts as `garret doctor` prints them: one aligned line per check,
+/// or with `json` one object whose `ok` is false if any check failed.
+pub fn render(checks: &[Check], json: bool) -> String {
+    if json {
+        let ok = checks.iter().all(|c| c.status != Status::Fail);
+        let checks: Vec<_> = checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "detail": c.detail,
+                })
+            })
+            .collect();
+        return format!("{}\n", serde_json::json!({ "ok": ok, "checks": checks }));
+    }
+    checks
+        .iter()
+        .map(|c| format!("{:<4} {:<9} {}\n", c.status.as_str(), c.name, c.detail))
+        .collect()
+}
+
 /// Runs every check in layer order and returns all the verdicts. Never an
 /// `Err` — a broken layer is a `Fail` verdict, not an early return — so the
 /// caller always gets the whole picture before deciding the exit code.
@@ -381,6 +404,29 @@ mod tests {
     use super::*;
     use crate::testing::{config as cfg, discovery as advertised};
     use garret_common::wire::Oidc;
+
+    #[test]
+    fn json_output_has_ok_and_every_check() {
+        let checks = [
+            Check::pass("discovery", "answered"),
+            Check::fail("auth", "rejected"),
+            Check::skip("path"),
+        ];
+        let out: serde_json::Value = serde_json::from_str(&render(&checks, true)).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "ok": false,
+                "checks": [
+                    {"name": "discovery", "status": "pass", "detail": "answered"},
+                    {"name": "auth", "status": "fail", "detail": "rejected"},
+                    {"name": "path", "status": "skip", "detail": "skipped: an earlier layer failed"},
+                ],
+            })
+        );
+        let out: serde_json::Value = serde_json::from_str(&render(&checks[..1], true)).unwrap();
+        assert_eq!(out["ok"], true);
+    }
 
     #[test]
     fn a_matching_config_has_no_drift() {

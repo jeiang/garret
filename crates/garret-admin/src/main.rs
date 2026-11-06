@@ -592,11 +592,28 @@ mod tests {
         assert!(parse_cutoff("1s", i64::MIN).is_err(), "underflow accepted");
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    /// A per-test directory under the temp dir, removed when dropped so a
+    /// failing assertion does not leave it behind.
+    struct Scratch(std::path::PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("garret-admin-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Scratch(dir)
     }
 
     #[test]
@@ -608,7 +625,6 @@ mod tests {
         let mode = std::fs::metadata(&key).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&key).unwrap(), "k:secret\n");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Existing keys and planted symlinks are both refused: following a
@@ -626,6 +642,5 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(write_secret(&link, "new").is_err());
         assert!(!target.exists(), "the write followed the symlink");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

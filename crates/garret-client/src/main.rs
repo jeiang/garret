@@ -175,28 +175,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .filter(|c| c.status == doctor::Status::Fail)
                 .count();
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({
-                        "ok": failed == 0,
-                        "checks": checks.iter().map(|c| json!({
-                            "name": c.name,
-                            "status": c.status.as_str(),
-                            "detail": c.detail,
-                        })).collect::<Vec<_>>(),
-                    })
-                );
-            } else {
-                for check in &checks {
-                    println!(
-                        "{:<4} {:<9} {}",
-                        check.status.as_str(),
-                        check.name,
-                        check.detail
-                    );
-                }
-            }
+            print!("{}", doctor::render(&checks, cli.json));
             // Reported first, then the exit code carries the failure — the
             // same order push uses, so a --json consumer always gets the data.
             if failed > 0 {

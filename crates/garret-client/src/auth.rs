@@ -34,11 +34,8 @@ pub fn token_path() -> Result<PathBuf> {
 /// an error. The config stays — `rm` exists, and re-logging-in is the common case.
 pub fn logout() -> Result<PathBuf> {
     let path = token_path()?;
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path),
-        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
-    }
+    crate::files::remove_optional(&path).with_context(|| format!("removing {}", path.display()))?;
+    Ok(path)
 }
 
 /// The claims the client reads from a token it holds: `sub` and `exp` for
