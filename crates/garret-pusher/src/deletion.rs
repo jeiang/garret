@@ -42,20 +42,15 @@ impl Deletion {
         })
     }
 
-    /// Claims the path unless an upload or deletion already holds it, in
-    /// which case GC skips it. Dropping the claim instead of passing it to
-    /// [`Deletion::hold`] releases the path.
-    pub(crate) fn claim_available(in_flight: &InFlight, hash: &str) -> Option<Claim> {
-        in_flight.claim_delete(hash).ok()
-    }
-
     /// Queues the blob of a path from [`Deletion::claim_all`] whose row is gone.
     pub(crate) fn queue_blob(&mut self, hash: &str) {
         self.keys.push(storage::key_for(hash));
     }
 
-    /// Keeps a claim from [`Deletion::claim_available`] whose row is gone and
-    /// queues its blob.
+    /// Keeps a claim (from [`InFlight::claim_delete`]) whose row is gone and
+    /// queues its blob. GC claims each path just before its row goes and
+    /// skips one that an upload or deletion already holds; dropping the claim
+    /// instead of holding it releases the path.
     pub(crate) fn hold(&mut self, claim: Claim) {
         self.queue_blob(claim.hash());
         self.claims.push(claim);

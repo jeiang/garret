@@ -41,6 +41,9 @@ use verify::VerifiedNar;
 
 pub(crate) struct AppState {
     pub conn: Arc<Mutex<rusqlite::Connection>>,
+    /// The database file, for `garret-admin backup` to copy on a connection
+    /// of its own.
+    pub db_path: String,
     pub storage: Storage,
     pub keys: Vec<SigningKeyFile>,
     pub store_dir: String,
@@ -48,6 +51,8 @@ pub(crate) struct AppState {
     pub limits: UploadLimits,
     pub uploads: Arc<Semaphore>,
     pub in_flight: InFlight,
+    /// `None` without a `[gc]` section.
+    pub gc: Option<Arc<gc::Gc>>,
 }
 
 #[tokio::main]
@@ -69,9 +74,22 @@ async fn main() -> Result<()> {
         tracing::warn!("startup WAL checkpoint failed: {e}");
     }
 
+    let conn = Arc::new(Mutex::new(conn));
+    let storage = Storage::new(&cfg.s3).await?;
+    let in_flight = InFlight::new();
+    let gc = cfg.gc.clone().map(|gc_cfg| {
+        Arc::new(gc::Gc::new(
+            conn.clone(),
+            storage.clone(),
+            in_flight.clone(),
+            gc_cfg,
+        ))
+    });
+
     let state = Arc::new(AppState {
-        conn: Arc::new(Mutex::new(conn)),
-        storage: Storage::new(&cfg.s3).await?,
+        conn,
+        db_path: cfg.db_path,
+        storage,
         keys: garret_server::load_signing_keys(&cfg.signing_key_files)?,
         store_dir: cfg.store_dir,
         auth,
@@ -82,7 +100,8 @@ async fn main() -> Result<()> {
             Duration::from_secs(cfg.limits.body_idle_timeout_secs),
         ),
         uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
-        in_flight: InFlight::new(),
+        in_flight,
+        gc,
     });
 
     // Saturation must be visible before it hurts, so the caps are exported
@@ -90,33 +109,22 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_uploads_limit").set(cfg.limits.max_concurrent_uploads as f64);
     metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
-
-    let scrape_state = state.clone();
-    garret_metrics::on_scrape(move || {
-        metrics::gauge!("garret_in_flight_bytes").set(scrape_state.limits.in_flight_bytes() as f64);
-    });
-
-    let collector = cfg.gc.clone().map(|gc_cfg| {
-        Arc::new(gc::Gc::new(
-            state.conn.clone(),
-            state.storage.clone(),
-            state.in_flight.clone(),
-            gc_cfg,
-        ))
-    });
+    // Moved by the upload budget from here on; exported before the first
+    // upload so the series exists.
+    metrics::gauge!("garret_in_flight_bytes").set(0.0);
 
     if let Some(admin_listener) = admin_listener {
-        let (state, collector) = (state.clone(), collector.clone());
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = admin::serve(admin_listener, state, collector).await {
+            if let Err(e) = admin::serve(admin_listener, state).await {
                 tracing::error!("admin socket failed: {e:#}");
             }
         });
     }
 
-    match &collector {
-        Some(collector) => {
-            tokio::spawn(collector.clone().run_forever());
+    match &state.gc {
+        Some(gc) => {
+            tokio::spawn(gc.clone().run_forever());
         }
         None => tracing::warn!("no [gc] section: the cache is unbounded and will never evict"),
     }
@@ -427,15 +435,15 @@ async fn missing_paths(
     Ok(Json(missing))
 }
 
-/// The answer to a push while `fsck --repair --quiesce` holds the gate.
+/// The answer to a push while `fsck --repair --quiesce` holds the gate. With
+/// `Retry-After` the client waits it out on its deadline instead of
+/// spending retries during a drain of up to [`fsck::QUIESCE_TIMEOUT`].
 fn quiescing() -> Error {
     metrics::counter!("garret_upload_skipped_total", "reason" => "quiescing").increment(1);
-    Error {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        message: "cache is quiescing for fsck --repair --quiesce".into(),
-        reason: None,
-        retry_after: false,
-    }
+    Error::retry_after(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "cache is quiescing for fsck --repair --quiesce",
+    )
 }
 
 async fn upload(
@@ -577,12 +585,19 @@ async fn store_upload(
             verify::max_compressed_len(object.nar_size),
         )
         .await;
+    // Only an `Accepted` verdict may be signed (ADR-0010). No verdict means
+    // the stream never reached its end: the store failed, and its error is
+    // the cause. A store that succeeded without one is a server bug.
     match nar.into_outcome() {
+        Some(verify::Outcome::Accepted) => {}
         Some(verify::Outcome::Failed(reason)) => return Err(anyhow::anyhow!(reason).into()),
         Some(verify::Outcome::Refused(reason)) => {
             return Err(Error::refused(reason));
         }
-        Some(verify::Outcome::Accepted) | None => {}
+        None => {
+            stored?;
+            return Err(anyhow::anyhow!("stored a NAR the check never accepted").into());
+        }
     }
     let (digest, file_size) = stored?;
 
@@ -705,6 +720,7 @@ mod tests {
     ) -> Arc<AppState> {
         Arc::new(AppState {
             conn: Arc::new(Mutex::new(conn)),
+            db_path: ":memory:".into(),
             storage,
             keys: vec![],
             store_dir: "/nix/store".into(),
@@ -712,6 +728,7 @@ mod tests {
             limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024, Duration::from_secs(60)),
             uploads: Arc::new(Semaphore::new(1)),
             in_flight: InFlight::new(),
+            gc: None,
         })
     }
 
@@ -723,21 +740,24 @@ mod tests {
 
     /// The quiescing check sits before the idempotency check, the upload
     /// semaphore and the in-flight claim — this exercises it in isolation,
-    /// with no upload machinery reached.
+    /// with no upload machinery reached. `Retry-After` keeps the client
+    /// waiting rather than spending retries (spec 01).
     #[tokio::test]
     async fn quiescing_rejects_a_push_before_anything_else() {
         let state = test_state(open_db()).await;
         let _quiesce = state.in_flight.quiesce();
 
-        let err = upload(
+        let response = upload(
             State(state),
             Path("a".repeat(32)),
             axum::Extension(Subject("test#user".into())),
             Body::empty(),
         )
         .await
-        .expect_err("quiescing must reject the push");
-        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        .expect_err("quiescing must reject the push")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 
     /// Past the upload cap the push is shed before its body is read, with a

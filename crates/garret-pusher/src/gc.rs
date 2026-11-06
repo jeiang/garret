@@ -150,7 +150,7 @@ impl Gc {
             let mut deletion = Deletion::default();
             let mut settled = false;
             for (hash, _) in &candidates {
-                let Some(claim) = Deletion::claim_available(&self.in_flight, hash) else {
+                let Ok(claim) = self.in_flight.claim_delete(hash) else {
                     continue;
                 };
                 settled = true;
@@ -218,7 +218,7 @@ impl Gc {
             crate::db_run(&self.conn, move |conn| {
                 let mut deletion = Deletion::default();
                 for hash in orphan_hashes(&blobs, &known, &in_flight, grace) {
-                    let Some(claim) = Deletion::claim_available(&in_flight, hash) else {
+                    let Ok(claim) = in_flight.claim_delete(hash) else {
                         continue;
                     };
                     if db::exists(conn, hash)? {
@@ -261,20 +261,17 @@ fn counted<T>(phase: &'static str, result: Result<T>) -> Result<T> {
 /// blob completes, so a rowless blob might just be mid-push. Shared with
 /// `garret-admin fsck`'s read-only mirror-image check.
 pub(crate) fn orphan_hashes<'a>(
-    blobs: &'a [(String, Duration, i64)],
+    blobs: &'a [storage::Blob],
     known: &std::collections::HashSet<String>,
     in_flight: &InFlight,
     grace: Duration,
 ) -> Vec<&'a str> {
     blobs
         .iter()
-        .filter_map(|(key, age, _size)| {
-            let hash = storage::hash_for(key)?;
-            if known.contains(hash) || in_flight.contains(hash) || *age < grace {
-                return None;
-            }
-            Some(hash)
+        .filter(|blob| {
+            !known.contains(&blob.hash) && !in_flight.contains(&blob.hash) && blob.age >= grace
         })
+        .map(|blob| blob.hash.as_str())
         .collect()
 }
 
@@ -287,23 +284,16 @@ mod tests {
     #[test]
     fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
         let grace = Duration::from_secs(86400);
+        let blob = |hash: &str, age_secs| storage::Blob {
+            hash: hash.into(),
+            age: Duration::from_secs(age_secs),
+            size: 1,
+        };
         let blobs = vec![
-            (
-                "nar/known.nar.zst".to_string(),
-                Duration::from_secs(90000),
-                1,
-            ),
-            (
-                "nar/uploading.nar.zst".to_string(),
-                Duration::from_secs(90000),
-                1,
-            ),
-            ("nar/young.nar.zst".to_string(), Duration::from_secs(10), 1),
-            (
-                "nar/stale.nar.zst".to_string(),
-                Duration::from_secs(90000),
-                1,
-            ),
+            blob("known", 90000),
+            blob("uploading", 90000),
+            blob("young", 10),
+            blob("stale", 90000),
         ];
         let known: std::collections::HashSet<String> = ["known".to_string()].into();
         let in_flight = InFlight::new();

@@ -507,15 +507,10 @@ pub fn pin(
     expires_at: Option<i64>,
     now: i64,
 ) -> Result<()> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT 1 FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    anyhow::ensure!(exists, "{hash} is not in the cache — nothing to pin");
+    anyhow::ensure!(
+        exists(conn, hash)?,
+        "{hash} is not in the cache — nothing to pin"
+    );
     conn.execute(
         "INSERT OR REPLACE INTO pins (name, store_path_hash, expires_at, created_at)
          VALUES (?1, ?2, ?3, ?4)",
@@ -598,7 +593,7 @@ pub struct ObjectBrief {
 
 impl ObjectBrief {
     /// Reads a row selecting at least these four columns, by name.
-    pub fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             store_path_hash: row.get("store_path_hash")?,
             name: row.get("name")?,
@@ -616,6 +611,28 @@ pub fn all_objects_brief(conn: &Connection) -> Result<Vec<ObjectBrief>> {
     Ok(stmt
         .query_map([], ObjectBrief::from_row)?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Every object first pushed by `subject`, at or after `since` when given,
+/// oldest first. Exact match: a subject is `<issuer>#<sub>`, and a prefix of
+/// one GitHub ref's subject can be another's.
+pub fn pushed_by(conn: &Connection, subject: &str, since: Option<i64>) -> Result<Vec<ObjectBrief>> {
+    let mut stmt = conn.prepare(
+        "SELECT store_path_hash, name, created_at, file_size FROM objects
+         WHERE pushed_by = ?1 AND created_at >= ?2
+         ORDER BY created_at, store_path_hash",
+    )?;
+    Ok(stmt
+        .query_map(
+            params![subject, since.unwrap_or(i64::MIN)],
+            ObjectBrief::from_row,
+        )?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// How many objects the cache holds (`garret-admin status`).
+pub fn object_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?)
 }
 
 /// Debounced last-accessed bumps (spec 02), one IMMEDIATE transaction per
@@ -809,6 +826,44 @@ mod tests {
     /// A time past the push grace of every object these tests insert (at
     /// times up to 1000), so only references and pins decide evictability.
     const LATER: i64 = PUSH_GRACE + 1000;
+
+    /// Matches only the exact subject -- never one it is a prefix of -- and
+    /// `since` is inclusive, so the first push after a leak is not missed.
+    #[test]
+    fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
+        let mut conn = db();
+        let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|h| h.repeat(32));
+        for (hash, subject, at) in [
+            (&a, leaked.to_owned(), 100),
+            (&b, leaked.to_owned(), 200),
+            (&c, format!("{leaked}-other"), 200),
+            (&d, "https://issuer#someone-else".to_owned(), 300),
+        ] {
+            let object = Object {
+                pushed_by: Some(subject),
+                ..object(hash)
+            };
+            insert_object(&mut conn, &object, at).unwrap();
+        }
+        // Negotiation refreshes pushed_at, never who pushed first or when.
+        conn.execute("UPDATE objects SET pushed_at = 500", [])
+            .unwrap();
+
+        let hashes = |since| -> Vec<String> {
+            pushed_by(&conn, leaked, since)
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    assert_eq!((row.name.as_str(), row.file_size), ("thing", 5));
+                    row.store_path_hash
+                })
+                .collect()
+        };
+        assert_eq!(hashes(None), [a, b.clone()]);
+        assert_eq!(hashes(Some(200)), [b]);
+        assert!(hashes(Some(201)).is_empty());
+    }
 
     #[test]
     fn round_trips_an_object_with_sorted_references() {
