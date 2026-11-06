@@ -128,7 +128,6 @@ impl Gc {
         let mut result = PassResult::default();
         let low = self.cfg.low();
 
-        // Correct any drift before deciding how much to delete.
         let mut usage = crate::db_run(&self.conn, |conn| db::reconcile_total_bytes(conn)).await?;
 
         while usage > low {
@@ -150,7 +149,6 @@ impl Gc {
             let mut deletion = Deletion::default();
             let mut settled = false;
             for (hash, _) in &candidates {
-                // Being uploaded or deleted elsewhere: not ours to touch.
                 let Some(claim) = Deletion::claim_available(&self.in_flight, hash) else {
                     continue;
                 };
@@ -359,7 +357,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_passes_and_sweeps_are_counted() {
-        // Failures used to be logged only, which no alert can watch.
         let (passes, sweeps) = (gc_failures("pass"), gc_failures("sweep"));
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();

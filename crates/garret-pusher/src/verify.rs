@@ -156,7 +156,6 @@ enum Engine {
     },
 }
 
-/// How a [`VerifiedNar`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// End of stream, and the NAR matched its claim.

@@ -42,7 +42,6 @@ pub fn bind(path: &str) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Accept loop over a socket from [`bind`].
 pub async fn serve(
     listener: UnixListener,
     state: Arc<AppState>,
@@ -59,7 +58,6 @@ pub async fn serve(
     }
 }
 
-/// 0600: the file mode *is* the authorization for this socket.
 fn restrict(path: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -171,7 +169,6 @@ async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
     .await
 }
 
-/// What [`delete`] removed (or, on a dry run, would remove).
 #[derive(Debug)]
 struct Deleted {
     deleted: usize,
@@ -266,7 +263,6 @@ async fn delete_pushed_by(
     })
 }
 
-/// `<hash>-<name>`, the store path basename each listed object is reported as.
 fn basenames(rows: Vec<db::ObjectBrief>) -> Vec<String> {
     rows.into_iter()
         .map(|row| format!("{}-{}", row.store_path_hash, row.name))
@@ -317,7 +313,7 @@ fn pushed_by(
 }
 
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
-/// chose the cutoff. Row first, blob second, as everywhere else.
+/// chose the cutoff.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
     let in_flight = state.in_flight.clone();
     // One closure, so listing and deleting stay atomic under the lock.
@@ -379,7 +375,6 @@ async fn resign(state: &AppState) -> Result<Response> {
                 .collect::<Result<Vec<_>>>()
         })
         .await?;
-        // Verify and sign without the lock.
         let mut updates = Vec::new();
         for object in objects {
             if !narinfo::verify(&object, &state.store_dir, &state.keys) {

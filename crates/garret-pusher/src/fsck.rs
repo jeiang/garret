@@ -150,7 +150,6 @@ fn classify_rows<'a>(
         .collect()
 }
 
-/// The findings as the admin reply reports them, in listing order.
 fn to_wire(findings: &[Finding<'_>]) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
     let mut dangling = Vec::new();
     let mut size_mismatches = Vec::new();
@@ -216,7 +215,6 @@ mod tests {
         (storage::key_for(hash), Duration::from_secs(age_secs), size)
     }
 
-    /// [`classify_rows`] at `GRACE` and `NOW`, as the reply reports it.
     fn classified(
         rows: &[db::ObjectBrief],
         blobs: &[(String, Duration, i64)],
@@ -297,8 +295,8 @@ mod tests {
     }
 
     /// An upload that overwrote an orphan blob of another size since the S3
-    /// listing (review of #72): its fresh row would read as a mismatch and
-    /// `--repair` would delete it, so the guards apply here too.
+    /// listing: its fresh row would read as a mismatch and `--repair` would
+    /// delete it, so the guards apply here too.
     #[test]
     fn a_young_or_in_flight_row_is_not_reported_as_a_size_mismatch() {
         let blobs = vec![blob("a", 90000, 9)];

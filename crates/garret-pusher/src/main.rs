@@ -157,7 +157,6 @@ async fn main() -> Result<()> {
         })?
     };
 
-    // Kept for shutdown: `state` itself moves into the router.
     let storage = state.storage.clone();
     let app = router(state, discovery);
 
@@ -166,7 +165,6 @@ async fn main() -> Result<()> {
     serve_until_stopped(listener, app, storage).await
 }
 
-/// The Pusher's routes: OIDC on the push endpoints, anonymous discovery.
 fn router(state: Arc<AppState>, discovery: String) -> Router {
     Router::new()
         .route(wire::MISSING_PATHS, post(missing_paths))
@@ -355,7 +353,6 @@ where
     .context("database task failed")?
 }
 
-/// Whether the object's row exists, i.e. the push is already complete.
 async fn already_stored(state: &AppState, hash: &str) -> Result<bool, Error> {
     let hash = hash.to_owned();
     let stored = db_run(&state.conn, move |conn| db::exists(conn, &hash)).await?;
@@ -386,7 +383,6 @@ impl Drop for UploadGauge {
     }
 }
 
-/// Every Pusher endpoint requires a valid token from a configured issuer.
 async fn require_oidc(
     State(state): State<Arc<AppState>>,
     mut request: Request,
@@ -531,8 +527,7 @@ async fn upload(
     Ok((StatusCode::CREATED, Json(UploadAck::Created)).into_response())
 }
 
-/// Reads the preamble, then streams the rest straight to S3. Returns the
-/// stored size. The body never lands in memory whole.
+/// Returns the stored size. The body never lands in memory whole.
 async fn store_upload(
     state: &AppState,
     hash: &str,
@@ -797,8 +792,6 @@ mod tests {
         assert!(response.headers().contains_key(header::RETRY_AFTER));
     }
 
-    /// With no quiesce live, the handler proceeds past the quiescing check
-    /// into its normal idempotency short-circuit.
     #[tokio::test]
     async fn a_non_quiescing_push_reaches_the_idempotency_check() {
         let mut conn = open_db();
@@ -921,7 +914,7 @@ mod tests {
                     p.store_path = format!("/nix/store/{H}-héllo");
                 }),
             ),
-            // Byte 32 inside `é`: this used to panic the Puller's browse tree.
+            // Byte 32 falls inside `é`.
             (
                 "reference with a non-ASCII hash",
                 with(|p| {
