@@ -205,10 +205,11 @@ an ordinary failure: an upload fails at once, and the watcher logs the
 Negotiation's failure and keeps the batch's paths on the failed list, since
 the Pusher answers 401 for transient causes too (an unreachable issuer JWKS,
 a key rotation), so a restart or drain retries them. A 403 is a permanent
-policy refusal (spec 04): it is never renewed or retried, an upload fails at
-once, and the watcher logs the Negotiation's refusal once at error level,
-naming the Pusher's reason, and does not put the batch's paths on the failed
-list. An older Pusher answers 401 for these, which follows the 401 rule. `GARRET_TOKEN` is used as given and never renewed.
+policy refusal (spec 04): it is never renewed or retried within the push, an
+upload fails at once, and the watcher logs the Negotiation's refusal at error
+level, naming the Pusher's reason, and puts the batch's paths on the failed
+list like any other failed Negotiation, so they push once the policy is fixed;
+`max_attempts` bounds the retries. An older Pusher answers 401 for these, which follows the 401 rule. `GARRET_TOKEN` is used as given and never renewed.
 
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure
@@ -283,7 +284,10 @@ with the total NAR bytes and elapsed time.
 
 `garret use` appends `extra-substituters` and `extra-trusted-public-keys` to
 the user's `~/.config/nix/nix.conf` — never `/etc/nix/nix.conf`, never via
-sudo. Idempotence is a substring match on the URL, not a nix.conf parse.
+sudo. Idempotence is a substring match on the URL, not a nix.conf parse. A
+nix.conf that exists but cannot be read is an error, never rewritten; the
+new contents replace the file by a rename, written where a symlinked nix.conf
+(Home Manager, dotfile managers) points.
 
 It then runs `nix config show substituters` and checks the URL comes back.
 Substituters in a *user's* nix.conf are silently ignored unless that user is in
@@ -348,9 +352,13 @@ configured key, so a rotation has several live at once.
   leaves the path on the list for a restart (which starts every path's
   count afresh) or a drain. Paths nix-GC'd before push are dropped
   silently. The cursor and the list are each replaced whole by a rename,
-  so a kill mid-write cannot lose the backlog.
-- **Bootstrap**: cursor starts at `MAX(id)` (only new paths push) and is
-  written at startup; `--full-sync` opts into walking history from id 0.
+  so a kill mid-write cannot lose the backlog. A cursor or list that exists
+  but cannot be read (or a cursor that is not a number) stops the watcher
+  with an error naming it, rather than reading as a first run or an empty
+  list that would skip or erase the backlog.
+- **Bootstrap**: when no cursor file exists, the cursor starts at `MAX(id)`
+  (only new paths push) and is written at startup; `--full-sync` opts into
+  walking history from id 0.
 - **Drain** (`--drain`): push every path validated after the cursor as of
   invocation, plus the failed list, in batches of 500 (one `nix path-info`
   and one Negotiation each, like a poll), then exit — non-zero, naming the

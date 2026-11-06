@@ -335,7 +335,7 @@ pub fn write(path: &std::path::Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_private_dir(parent)?;
     }
-    std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
+    crate::files::write_atomic(path, contents.as_bytes(), 0o666)
 }
 
 /// Creates `dir` and any missing parents mode 0700. `~/.config/garret/` holds

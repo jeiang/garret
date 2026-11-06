@@ -8,6 +8,7 @@ pub mod browse;
 pub mod config;
 pub mod discovery;
 pub mod doctor;
+pub mod files;
 pub mod nixconf;
 pub mod push;
 pub mod watcher;
