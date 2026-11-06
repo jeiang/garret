@@ -151,20 +151,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn framing_round_trips() {
+    fn framing_is_what_preamble_end_reads() {
         let p = Preamble {
-            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".into(),
+            store_path: format!("/nix/store/{}-x", "a".repeat(32)),
             nar_hash: "sha256:x".into(),
             nar_size: 1,
             references: vec![],
             deriver: None,
             ca: None,
         };
-        let framed = p.to_framed().unwrap();
-        let len = u32::from_le_bytes(framed[..4].try_into().unwrap()) as usize;
-        assert_eq!(framed.len(), 4 + len);
-        let back: Preamble = serde_json::from_slice(&framed[4..]).unwrap();
-        assert_eq!(back.store_path, p.store_path);
+        let json = format!(
+            r#"{{"store_path":"{}","nar_hash":"sha256:x","nar_size":1,"references":[],"deriver":null,"ca":null}}"#,
+            p.store_path
+        );
+        let mut framed = p.to_framed().unwrap();
+        assert_eq!(framed[..4], [138, 0, 0, 0]);
+        assert_eq!(framed[4..], *json.as_bytes());
+
+        let end = framed.len();
+        assert_eq!(preamble_end(&framed[..end - 1], end), Ok(None));
+        framed.extend_from_slice(b"zstd NAR");
+        assert_eq!(preamble_end(&framed, end), Ok(Some(end)));
+        assert_eq!(preamble_end(&framed, json.len() - 1), Err(json.len()));
     }
 
     #[test]
@@ -267,20 +275,5 @@ mod proofs {
             }
             Err(declared) => assert!(declared > max),
         }
-    }
-
-    /// What `to_framed` writes, the Pusher reads back: the frame ends after
-    /// the declared length whatever NAR bytes follow it.
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn preamble_end_round_trips_the_header() {
-        let json_len: u32 = kani::any_where(|l| *l <= 3);
-        let mut buf = [0u8; 8];
-        buf[..4].copy_from_slice(&json_len.to_le_bytes());
-        let total: usize = kani::any_where(|t| *t >= 4 + json_len as usize && *t <= 8);
-        assert_eq!(
-            preamble_end(&buf[..total], 3),
-            Ok(Some(4 + json_len as usize))
-        );
     }
 }
