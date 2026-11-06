@@ -64,14 +64,9 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
     Ok(handle)
 }
 
-/// Serves `/metrics` and `/healthz` on the pre-bound `listener`, forever.
-/// Binding is the caller's job, so a bad address or a taken port fails
-/// startup rather than a detached task.
-pub(crate) async fn serve(
-    handle: PrometheusHandle,
-    listener: tokio::net::TcpListener,
-) -> Result<()> {
-    let app = Router::new()
+/// The metrics listener's routes: `/metrics` and `/healthz`.
+pub(crate) fn router(handle: PrometheusHandle) -> Router {
+    Router::new()
         .route(
             "/metrics",
             get(move || {
@@ -82,10 +77,7 @@ pub(crate) async fn serve(
                 }
             }),
         )
-        .route("/healthz", get(|| async { "ok" }));
-
-    crate::runtime::serve(listener, app, std::future::pending()).await?;
-    Ok(())
+        .route("/healthz", get(|| async { "ok" }))
 }
 
 /// Per-request metrics with bounded labels only: the matched route template,
