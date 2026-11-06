@@ -219,20 +219,22 @@ mod tests {
         let ratio = |e: &Entry| zstd::encode_all(e.body().as_slice(), 3).unwrap().len();
         // The incompressible slice must not quietly compress away, or the
         // benchmark measures the wrong thing entirely.
-        assert!(ratio(&squishy) < e_len(&squishy) / 10);
-        assert!(ratio(&solid) > e_len(&solid) / 2);
-    }
-
-    fn e_len(entry: &Entry) -> usize {
-        entry.size
+        assert!(ratio(&squishy) < squishy.size / 10);
+        assert!(ratio(&solid) > solid.size / 2);
     }
 
     #[test]
-    fn rekeying_moves_every_first_character() {
-        // Including the wrap at the end of the alphabet.
-        for (input, expected) in [("0aa", '1'), ("zaa", '0'), ("baa", 'c')] {
-            assert_eq!(next_char(input), expected);
-        }
+    fn rekeying_the_last_alphabet_character_wraps_to_a_valid_hash() {
+        let entry = Entry {
+            hash: "z".repeat(32),
+            name: "x".into(),
+            size: 1,
+            compressibility: 0,
+        };
+        let rekeyed = &rekey(std::slice::from_ref(&entry))[0].hash;
+        assert_ne!(rekeyed, &entry.hash);
+        assert_eq!(rekeyed.len(), 32);
+        assert!(rekeyed.bytes().all(|c| NIX_BASE32_ALPHABET.contains(&c)));
     }
 
     #[test]

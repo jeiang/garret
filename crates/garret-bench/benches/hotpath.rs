@@ -11,8 +11,10 @@
 
 // The corpus generator is part of the bin crate, not a library; include it
 // directly rather than growing a lib target for one bench. Only Entry::body
-// is used here, so the rest of the module is dead code in this target.
-#[allow(dead_code)]
+// is used here, so the rest of the module is dead code in this target, and
+// `clippy --all-targets` compiles its test module without the `#[test]` fns
+// (harness = false), leaving the module's `use super::*` unused.
+#[allow(dead_code, unused_imports)]
 #[path = "../src/corpus.rs"]
 mod corpus;
 

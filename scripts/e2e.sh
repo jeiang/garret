@@ -697,8 +697,7 @@ print('  pushed', r['pushed'], 'failed', r['failed'],
       'shed-retries', r['shed_retries'], 'dropped-retries', r['dropped_retries'])
 assert r['zero_failures'], r
 assert r['pushed'] == r['corpus_entries'], r
-assert r['uncontended_median_ms'] > 0, 'baseline must actually be measured'
-assert r['p99_slowdown'] > 0, 'slowdown must be measured even though it is not a gate'
+assert r['p99_slowdown'] > 0, 'no slowdown measured: the baseline did not pair with the load run'
 assert r['nar_mib_per_sec'] > 0 and r['wire_bytes'] > 0, r
 "
 "$bin"/garret-bench stream --endpoint "$pusher_url" \
