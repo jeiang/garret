@@ -141,7 +141,8 @@ impl Gc {
                     usage,
                     low,
                     "GC cannot reach the low watermark: everything left is referenced, \
-                     pinned, or pushed within the last day"
+                     pinned, or pushed within the last {} hours",
+                    db::PUSH_GRACE / 3600
                 );
                 break;
             }
