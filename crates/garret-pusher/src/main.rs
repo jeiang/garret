@@ -27,7 +27,7 @@ use garret_common::{
     wire::{self, Discovery, Oidc, UploadAck},
 };
 use garret_server::{
-    auth::{self, Authenticator, Subject},
+    auth::{self, Authenticator, Rejection, Subject},
     config::PusherConfig,
     db::{self, Object},
     inflight::{self, InFlight},
@@ -53,30 +53,12 @@ pub(crate) struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    garret_server::runtime::init_tracing();
-    let path = std::env::args()
-        .nth(1)
-        .context("usage: garret-pusher <config.toml>")?;
-    let cfg: PusherConfig = garret_server::config::load(&path)?;
-    cfg.validate()?;
-
-    // Before any metric call: the recorder must exist first or the value is lost.
-    let metrics_handle = garret_metrics::install("pusher")?;
-
-    // Every listener is bound before anything serves, so a taken port or an
-    // unusable socket path fails startup instead of leaving a half-up Pusher.
-    let metrics_addr: std::net::SocketAddr = cfg
-        .metrics_listen
-        .parse()
-        .context("invalid metrics listen address")?;
-    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
-        .await
-        .with_context(|| format!("binding metrics listener {metrics_addr}"))?;
-
-    let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
+    let garret_server::runtime::Started {
+        config: cfg,
+        listener,
+    } = garret_server::runtime::start::<PusherConfig>("pusher").await?;
+    // Bound before anything serves, like the listeners, so an unusable socket
+    // path fails startup instead of leaving a half-up Pusher.
     let admin_listener = cfg.admin_socket.as_deref().map(admin::bind).transpose()?;
     // Authenticator::new refuses an empty issuer list, so this cannot start
     // unauthenticated (spec 04: no auth-disable flag).
@@ -105,21 +87,14 @@ async fn main() -> Result<()> {
     });
 
     // Saturation must be visible before it hurts, so the caps are exported
-    // alongside the gauges that approach them (spec 08). The recorder is
-    // already installed above — a gauge set before it would go nowhere.
+    // alongside the gauges that approach them (spec 08).
     metrics::gauge!("garret_uploads_limit").set(cfg.limits.max_concurrent_uploads as f64);
     metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
 
     let scrape_state = state.clone();
-    tokio::spawn(async move {
-        let scrape = move || {
-            metrics::gauge!("garret_in_flight_bytes")
-                .set(scrape_state.limits.in_flight_bytes() as f64);
-        };
-        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener, scrape).await {
-            tracing::error!("metrics listener failed: {e:#}");
-        }
+    garret_metrics::on_scrape(move || {
+        metrics::gauge!("garret_in_flight_bytes").set(scrape_state.limits.in_flight_bytes() as f64);
     });
 
     let collector = cfg.gc.clone().map(|gc_cfg| {
@@ -207,7 +182,6 @@ async fn main() -> Result<()> {
     let storage = state.storage.clone();
     let app = router(state, discovery);
 
-    tracing::info!("pusher listening on {addr}");
     // Every listener is bound and every background task spawned.
     garret_server::runtime::notify_ready();
     serve_until_stopped(listener, app, storage).await
@@ -439,45 +413,24 @@ async fn require_oidc(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let token = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let Some(token) = token else {
-        return unauthorized("missing bearer token");
-    };
-    match state.auth.authenticate(token).await {
+    match auth::bearer(&state.auth, request.headers()).await {
         Ok(subject) => {
             request.extensions_mut().insert(subject);
             next.run(request).await
         }
         // The reason stays in the log; the caller learns only that it failed.
-        Err(e) => {
-            tracing::warn!("rejected token: {}", auth::loggable(&e));
-            // A verified identity that policy refuses stays refused: 403,
-            // so clients do not renew or retry. Anything else may be
-            // transient (JWKS outage), so it stays a 401.
-            if e.is::<auth::PolicyRefused>() {
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({ "error": "not authorized" })),
-                )
-                    .into_response()
-            } else {
-                unauthorized("invalid token")
+        Err(rejection) => {
+            if let Some(reason) = rejection.reason() {
+                tracing::warn!("rejected token: {reason}");
             }
+            let error = match &rejection {
+                Rejection::Missing => "missing bearer token",
+                Rejection::Invalid(_) => "invalid token",
+                Rejection::Refused(_) => "not authorized",
+            };
+            rejection.respond(Json(json!({ "error": error })))
         }
     }
-}
-
-fn unauthorized(message: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Bearer")],
-        Json(json!({ "error": message })),
-    )
-        .into_response()
 }
 
 async fn missing_paths(
@@ -806,21 +759,7 @@ mod tests {
             storage,
             keys: vec![],
             store_dir: "/nix/store".into(),
-            auth: Authenticator::new(vec![IssuerConfig {
-                issuer: "https://issuer.example".into(),
-                audience: "aud".into(),
-                extra_audiences: vec![],
-                client_id: None,
-                jwks_url: None,
-                github_owner_id: None,
-                ref_patterns: vec![],
-                ref_protected: None,
-                repository_ids: vec![],
-                event_names: vec![],
-                job_workflow_refs: vec![],
-                allowed_groups: vec![],
-            }])
-            .unwrap(),
+            auth: Authenticator::new(vec![garret_server::testing::dev_issuer("unused")]).unwrap(),
             limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024, Duration::from_secs(60)),
             uploads: Arc::new(Semaphore::new(1)),
             in_flight: InFlight::new(),
@@ -1266,50 +1205,32 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// A verified token that a policy gate refuses is a 403 with no
-    /// `WWW-Authenticate`; an unverifiable one stays a 401 (spec 04).
+    /// The 401/403 split is `auth::bearer`'s; the Pusher's part is the JSON
+    /// body spec 04 names for the 403.
     #[tokio::test]
-    async fn a_policy_refused_token_gets_403_and_a_bad_token_401() {
+    async fn a_policy_refusal_answers_the_spec_04_body() {
         use tower::ServiceExt;
-        let jwks = std::env::temp_dir().join(format!("garret-pusher-jwks-{}", std::process::id()));
-        std::fs::write(&jwks, garret_server::testing::jwks()).unwrap();
+        let jwks = garret_server::testing::jwks_file();
         let mut state = Arc::into_inner(test_state(open_db()).await).unwrap();
         state.auth = Authenticator::new(vec![IssuerConfig {
-            issuer: "https://issuer.example".into(),
-            audience: "aud".into(),
-            extra_audiences: vec![],
-            client_id: None,
-            jwks_url: Some(jwks.to_str().unwrap().into()),
-            github_owner_id: None,
-            ref_patterns: vec![],
-            ref_protected: None,
             repository_ids: vec!["42".into()],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
+            ..garret_server::testing::dev_issuer(jwks.path())
         }])
         .unwrap();
-        let app = router(Arc::new(state), "{}".into());
-        let send = |token: String| {
-            let app = app.clone();
-            async move {
-                let req = Request::post(wire::MISSING_PATHS)
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap();
-                app.oneshot(req).await.unwrap()
-            }
-        };
-        let signed = garret_server::testing::sign(
-            r#"{"iss": "https://issuer.example", "sub": "ci", "aud": "aud", "exp": 4102444800, "repository_id": "99"}"#,
-        );
-        let res = send(signed).await;
+        let token = garret_server::testing::sign(&format!(
+            r#"{{"iss":"{}","sub":"ci","aud":"garret","exp":4102444800,"repository_id":"99"}}"#,
+            garret_server::testing::DEV_ISSUER
+        ));
+        let req = Request::post(wire::MISSING_PATHS)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = router(Arc::new(state), "{}".into())
+            .oneshot(req)
+            .await
+            .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
         let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], br#"{"error":"not authorized"}"#);
-        let res = send("not-a-jwt".into()).await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_file(jwks);
     }
 }

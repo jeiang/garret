@@ -1,7 +1,7 @@
 //! Prometheus metrics on a dedicated internal listener (spec 08-observability).
 //! The public listener never exposes them.
 
-use std::time::Instant;
+use std::{sync::OnceLock, time::Instant};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -64,24 +64,35 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
     Ok(handle)
 }
 
+/// Runs before every `/metrics` render; see [`on_scrape`].
+static SCRAPE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Registers `refresh` to run before every `/metrics` render, for gauges
+/// that are cheaper to read than to keep current. Once per process, like the
+/// recorder.
+pub fn on_scrape(refresh: impl Fn() + Send + Sync + 'static) {
+    if SCRAPE.set(Box::new(refresh)).is_err() {
+        panic!("metrics::on_scrape called twice");
+    }
+}
+
 /// Serves `/metrics` and `/healthz` on the pre-bound `listener`, forever.
 /// Binding is the caller's job, so a bad address or a taken port fails
-/// startup rather than a detached task. `scrape` runs before every render, to
-/// refresh gauges that are cheaper to read than to keep current.
-pub async fn serve(
+/// startup rather than a detached task.
+pub(crate) async fn serve(
     handle: PrometheusHandle,
     listener: tokio::net::TcpListener,
-    scrape: impl Fn() + Clone + Send + Sync + 'static,
 ) -> Result<()> {
     let app = Router::new()
         .route(
             "/metrics",
             get(move || {
                 let handle = handle.clone();
-                let scrape = scrape.clone();
                 async move {
                     record_process_metrics();
-                    scrape();
+                    if let Some(refresh) = SCRAPE.get() {
+                        refresh();
+                    }
                     handle.render()
                 }
             }),

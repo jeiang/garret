@@ -266,11 +266,11 @@ pub struct PusherConfig {
     pub metrics_listen: String,
 }
 
-impl PusherConfig {
+impl ServiceConfig for PusherConfig {
     /// Rejects values that would wedge or silently disable the service
     /// (a part size S3 refuses, a zero permit count, a watermark that never
     /// triggers), naming the key so the operator can fix it at startup.
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         let l = &self.limits;
         if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&l.part_size) {
             bail!(
@@ -327,6 +327,14 @@ impl PusherConfig {
         }
         Ok(())
     }
+
+    fn listen(&self) -> &str {
+        &self.listen
+    }
+
+    fn metrics_listen(&self) -> &str {
+        &self.metrics_listen
+    }
 }
 
 /// The Puller's config file (the public substituter frontend; read-only).
@@ -370,11 +378,11 @@ pub struct PullerConfig {
     pub presign_budget_ms: u64,
 }
 
-impl PullerConfig {
+impl ServiceConfig for PullerConfig {
     /// Rejects values that would break every pull (a zero or over-long presign
     /// lifetime, a zero budget that degrades every request to a miss) naming
     /// the key, at startup.
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         self.s3.validate()?;
         // 7 days is the SigV4 presigned-URL maximum.
         if !(1..=604_800).contains(&self.presign_ttl_secs) {
@@ -396,6 +404,14 @@ impl PullerConfig {
             bail!("db_wait_timeout_secs must be at least 1");
         }
         Ok(())
+    }
+
+    fn listen(&self) -> &str {
+        &self.listen
+    }
+
+    fn metrics_listen(&self) -> &str {
+        &self.metrics_listen
     }
 }
 
@@ -423,11 +439,25 @@ fn presign_ttl() -> u64 {
     3600
 }
 
-/// Parses a TOML config file. Unknown or misplaced keys are errors
-/// (`deny_unknown_fields`), so typos fail loudly instead of doing nothing.
-pub fn load<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
+/// A service's config file: what [`load`] parses and validates, and what
+/// `runtime::start` binds.
+pub trait ServiceConfig: serde::de::DeserializeOwned {
+    /// Rejects values that would break the service, naming the key.
+    fn validate(&self) -> Result<()>;
+    /// Public listen address.
+    fn listen(&self) -> &str;
+    /// Internal metrics listen address (spec 08).
+    fn metrics_listen(&self) -> &str;
+}
+
+/// Parses and validates a TOML config file. Unknown or misplaced keys are
+/// errors (`deny_unknown_fields`), so typos fail loudly instead of doing
+/// nothing.
+pub fn load<T: ServiceConfig>(path: &str) -> Result<T> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
-    toml::from_str(&text).with_context(|| format!("parsing config {path}"))
+    let config: T = toml::from_str(&text).with_context(|| format!("parsing config {path}"))?;
+    config.validate()?;
+    Ok(config)
 }
 
 #[cfg(test)]
