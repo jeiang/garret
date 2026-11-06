@@ -1,13 +1,14 @@
 //! SQLite access. Schema per spec 02-database; the Pusher owns all writes.
 
 use anyhow::{Context, Result};
+use garret_common::{PUSH_GRACE, PUSH_GRACE_HOURS};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params, params,
 };
 
 /// One cached store path: the unit of content in the cache, keyed by its
 /// store path hash. A row exists if and only if its blob does (spec 02).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
     /// 32-char nix-base32 store path hash — the object key, and the blob key
     /// via [`crate::storage::key_for`].
@@ -165,24 +166,20 @@ fn persist_wal(conn: &Connection) -> Result<()> {
 /// per job.
 const PUSHED_AT_DEBOUNCE: i64 = 3600;
 
-/// How long a Negotiation protects the paths it reported present. The client
-/// was told it need not upload them and relies on them until its push
-/// finishes; their debounced `pushed_at` is at most `PUSHED_AT_DEBOUNCE`
-/// behind that Negotiation. Neither GC ([`evictable`]) nor prune ([`prunable`]) removes
-/// an object pushed more recently than this, which leaves a push up to 23
-/// hours long room to finish against a complete closure.
-pub const PUSH_GRACE: i64 = 86400;
-
 /// Applies the schema (idempotent `IF NOT EXISTS`). Pusher-only, like every
 /// other write.
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA).context("applying schema")?;
     // Databases created before `pushed_at` existed: the best record of when
     // those objects were last pushed is when they were first stored.
-    if conn
-        .prepare("SELECT pushed_at FROM objects LIMIT 0")
-        .is_err()
-    {
+    let has_pushed_at: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('objects') WHERE name = 'pushed_at')",
+            [],
+            |row| row.get(0),
+        )
+        .context("checking for objects.pushed_at")?;
+    if !has_pushed_at {
         conn.execute_batch(
             "BEGIN;
              ALTER TABLE objects ADD COLUMN pushed_at INTEGER NOT NULL DEFAULT 0;
@@ -195,28 +192,42 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 }
 
 /// The Pusher creates the database, so a Puller started first would otherwise
-/// die on a missing file. Wait instead — including for the schema, since the
-/// file appears (WAL, journal) before the Pusher has finished migrating.
-/// Gives up after `timeout` so a typo'd `db_path` still fails loudly.
+/// die on a missing file. Wait instead — for the file, and for the schema,
+/// since the file appears (empty, then unmigrated) before the Pusher has
+/// finished migrating. Any other failure (permissions, corruption) is
+/// returned at once. Gives up after `timeout` so a typo'd `db_path` still
+/// fails loudly.
 pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result<Connection> {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(250);
     loop {
-        match open(path, false).and_then(|conn| {
-            conn.query_row(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'objects'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .context("checking for schema")
-            .map(|found| (conn, found.is_some()))
-        }) {
-            Ok((conn, true)) => return Ok(conn),
-            Ok((_, false)) => tracing::info!("waiting for {path}: pusher has not migrated it yet"),
-            Err(e) => tracing::info!("waiting for database: {e:#}"),
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!("waiting for {path}: pusher has not created it yet");
+            }
+            Err(e) => return Err(e).with_context(|| format!("checking database {path}")),
+            Ok(meta) if meta.len() == 0 => {
+                tracing::info!("waiting for {path}: pusher has not initialized it yet");
+            }
+            Ok(_) => {
+                let conn = open(path, false)?;
+                let migrated = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'objects'",
+                        [],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .context("checking for schema")?
+                    .is_some();
+                if migrated {
+                    return Ok(conn);
+                }
+                tracing::info!("waiting for {path}: pusher has not migrated it yet");
+            }
         }
         let now = Instant::now();
         anyhow::ensure!(
@@ -282,15 +293,10 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
         let mut stmt =
             tx.prepare_cached("INSERT INTO object_refs (referrer, reference) VALUES (?1, ?2)")?;
         for r in &obj.references {
-            // Self-references are stored, not dropped: the signature covers the
-            // full reference list the pusher was handed, so a narinfo rendered
-            // without them produces a fingerprint nix cannot match, and every
-            // self-referential path -- which is most compiled packages -- fails
-            // verification with "lacks a signature by a trusted key".
-            //
-            // The reason they were dropped (spec 02: a self-edge makes an object
-            // permanently unevictable) is handled where it belongs, in
-            // `evictable`, which ignores self-edges when deciding reachability.
+            // Self-references are stored: the signature covers the full
+            // reference list, so a narinfo rendered without them produces a
+            // fingerprint nix cannot match ("lacks a signature by a trusted
+            // key"). `evictable` ignores self-edges for reachability instead.
             stmt.execute(params![obj.store_path_hash, r])?;
         }
     }
@@ -333,8 +339,15 @@ pub fn get_object_and_last_accessed(
                 deriver: row.get(6)?,
                 ca: row.get(7)?,
                 references: Vec::new(),
-                sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?)
-                    .unwrap_or_default(),
+                sigs: serde_json::from_str::<Vec<String>>(&row.get::<_, String>(8)?).map_err(
+                    |e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    },
+                )?,
                 pushed_by: row.get(9)?,
             };
             Ok((obj, row.get(10)?))
@@ -342,7 +355,6 @@ pub fn get_object_and_last_accessed(
         .optional()?;
 
     if let Some((obj, _)) = obj.as_mut() {
-        // Sorted: narinfo References order is part of what the signature covers.
         let mut stmt = conn.prepare_cached(
             "SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference",
         )?;
@@ -488,15 +500,10 @@ pub fn pin(
     expires_at: Option<i64>,
     now: i64,
 ) -> Result<()> {
-    let exists: bool = conn
-        .query_row(
-            "SELECT 1 FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    anyhow::ensure!(exists, "{hash} is not in the cache — nothing to pin");
+    anyhow::ensure!(
+        exists(conn, hash)?,
+        "{hash} is not in the cache — nothing to pin"
+    );
     conn.execute(
         "INSERT OR REPLACE INTO pins (name, store_path_hash, expires_at, created_at)
          VALUES (?1, ?2, ?3, ?4)",
@@ -577,9 +584,12 @@ pub struct ObjectBrief {
     pub file_size: i64,
 }
 
+/// The columns [`ObjectBrief::from_row`] reads, from `objects`.
+const OBJECT_BRIEF_COLUMNS: &str = "store_path_hash, name, created_at, file_size";
+
 impl ObjectBrief {
-    /// Reads a row selecting at least these four columns, by name.
-    pub fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+    /// Reads a row selecting [`OBJECT_BRIEF_COLUMNS`], by name.
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             store_path_hash: row.get("store_path_hash")?,
             name: row.get("name")?,
@@ -592,11 +602,32 @@ impl ObjectBrief {
 /// Every object row — exactly what `garret-admin fsck` needs to classify
 /// rows, without an N+1 fetch through [`get_object`] per hash.
 pub fn all_objects_brief(conn: &Connection) -> Result<Vec<ObjectBrief>> {
-    let mut stmt =
-        conn.prepare("SELECT store_path_hash, name, created_at, file_size FROM objects")?;
+    let mut stmt = conn.prepare(&format!("SELECT {OBJECT_BRIEF_COLUMNS} FROM objects"))?;
     Ok(stmt
         .query_map([], ObjectBrief::from_row)?
         .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Every object first pushed by `subject`, at or after `since` when given,
+/// oldest first. Exact match: a subject is `<issuer>#<sub>`, and a prefix of
+/// one GitHub ref's subject can be another's.
+pub fn pushed_by(conn: &Connection, subject: &str, since: Option<i64>) -> Result<Vec<ObjectBrief>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {OBJECT_BRIEF_COLUMNS} FROM objects
+         WHERE pushed_by = ?1 AND created_at >= ?2
+         ORDER BY created_at, store_path_hash"
+    ))?;
+    Ok(stmt
+        .query_map(
+            params![subject, since.unwrap_or(i64::MIN)],
+            ObjectBrief::from_row,
+        )?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// How many objects the cache holds (`garret-admin status`).
+pub fn object_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?)
 }
 
 /// Debounced last-accessed bumps (spec 02), one IMMEDIATE transaction per
@@ -698,10 +729,10 @@ pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<ObjectBr
     anyhow::ensure!(
         before <= now - PUSH_GRACE,
         "the cutoff must be at least {} hours ago, so a push in progress keeps its closure",
-        PUSH_GRACE / 3600
+        PUSH_GRACE_HOURS
     );
     Ok(conn
-        .prepare(
+        .prepare(&format!(
             "WITH RECURSIVE keep(hash) AS (
                  SELECT store_path_hash FROM objects WHERE pushed_at >= ?1
                  UNION
@@ -709,10 +740,10 @@ pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<ObjectBr
                  UNION
                  SELECT r.reference_hash FROM object_refs r JOIN keep ON r.referrer = keep.hash
              )
-             SELECT store_path_hash, name, created_at, file_size FROM objects
+             SELECT {OBJECT_BRIEF_COLUMNS} FROM objects
              WHERE store_path_hash NOT IN (SELECT hash FROM keep)
-             ORDER BY name, store_path_hash",
-        )?
+             ORDER BY name, store_path_hash"
+        ))?
         .query_map(params![before, now], ObjectBrief::from_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
@@ -779,23 +810,7 @@ fn referrers_first(conn: &Connection, doomed: &[ObjectBrief]) -> Result<Vec<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn object(hash: &str, refs: &[&str]) -> Object {
-        Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: refs.iter().map(|r| (*r).to_owned()).collect(),
-            sigs: vec!["k:sig".into()],
-            pushed_by: Some("someone".into()),
-        }
-    }
+    use crate::testing::{object, scratch_dir};
 
     fn db() -> Connection {
         let conn = open(":memory:", true).unwrap();
@@ -807,17 +822,55 @@ mod tests {
     /// times up to 1000), so only references and pins decide evictability.
     const LATER: i64 = PUSH_GRACE + 1000;
 
+    /// Matches only the exact subject -- never one it is a prefix of -- and
+    /// `since` is inclusive, so the first push after a leak is not missed.
+    #[test]
+    fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
+        let mut conn = db();
+        let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|h| h.repeat(32));
+        for (hash, subject, at) in [
+            (&a, leaked.to_owned(), 100),
+            (&b, leaked.to_owned(), 200),
+            (&c, format!("{leaked}-other"), 200),
+            (&d, "https://issuer#someone-else".to_owned(), 300),
+        ] {
+            let object = Object {
+                pushed_by: Some(subject),
+                ..object(hash)
+            };
+            insert_object(&mut conn, &object, at).unwrap();
+        }
+        // Negotiation refreshes pushed_at, never who pushed first or when.
+        conn.execute("UPDATE objects SET pushed_at = 500", [])
+            .unwrap();
+
+        let hashes = |since| -> Vec<String> {
+            pushed_by(&conn, leaked, since)
+                .unwrap()
+                .into_iter()
+                .map(|row| {
+                    assert_eq!((row.name.as_str(), row.file_size), ("thing", 5));
+                    row.store_path_hash
+                })
+                .collect()
+        };
+        assert_eq!(hashes(None), [a, b.clone()]);
+        assert_eq!(hashes(Some(200)), [b]);
+        assert!(hashes(Some(201)).is_empty());
+    }
+
     #[test]
     fn round_trips_an_object_with_sorted_references() {
         let mut conn = db();
         let a = "a".repeat(32);
-        let obj = object(
-            &a,
-            &[
+        let obj = Object {
+            sigs: vec!["k:sig".into()],
+            ..object(&a).referencing(&[
                 &format!("{}-zed", "c".repeat(32)),
                 &format!("{}-abe", "b".repeat(32)),
-            ],
-        );
+            ])
+        };
         insert_object(&mut conn, &obj, 100).unwrap();
 
         let got = get_object(&conn, &a).unwrap().unwrap();
@@ -838,16 +891,10 @@ mod tests {
 
     #[test]
     fn self_references_survive_the_round_trip_and_stay_evictable() {
-        // Replaces an earlier `drops_self_references`, which pinned the
-        // opposite behaviour: the signature covers the reference list as
-        // pushed, self-reference included, so dropping it on write renders a
-        // narinfo whose fingerprint nix cannot reproduce. Most compiled store
-        // paths self-reference, so that failed verification for nearly
-        // everything.
         let mut conn = db();
         let a = "a".repeat(32);
         let own = format!("{a}-thing");
-        insert_object(&mut conn, &object(&a, &[&own]), 100).unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&own]), 100).unwrap();
 
         assert_eq!(
             get_object(&conn, &a).unwrap().unwrap().references,
@@ -870,12 +917,9 @@ mod tests {
     fn reinserting_does_not_double_count_usage() {
         let mut conn = db();
         let a = "a".repeat(32);
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&a, &[]), 200).unwrap();
-        let total: i64 = conn
-            .query_row("SELECT total_bytes FROM stats", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 5);
+        insert_object(&mut conn, &object(&a), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 200).unwrap();
+        assert_eq!(total_bytes(&conn).unwrap(), 5);
     }
 
     #[test]
@@ -883,9 +927,14 @@ mod tests {
         let mut conn = db();
         let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
         // a → b, so b is pinned by a. c is loose.
-        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 300).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&c, &[]), 200).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&a).referencing(&[&format!("{b}-dep")]),
+            300,
+        )
+        .unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
+        insert_object(&mut conn, &object(&c), 200).unwrap();
 
         let candidates = evictable(&conn, 10, LATER).unwrap();
         let hashes: Vec<&str> = candidates.iter().map(|(h, _)| h.as_str()).collect();
@@ -913,8 +962,13 @@ mod tests {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
         // a → b: pinning a must keep b too, via root-first eviction.
-        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&a).referencing(&[&format!("{b}-dep")]),
+            100,
+        )
+        .unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
 
         pin(&conn, "release", &a, None, 500).unwrap();
         assert!(
@@ -947,7 +1001,7 @@ mod tests {
         // client's referrers are not in the cache yet to protect it.
         let mut conn = db();
         let d = "d".repeat(32);
-        insert_object(&mut conn, &object(&d, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&d), 100).unwrap();
         assert_eq!(evictable(&conn, 10, LATER).unwrap(), vec![(d.clone(), 5)]);
 
         assert!(
@@ -970,10 +1024,15 @@ mod tests {
     fn a_referrer_uploaded_after_the_candidate_snapshot_keeps_its_dependency() {
         let mut conn = db();
         let (d, x) = ("d".repeat(32), "x".repeat(32));
-        insert_object(&mut conn, &object(&d, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&d), 100).unwrap();
         assert_eq!(evictable(&conn, 10, LATER).unwrap(), vec![(d.clone(), 5)]);
 
-        insert_object(&mut conn, &object(&x, &[&format!("{d}-dep")]), LATER).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&x).referencing(&[&format!("{d}-dep")]),
+            LATER,
+        )
+        .unwrap();
         assert_eq!(evict_object(&mut conn, &d, LATER).unwrap(), None);
         assert!(exists(&conn, &d).unwrap(), "evicted a referenced path");
     }
@@ -989,11 +1048,11 @@ mod tests {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
         let dep = format!("{b}-dep");
-        insert_object(&mut conn, &object(&a, &[&dep]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&dep]), 100).unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
         pin(&conn, "release", &a, None, 100).unwrap();
 
-        insert_object(&mut conn, &object(&a, &[&dep]), 200).unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&dep]), 200).unwrap();
         assert!(
             evictable(&conn, 10, LATER).unwrap().is_empty(),
             "re-push dropped the pin: the pinned closure became evictable"
@@ -1010,7 +1069,7 @@ mod tests {
         // must not linger pointing at nothing (FK cascade).
         let mut conn = db();
         let a = "a".repeat(32);
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
         pin(&conn, "release", &a, None, 100).unwrap();
         delete_object(&mut conn, &a).unwrap();
         let pins: i64 = conn
@@ -1023,8 +1082,8 @@ mod tests {
     fn deleting_debits_usage_and_reconciles() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
         assert_eq!(total_bytes(&conn).unwrap(), 10);
 
         assert_eq!(delete_object(&mut conn, &a).unwrap(), Some(5));
@@ -1042,14 +1101,11 @@ mod tests {
 
     #[test]
     fn pusher_writes_wait_out_another_connections_write_lock() {
-        // The Puller's bumps take the WAL write lock on its own connection.
-        // A read-then-write transaction that began deferred could not wait
-        // for it: SQLite fails the read-to-write upgrade with SQLITE_BUSY at
-        // once, ignoring busy_timeout, so uploads and GC failed under pull
-        // load. Needs a real file: WAL does not apply to `:memory:`.
-        let dir = std::env::temp_dir().join(format!("garret-db-busy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // The Puller's bumps take the WAL write lock on its own connection. A
+        // deferred read-then-write transaction would fail the upgrade with
+        // SQLITE_BUSY at once, ignoring busy_timeout. Needs a real file: WAL
+        // does not apply to `:memory:`.
+        let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap();
         let mut conn = open(path, true).unwrap();
@@ -1065,15 +1121,12 @@ mod tests {
         let a = "a".repeat(32);
 
         let holder = hold_write_lock();
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
         holder.join().unwrap();
 
         let holder = hold_write_lock();
         assert_eq!(delete_object(&mut conn, &a).unwrap(), Some(5));
         holder.join().unwrap();
-
-        drop(conn);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1086,12 +1139,17 @@ mod tests {
         // Old root a (self-referencing) → b (exclusive) and s (shared with
         // the new root n). Old root p is pinned, keeping q. Old c is
         // re-negotiated today, which is a push as far as prune is concerned.
-        insert_object(&mut conn, &object(&a, &[&dep(&a), &dep(&b), &dep(&s)]), 100).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&a).referencing(&[&dep(&a), &dep(&b), &dep(&s)]),
+            100,
+        )
+        .unwrap();
         for h in [&b, &s, &q, &c] {
-            insert_object(&mut conn, &object(h, &[]), 100).unwrap();
+            insert_object(&mut conn, &object(h), 100).unwrap();
         }
-        insert_object(&mut conn, &object(&p, &[&dep(&q)]), 100).unwrap();
-        insert_object(&mut conn, &object(&n, &[&dep(&s)]), 10 * DAY).unwrap();
+        insert_object(&mut conn, &object(&p).referencing(&[&dep(&q)]), 100).unwrap();
+        insert_object(&mut conn, &object(&n).referencing(&[&dep(&s)]), 10 * DAY).unwrap();
         pin(&conn, "release", &p, None, 100).unwrap();
         let now = 10 * DAY + 1;
         missing(&mut conn, std::slice::from_ref(&c), now).unwrap();
@@ -1127,10 +1185,15 @@ mod tests {
         let [a, b, c, d] = ['a', 'b', 'c', 'd'].map(|x| x.to_string().repeat(32));
         let dep = |h: &str| format!("{h}-dep");
         // c ← b ← a, c ← d, and b refers to itself.
-        insert_object(&mut conn, &object(&c, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[&dep(&b), &dep(&c)]), 100).unwrap();
-        insert_object(&mut conn, &object(&a, &[&dep(&b)]), 100).unwrap();
-        insert_object(&mut conn, &object(&d, &[&dep(&c)]), 100).unwrap();
+        insert_object(&mut conn, &object(&c), 100).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&b).referencing(&[&dep(&b), &dep(&c)]),
+            100,
+        )
+        .unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&dep(&b)]), 100).unwrap();
+        insert_object(&mut conn, &object(&d).referencing(&[&dep(&c)]), 100).unwrap();
         let doomed = [&c, &b, &a, &d].map(|h| brief(h, 100));
         let order: Vec<&str> = referrers_first(&conn, &doomed)
             .unwrap()
@@ -1165,11 +1228,21 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_sigs_are_an_error_not_an_unsigned_object() {
+        let mut conn = db();
+        let a = "a".repeat(32);
+        insert_object(&mut conn, &object(&a), 100).unwrap();
+        conn.execute("UPDATE objects SET sigs = 'not json'", [])
+            .unwrap();
+        assert!(get_object(&conn, &a).is_err());
+    }
+
+    #[test]
     fn last_accessed_bumps_are_debounced() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[]), 1000).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 1000).unwrap();
+        insert_object(&mut conn, &object(&a), 1000).unwrap();
+        insert_object(&mut conn, &object(&b), 1000).unwrap();
 
         // Within the debounce window: the row stays put.
         bump_last_accessed(&mut conn, [&a], 1001, 86400).unwrap();
@@ -1186,20 +1259,15 @@ mod tests {
     }
 
     fn last_accessed(conn: &Connection, hash: &str) -> i64 {
-        conn.query_row(
-            "SELECT last_accessed_at FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |r| r.get(0),
-        )
-        .unwrap()
+        get_object_and_last_accessed(conn, hash).unwrap().unwrap().1
     }
 
     #[test]
     fn brief_listing_carries_what_fsck_needs() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 200).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
+        insert_object(&mut conn, &object(&b), 200).unwrap();
 
         let mut rows = all_objects_brief(&conn).unwrap();
         rows.sort_by(|x, y| x.store_path_hash.cmp(&y.store_path_hash));
@@ -1217,34 +1285,12 @@ mod tests {
     }
 
     #[test]
-    fn reverse_lookup_finds_referrers_by_hash() {
-        let mut conn = db();
-        let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 100).unwrap();
-        let referrers: Vec<String> = conn
-            .prepare("SELECT referrer FROM object_refs WHERE reference_hash = ?1")
-            .unwrap()
-            .query_map(params![b], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(referrers, vec![a]);
-    }
-
-    /// A database and its WAL sidecars, which outlive every connection.
-    fn remove_db(path: &str) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path}{suffix}"));
-        }
-    }
-
-    #[test]
     fn closing_leaves_the_wal_sidecars_for_the_puller() {
-        let path = std::env::temp_dir().join("garret-persist-wal.sqlite");
-        let path = path.to_str().unwrap().to_owned();
-        remove_db(&path);
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
+        let path = path.to_str().unwrap();
 
-        let conn = open(&path, true).unwrap();
+        let conn = open(path, true).unwrap();
         migrate(&conn).unwrap();
         drop(conn);
         // The Puller cannot create them (spec 10), so the last close must not
@@ -1255,25 +1301,24 @@ mod tests {
                 "{suffix} was removed on close"
             );
         }
-        remove_db(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn open_when_ready_waits_for_the_pusher_to_create_the_schema() {
-        let path = std::env::temp_dir().join("garret-open-when-ready.sqlite");
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap().to_owned();
-        // Sidecars outlive every connection, so clear an earlier run's too.
-        remove_db(&path);
 
         let waiter = tokio::spawn({
             let path = path.clone();
             async move { open_when_ready(&path, std::time::Duration::from_secs(30)).await }
         });
-        // Not ready while the file is absent, nor while it exists unmigrated.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Not ready while the file is absent, nor while it exists unmigrated;
+        // each sleep spans at least one retry.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(!waiter.is_finished());
         let created = open(&path, true).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(!waiter.is_finished(), "an empty database is not ready");
 
         migrate(&created).unwrap();
@@ -1283,17 +1328,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!exists(&conn, "nope").unwrap());
-        remove_db(&path);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn open_when_ready_gives_up_on_a_database_that_never_appears() {
         let err = open_when_ready(
             "/nonexistent-dir/garret.sqlite",
-            std::time::Duration::from_millis(600),
+            std::time::Duration::from_secs(60),
         )
         .await
         .unwrap_err();
         assert!(err.to_string().contains("was not created"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn open_when_ready_fails_at_once_on_a_file_that_is_not_a_database() {
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
+        let path = path.to_str().unwrap().to_owned();
+        std::fs::write(&path, b"not a sqlite database, just bytes").unwrap();
+        let opened = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            open_when_ready(&path, std::time::Duration::from_secs(300)),
+        )
+        .await
+        .expect("a corrupt database must not be waited on");
+        assert!(opened.is_err());
     }
 }

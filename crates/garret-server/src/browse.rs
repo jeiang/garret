@@ -2,90 +2,94 @@
 //! Served entirely by indices: name, creation order, PK, and the reverse-ref
 //! index.
 
-use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use std::{fmt, str::FromStr, sync::LazyLock};
 
-/// One object in a listing: the fields the browse UI shows, nothing heavier.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct Summary {
-    /// Store path hash — the object key.
-    pub hash: String,
-    /// Basename after the hash (`hello-1.0`).
-    pub name: String,
-    /// Full store path.
-    pub store_path: String,
-    /// Uncompressed NAR size in bytes.
-    pub nar_size: i64,
-    /// Stored (compressed) blob size in bytes.
-    pub file_size: i64,
-    /// Unix time the object was pushed.
-    pub created_at: i64,
-}
+use anyhow::{Context, Result};
+use garret_common::wire::{MAX_LIMIT, ObjectDetail, Page, Pin, Summary, TreeNode};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
-/// One page of listing results.
-#[derive(Debug, Serialize)]
-pub struct Page {
-    /// The page's objects, newest first.
-    pub objects: Vec<Summary>,
-    /// Opaque; pass back as `cursor` for the next page. Absent means the end.
-    pub next_cursor: Option<String>,
-}
+use crate::db;
 
-/// One node of a dependency tree.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct TreeNode {
-    /// Store path hash of this reference.
-    pub hash: String,
-    /// Reference basename for children; the object's `name` at the root.
-    pub name: String,
-    /// Absent from the cache: shown, but marked (spec 07).
-    pub missing: bool,
-    /// Already expanded elsewhere in this tree; children are omitted.
-    pub truncated: bool,
-    /// This node's references, empty when missing or truncated.
-    pub children: Vec<TreeNode>,
-}
+/// Levels below the root the Puller's tree expands (spec 07).
+pub const TREE_DEPTH: usize = 64;
+
+/// The columns every [`Summary`] query selects, from `objects o`, in
+/// [`summary_from_row`]'s order.
+const SUMMARY_COLUMNS: &str =
+    "o.store_path_hash, o.name, o.store_path, o.nar_size, o.file_size, o.created_at";
 
 /// The listing query. Its order is exactly the `objects_created` index, so a
 /// page walks the index and stops, instead of sorting every row per request.
-const LIST: &str = "SELECT store_path_hash, name, store_path, nar_size, file_size, created_at
-     FROM objects
-     WHERE (?1 IS NULL OR name LIKE ?1)
-       AND (created_at < ?2 OR (created_at = ?2 AND store_path_hash > ?3))
-     ORDER BY created_at DESC, store_path_hash ASC
-     LIMIT ?4";
+static LIST: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {SUMMARY_COLUMNS}
+         FROM objects o
+         WHERE (?1 IS NULL OR o.name LIKE ?1 ESCAPE '\\')
+           AND (o.created_at < ?2 OR (o.created_at = ?2 AND o.store_path_hash > ?3))
+         ORDER BY o.created_at DESC, o.store_path_hash ASC
+         LIMIT ?4"
+    )
+});
 
-/// Keyset pagination, newest first. The cursor is `created_at:hash` so the
-/// pair is strictly ordered even when timestamps collide — offset pagination
-/// would skip or repeat rows as objects are pushed underneath it.
+/// Where the next listing page starts: the last row's `created_at:hash`,
+/// a pair strictly ordered even when timestamps collide. Parsing rejects
+/// anything else, so a malformed cursor is the caller's error rather than
+/// a silent restart at page 1.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct Cursor {
+    created_at: i64,
+    hash: String,
+}
+
+impl FromStr for Cursor {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let malformed = || format!("malformed cursor {s:?}: expected created_at:hash");
+        let (time, hash) = s.split_once(':').with_context(malformed)?;
+        Ok(Self {
+            created_at: time.parse().with_context(malformed)?,
+            hash: hash.to_owned(),
+        })
+    }
+}
+
+impl TryFrom<String> for Cursor {
+    type Error = anyhow::Error;
+
+    fn try_from(s: String) -> Result<Self> {
+        s.parse()
+    }
+}
+
+impl fmt::Display for Cursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.created_at, self.hash)
+    }
+}
+
+/// Keyset pagination, newest first, by [`Cursor`] — offset pagination would
+/// skip or repeat rows as objects are pushed underneath it. `query` matches
+/// a literal substring of the name.
 pub fn list(
     conn: &Connection,
     query: Option<&str>,
     limit: usize,
-    cursor: Option<&str>,
+    cursor: Option<&Cursor>,
 ) -> Result<Page> {
-    let limit = limit.clamp(1, 500);
-    let (after_time, after_hash) = match cursor.and_then(|c| c.split_once(':')) {
-        Some((time, hash)) => (time.parse::<i64>().unwrap_or(i64::MAX), hash.to_owned()),
-        None => (i64::MAX, String::new()),
+    let limit = limit.clamp(1, MAX_LIMIT);
+    let (after_time, after_hash) = match cursor {
+        Some(c) => (c.created_at, c.hash.as_str()),
+        None => (i64::MAX, ""),
     };
-    let pattern = query.map(|q| format!("%{q}%"));
+    let pattern = query.map(|q| format!("%{}%", escape_like(q)));
 
-    let mut stmt = conn.prepare(LIST)?;
+    let mut stmt = conn.prepare(&LIST)?;
     let mut objects: Vec<Summary> = stmt
         .query_map(
             params![pattern, after_time, after_hash, limit as i64 + 1],
-            |row| {
-                Ok(Summary {
-                    hash: row.get(0)?,
-                    name: row.get(1)?,
-                    store_path: row.get(2)?,
-                    nar_size: row.get(3)?,
-                    file_size: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            },
+            summary_from_row,
         )?
         .collect::<rusqlite::Result<_>>()?;
 
@@ -93,12 +97,75 @@ pub fn list(
     let next_cursor = (objects.len() > limit).then(|| {
         objects.truncate(limit);
         let last = objects.last().expect("limit is at least 1");
-        format!("{}:{}", last.created_at, last.hash)
+        Cursor {
+            created_at: last.created_at,
+            hash: last.hash.clone(),
+        }
+        .to_string()
     });
     Ok(Page {
         objects,
         next_cursor,
     })
+}
+
+/// `q` as a literal inside a `LIKE … ESCAPE '\'` pattern.
+fn escape_like(q: &str) -> String {
+    let mut escaped = String::with_capacity(q.len());
+    for c in q.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+/// A [`Summary`] from a row selecting [`SUMMARY_COLUMNS`].
+fn summary_from_row(row: &Row) -> rusqlite::Result<Summary> {
+    Ok(Summary {
+        hash: row.get(0)?,
+        name: row.get(1)?,
+        store_path: row.get(2)?,
+        nar_size: row.get(3)?,
+        file_size: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+/// One object's detail. Every [`db::Object`] field is named here, so a
+/// schema change cannot silently change the public API.
+pub fn object(conn: &Connection, hash: &str) -> Result<Option<ObjectDetail>> {
+    Ok(db::get_object(conn, hash)?.map(|object| {
+        let db::Object {
+            store_path_hash,
+            store_path,
+            name,
+            nar_hash,
+            nar_size,
+            file_hash,
+            file_size,
+            deriver,
+            ca,
+            references,
+            sigs,
+            pushed_by,
+        } = object;
+        ObjectDetail {
+            store_path_hash,
+            store_path,
+            name,
+            nar_hash,
+            nar_size,
+            file_hash,
+            file_size,
+            deriver,
+            ca,
+            references,
+            sigs,
+            pushed_by,
+        }
+    }))
 }
 
 /// Dependency tree: first occurrence expands, repeats truncate,
@@ -172,40 +239,16 @@ fn children_of(
 
 /// Reverse dependencies, via the reverse-ref index.
 pub fn referrers(conn: &Connection, hash: &str) -> Result<Vec<Summary>> {
-    let mut stmt = conn.prepare(
-        "SELECT o.store_path_hash, o.name, o.store_path, o.nar_size, o.file_size, o.created_at
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SUMMARY_COLUMNS}
          FROM object_refs r
          JOIN objects o ON o.store_path_hash = r.referrer
          WHERE r.reference_hash = ?1 AND r.referrer != ?1
-         ORDER BY o.name",
-    )?;
+         ORDER BY o.name"
+    ))?;
     Ok(stmt
-        .query_map(params![hash], |row| {
-            Ok(Summary {
-                hash: row.get(0)?,
-                name: row.get(1)?,
-                store_path: row.get(2)?,
-                nar_size: row.get(3)?,
-                file_size: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?
+        .query_map(params![hash], summary_from_row)?
         .collect::<rusqlite::Result<_>>()?)
-}
-
-/// One GC-exempt root (ticket 22), as `GET /api/v1/pins` reports it.
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct Pin {
-    /// Operator-chosen pin name.
-    pub name: String,
-    /// Store path hash of the pinned root.
-    pub store_path_hash: String,
-    /// Full store path of the pinned root.
-    pub store_path: String,
-    /// Unix time the pin stops protecting; `None` = permanent.
-    pub expires_at: Option<i64>,
-    /// Unix time the pin was created.
-    pub created_at: i64,
 }
 
 /// All pins, expired ones included — the listing is for auditing what the
@@ -243,24 +286,8 @@ fn name_of(conn: &Connection, hash: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{self, Object};
-
-    fn object(hash: &str, name: &str, refs: &[&str]) -> Object {
-        Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-{name}"),
-            name: name.into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_size: 5,
-            file_hash: "sha256:y".into(),
-            deriver: None,
-            ca: None,
-            references: refs.iter().map(|r| (*r).to_owned()).collect(),
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
+    use crate::db;
+    use crate::testing::object;
 
     fn h(c: char) -> String {
         std::iter::repeat_n(c, 32).collect()
@@ -278,7 +305,7 @@ mod tests {
         // `b` and `c` share a timestamp, and the page boundary falls between
         // them: the hash tiebreak must carry the walk across it.
         for (c, at) in [('a', 100), ('b', 101), ('c', 101), ('d', 102)] {
-            db::insert_object(&mut conn, &object(&h(c), "thing", &[]), at).unwrap();
+            db::insert_object(&mut conn, &object(&h(c)), at).unwrap();
         }
 
         let first = list(&conn, None, 2, None).unwrap();
@@ -287,7 +314,8 @@ mod tests {
         assert_eq!(first.objects[0].hash, h('d'));
         assert!(first.next_cursor.is_some());
 
-        let second = list(&conn, None, 2, first.next_cursor.as_deref()).unwrap();
+        let cursor: Cursor = first.next_cursor.as_deref().unwrap().parse().unwrap();
+        let second = list(&conn, None, 2, Some(&cursor)).unwrap();
         let seen: Vec<&str> = first
             .objects
             .iter()
@@ -304,7 +332,7 @@ mod tests {
     fn the_unfiltered_listing_walks_an_index_instead_of_sorting() {
         let conn = db();
         let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {LIST}"))
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", *LIST))
             .unwrap()
             .query_map(params![None::<String>, i64::MAX, "", 51], |row| row.get(3))
             .unwrap()
@@ -319,8 +347,8 @@ mod tests {
     #[test]
     fn search_filters_by_name() {
         let mut conn = db();
-        db::insert_object(&mut conn, &object(&h('a'), "hello-1.0", &[]), 100).unwrap();
-        db::insert_object(&mut conn, &object(&h('b'), "ripgrep", &[]), 101).unwrap();
+        db::insert_object(&mut conn, &object(&h('a')).named("hello-1.0"), 100).unwrap();
+        db::insert_object(&mut conn, &object(&h('b')).named("ripgrep"), 101).unwrap();
 
         let page = list(&conn, Some("hell"), 10, None).unwrap();
         assert_eq!(page.objects.len(), 1);
@@ -333,10 +361,62 @@ mod tests {
         );
     }
 
+    /// `%`, `_` and `\` in a search are literal characters, not wildcards.
+    #[test]
+    fn search_is_a_literal_substring_match() {
+        let mut conn = db();
+        for (c, name) in [
+            ('a', "50%-off"),
+            ('b', "500-off"),
+            ('c', "a_b"),
+            ('d', "axb"),
+            ('e', r"back\slash"),
+            ('f', "backslash"),
+        ] {
+            db::insert_object(&mut conn, &object(&h(c)).named(name), 100).unwrap();
+        }
+        let names = |q: &str| -> Vec<String> {
+            list(&conn, Some(q), 10, None)
+                .unwrap()
+                .objects
+                .into_iter()
+                .map(|o| o.name)
+                .collect()
+        };
+        assert_eq!(names("0%"), ["50%-off"]);
+        assert_eq!(names("a_"), ["a_b"]);
+        assert_eq!(names(r"k\s"), [r"back\slash"]);
+    }
+
+    /// `GET /objects/{hash}` serves this JSON; pinned so a schema change
+    /// cannot alter the public API unnoticed.
+    #[test]
+    fn object_detail_json_is_stable() {
+        let mut conn = db();
+        let (a, b) = (h('a'), h('b'));
+        let obj = db::Object {
+            deriver: Some(format!("{b}-hello.drv")),
+            sigs: vec!["k:c2ln".into()],
+            pushed_by: Some("https://id.example#me".into()),
+            ..object(&a)
+                .named("hello")
+                .referencing(&[&format!("{b}-dep")])
+        };
+        db::insert_object(&mut conn, &obj, 100).unwrap();
+        let json = serde_json::to_string(&super::object(&conn, &a).unwrap().unwrap()).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"store_path_hash":"{a}","store_path":"/nix/store/{a}-hello","name":"hello","nar_hash":"sha256:x","nar_size":10,"file_hash":"sha256:y","file_size":5,"deriver":"{b}-hello.drv","ca":null,"references":["{b}-dep"],"sigs":["k:c2ln"],"pushed_by":"https://id.example#me"}}"#
+            )
+        );
+        assert!(super::object(&conn, &b).unwrap().is_none());
+    }
+
     #[test]
     fn pin_listing_joins_the_store_path_and_keeps_expired_pins_visible() {
         let mut conn = db();
-        db::insert_object(&mut conn, &object(&h('a'), "hello-1.0", &[]), 100).unwrap();
+        db::insert_object(&mut conn, &object(&h('a')).named("hello-1.0"), 100).unwrap();
         db::pin(&conn, "release", &h('a'), Some(50), 10).unwrap();
 
         let got = pins(&conn).unwrap();
@@ -359,25 +439,21 @@ mod tests {
         let (root, mid, shared, gone) = (h('a'), h('b'), h('c'), h('d'));
         db::insert_object(
             &mut conn,
-            &object(
-                &root,
-                "root",
-                &[&format!("{mid}-mid"), &format!("{shared}-shared")],
-            ),
+            &object(&root)
+                .named("root")
+                .referencing(&[&format!("{mid}-mid"), &format!("{shared}-shared")]),
             100,
         )
         .unwrap();
         db::insert_object(
             &mut conn,
-            &object(
-                &mid,
-                "mid",
-                &[&format!("{shared}-shared"), &format!("{gone}-gone")],
-            ),
+            &object(&mid)
+                .named("mid")
+                .referencing(&[&format!("{shared}-shared"), &format!("{gone}-gone")]),
             100,
         )
         .unwrap();
-        db::insert_object(&mut conn, &object(&shared, "shared", &[]), 100).unwrap();
+        db::insert_object(&mut conn, &object(&shared).named("shared"), 100).unwrap();
 
         let tree = tree(&conn, &root, 10).unwrap().unwrap();
         let mid_node = &tree.children[0];
@@ -388,12 +464,17 @@ mod tests {
         assert!(gone_node.missing);
         assert!(gone_node.children.is_empty());
 
-        // `shared` is reached twice; the second occurrence does not re-expand.
+        // `shared` is reached twice. Depth-first in reference order, the copy
+        // under `mid` comes first and expands; the later one is truncated.
         let shared_under_mid = mid_node.children.iter().find(|c| c.hash == shared).unwrap();
         let shared_under_root = tree.children.iter().find(|c| c.hash == shared).unwrap();
-        assert!(shared_under_mid.truncated ^ shared_under_root.truncated);
+        assert!(!shared_under_mid.truncated);
+        assert!(shared_under_root.truncated);
+    }
 
-        assert!(tree_of_unknown_hash(&conn));
+    #[test]
+    fn tree_of_an_unknown_hash_is_none() {
+        assert!(tree(&db(), "nope", 10).unwrap().is_none());
     }
 
     #[test]
@@ -403,11 +484,18 @@ mod tests {
         let (root_ref, dep_ref) = (format!("{root}-root"), format!("{dep}-dep"));
         db::insert_object(
             &mut conn,
-            &object(&root, "root", &[&root_ref, &dep_ref]),
+            &object(&root)
+                .named("root")
+                .referencing(&[&root_ref, &dep_ref]),
             100,
         )
         .unwrap();
-        db::insert_object(&mut conn, &object(&dep, "dep", &[&dep_ref]), 100).unwrap();
+        db::insert_object(
+            &mut conn,
+            &object(&dep).named("dep").referencing(&[&dep_ref]),
+            100,
+        )
+        .unwrap();
 
         let tree = tree(&conn, &root, 10).unwrap().unwrap();
         let hashes: Vec<&str> = tree.children.iter().map(|c| c.hash.as_str()).collect();
@@ -446,8 +534,18 @@ mod tests {
         let mut conn = db();
         let (a, b) = (h('a'), h('b'));
         let (a_ref, b_ref) = (format!("{a}-a"), format!("{b}-b"));
-        db::insert_object(&mut conn, &object(&a, "a", &[&b_ref]), 100).unwrap();
-        db::insert_object(&mut conn, &object(&b, "b", &[&a_ref]), 100).unwrap();
+        db::insert_object(
+            &mut conn,
+            &object(&a).named("a").referencing(&[&b_ref]),
+            100,
+        )
+        .unwrap();
+        db::insert_object(
+            &mut conn,
+            &object(&b).named("b").referencing(&[&a_ref]),
+            100,
+        )
+        .unwrap();
 
         let tree = tree(&conn, &a, 10).unwrap().unwrap();
         let b_node = &tree.children[..];
@@ -464,21 +562,19 @@ mod tests {
         assert!(a_again[0].children.is_empty());
     }
 
-    fn tree_of_unknown_hash(conn: &Connection) -> bool {
-        tree(conn, "nope", 10).unwrap().is_none()
-    }
-
     #[test]
     fn referrers_are_the_reverse_of_references() {
         let mut conn = db();
         let (root, dep) = (h('a'), h('b'));
         db::insert_object(
             &mut conn,
-            &object(&root, "root", &[&format!("{dep}-dep")]),
+            &object(&root)
+                .named("root")
+                .referencing(&[&format!("{dep}-dep")]),
             100,
         )
         .unwrap();
-        db::insert_object(&mut conn, &object(&dep, "dep", &[]), 100).unwrap();
+        db::insert_object(&mut conn, &object(&dep).named("dep"), 100).unwrap();
 
         let found = referrers(&conn, &dep).unwrap();
         assert_eq!(found.len(), 1);

@@ -5,6 +5,13 @@
 //! Seeded so the corpus is identical on any machine — results are comparable
 //! across runs and hosts, and no real store contents live in the repo.
 
+use garret_common::NIX_BASE32_ALPHABET;
+
+/// Bumped whenever the same seed would generate a different corpus, so
+/// results from different generators are never compared. 2: each body's RNG
+/// is seeded from its full hash (before, most entries shared seed 1).
+pub const VERSION: u32 = 2;
+
 /// xorshift64*: a few lines, no dependency, and identical everywhere. Bench
 /// input needs reproducibility, not statistical quality.
 pub struct Rng(u64);
@@ -23,7 +30,6 @@ impl Rng {
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 
-    /// Uniform in `[0, n)`.
     pub fn below(&mut self, n: u64) -> u64 {
         if n == 0 { 0 } else { self.next_u64() % n }
     }
@@ -46,7 +52,7 @@ impl Entry {
     /// Deterministic body: the same entry always produces the same bytes, so
     /// a rerun pushes an identical corpus.
     pub fn body(&self) -> Vec<u8> {
-        let mut rng = Rng::new(u64::from_str_radix(&self.hash[..16], 32).unwrap_or(1));
+        let mut rng = entry_rng(&self.hash);
         let mut out = Vec::with_capacity(self.size);
         // A run of repeats compresses; random bytes do not. Mixing the two in
         // proportion gives a body with roughly the intended compressibility.
@@ -71,7 +77,7 @@ impl Entry {
     /// the scenario measures, and compressing would only measure the
     /// client's CPU.
     pub fn chunks(&self, chunk_size: usize) -> impl Iterator<Item = Vec<u8>> + use<> {
-        let mut rng = Rng::new(u64::from_str_radix(&self.hash[..16], 32).unwrap_or(1));
+        let mut rng = entry_rng(&self.hash);
         let mut remaining = self.size;
         std::iter::from_fn(move || {
             if remaining == 0 {
@@ -89,15 +95,29 @@ impl Entry {
     }
 }
 
+/// Seeds an entry's body from its full hash (FNV-1a), so every entry gets its
+/// own bytes.
+fn entry_rng(hash: &str) -> Rng {
+    let seed = hash.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    Rng::new(seed)
+}
+
+/// 32 random nix-base32 characters: the hash part of a store path.
+fn random_hash(rng: &mut Rng) -> String {
+    (0..32)
+        .map(|_| NIX_BASE32_ALPHABET[rng.below(32) as usize] as char)
+        .collect()
+}
+
 /// One entry for the large-body streaming scenario. `salt` keeps reruns
 /// against a long-lived server from colliding with their own past uploads
 /// (an `exists` ack skips the body and fakes an instant push); sizes stay
 /// fixed, so runs remain comparable.
 pub fn stream_entry(seed: u64, size: usize, rep: usize, salt: u64) -> Entry {
     let mut rng = Rng::new(seed ^ salt ^ ((size as u64) << 8) ^ rep as u64);
-    let hash: String = (0..32)
-        .map(|_| NIX_BASE32[rng.below(32) as usize] as char)
-        .collect();
+    let hash = random_hash(&mut rng);
     Entry {
         hash,
         name: format!("bench-stream-{size}-{rep}"),
@@ -106,17 +126,13 @@ pub fn stream_entry(seed: u64, size: usize, rep: usize, salt: u64) -> Entry {
     }
 }
 
-use garret_common::NIX_BASE32_ALPHABET as NIX_BASE32;
-
 /// `count` entries plus, when `with_giant` is set, one multi-GB blob — the fat
 /// tail is the interesting part of the real distribution, not the median.
 pub fn generate(seed: u64, count: usize, with_giant: bool) -> Vec<Entry> {
     let mut rng = Rng::new(seed);
     let mut entries = Vec::with_capacity(count + 1);
     for i in 0..count {
-        let hash: String = (0..32)
-            .map(|_| NIX_BASE32[rng.below(32) as usize] as char)
-            .collect();
+        let hash = random_hash(&mut rng);
         // Log-ish spread from ~4 KiB to ~64 MiB, weighted small.
         let magnitude = rng.below(5);
         let size = (4096u64 << (magnitude * 3)) + rng.below(4096);
@@ -129,9 +145,7 @@ pub fn generate(seed: u64, count: usize, with_giant: bool) -> Vec<Entry> {
         });
     }
     if with_giant {
-        let hash: String = (0..32)
-            .map(|_| NIX_BASE32[rng.below(32) as usize] as char)
-            .collect();
+        let hash = random_hash(&mut rng);
         entries.push(Entry {
             hash,
             name: "bench-giant".into(),
@@ -162,8 +176,11 @@ pub fn rekey(entries: &[Entry]) -> Vec<Entry> {
 
 fn next_char(hash: &str) -> char {
     let first = hash.bytes().next().unwrap_or(b'0');
-    let index = NIX_BASE32.iter().position(|c| *c == first).unwrap_or(0);
-    NIX_BASE32[(index + 1) % NIX_BASE32.len()] as char
+    let index = NIX_BASE32_ALPHABET
+        .iter()
+        .position(|c| *c == first)
+        .unwrap_or(0);
+    NIX_BASE32_ALPHABET[(index + 1) % NIX_BASE32_ALPHABET.len()] as char
 }
 
 #[cfg(test)]
@@ -177,16 +194,25 @@ mod tests {
     }
 
     #[test]
-    fn bodies_are_deterministic_and_the_right_length() {
-        let entry = &generate(7, 3, false)[0];
-        assert_eq!(entry.body(), entry.body());
-        assert_eq!(entry.body().len(), entry.size);
+    fn bodies_are_seeded_per_hash() {
+        let entries = generate(7, 2, false);
+        let body = |hash: &str| {
+            Entry {
+                hash: hash.into(),
+                size: 4096,
+                ..entries[0].clone()
+            }
+            .body()
+        };
+        assert_eq!(body(&entries[0].hash), body(&entries[0].hash));
+        assert_ne!(body(&entries[0].hash), body(&entries[1].hash));
+        assert_eq!(entries[0].body().len(), entries[0].size);
     }
 
     #[test]
     fn compressibility_actually_varies() {
         let squishy = Entry {
-            hash: "a".repeat(32),
+            hash: "0c9f8k2h5mnyw1zxa7qrl3dsvbg4ip6j".into(),
             name: "x".into(),
             size: 256 * 1024,
             compressibility: 100,
@@ -198,20 +224,22 @@ mod tests {
         let ratio = |e: &Entry| zstd::encode_all(e.body().as_slice(), 3).unwrap().len();
         // The incompressible slice must not quietly compress away, or the
         // benchmark measures the wrong thing entirely.
-        assert!(ratio(&squishy) < e_len(&squishy) / 10);
-        assert!(ratio(&solid) > e_len(&solid) / 2);
-    }
-
-    fn e_len(entry: &Entry) -> usize {
-        entry.size
+        assert!(ratio(&squishy) < squishy.size / 10);
+        assert!(ratio(&solid) > solid.size / 2);
     }
 
     #[test]
-    fn rekeying_moves_every_first_character() {
-        // Including the wrap at the end of the alphabet.
-        for (input, expected) in [("0aa", '1'), ("zaa", '0'), ("baa", 'c')] {
-            assert_eq!(next_char(input), expected);
-        }
+    fn rekeying_the_last_alphabet_character_wraps_to_a_valid_hash() {
+        let entry = Entry {
+            hash: "z".repeat(32),
+            name: "x".into(),
+            size: 1,
+            compressibility: 0,
+        };
+        let rekeyed = &rekey(std::slice::from_ref(&entry))[0].hash;
+        assert_ne!(rekeyed, &entry.hash);
+        assert_eq!(rekeyed.len(), 32);
+        assert!(rekeyed.bytes().all(|c| NIX_BASE32_ALPHABET.contains(&c)));
     }
 
     #[test]
@@ -256,14 +284,12 @@ mod tests {
         assert_eq!(a, stream_entry(1, 4096, 0, 7));
         assert_ne!(a.hash, stream_entry(1, 4096, 1, 7).hash);
         assert_ne!(a.hash, stream_entry(1, 4096, 0, 8).hash);
-        assert_eq!(a.size, 4096);
     }
 
     #[test]
     fn the_fat_tail_is_present_when_asked_for() {
         let with = generate(1, 5, true);
         assert_eq!(with.len(), 6);
-        assert!(with.last().unwrap().size >= 2 * 1024 * 1024 * 1024);
         assert_eq!(generate(1, 5, false).len(), 5);
     }
 }

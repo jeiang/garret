@@ -6,38 +6,11 @@
 //! address is a loopback that would be wrong to advertise.
 
 use anyhow::{Context, Result, bail};
+use garret_common::wire::{self, Discovery};
 use reqwest::StatusCode;
-use serde::Deserialize;
 
-/// The discovery document: what the server tells any anonymous caller about
-/// itself, and everything `render` needs to write a config.
-#[derive(Debug, Deserialize)]
-pub struct Discovery {
-    /// Absent when the Pusher has no `puller_endpoint` configured.
-    pub puller_endpoint: Option<String>,
-    /// Public halves of the cache's signing keys — plural, because every object
-    /// is signed with every configured key and a rotation runs several at once.
-    #[serde(default)]
-    pub public_keys: Vec<String>,
-    /// Absent when no issuer sets a `client_id`, in which case the device flow
-    /// has nothing to identify itself as.
-    pub oidc: Option<Oidc>,
-}
-
-/// The advertised OIDC settings, destined for the config's `[oidc]` section.
-#[derive(Debug, Deserialize)]
-pub struct Oidc {
-    /// Issuer base URL.
-    pub issuer: String,
-    /// The `aud` claim the Pusher validates tokens against.
-    pub audience: String,
-    /// The device flow's public client id; `None` when no issuer sets one,
-    /// which makes `garret login` impossible against this server.
-    pub client_id: Option<String>,
-}
-
-/// Fetches `GET /api/v1/discovery` from the Pusher, anonymously, and refuses a
-/// document that [`Discovery::check`] rejects.
+/// Fetches `GET /api/v1/discovery` from the Pusher at `endpoint` (no trailing
+/// `/`), anonymously, and refuses a document that [`check`] rejects.
 ///
 /// Distinguishes one failure precisely: a 404 *or* 401 means a server that
 /// predates the discovery endpoint (discovery needs no token, so a 401 can
@@ -45,21 +18,13 @@ pub struct Oidc {
 /// letting it read as a typo'd URL or bad credentials.
 pub async fn fetch(http: &reqwest::Client, endpoint: &str) -> Result<Discovery> {
     check_url("the Pusher URL", endpoint)?;
-    let url = format!("{}/api/v1/discovery", endpoint.trim_end_matches('/'));
+    let url = format!("{endpoint}{}", wire::DISCOVERY);
     let response = http
         .get(&url)
         .send()
         .await
         .with_context(|| format!("fetching {url}"))?;
 
-    // The one failure worth naming precisely: a client newer than its server.
-    // Without this it surfaces as a bare 404 and looks like a typo'd URL.
-    //
-    // 401 lands here too. Discovery is anonymous by design, so a server that
-    // demands a token on it is one whose auth layer still wraps the whole
-    // router — the shape the Pusher had before this endpoint existed. Left to
-    // the generic arm below it reads as "your credentials are wrong", which
-    // sends you off chasing an OIDC problem that isn't there.
     let status = response.status();
     if status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED {
         bail!(
@@ -69,52 +34,45 @@ pub async fn fetch(http: &reqwest::Client, endpoint: &str) -> Result<Discovery> 
              Upgrade the server, or write the config by hand."
         );
     }
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        bail!("discovery failed with {status}: {}", body.trim());
-    }
-    let discovery: Discovery = response
+    let discovery: Discovery = crate::http::ensure_success(response, "discovery failed")
+        .await?
         .json()
         .await
         .context("parsing the discovery document")?;
-    discovery
-        .check()
-        .with_context(|| format!("refusing the discovery document from {url}"))?;
+    check(&discovery).with_context(|| format!("refusing the discovery document from {url}"))?;
     Ok(discovery)
 }
 
-impl Discovery {
-    /// Every advertised value ends up somewhere that trusts it: the puller URL
-    /// and keys in nix.conf, where a trusted key applies to *every* substituter
-    /// and a newline would start a new setting (`post-build-hook`, say); the
-    /// issuer as the place the device flow sends the human to sign in.
-    pub fn check(&self) -> Result<()> {
-        if let Some(puller) = &self.puller_endpoint {
-            check_url("puller_endpoint", puller)?;
-        }
-        for key in &self.public_keys {
-            check_key(key)?;
-        }
-        if let Some(oidc) = &self.oidc {
-            check_url("oidc.issuer", &oidc.issuer)?;
-            for (what, value) in [
-                ("oidc.audience", Some(&oidc.audience)),
-                ("oidc.client_id", oidc.client_id.as_ref()),
-            ] {
-                if let Some(value) = value
-                    && (value.is_empty()
-                        || !value
-                            .chars()
-                            .all(|c| c.is_ascii_graphic() && c != '"' && c != '\\'))
-                {
-                    bail!(
-                        "{what} {value:?} is empty or holds whitespace, quotes or control characters"
-                    );
-                }
+/// Every advertised value ends up somewhere that trusts it: the puller URL
+/// and keys in nix.conf, where a trusted key applies to *every* substituter
+/// and a newline would start a new setting (`post-build-hook`, say); the
+/// issuer as the place the device flow sends the human to sign in.
+pub fn check(discovery: &Discovery) -> Result<()> {
+    if let Some(puller) = &discovery.puller_endpoint {
+        check_url("puller_endpoint", puller)?;
+    }
+    for key in &discovery.public_keys {
+        check_key(key)?;
+    }
+    if let Some(oidc) = &discovery.oidc {
+        check_url("oidc.issuer", &oidc.issuer)?;
+        for (what, value) in [
+            ("oidc.audience", Some(&oidc.audience)),
+            ("oidc.client_id", oidc.client_id.as_ref()),
+        ] {
+            if let Some(value) = value
+                && (value.is_empty()
+                    || !value
+                        .chars()
+                        .all(|c| c.is_ascii_graphic() && c != '"' && c != '\\'))
+            {
+                bail!(
+                    "{what} {value:?} is empty or holds whitespace, quotes or control characters"
+                );
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// Refuses a URL that is not `https`, or plain `http` to a loopback host (a
@@ -233,29 +191,21 @@ mod tests {
 
     #[test]
     fn a_document_with_one_bad_value_is_refused() {
-        let good = || Discovery {
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA".into()],
-            oidc: Some(Oidc {
-                issuer: "https://id.example".into(),
-                audience: "garret".into(),
-                client_id: Some("garret-cli".into()),
-            }),
-        };
-        good().check().unwrap();
+        let good = crate::testing::discovery;
+        check(&good()).unwrap();
 
         let mut d = good();
         d.puller_endpoint = Some("http://cache.example".into());
-        assert!(d.check().is_err());
+        assert!(check(&d).is_err());
         let mut d = good();
         d.public_keys
             .push("evil:AAAA\nextra-substituters = http://x".into());
-        assert!(d.check().is_err());
+        assert!(check(&d).is_err());
         let mut d = good();
         d.oidc.as_mut().unwrap().issuer = "http://id.example".into();
-        assert!(d.check().is_err());
+        assert!(check(&d).is_err());
         let mut d = good();
         d.oidc.as_mut().unwrap().client_id = Some("a\nb".into());
-        assert!(d.check().is_err());
+        assert!(check(&d).is_err());
     }
 }

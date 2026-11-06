@@ -11,6 +11,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use axum::{
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use futures::{
     FutureExt,
     future::{BoxFuture, Shared},
@@ -19,7 +23,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, jwk::JwkSet};
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
 
-use crate::config::IssuerConfig;
+use crate::config::{IssuerConfig, check_remote_url, is_remote_url};
 
 /// Clock skew allowance, per spec 04-auth.
 const LEEWAY_SECS: u64 = 60;
@@ -34,8 +38,6 @@ const KEY_TTL: Duration = Duration::from_secs(3600);
 /// Bound how long a slow or hung issuer can hold a fetch attempt.
 const JWKS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const JWKS_TIMEOUT: Duration = Duration::from_secs(10);
-/// The GitHub Actions OIDC issuer, which any repository can mint tokens from.
-const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 /// RS256-pinned validation for one issuer: its `audience` plus every
 /// `extra_audiences` entry is accepted.
@@ -121,22 +123,9 @@ pub struct Authenticator {
 pub struct Subject(pub String);
 
 impl Authenticator {
-    /// Fails on an empty issuer list: garret has no auth-disable mode (spec 04).
+    /// Trusts `issuers` as given: [`IssuerConfig::validate`] is the gate,
+    /// run when the config loads.
     pub fn new(issuers: Vec<IssuerConfig>) -> Result<Self> {
-        if issuers.is_empty() {
-            bail!("no OIDC issuers configured — garret has no auth-disable mode (spec 04)");
-        }
-        for cfg in &issuers {
-            if cfg.issuer == GITHUB_ISSUER
-                && cfg.github_owner_id.is_none()
-                && cfg.repository_ids.is_empty()
-            {
-                bail!(
-                    "issuer {GITHUB_ISSUER} needs github_owner_id or repository_ids: \
-                     any GitHub repository can mint a token for this audience"
-                );
-            }
-        }
         Ok(Self {
             issuers: issuers
                 .into_iter()
@@ -156,11 +145,9 @@ impl Authenticator {
         })
     }
 
-    /// Validates a bearer token and returns its subject, or an error naming
-    /// only what the caller may safely learn (log it via [`loggable`]). A
-    /// verified token that fails an issuer policy gate carries
-    /// [`PolicyRefused`] (`e.is::<PolicyRefused>()`).
-    pub async fn authenticate(&self, token: &str) -> Result<Subject> {
+    /// Validates a bearer token and returns its subject, or the [`Refusal`]
+    /// naming only what the caller may safely learn.
+    async fn authenticate(&self, token: &str) -> Result<Subject, Refusal> {
         let (issuer, verdict) = self.check(token).await;
         let outcome = match &verdict {
             Ok(_) => Outcome::Accepted,
@@ -171,7 +158,7 @@ impl Authenticator {
             "issuer" => issuer, "outcome" => outcome.as_str(),
         )
         .increment(1);
-        verdict.map_err(|r| r.error)
+        verdict
     }
 
     /// The verdict and the issuer label: the configured issuer's URL, never
@@ -245,17 +232,58 @@ impl Authenticator {
     }
 }
 
-/// Context on an [`Authenticator::authenticate`] error: the token verified, but
-/// an issuer policy gate refused it. Callers answer 403 for it (the identity
-/// is known and will stay refused) and 401 for every other failure, some of
-/// which are transient (spec 04).
+/// Why [`bearer`] refused a request.
 #[derive(Debug)]
-pub struct PolicyRefused;
+pub enum Rejection {
+    /// No `Authorization: Bearer` header.
+    Missing,
+    /// A token that failed verification; some causes are transient (a JWKS
+    /// outage), so the client may renew or retry.
+    Invalid(String),
+    /// A verified token an issuer policy gate refused: the identity is known
+    /// and stays refused.
+    Refused(String),
+}
 
-impl std::fmt::Display for PolicyRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("refused by policy")
+impl Rejection {
+    /// Why the token was refused, escaped and bounded for the log (spec 08);
+    /// `None` when no token was sent.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Rejection::Missing => None,
+            Rejection::Invalid(reason) | Rejection::Refused(reason) => Some(reason),
+        }
     }
+
+    /// `403` for [`Rejection::Refused`], so clients neither renew nor retry;
+    /// `401` with `WWW-Authenticate: Bearer` for everything else (spec 04).
+    /// `body` is the service's own error format.
+    pub fn respond(&self, body: impl IntoResponse) -> Response {
+        match self {
+            Rejection::Refused(_) => (StatusCode::FORBIDDEN, body).into_response(),
+            Rejection::Missing | Rejection::Invalid(_) => (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                body,
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Authenticates a request by its `Authorization: Bearer` header.
+pub async fn bearer(auth: &Authenticator, headers: &HeaderMap) -> Result<Subject, Rejection> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(Rejection::Missing)?;
+    auth.authenticate(token)
+        .await
+        .map_err(|refusal| match refusal.outcome {
+            Outcome::Unauthorized(_) => Rejection::Refused(refusal.to_string()),
+            _ => Rejection::Invalid(refusal.to_string()),
+        })
 }
 
 /// The `outcome` label of `garret_auth_validations_total` (spec 08).
@@ -313,20 +341,22 @@ impl Gate {
 }
 
 /// A refused token: its outcome label and the reason for the log.
+#[derive(Debug)]
 struct Refusal {
     outcome: Outcome,
     error: anyhow::Error,
 }
 
 impl Refusal {
-    /// The only constructor, so an [`Outcome::Unauthorized`] refusal always
-    /// carries [`PolicyRefused`] and no other outcome does.
     fn new(outcome: Outcome, error: anyhow::Error) -> Self {
-        let error = match outcome {
-            Outcome::Unauthorized(_) => error.context(PolicyRefused),
-            _ => error,
-        };
         Self { outcome, error }
+    }
+}
+
+/// The reason, escaped and bounded for the log via [`loggable`].
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&loggable(&self.error))
     }
 }
 
@@ -334,7 +364,7 @@ impl Refusal {
 /// attacker-controlled token text (the kid, header fields echoed by parse
 /// errors), so it is escaped, leaving no way to forge a log line, and
 /// bounded.
-pub fn loggable(e: &anyhow::Error) -> String {
+fn loggable(e: &anyhow::Error) -> String {
     const MAX_CHARS: usize = 256;
     let rendered = format!("{e:#}");
     let mut escaped = rendered.escape_debug();
@@ -344,14 +374,13 @@ pub fn loggable(e: &anyhow::Error) -> String {
     }
     out
 }
-/// Fetches and parses an issuer's current key set.
+
 async fn fetch_keys(
     http: &reqwest::Client,
     cfg: &IssuerConfig,
 ) -> Result<HashMap<String, DecodingKey>> {
     let url = jwks_url(http, cfg).await?;
-    let is_remote = url.starts_with("http://") || url.starts_with("https://");
-    let body = if is_remote {
+    let body = if is_remote_url(&url) {
         check_remote_url(&url)?;
         http.get(&url)
             .send()
@@ -375,7 +404,13 @@ async fn fetch_keys(
         .iter()
         .filter_map(|jwk| {
             let kid = jwk.common.key_id.clone()?;
-            DecodingKey::from_jwk(jwk).ok().map(|k| (kid, k))
+            match DecodingKey::from_jwk(jwk) {
+                Ok(key) => Some((kid, key)),
+                Err(e) => {
+                    tracing::warn!("skipping unusable JWK {kid} from {url}: {e}");
+                    None
+                }
+            }
         })
         .collect())
 }
@@ -392,7 +427,7 @@ async fn jwks_url(http: &reqwest::Client, cfg: &IssuerConfig) -> Result<String> 
         "{}/.well-known/openid-configuration",
         cfg.issuer.trim_end_matches('/')
     );
-    check_remote_url(&url)?;
+    // The issuer URL passed `check_remote_url` when the config loaded.
     Ok(http
         .get(&url)
         .send()
@@ -454,17 +489,6 @@ impl Issuer {
             .shared();
         state.in_flight = Some(attempt.clone());
         Some(attempt)
-    }
-}
-
-/// Remote JWKS and discovery URLs must be https; plain http is for a local
-/// dev issuer on a loopback host only.
-fn check_remote_url(url: &str) -> Result<()> {
-    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
-    match (parsed.scheme(), parsed.host_str()) {
-        ("https", Some(_)) => Ok(()),
-        ("http", Some("localhost" | "127.0.0.1" | "[::1]")) => Ok(()),
-        _ => bail!("{url} must be https (http only for loopback hosts)"),
     }
 }
 
@@ -606,21 +630,16 @@ mod tests {
     };
 
     use super::*;
+    use crate::config::GITHUB_ISSUER;
+    use crate::testing::{DEV_ISSUER, dev_issuer};
 
     fn github(owner: &str, refs: &[&str]) -> IssuerConfig {
         IssuerConfig {
-            issuer: "https://token.actions.githubusercontent.com".into(),
-            audience: "garret".into(),
-            extra_audiences: vec![],
-            client_id: None,
+            issuer: GITHUB_ISSUER.into(),
             jwks_url: None,
             github_owner_id: Some(owner.into()),
             ref_patterns: refs.iter().map(|r| (*r).to_owned()).collect(),
-            ref_protected: None,
-            repository_ids: vec![],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
+            ..dev_issuer("unused")
         }
     }
 
@@ -767,28 +786,6 @@ mod tests {
         assert!(with_ref(None).is_err());
     }
 
-    #[test]
-    fn an_unscoped_github_issuer_is_refused_at_startup() {
-        let mut cfg = github("1234", &[]);
-        cfg.github_owner_id = None;
-        let e = Authenticator::new(vec![cfg.clone()]).err().unwrap();
-        assert!(format!("{e:#}").contains("token.actions.githubusercontent.com"));
-        cfg.repository_ids = vec!["42".into()];
-        assert!(Authenticator::new(vec![cfg]).is_ok());
-        assert!(Authenticator::new(vec![github("1234", &[])]).is_ok());
-    }
-
-    #[test]
-    fn remote_jwks_urls_must_be_https_or_loopback() {
-        assert!(check_remote_url("https://id.example/jwks").is_ok());
-        assert!(check_remote_url("http://127.0.0.1:8080/jwks").is_ok());
-        assert!(check_remote_url("http://localhost/jwks").is_ok());
-        assert!(check_remote_url("http://[::1]/jwks").is_ok());
-        assert!(check_remote_url("http://id.example/jwks").is_err());
-        assert!(check_remote_url("http://127.0.0.1.evil.example/jwks").is_err());
-        assert!(check_remote_url("ftp://id.example/jwks").is_err());
-    }
-
     #[tokio::test]
     async fn a_discovered_jwks_uri_is_never_read_as_a_file() {
         let app = axum::Router::new().route(
@@ -888,17 +885,8 @@ mod tests {
     fn pocket_id_grants_on_audience_alone_unless_groups_are_set() {
         let mut cfg = IssuerConfig {
             issuer: "https://id.example".into(),
-            audience: "garret".into(),
-            extra_audiences: vec![],
-            client_id: None,
             jwks_url: None,
-            github_owner_id: None,
-            ref_patterns: vec![],
-            ref_protected: None,
-            repository_ids: vec![],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
+            ..dev_issuer("unused")
         };
         assert!(authorize(&cfg, &claims(None, None, &[])).is_ok());
 
@@ -944,11 +932,6 @@ mod tests {
     }
 
     #[test]
-    fn an_authenticator_with_no_issuers_is_refused() {
-        assert!(Authenticator::new(vec![]).is_err());
-    }
-
-    #[test]
     fn issuer_is_read_from_the_payload_for_routing() {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let payload = URL_SAFE_NO_PAD.encode(br#"{"iss":"https://id.example"}"#);
@@ -957,25 +940,6 @@ mod tests {
             "https://id.example"
         );
         assert!(unverified_issuer("nope").is_err());
-    }
-
-    const DEV_ISSUER: &str = "https://issuer.example";
-
-    fn dev_issuer(jwks_url: &str) -> IssuerConfig {
-        IssuerConfig {
-            issuer: DEV_ISSUER.into(),
-            audience: "garret".into(),
-            extra_audiences: vec![],
-            client_id: None,
-            jwks_url: Some(jwks_url.into()),
-            github_owner_id: None,
-            ref_patterns: vec![],
-            ref_protected: None,
-            repository_ids: vec![],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
-        }
     }
 
     /// Routes to `iss` and names `kid`, with a signature nothing verifies.
@@ -1212,33 +1176,51 @@ mod tests {
         assert!(loggable(&flood).chars().count() <= 257);
     }
 
-    /// A verified token a policy gate refuses is the one failure that carries
-    /// [`PolicyRefused`]; callers answer it 403, everything else 401.
+    /// Only a verified token a policy gate refuses is a 403 without
+    /// `WWW-Authenticate`; a missing, malformed or unverifiable token is a 401
+    /// asking for a bearer token (spec 04).
     #[tokio::test]
-    async fn only_a_verified_token_refused_by_policy_is_a_policy_refusal() {
-        let jwks = std::env::temp_dir().join(format!("garret-jwks-{}", std::process::id()));
-        std::fs::write(&jwks, crate::testing::jwks()).unwrap();
-        let mut cfg = dev_issuer(jwks.to_str().unwrap());
+    async fn bearer_answers_403_only_for_a_policy_refusal() {
+        let jwks = crate::testing::jwks_file();
+        let mut cfg = dev_issuer(jwks.path());
         cfg.repository_ids = vec!["42".into()];
         let auth = Authenticator::new(vec![cfg]).unwrap();
-        let token = |repository_id: &str| {
-            crate::testing::sign(&format!(
-                r#"{{"iss":"{DEV_ISSUER}","sub":"ci","aud":"garret","exp":4102444800,"repository_id":"{repository_id}"}}"#
-            ))
+        let headers = |authorization: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, authorization.parse().unwrap());
+            headers
         };
-        assert!(auth.authenticate(&token("42")).await.is_ok());
-        let refused = auth.authenticate(&token("99")).await.unwrap_err();
-        assert!(refused.is::<PolicyRefused>());
-        assert!(loggable(&refused).contains("repository_id"), "{refused:#}");
-        for bad in ["not-a-jwt".to_owned(), token_with_kid("forged")] {
+        let token = |repository_id: &str| {
+            let token = crate::testing::sign(&format!(
+                r#"{{"iss":"{DEV_ISSUER}","sub":"ci","aud":"garret","exp":4102444800,"repository_id":"{repository_id}"}}"#
+            ));
+            headers(&format!("Bearer {token}"))
+        };
+
+        let subject = bearer(&auth, &token("42")).await.unwrap();
+        assert_eq!(subject.0, format!("{DEV_ISSUER}#ci"));
+
+        let refused = bearer(&auth, &token("99")).await.unwrap_err();
+        assert!(matches!(refused, Rejection::Refused(_)), "{refused:?}");
+        assert!(refused.reason().unwrap().contains("repository_id"));
+        let res = refused.respond(());
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+
+        for sent in [
+            HeaderMap::new(),
+            headers("Basic x"),
+            headers("Bearer not-a-jwt"),
+            headers(&format!("Bearer {}", token_with_kid("forged"))),
+        ] {
+            let rejected = bearer(&auth, &sent).await.unwrap_err();
             assert!(
-                !auth
-                    .authenticate(&bad)
-                    .await
-                    .unwrap_err()
-                    .is::<PolicyRefused>()
+                !matches!(rejected, Rejection::Refused(_)),
+                "{sent:?}: {rejected:?}"
             );
+            let res = rejected.respond(());
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(res.headers()[header::WWW_AUTHENTICATE], "Bearer");
         }
-        let _ = std::fs::remove_file(jwks);
     }
 }

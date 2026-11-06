@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use garret_client::{auth, browse, config, discovery, doctor, nixconf, push, watcher};
-use garret_common::human_bytes;
+use garret_client::{auth, browse, config, discovery, doctor, http, nixconf, push, watcher};
+use garret_common::wire;
 use indicatif::MultiProgress;
 use serde_json::json;
 
@@ -100,7 +100,7 @@ enum Command {
         /// Substring to match against store path names; omit to list everything
         query: Option<String>,
         /// Maximum number of Objects to print
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = wire::DEFAULT_LIMIT)]
         limit: usize,
     },
     /// Print an object's dependency tree
@@ -141,8 +141,7 @@ async fn main() -> Result<()> {
     // A server that never accepts becomes an error instead of a hang. A
     // connection that stalls once open is `push`'s to catch: reqwest's read
     // timeout cannot tell a slow upload from a stuck one.
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
+    let http = http::client_builder()
         .connect_timeout(Duration::from_secs(30))
         // The servers close connections idle for 30 s; retire pooled ones
         // first so an upload is never sent on a connection mid-close.
@@ -168,8 +167,7 @@ async fn main() -> Result<()> {
             // A diagnostic that hangs is a diagnostic that failed: every probe
             // gets a hard timeout, unlike the push path, which gives up only
             // on a stalled connection, never on a slow one.
-            let timed = reqwest::Client::builder()
-                .user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
+            let timed = http::client_builder()
                 .timeout(Duration::from_secs(15))
                 .build()?;
             let checks = doctor::run(&cfg, &timed, path.as_deref()).await;
@@ -177,28 +175,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .filter(|c| c.status == doctor::Status::Fail)
                 .count();
-            if cli.json {
-                println!(
-                    "{}",
-                    json!({
-                        "ok": failed == 0,
-                        "checks": checks.iter().map(|c| json!({
-                            "name": c.name,
-                            "status": c.status.as_str(),
-                            "detail": c.detail,
-                        })).collect::<Vec<_>>(),
-                    })
-                );
-            } else {
-                for check in &checks {
-                    println!(
-                        "{:<4} {:<9} {}",
-                        check.status.as_str(),
-                        check.name,
-                        check.detail
-                    );
-                }
-            }
+            print!("{}", doctor::render(&checks, cli.json));
             // Reported first, then the exit code carries the failure — the
             // same order push uses, so a --json consumer always gets the data.
             if failed > 0 {
@@ -227,43 +204,18 @@ async fn main() -> Result<()> {
             if paths.is_empty() {
                 anyhow::bail!("nothing to push");
             }
-            let pusher = pusher(&cfg, &http, jobs)?;
-            let closure = push::closure(&paths).await?;
-            let closure_len = closure.len();
-            // Paths an upstream cache already signs never enter the
-            // Negotiation; they are reported as `upstream` instead.
-            let (own, upstream) = match no_upstream_filter {
-                true => (closure, Vec::new()),
-                false => push::partition_upstream(closure, &cfg.upstream_keys),
+            let mut pusher = push::Pusher::from_config(&cfg, &http)?;
+            // The config's `jobs` is validated on load; the flag only here.
+            if let Some(jobs) = jobs {
+                anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
+                pusher.jobs = jobs;
+            }
+            let upstream_keys: &[String] = match no_upstream_filter {
+                true => &[],
+                false => &cfg.upstream_keys,
             };
-            let missing = pusher.missing(&own).await?;
-
-            if dry_run {
-                return dry_run_report(cli.json, closure_len, &upstream, &missing);
-            }
-
-            let report = push::Report::start(cli.json, &progress, closure_len, &upstream, &missing);
-            let pushed_any = !missing.is_empty();
-            let mut summary = pusher.push_all(missing, &report).await;
-            // A closure is only substitutable whole, and a path the Negotiation
-            // found present can be gone by the end of the run (evicted, deleted,
-            // or another pusher's upload that never finished). One more
-            // Negotiation after a clean run catches it, and pushes it.
-            let mut recheck = Ok(());
-            if pushed_any && summary.failed == 0 {
-                match pusher.missing(&own).await {
-                    Ok(gone) if gone.is_empty() => {}
-                    Ok(gone) => {
-                        report.rechecked(&gone);
-                        summary += pusher.push_all(gone, &report).await;
-                    }
-                    Err(e) => recheck = Err(e.context("re-checking the closure after pushing")),
-                }
-            }
-            report.finish(&summary);
-            // Reported first, so a --json consumer always sees `done`, then the
-            // exit code carries the failure.
-            recheck?;
+            let summary =
+                push::run(&pusher, &paths, upstream_keys, dry_run, cli.json, &progress).await?;
             if summary.failed > 0 {
                 anyhow::bail!("{} path(s) failed to push", summary.failed);
             }
@@ -276,31 +228,11 @@ async fn main() -> Result<()> {
             socket,
         } => {
             let cfg = load()?;
-            let pusher = pusher(&cfg, &http, None)?;
+            let pusher = push::Pusher::from_config(&cfg, &http)?;
             // Minted once up front so a daemon that cannot authenticate exits
             // saying so, rather than failing every path it sees.
             pusher.tokens.get().await?;
-            let watcher = watcher::Watcher {
-                nix_db: cfg.watch.nix_db.clone(),
-                cursor_path: cursor
-                    .unwrap_or_else(|| cfg.watch.cursor_path.clone())
-                    .into(),
-                poll_interval: Duration::from_secs(cfg.watch.poll_interval_secs),
-                filters: watcher::Filters {
-                    // `[watch]` may override the client-wide upstream list.
-                    upstream_keys: cfg
-                        .watch
-                        .upstream_keys
-                        .clone()
-                        .unwrap_or_else(|| cfg.upstream_keys.clone()),
-                    exclude_patterns: cfg.watch.exclude_patterns.clone(),
-                    own_keys: cfg.public_keys.clone(),
-                },
-                max_attempts: cfg.watch.max_attempts,
-                socket_path: socket
-                    .unwrap_or_else(|| cfg.watch.socket_path.clone())
-                    .into(),
-            };
+            let watcher = watcher::Watcher::from_config(&cfg, cursor, socket);
             if !drain {
                 watcher.run(&pusher, full_sync).await?;
             } else {
@@ -320,25 +252,20 @@ async fn main() -> Result<()> {
 
         Command::List { query, limit } => {
             let cfg = load()?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::list(&http, &puller, &token, query.as_deref(), limit).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let page: browse::Page =
-                serde_json::from_value(raw).context("parsing the object list")?;
-            for object in &page.objects {
-                println!(
-                    "{}  {:<40} {:>12} on disk",
-                    object.hash,
-                    object.name,
-                    human_bytes(object.file_size),
-                );
-            }
-            if page.next_cursor.is_some() {
-                println!("… more results; narrow the query or raise --limit");
-            }
+            let limit_param = limit.to_string();
+            let mut params = vec![("limit", limit_param.as_str())];
+            params.extend(query.as_deref().map(|q| ("q", q)));
+            let render = |page: wire::Page| print!("{}", browse::render_page(&page, limit));
+            show(
+                &cfg,
+                &http,
+                wire::OBJECTS,
+                &params,
+                cli.json,
+                "the object list",
+                render,
+            )
+            .await?;
         }
 
         Command::Tree { hash } => {
@@ -346,51 +273,42 @@ async fn main() -> Result<()> {
             let hash = garret_common::parse_store_hash(&hash).with_context(|| {
                 format!("`{hash}` is not a 32-character store hash or a store path")
             })?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::tree(&http, &puller, &token, hash).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let tree: browse::TreeNode =
-                serde_json::from_value(raw).context("parsing the dependency tree")?;
-            let mut out = String::new();
-            browse::render(&tree, 0, &mut out);
-            print!("{out}");
+            let route = wire::with_hash(wire::OBJECT_TREE, hash);
+            let render = |tree: wire::TreeNode| {
+                let mut out = String::new();
+                browse::render(&tree, 0, &mut out);
+                print!("{out}");
+            };
+            show(
+                &cfg,
+                &http,
+                &route,
+                &[],
+                cli.json,
+                "the dependency tree",
+                render,
+            )
+            .await?;
         }
 
         Command::Pins => {
             let cfg = load()?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::pins(&http, &puller, &token).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let pins: Vec<browse::Pin> =
-                serde_json::from_value(raw).context("parsing the pin list")?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            for pin in &pins {
-                let expiry = match pin.expires_at {
-                    None => "permanent".to_owned(),
-                    Some(t) if t <= now => "expired".to_owned(),
-                    // Unix seconds, not a formatted date: no date dependency
-                    // for one column, and --json is the machine surface.
-                    Some(t) => format!("expires at {t}"),
-                };
-                println!(
-                    "{:<20} {}  {} ({expiry})",
-                    pin.name,
-                    &pin.store_path_hash[..8.min(pin.store_path_hash.len())],
-                    pin.store_path,
-                );
-            }
-            if pins.is_empty() {
-                eprintln!("no pins");
-            }
+            let render = |pins: Vec<wire::Pin>| {
+                print!("{}", browse::render_pins(&pins, garret_common::unix_now()));
+                if pins.is_empty() {
+                    eprintln!("no pins");
+                }
+            };
+            show(
+                &cfg,
+                &http,
+                wire::PINS,
+                &[],
+                cli.json,
+                "the pin list",
+                render,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -441,26 +359,18 @@ async fn login(
     url: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let path = match explicit {
-        Some(p) => std::path::PathBuf::from(p),
-        None => config::path()?,
-    };
-    let exists = path.exists();
-
-    let cfg = match (&url, exists) {
-        // Nothing to go on: no config to re-authenticate against, no URL to
-        // bootstrap from.
-        (None, false) => anyhow::bail!(
-            "no config at {} — run `garret login <pusher-url>` to create one",
-            path.display()
-        ),
+    let cfg = match url {
         // Pure re-authentication. The config is not touched, so a token that
-        // has expired or been revoked costs nothing to replace.
-        (None, true) => config::load(explicit)?,
-        (Some(url), _) => {
+        // has expired or been revoked costs nothing to replace. Without a
+        // config there is nothing to re-authenticate against, and `load`
+        // says to pass a URL.
+        None => config::load(explicit)?,
+        Some(url) => {
+            let path = config::resolve_path(explicit)?;
+            let url = url.trim_end_matches('/');
             let discovered = discovery::fetch(http, url).await?;
-            let rendered = config::render(url.trim_end_matches('/'), &discovered)?;
-            let current = exists.then(|| std::fs::read_to_string(&path).unwrap_or_default());
+            let rendered = config::render(url, &discovered)?;
+            let current = garret_client::files::read_optional(&path)?;
             match current {
                 // Re-running against the server that wrote this config: nothing
                 // to replace, so nothing to refuse.
@@ -499,25 +409,29 @@ async fn login(
         .issuer
         .as_deref()
         .context("`oidc.issuer` is required to log in")?;
-    auth::device_login(http, issuer, client_id, cfg.oidc.resource.as_deref()).await?;
-    println!(
-        "Logged in; refresh token stored at {}",
-        auth::token_path()?.display()
-    );
+    let stored = auth::device_login(http, issuer, client_id, cfg.oidc.resource.as_deref()).await?;
+    match stored {
+        true => println!(
+            "Logged in; refresh token stored at {}",
+            auth::token_path()?.display()
+        ),
+        false => eprintln!(
+            "warning: logged in, but the issuer returned no refresh token, so nothing was \
+             stored and later commands cannot get a token; let client `{client_id}` use \
+             refresh tokens (the `offline_access` scope) at the issuer"
+        ),
+    }
     Ok(())
 }
 
-/// Proves the token is not merely present but accepted — the same probe
-/// `doctor` runs ([`auth::probe_pusher`]), which exercises exactly the
-/// authentication path `push` uses.
+/// Proves the token is not merely present but accepted, with the same
+/// [`push::Pusher::authenticate`] `doctor` runs.
 async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> Result<()> {
-    let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
-    let claims = auth::peek_claims(&token).unwrap_or_default();
-    auth::probe_pusher(http, &cfg.endpoint, &token).await?;
+    let claims = push::Pusher::from_config(cfg, http)?.authenticate().await?;
 
     let issuer = cfg.oidc.issuer.as_deref();
     let expires_at = claims.exp.map(|exp| {
-        let remaining = exp - now();
+        let remaining = exp - garret_common::unix_now();
         format!("{exp} ({})", human_duration(remaining))
     });
 
@@ -566,12 +480,6 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
             cfg.endpoint
         );
     }
-    // Checked again here, not only at login: the config may predate the check
-    // or be hand-edited, and this is the write that makes nix trust the values.
-    discovery::check_url("puller_endpoint", puller)?;
-    for key in &cfg.public_keys {
-        discovery::check_key(key)?;
-    }
 
     if print {
         print!("{}", nixconf::lines(puller, &cfg.public_keys));
@@ -601,85 +509,34 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
     Ok(())
 }
 
-/// `--dry-run` reuses the push schema exactly — same events, same field names —
-/// so a consumer needs one parser rather than two. Upstream-filtered paths keep
-/// their real `upstream` status: the filter runs identically either way.
-fn dry_run_report(
-    as_json: bool,
-    closure: usize,
-    upstream: &[push::PathInfo],
-    missing: &[push::PathInfo],
-) -> Result<()> {
-    let nar_bytes: u64 = missing.iter().map(|p| p.nar_size.max(0) as u64).sum();
-    if as_json {
-        println!(
-            "{}",
-            json!({"event":"negotiated","closure":closure,"upstream":upstream.len(),"missing":missing.len(),"nar_bytes":nar_bytes})
-        );
-        for info in upstream {
-            println!(
-                "{}",
-                json!({"event":"path","path":info.path,"status":"upstream","nar_size":info.nar_size})
-            );
-        }
-        for info in missing {
-            println!(
-                "{}",
-                json!({"event":"path","path":info.path,"status":"would-push","nar_size":info.nar_size})
-            );
-        }
-        println!(
-            "{}",
-            json!({"event":"done","pushed":0,"deduped":0,"failed":0,"nar_bytes":nar_bytes})
-        );
-        return Ok(());
-    }
-    println!(
-        "{}",
-        push::Report::negotiated_line(closure, upstream.len(), missing.len())
-    );
-    for info in upstream {
-        println!("  upstream   {}", info.path);
-    }
-    for info in missing {
-        println!("  would-push {}", info.path);
-    }
-    println!("{} to upload (uncompressed)", human_bytes(nar_bytes as i64));
-    Ok(())
-}
-
-fn pusher(
+/// `list`/`tree`/`pins`: one GET of `route` on the Puller. `--json` prints
+/// the answer verbatim; otherwise it is parsed as `T` and rendered.
+async fn show<T: serde::de::DeserializeOwned>(
     cfg: &config::Config,
     http: &reqwest::Client,
-    jobs: Option<usize>,
-) -> Result<push::Pusher> {
-    let jobs = jobs.unwrap_or(cfg.jobs);
-    anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
-    Ok(push::Pusher {
-        tokens: auth::TokenSource::for_config(http, cfg)?,
-        http: http.clone(),
-        endpoint: cfg.endpoint.clone(),
-        jobs,
-        zstd_level: cfg.zstd_level,
-        max_retries: cfg.max_retries,
-        upload_idle: std::time::Duration::from_secs(cfg.upload_idle_secs),
-    })
-}
-
-async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(String, String)> {
+    route: &str,
+    params: &[(&str, &str)],
+    as_json: bool,
+    what: &str,
+    render: impl FnOnce(T),
+) -> Result<()> {
     let puller = cfg
         .puller_endpoint
-        .clone()
-        .context("set `puller_endpoint` in the config: list/tree query the Puller")?;
+        .as_deref()
+        .context("set `puller_endpoint` in the config: list/tree/pins query the Puller")?;
     let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
-    Ok((puller, token))
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    let mut url = reqwest::Url::parse(&format!("{puller}{route}"))
+        .with_context(|| format!("building the URL for {what}"))?;
+    if !params.is_empty() {
+        url.query_pairs_mut().extend_pairs(params);
+    }
+    let raw = browse::get(http, url, &token, what).await?;
+    if as_json {
+        println!("{raw}");
+        return Ok(());
+    }
+    render(serde_json::from_value(raw).with_context(|| format!("parsing {what}"))?);
+    Ok(())
 }
 
 /// Relative time for a token expiry; the JSON output keeps the raw epoch.

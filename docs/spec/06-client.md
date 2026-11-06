@@ -8,7 +8,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 
 | Command | Behavior |
 |---|---|
-| `garret login [pusher-url] [--force]` | Writes the config from server discovery, then device flow against Pocket ID; stores rotating refresh token |
+| `garret login [pusher-url] [--force]` | Writes the config from server discovery, then device flow against Pocket ID; stores rotating refresh token, or warns that nothing was stored when the issuer returns none |
 | `garret logout` | Deletes the stored refresh token; the config stays |
 | `garret whoami` | Subject, audience, expiry, and a live probe that the Pusher accepts the token |
 | `garret doctor [path]` | Layer-by-layer diagnosis (below); with a path, a Negotiation round answers "is this cached" |
@@ -16,7 +16,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers. With no paths and a non-terminal stdin, reads whitespace-separated paths from stdin until EOF (`nix build --print-out-paths \| garret push`). A path not valid in the local store fails the push with an error naming it |
 | `garret watch-store [--full-sync] [--drain] [--cursor <path>] [--socket <path>]` | Watcher daemon (below); `--drain` pushes what it has not yet and exits, for CI; `--cursor`/`--socket` override `[watch] cursor_path`/`socket_path` |
 | `garret enqueue [paths…] [--socket]` | Wake a running `watch-store` to poll now; paths default to `$OUT_PATHS`, for use as nix's `post-build-hook`. Exits 0 unconditionally |
-| `garret list [query] [--limit N]` | Search/filter cache contents (browse API); prints full 32-character hashes |
+| `garret list [query] [--limit N]` | Search/filter cache contents (browse API); prints full 32-character hashes. `--limit` defaults to the API's 50; when more results remain the output says so, suggesting a larger `--limit` only while N is below the API's cap of 500 |
 | `garret tree <hash\|path>` | Dependency tree (browse API); accepts a 32-character store hash or a store path |
 | `garret pins` | List GC-exempt pins (browse API; set with `garret-admin pin`) |
 | `garret completions <shell>` | bash/zsh/fish completion script |
@@ -57,8 +57,8 @@ quotes or braces, the OIDC audience and client id printable ASCII with no
 whitespace or quotes, and every key `name:base64`. A newline in any of them
 would otherwise become a new nix.conf setting, and an advertised key is
 trusted for every substituter, not just this one. `login` prints the keys it
-wrote; `use` re-checks the URL and keys before writing nix.conf, since the
-config may predate the check or be hand-edited.
+wrote; every command re-checks the URLs and keys when it loads the config,
+since the config may predate the check or be hand-edited.
 
 The written file is a hand-rendered subset with comments, not a serialization
 of the config struct — which would emit every default and the entire `[watch]`
@@ -110,15 +110,16 @@ non-zero if any check failed:
 | `discovery` | `GET /api/v1/discovery` on the Pusher — the server is reachable at all, and its document passes the checks `login` applies |
 | `config` | The local config against the discovery document — drift in `puller_endpoint`, and (device-flow configs only) `[oidc]`, since `garret login` wrote it. Fields the server does not advertise are sparse, not drifted |
 | `keys` | Device-flow configs only: configured `public_keys` against discovery's — a configured key the server no longer signs with fails; *extra* server keys pass with a re-login nudge (rotation in progress) |
-| `auth` | Token acquisition plus the empty-Negotiation liveness probe `whoami` uses (one shared helper) — the token is not merely present but accepted |
+| `auth` | Token acquisition plus the empty Negotiation `whoami` also sends, through the same Negotiation client `push` uses (a 401 renews the token once) — the token is not merely present but accepted |
 | `pull` | The Puller's `/nix-cache-info`, then one narinfo probe. Hit and miss both pass: the question is whether the substituter protocol is served, not whether a given path is cached |
 | `path` | Only with a path argument: one Negotiation round for its hash. Not cached is a `fail`, so the exit code carries the answer for scripts |
 
 A check whose prerequisite failed reports `skip` rather than guessing:
 no discovery document leaves `config` and `keys` nothing to compare
 against, and without an accepted token `path` cannot be asked. Every probe
-runs under a hard timeout — a diagnostic that hangs is a diagnostic that
-failed.
+runs under a hard timeout — 15 s, or the push path's Negotiation timeout
+for the two Negotiations — since a diagnostic that hangs is a diagnostic
+that failed.
 
 Under `--json`, `doctor` emits one object (the checks are the data; the
 failure summary goes to stderr):
@@ -134,10 +135,13 @@ Per the protocol: worker pool of concurrent PUTs, client-side zstd
 (default level 3), idempotent retries. No client metrics endpoint in v1.
 
 Every request carries `User-Agent: garret/<version>`. The configured Pusher
-URL (after any `GARRET_ENDPOINT` override), `oidc.issuer` and the OIDC
-`token_endpoint` and `device_authorization_endpoint` must follow the same
-https rule as discovery (plain `http` only to loopback); a config or issuer
-that breaks it is refused before any token is sent.
+URL (after any `GARRET_ENDPOINT` override), `puller_endpoint`, `oidc.issuer`
+and the OIDC `token_endpoint` and `device_authorization_endpoint` must follow
+the same https rule as discovery (plain `http` only to loopback), and every
+configured key must be `name:base64`; a config or issuer that breaks it is
+refused before any token is sent (`list`, `tree` and `pins` send the token to
+the Puller). Trailing `/`s on `endpoint` (after the override) and
+`puller_endpoint` are dropped on load.
 
 **Retries** run on two schedules. A `429` is the server's queue, not a
 fault: the path waits out `Retry-After` (held between 1 s and 15 minutes,
@@ -205,10 +209,11 @@ an ordinary failure: an upload fails at once, and the watcher logs the
 Negotiation's failure and keeps the batch's paths on the failed list, since
 the Pusher answers 401 for transient causes too (an unreachable issuer JWKS,
 a key rotation), so a restart or drain retries them. A 403 is a permanent
-policy refusal (spec 04): it is never renewed or retried, an upload fails at
-once, and the watcher logs the Negotiation's refusal once at error level,
-naming the Pusher's reason, and does not put the batch's paths on the failed
-list. An older Pusher answers 401 for these, which follows the 401 rule. `GARRET_TOKEN` is used as given and never renewed.
+policy refusal (spec 04): it is never renewed or retried within the push, an
+upload fails at once, and the watcher logs the Negotiation's refusal at error
+level, naming the Pusher's reason, and puts the batch's paths on the failed
+list like any other failed Negotiation, so they push once the policy is fixed;
+`max_attempts` bounds the retries. An older Pusher answers 401 for these, which follows the 401 rule. `GARRET_TOKEN` is used as given and never renewed.
 
 **Upstream filter** (ticket 21; prior art: attic's
 `--upstream-cache-key-name`, cachix's configurable upstreams). During closure
@@ -244,8 +249,9 @@ then does the process exit non-zero.
 `--json` is global. It sends everything human to stderr, so stdout carries only
 data.
 
-- `list` and `tree` emit the browse API's JSON verbatim. The server already has
-  a schema (spec 07); mirroring it client-side would create a second one.
+- `list` and `tree` emit the browse API's JSON verbatim. The human output
+  parses it into the shared `garret_common::wire` types, so spec 07's schema
+  has one definition.
 - `whoami` and `doctor` each emit one object.
 - `push` emits NDJSON, one event per line:
 
@@ -283,7 +289,10 @@ with the total NAR bytes and elapsed time.
 
 `garret use` appends `extra-substituters` and `extra-trusted-public-keys` to
 the user's `~/.config/nix/nix.conf` — never `/etc/nix/nix.conf`, never via
-sudo. Idempotence is a substring match on the URL, not a nix.conf parse.
+sudo. Idempotence is a substring match on the URL, not a nix.conf parse. A
+nix.conf that exists but cannot be read is an error, never rewritten; the
+new contents replace the file by a rename, written where a symlinked nix.conf
+(Home Manager, dotfile managers) points.
 
 It then runs `nix config show substituters` and checks the URL comes back.
 Substituters in a *user's* nix.conf are silently ignored unless that user is in
@@ -308,7 +317,9 @@ configured key, so a rotation has several live at once.
   bursts coalesce into one early poll. `garret enqueue`, registered as
   nix's `post-build-hook` (which passes paths via `$OUT_PATHS`, not
   argv), is the sender — so pushes start the moment a build finishes
-  instead of up to `poll_interval_secs` later. The socket carries no
+  instead of up to `poll_interval_secs` later. A socket left at the path
+  by an earlier run is replaced; anything else there is refused rather
+  than deleted. The socket carries no
   authority (the cursor decides what pushes), so it is mode `0666` and
   a bind failure only warns: the watcher keeps polling, and `enqueue`
   exits 0 even when nothing listens — a hook must never block or fail
@@ -344,13 +355,18 @@ configured key, so a rotation has several live at once.
   failures are on the list. If `nix path-info` rejects a batch, its paths
   are described one by one, so a single bad path cannot fail the rest; a
   failed Negotiation puts the whole batch on the list. The daemon retries the list whenever a poll finds nothing
-  new, up to `max_attempts` (default 5) per path, then logs loudly and
-  leaves the path on the list for a restart (which starts every path's
-  count afresh) or a drain. Paths nix-GC'd before push are dropped
+  new, up to `max_attempts` (default 5) attempts per path, the first push
+  included; the failure that spends the last one logs loudly (with
+  `max_attempts = 1`, the first) and leaves the path on the list for a
+  restart (which starts every path's count afresh) or a drain. Paths nix-GC'd before push are dropped
   silently. The cursor and the list are each replaced whole by a rename,
-  so a kill mid-write cannot lose the backlog.
-- **Bootstrap**: cursor starts at `MAX(id)` (only new paths push) and is
-  written at startup; `--full-sync` opts into walking history from id 0.
+  so a kill mid-write cannot lose the backlog. A cursor or list that exists
+  but cannot be read (or a cursor that is not a number) stops the watcher
+  with an error naming it, rather than reading as a first run or an empty
+  list that would skip or erase the backlog.
+- **Bootstrap**: when no cursor file exists, the cursor starts at `MAX(id)`
+  (only new paths push) and is written at startup; `--full-sync` opts into
+  walking history from id 0.
 - **Drain** (`--drain`): push every path validated after the cursor as of
   invocation, plus the failed list, in batches of 500 (one `nix path-info`
   and one Negotiation each, like a poll), then exit — non-zero, naming the

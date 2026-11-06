@@ -88,7 +88,10 @@ Defaults, all configurable:
   `operation_timeout_secs` (a value of 0 or at least the overall deadline
   is rejected at startup), and above the time to send `part_size` on the
   slowest uplink, or healthy part uploads are cut off. `UploadPart` is not
-  retried, so for it this only shortens the wait for failure.
+  retried, so for it this only shortens the wait for failure. The Pusher
+  and the Puller both check the `[s3]` section at startup (credentials
+  set together, `operation_timeout_secs` at least 1, the attempt deadline
+  inside it), though the Puller only presigns.
 - `[s3] sign_payload` (default off): uploads (`PutObject`, `UploadPart`)
   are sent as `UNSIGNED-PAYLOAD`, so the SDK does not SHA-256 every
   stored byte a second time for SigV4. The headers stay signed, the
@@ -127,7 +130,9 @@ The Puller **does not proxy NAR bytes**. `GET /nar/<hash>.nar.zst`
 answers `307 Temporary Redirect` with a presigned S4 URL (TTL configurable, default 1 h);
 the client fetches bytes directly from S4, which serves Range requests
 itself. Narinfo is still served by the Puller — it holds the signatures
-— so the substituter surface is unchanged from a client's view.
+— so the substituter surface is unchanged from a client's view. A file
+name that is not a store hash's (32 nix-base32 characters, then
+`.narinfo` or `.nar.zst`) answers 404 without a database read.
 
 Rationale: with a remote store, proxying crosses the host's uplink twice
 per byte served. Redirecting removes the Puller from the byte path

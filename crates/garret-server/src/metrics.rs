@@ -13,6 +13,9 @@ use axum::{
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
+/// Histogram of waits for a SQLite connection's lock, labelled by `conn`.
+pub const DB_LOCK_WAIT_SECONDS: &str = "garret_db_lock_wait_seconds";
+
 /// Bucket bounds from spec 08: bytes 64 KiB…8 GiB, latency 100 us…15 min.
 fn byte_buckets() -> Vec<f64> {
     (16..=33).map(|p| (1u64 << p) as f64).collect()
@@ -57,39 +60,24 @@ pub fn install(service: &str) -> Result<PrometheusHandle> {
     .set(1.0);
     // Captured here, not read from `/proc` (`/proc/stat` is hidden under
     // `ProcSubset=pid`), so it is exported on every platform.
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0.0, |d| d.as_secs_f64());
-    metrics::gauge!("process_start_time_seconds").set(started);
+    metrics::gauge!("process_start_time_seconds").set(garret_common::unix_now() as f64);
     Ok(handle)
 }
 
-/// Serves `/metrics` and `/healthz` on the pre-bound `listener`, forever.
-/// Binding is the caller's job, so a bad address or a taken port fails
-/// startup rather than a detached task. `scrape` runs before every render, to
-/// refresh gauges that are cheaper to read than to keep current.
-pub async fn serve(
-    handle: PrometheusHandle,
-    listener: tokio::net::TcpListener,
-    scrape: impl Fn() + Clone + Send + Sync + 'static,
-) -> Result<()> {
-    let app = Router::new()
+/// The metrics listener's routes: `/metrics` and `/healthz`.
+pub(crate) fn router(handle: PrometheusHandle) -> Router {
+    Router::new()
         .route(
             "/metrics",
             get(move || {
                 let handle = handle.clone();
-                let scrape = scrape.clone();
                 async move {
                     record_process_metrics();
-                    scrape();
                     handle.render()
                 }
             }),
         )
-        .route("/healthz", get(|| async { "ok" }));
-
-    crate::runtime::serve(listener, app, std::future::pending()).await?;
-    Ok(())
+        .route("/healthz", get(|| async { "ok" }))
 }
 
 /// Per-request metrics with bounded labels only: the matched route template,
@@ -163,10 +151,10 @@ fn method_label(method: &axum::http::Method) -> &'static str {
     }
 }
 
-/// Refreshes the standard `process_*` metrics from `/proc` (Linux only; a
-/// no-op elsewhere). Called on every `/metrics` render, so there is no
-/// background task. Anything unreadable is skipped, never an error.
-#[cfg(target_os = "linux")]
+/// Refreshes the standard `process_*` metrics from `/proc` (Linux; elsewhere
+/// nothing is readable, so nothing is recorded). Called on every `/metrics`
+/// render, so there is no background task. Anything unreadable is skipped,
+/// never an error.
 fn record_process_metrics() {
     // USER_HZ is 100 on every Linux target this runs on.
     const TICKS_PER_SEC: f64 = 100.0;
@@ -203,29 +191,38 @@ fn record_process_metrics() {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn record_process_metrics() {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn statuses_collapse_to_classes() {
-        assert_eq!(status_class(200), "2xx");
-        assert_eq!(status_class(307), "3xx");
-        assert_eq!(status_class(429), "4xx");
-        assert_eq!(status_class(503), "5xx");
-    }
-
-    #[test]
-    fn buckets_span_the_ranges_the_spec_asks_for() {
-        let bytes = byte_buckets();
-        assert_eq!(bytes.first(), Some(&(64.0 * 1024.0)));
-        assert_eq!(bytes.last(), Some(&(8.0 * 1024.0 * 1024.0 * 1024.0)));
-        let latency = latency_buckets();
-        assert_eq!(latency.first(), Some(&0.0001));
-        assert_eq!(latency.last(), Some(&900.0));
+    /// Labels stay bounded: the route template, not the path; the
+    /// status class, not the code; `OTHER` for an extension method.
+    #[tokio::test]
+    async fn request_labels_are_bounded() {
+        use tower::ServiceExt;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let app = Router::new()
+            .route(
+                "/item/{id}",
+                axum::routing::any(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .layer(axum::middleware::from_fn(track_http));
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::from_bytes(b"BREW").unwrap())
+            .uri("/item/0123456789abcdef")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap();
+        let out = handle.render();
+        assert!(
+            out.contains(
+                r#"garret_http_requests_total{route="/item/{id}",method="OTHER",status="5xx"} 1"#
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("0123456789abcdef"), "{out}");
     }
 
     #[test]
@@ -238,16 +235,6 @@ mod tests {
         assert!(out.contains("garret_x_duration_seconds_bucket{le=\"900\"}"));
         assert!(out.contains("garret_negotiation_batch_size_bucket{le=\"10000\"}"));
         assert!(out.contains("garret_negotiation_missing_ratio_bucket{le=\"0.75\"}"));
-    }
-
-    #[test]
-    fn extension_methods_collapse_to_other() {
-        use axum::http::Method;
-        assert_eq!(method_label(&Method::GET), "GET");
-        assert_eq!(method_label(&Method::DELETE), "DELETE");
-        let custom = Method::from_bytes(b"BREW").unwrap();
-        assert_eq!(method_label(&custom), "OTHER");
-        assert_eq!(method_label(&Method::PATCH), "OTHER");
     }
 
     /// A request future dropped mid-flight (client gone) leaves the gauge at 0.

@@ -18,7 +18,7 @@ use tokio::net::UnixDatagram;
 
 use garret_common::hash_of_store_path;
 
-use crate::push::{PathInfo, Pusher, Refused, retain_missing};
+use crate::push::{PathInfo, Pusher, Refused, key_name, retain_missing, signed_by};
 
 /// Paths per poll, drain chunk, and retry chunk: one `nix path-info` and one
 /// Negotiation each, so argv and request bodies stay bounded.
@@ -27,75 +27,86 @@ const BATCH_SIZE: usize = 500;
 /// The daemon's assembled settings; [`run`](Watcher::run) is its whole life.
 pub struct Watcher {
     /// Path to the Nix database (normally `/nix/var/nix/db/db.sqlite`).
-    pub nix_db: String,
+    nix_db: String,
     /// Where the Watcher Cursor persists across restarts.
-    pub cursor_path: PathBuf,
+    cursor_path: PathBuf,
     /// How long to sleep when a poll finds nothing new.
-    pub poll_interval: Duration,
+    poll_interval: Duration,
     /// What not to push.
-    pub filters: Filters,
+    filters: Filters,
     /// Push attempts per path in one process, the first included, before the
     /// watcher leaves it on the failed list for a restart or a drain.
-    pub max_attempts: u32,
+    max_attempts: u32,
     /// Where the wake socket listens; `garret enqueue` pokes it to collapse
     /// push latency from `poll_interval` to "right after the build".
-    pub socket_path: PathBuf,
+    socket_path: PathBuf,
 }
 
 /// Why a newly-valid path might not be worth pushing (spec 06).
 #[derive(Debug, Default, Clone)]
-pub struct Filters {
+struct Filters {
     /// Signed by one of these upstreams already — someone else serves it.
-    pub upstream_keys: Vec<String>,
+    upstream_keys: Vec<String>,
     /// Substring matches, so an operator can exclude a whole family of paths.
-    pub exclude_patterns: Vec<String>,
+    exclude_patterns: Vec<String>,
     /// The cache's own `public_keys` (`name:base64`); a path signed by one of
     /// these names came from the cache, so pushing it back is pointless.
-    pub own_keys: Vec<String>,
+    own_keys: Vec<String>,
 }
 
 /// One newly-valid store path, as the Nix database describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidPath {
+struct ValidPath {
     /// `ValidPaths.id` — AUTOINCREMENT, so also the cursor value.
-    pub id: i64,
+    id: i64,
     /// Full store path.
-    pub path: String,
+    path: String,
     /// Its signatures, `key-name:base64` each, for the upstream filter.
-    pub sigs: Vec<String>,
+    sigs: Vec<String>,
 }
 
 impl Filters {
     /// `.drv` files are build recipes nix fetches from its own sources, and a
     /// path already signed upstream is already served by someone else. Keeps
     /// `-source` and fixed-output paths (spec 06).
-    pub fn should_skip(&self, path: &ValidPath) -> Option<&'static str> {
+    fn should_skip(&self, path: &ValidPath) -> Option<&'static str> {
         if path.path.ends_with(".drv") {
             return Some("drv");
         }
         if self.exclude_patterns.iter().any(|p| path.path.contains(p)) {
             return Some("excluded");
         }
-        if crate::push::signed_upstream(&path.sigs, &self.upstream_keys) {
+        if signed_by(&path.sigs, self.upstream_keys.iter().map(String::as_str)) {
             return Some("upstream");
         }
         // Our own signature means this path came from the cache (or was
         // already pushed to it): CI needs no upstream_keys entry for that.
-        if path.sigs.iter().any(|sig| {
-            let signer = sig.split(':').next().unwrap_or_default();
-            self.own_keys
-                .iter()
-                .any(|key| key.split(':').next().unwrap_or_default() == signer)
-        }) {
+        if signed_by(&path.sigs, self.own_keys.iter().map(|key| key_name(key))) {
             return Some("own");
         }
         None
+    }
+
+    /// The store paths of `batch` worth pushing, in order; the rest are
+    /// skipped with their reason logged.
+    fn select(&self, batch: &[ValidPath]) -> Vec<String> {
+        batch
+            .iter()
+            .filter(|entry| match self.should_skip(entry) {
+                Some(reason) => {
+                    tracing::debug!(path = entry.path, reason, "skipping");
+                    false
+                }
+                None => true,
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
     }
 }
 
 /// Opens the Nix database read-only and checks the schema is the one we index
 /// against — a silent schema change would make the cursor meaningless.
-pub fn open_nix_db(path: &str) -> Result<Connection> {
+fn open_nix_db(path: &str) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -108,7 +119,7 @@ pub fn open_nix_db(path: &str) -> Result<Connection> {
             |row| row.get::<_, i64>(0),
         )
         .map(|n| n > 0)
-        .unwrap_or(false);
+        .with_context(|| format!("reading the schema of the nix database at {path}"))?;
     if !has_valid_paths {
         bail!("{path} has no ValidPaths table — is this a nix database?");
     }
@@ -117,7 +128,7 @@ pub fn open_nix_db(path: &str) -> Result<Connection> {
 
 /// Paths validated after `cursor`, oldest first. Signatures come along so the
 /// upstream filter needs no second query.
-pub fn paths_after(conn: &Connection, cursor: i64, limit: usize) -> Result<Vec<ValidPath>> {
+fn paths_after(conn: &Connection, cursor: i64, limit: usize) -> Result<Vec<ValidPath>> {
     let mut stmt = conn
         .prepare("SELECT id, path, sigs FROM ValidPaths WHERE id > ?1 ORDER BY id ASC LIMIT ?2")?;
     Ok(stmt
@@ -138,7 +149,7 @@ pub fn paths_after(conn: &Connection, cursor: i64, limit: usize) -> Result<Vec<V
 
 /// The newest `ValidPaths.id`, or 0 in an empty store — where a fresh cursor
 /// bootstraps so only paths validated from now on push.
-pub fn max_id(conn: &Connection) -> Result<i64> {
+fn max_id(conn: &Connection) -> Result<i64> {
     Ok(
         conn.query_row("SELECT COALESCE(MAX(id), 0) FROM ValidPaths", [], |r| {
             r.get(0)
@@ -146,81 +157,144 @@ pub fn max_id(conn: &Connection) -> Result<i64> {
     )
 }
 
-/// Reads the persisted cursor; `None` (missing or unparseable file) means
-/// first run and triggers the bootstrap in [`Watcher::run`].
-pub fn read_cursor(path: &std::path::Path) -> Option<i64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Reads the persisted cursor; `None` (no file) means first run and triggers
+/// the bootstrap in [`Watcher::run`]. A cursor that is there but unreadable is
+/// an error: bootstrapping past it would silently skip the backlog.
+fn read_cursor(path: &Path) -> Result<Option<i64>> {
+    crate::files::read_optional(path)?
+        .map(|text| {
+            text.trim()
+                .parse()
+                .with_context(|| format!("cursor {path:?} holds {text:?}, not a ValidPaths id"))
+        })
+        .transpose()
 }
 
-/// Persists the cursor, creating its directory on first write.
-pub fn write_cursor(path: &Path, cursor: i64) -> Result<()> {
-    write_atomic(path, &cursor.to_string()).with_context(|| format!("writing cursor {path:?}"))
+/// Persists the cursor, replaced whole: the daemon is stopped by a signal (CI
+/// kills it before draining), and a kill mid-write must not leave an empty
+/// cursor that bootstraps past the backlog.
+fn write_cursor(path: &Path, cursor: i64) -> Result<()> {
+    crate::files::write_atomic(path, cursor.to_string().as_bytes(), 0o666)
 }
 
-/// Where the failed list lives: beside the cursor, as `<cursor>.failed`.
+/// The failed list, `<cursor>.failed` beside the cursor, one store path per
+/// line, and the attempts this process has spent on each entry.
 ///
 /// The cursor passes a path whether or not its push worked — one poison path
-/// must never wedge the pipeline — so a failure is recorded here instead, one
-/// store path per line, until a later poll, a restart or a drain pushes it.
-pub fn failed_path(cursor_path: &Path) -> PathBuf {
-    let mut name = cursor_path.file_name().unwrap_or_default().to_os_string();
-    name.push(".failed");
-    cursor_path.with_file_name(name)
+/// must never wedge the pipeline — so a failure is recorded here instead,
+/// until a later poll, a restart or a drain pushes it. Attempts are not
+/// persisted, so a restart or a drain gives every failed path a fresh budget.
+struct FailedList {
+    file: PathBuf,
+    paths: BTreeSet<String>,
+    attempts: HashMap<String, u32>,
 }
 
-/// Reads the failed list; a missing file is an empty list.
-pub fn read_failed(path: &Path) -> BTreeSet<String> {
-    std::fs::read_to_string(path)
-        .map(|text| {
-            text.lines()
-                .filter(|l| !l.is_empty())
-                .map(str::to_owned)
-                .collect()
+impl FailedList {
+    /// Reads the list beside `cursor_path`; a missing file is an empty list,
+    /// an unreadable one an error, since the next save would erase it.
+    fn load(cursor_path: &Path) -> Result<Self> {
+        let mut name = cursor_path.file_name().unwrap_or_default().to_os_string();
+        name.push(".failed");
+        let file = cursor_path.with_file_name(name);
+        let paths = crate::files::read_optional(&file)?
+            .map(|text| {
+                text.lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            file,
+            paths,
+            attempts: HashMap::new(),
         })
-        .unwrap_or_default()
-}
+    }
 
-/// Persists the failed list, removing the file once it is empty.
-pub fn write_failed(path: &Path, failed: &BTreeSet<String>) -> Result<()> {
-    if failed.is_empty() {
-        return match std::fs::remove_file(path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                Err(e).with_context(|| format!("removing {path:?}"))
+    /// Puts `path` on the list; the attempts now spent on it in this process.
+    fn record_failure(&mut self, path: &str) -> u32 {
+        self.paths.insert(path.to_owned());
+        let spent = self.attempts.entry(path.to_owned()).or_default();
+        *spent += 1;
+        *spent
+    }
+
+    /// Takes a pushed `path` off the list.
+    fn record_success(&mut self, path: &str) {
+        self.paths.remove(path);
+        self.attempts.remove(path);
+    }
+
+    /// The listed paths this process has tried fewer than `max` times.
+    fn due(&self, max: u32) -> Vec<String> {
+        self.paths
+            .iter()
+            .filter(|p| self.attempts.get(*p).copied().unwrap_or(0) < max)
+            .cloned()
+            .collect()
+    }
+
+    /// Applies one pushed `chunk`: each path in `still_failed` is recorded
+    /// and handed to `on_fail` with the attempts now spent on it, every other
+    /// path comes off the list. Returns how many came off.
+    fn apply(
+        &mut self,
+        chunk: &[String],
+        still_failed: Vec<String>,
+        mut on_fail: impl FnMut(&str, u32),
+    ) -> usize {
+        let still_failed: HashSet<String> = still_failed.into_iter().collect();
+        let mut pushed = 0;
+        for path in chunk {
+            if still_failed.contains(path) {
+                on_fail(path, self.record_failure(path));
+            } else {
+                self.record_success(path);
+                pushed += 1;
             }
-            _ => Ok(()),
-        };
+        }
+        pushed
     }
-    let text: String = failed.iter().map(|p| format!("{p}\n")).collect();
-    write_atomic(path, &text).with_context(|| format!("writing failed list {path:?}"))
+
+    /// Persists the list, replaced whole, removing the file once it is empty.
+    fn save(&self) -> Result<()> {
+        if self.paths.is_empty() {
+            return crate::files::remove_optional(&self.file)
+                .with_context(|| format!("removing {:?}", self.file));
+        }
+        let text: String = self.paths.iter().map(|p| format!("{p}\n")).collect();
+        crate::files::write_atomic(&self.file, text.as_bytes(), 0o666)
+    }
 }
 
-/// Replaces `path` whole: the daemon is stopped by a signal (CI kills it before
-/// draining), and a kill between truncate and write would leave an empty
-/// cursor that bootstraps past the backlog. The temporary file is named per
-/// process, so a drain overlapping a daemon cannot rename the other's
-/// half-written file into place.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Logs a failed push of `path` with `spent` of its `max` attempts used.
+fn log_failure(path: &str, spent: u32, max: u32) {
+    if spent >= max {
+        tracing::error!(
+            path,
+            attempts = spent,
+            "giving up on this path until the watcher restarts or \
+             `garret watch-store --drain` runs"
+        );
+    } else if spent == 1 {
+        tracing::warn!(path, "on the failed list, retried when idle");
+    } else {
+        tracing::warn!(path, attempts = spent, "retry failed");
     }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
-/// Binds the wake socket `garret enqueue` datagrams land on. A stale file from
-/// an unclean shutdown is unlinked first, so the only warning-worthy failure
-/// left is a real one (usually: the directory is not writable by this user).
-pub fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
+/// Binds the wake socket `garret enqueue` datagrams land on. A stale socket
+/// from an unclean shutdown is unlinked first, so the only warning-worthy
+/// failure left is a real one (usually: the directory is not writable by this
+/// user, or something other than a socket sits at `path`).
+fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket directory {parent:?}"))?;
     }
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("unlinking stale socket {path:?}"))?;
-    }
+    garret_common::remove_stale_socket(path)
+        .with_context(|| format!("unlinking stale socket {path:?}"))?;
     let socket =
         UnixDatagram::bind(path).with_context(|| format!("binding wake socket {path:?}"))?;
     // ponytail: 0666 on purpose — the socket carries no authority. A datagram
@@ -235,7 +309,7 @@ pub fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
 /// Sleeps until `interval` elapses or a wake datagram arrives, whichever comes
 /// first. Bursts coalesce: whatever queued is drained before returning, so a
 /// hook firing fifty times costs one early poll.
-pub async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
+async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
     let Some(socket) = socket else {
         return tokio::time::sleep(interval).await;
     };
@@ -252,13 +326,42 @@ pub async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
 }
 
 impl Watcher {
+    /// The Watcher `cfg`'s `[watch]` table describes; `cursor_path` and
+    /// `socket_path` override it, as the `--cursor` and `--socket` flags do.
+    pub fn from_config(
+        cfg: &crate::config::Config,
+        cursor_path: Option<String>,
+        socket_path: Option<String>,
+    ) -> Self {
+        let watch = &cfg.watch;
+        Self {
+            nix_db: watch.nix_db.clone(),
+            cursor_path: cursor_path
+                .unwrap_or_else(|| watch.cursor_path.clone())
+                .into(),
+            poll_interval: Duration::from_secs(watch.poll_interval_secs),
+            filters: Filters {
+                upstream_keys: watch
+                    .upstream_keys
+                    .clone()
+                    .unwrap_or_else(|| cfg.upstream_keys.clone()),
+                exclude_patterns: watch.exclude_patterns.clone(),
+                own_keys: cfg.public_keys.clone(),
+            },
+            max_attempts: watch.max_attempts,
+            socket_path: socket_path
+                .unwrap_or_else(|| watch.socket_path.clone())
+                .into(),
+        }
+    }
+
     /// Runs until killed. The cursor always advances: one poison path must
     /// never wedge the pipeline, so a failed push goes on the failed list and
     /// the watcher moves on, retrying it on idle polls up to `max_attempts`
     /// times, then loudly giving up until a restart or a drain (spec 06).
     pub async fn run(&self, pusher: &Pusher, full_sync: bool) -> Result<()> {
         let conn = open_nix_db(&self.nix_db)?;
-        let mut cursor = match read_cursor(&self.cursor_path) {
+        let mut cursor = match read_cursor(&self.cursor_path)? {
             Some(cursor) => cursor,
             // Bootstrap at the end of history: only new paths push, unless
             // --full-sync opts into walking everything.
@@ -285,28 +388,20 @@ impl Watcher {
             }
         };
 
-        let failed_file = failed_path(&self.cursor_path);
-        let mut failed = read_failed(&failed_file);
-        // Attempts spent in this process. The list itself outlives it, so a
-        // restart or a drain gives every failed path a fresh budget.
-        let mut attempts: HashMap<String, u32> = HashMap::new();
+        let mut failed = FailedList::load(&self.cursor_path)?;
 
         loop {
             let batch = paths_after(&conn, cursor, BATCH_SIZE)?;
             let Some(newest) = batch.last().map(|entry| entry.id) else {
-                self.retry_failed(pusher, &mut failed, &mut attempts)
-                    .await?;
+                self.retry_failed(pusher, &mut failed).await?;
                 wait_for_wake(wake.as_ref(), self.poll_interval).await;
                 continue;
             };
 
-            // One Negotiation and one `nix path-info` for the whole poll.
-            for path in self.push_batch(pusher, &self.select(&batch)).await {
-                tracing::warn!(path, "on the failed list, retried when idle");
-                attempts.insert(path.clone(), 1);
-                failed.insert(path);
+            for path in push_batch(pusher, &self.filters.select(&batch)).await {
+                log_failure(&path, failed.record_failure(&path), self.max_attempts);
             }
-            write_failed(&failed_file, &failed)?;
+            failed.save()?;
             // Advance regardless of outcome — an old cursor is a backlog,
             // but a stuck cursor is an outage. Written once the whole batch
             // is handled, so a crash mid-batch re-pushes it (Negotiation makes
@@ -318,46 +413,21 @@ impl Watcher {
 
     /// One more try for each failed path with attempts left in this process,
     /// in batches of `BATCH_SIZE`.
-    async fn retry_failed(
-        &self,
-        pusher: &Pusher,
-        failed: &mut BTreeSet<String>,
-        attempts: &mut HashMap<String, u32>,
-    ) -> Result<()> {
-        let due: Vec<String> = failed
-            .iter()
-            .filter(|p| attempts.get(*p).copied().unwrap_or(0) < self.max_attempts)
-            .cloned()
-            .collect();
+    async fn retry_failed(&self, pusher: &Pusher, failed: &mut FailedList) -> Result<()> {
+        let due = failed.due(self.max_attempts);
         if due.is_empty() {
             return Ok(());
         }
-        // In batches the size of a poll, so a long failed list never becomes
-        // one huge argv or an oversized Negotiation body.
         for chunk in due.chunks(BATCH_SIZE) {
-            let still: HashSet<String> = self.push_batch(pusher, chunk).await.into_iter().collect();
-            for path in chunk {
-                if !still.contains(path) {
-                    tracing::info!(path, "pushed on retry");
-                    attempts.remove(path);
-                    failed.remove(path);
-                    continue;
-                }
-                let count = attempts.entry(path.clone()).or_default();
-                *count += 1;
-                if *count >= self.max_attempts {
-                    tracing::error!(
-                        path,
-                        attempts = *count,
-                        "giving up on this path until the watcher restarts or \
-                         `garret watch-store --drain` runs"
-                    );
-                } else {
-                    tracing::warn!(path, attempts = *count, "retry failed");
-                }
+            let still_failed = push_batch(pusher, chunk).await;
+            let pushed = failed.apply(chunk, still_failed, |path, spent| {
+                log_failure(path, spent, self.max_attempts)
+            });
+            if pushed > 0 {
+                tracing::info!(pushed, "pushed on retry");
             }
         }
-        write_failed(&failed_path(&self.cursor_path), failed)
+        failed.save()
     }
 
     /// Pushes everything validated after the cursor as of now, and every path
@@ -367,7 +437,7 @@ impl Watcher {
     pub async fn drain(&self, pusher: &Pusher, full_sync: bool) -> Result<Vec<String>> {
         let conn = open_nix_db(&self.nix_db)?;
         let target = max_id(&conn)?;
-        let mut cursor = match read_cursor(&self.cursor_path) {
+        let mut cursor = match read_cursor(&self.cursor_path)? {
             Some(cursor) => cursor,
             None if full_sync => 0,
             // Nothing recorded where to start, so "nothing to push" would be
@@ -378,9 +448,8 @@ impl Watcher {
                 self.cursor_path
             ),
         };
-        let failed_file = failed_path(&self.cursor_path);
-        let mut failed = read_failed(&failed_file);
-        let mut todo: Vec<String> = failed.iter().cloned().collect();
+        let mut failed = FailedList::load(&self.cursor_path)?;
+        let mut todo: Vec<String> = failed.paths.iter().cloned().collect();
         while cursor < target {
             let mut batch = paths_after(&conn, cursor, BATCH_SIZE)?;
             // Paths validated after the drain began are the daemon's (or the
@@ -391,101 +460,83 @@ impl Watcher {
             };
             cursor = newest;
             todo.extend(
-                self.select(&batch)
+                self.filters
+                    .select(&batch)
                     .into_iter()
-                    .filter(|path| !failed.contains(path)),
+                    .filter(|path| !failed.paths.contains(path)),
             );
         }
         tracing::info!(cursor, paths = todo.len(), "draining");
 
-        // Oldest first, in batches the size of a poll: one `nix path-info`
-        // and one Negotiation each, and an argv that stays small.
         for chunk in todo.chunks(BATCH_SIZE) {
-            let still_failed = self.push_batch(pusher, chunk).await;
-            for path in chunk {
-                if still_failed.contains(path) {
-                    tracing::error!(path, "push failed");
-                    failed.insert(path.clone());
-                } else {
-                    failed.remove(path);
-                }
-            }
+            let still_failed = push_batch(pusher, chunk).await;
+            failed.apply(chunk, still_failed, |path, _| {
+                tracing::error!(path, "push failed")
+            });
         }
-        write_failed(&failed_file, &failed)?;
+        failed.save()?;
         write_cursor(&self.cursor_path, cursor)?;
-        Ok(failed.into_iter().collect())
+        Ok(failed.paths.into_iter().collect())
     }
+}
 
-    /// The store paths of `batch` worth pushing, in order; the rest are
-    /// skipped with their reason logged.
-    fn select(&self, batch: &[ValidPath]) -> Vec<String> {
-        batch
-            .iter()
-            .filter(|entry| match self.filters.should_skip(entry) {
-                Some(reason) => {
-                    tracing::debug!(path = entry.path, reason, "skipping");
-                    false
-                }
-                None => true,
-            })
-            .map(|entry| entry.path.clone())
-            .collect()
+/// Pushes a batch of paths with one `nix path-info` and one Negotiation,
+/// returning the paths that failed (never an error: a failure puts paths on
+/// the failed list, it does not stop the watcher).
+async fn push_batch(pusher: &Pusher, paths: &[String]) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
     }
+    let (infos, mut failed) = describe(paths).await;
+    failed.extend(push_described(pusher, infos).await);
+    failed
+}
 
-    /// Pushes a batch of paths with one `nix path-info` and one Negotiation,
-    /// returning the paths that failed (never an error: a failure puts paths
-    /// on the failed list, it does not stop the watcher).
-    ///
-    /// The Negotiation names the batch and its *direct* references, not whole
-    /// closures. Dependencies need no upload from this batch (they are
-    /// pushed as their own newly-valid paths), but a present one must still
-    /// be named, because naming it is what refreshes its `pushed_at`: until
-    /// this batch lands nothing in the cache refers to it, and without the
-    /// refresh GC could see it as an unreferenced old root (spec 05
-    /// `PUSH_GRACE`). Anything deeper is kept by its referrer's `object_refs`
-    /// edges, so closure-wide Negotiations bought nothing but load.
-    async fn push_batch(&self, pusher: &Pusher, paths: &[String]) -> Vec<String> {
-        if paths.is_empty() {
-            return Vec::new();
-        }
-        let (infos, mut failed) = describe(paths).await;
-        if infos.is_empty() {
-            return failed;
-        }
-        let hashes = negotiation_hashes(&infos);
-        let missing = match pusher.negotiate(&hashes).await {
-            Ok(missing) => missing,
-            // A 403 is a permanent policy refusal: retrying cannot succeed,
-            // so say it once and leave the paths off the failed list.
-            Err(e) if e.is::<Refused>() => {
-                tracing::error!(paths = infos.len(), "{e:#}; dropping the batch");
-                return failed;
-            }
-            // Any other failure keeps the paths on the failed list, a 401
-            // that survives renewal included: the Pusher answers 401 for
-            // transient causes too (JWKS fetch failure, key rotation).
-            Err(e) => {
+/// The Negotiation and uploads for described paths; the paths that failed.
+///
+/// The Negotiation names the batch and its *direct* references, not whole
+/// closures. Dependencies need no upload from this batch (they are pushed as
+/// their own newly-valid paths), but a present one must still be named,
+/// because naming it is what refreshes its `pushed_at`: until this batch
+/// lands nothing in the cache refers to it, and without the refresh GC could
+/// see it as an unreferenced old root (spec 05 `PUSH_GRACE`). Anything deeper
+/// is kept by its referrer's `object_refs` edges, so closure-wide
+/// Negotiations bought nothing but load.
+async fn push_described(pusher: &Pusher, infos: Vec<PathInfo>) -> Vec<String> {
+    if infos.is_empty() {
+        return Vec::new();
+    }
+    let hashes = negotiation_hashes(&infos);
+    let missing = match pusher.negotiate(&hashes).await {
+        Ok(missing) => missing,
+        // Every failure keeps the paths on the failed list. A 403 is a policy
+        // refusal no retry fixes until the policy changes, so it is said
+        // loudly with the Pusher's reason; `max_attempts` bounds the retries.
+        // A 401 that survives renewal is transient (JWKS fetch failure, key
+        // rotation) and stays a warning.
+        Err(e) => {
+            if e.is::<Refused>() {
+                tracing::error!(paths = infos.len(), "negotiation refused: {e:#}");
+            } else {
                 tracing::warn!(paths = infos.len(), "negotiation failed: {e:#}");
-                failed.extend(infos.into_iter().map(|info| info.path));
-                return failed;
             }
-        };
-        let to_push = retain_missing(&infos, &missing);
-        tracing::debug!(
-            batch = infos.len(),
-            negotiated = hashes.len(),
-            missing = to_push.len(),
-            "negotiated"
-        );
-        if !to_push.is_empty() {
-            // The daemon reports per path into the journal and draws no bar.
-            let (_, pushed_failed) = pusher
-                .push_tracked(to_push, &crate::push::Report::plain())
-                .await;
-            failed.extend(pushed_failed);
+            return infos.into_iter().map(|info| info.path).collect();
         }
-        failed
+    };
+    let to_push = retain_missing(&infos, &missing);
+    tracing::debug!(
+        batch = infos.len(),
+        negotiated = hashes.len(),
+        missing = to_push.len(),
+        "negotiated"
+    );
+    if to_push.is_empty() {
+        return Vec::new();
     }
+    let (_, failed) = pusher
+        .push_tracked(to_push, &crate::push::Report::plain())
+        .await;
+    failed
 }
 
 /// `nix path-info` for a batch, non-recursive. A path that errors poisons the
@@ -585,9 +636,11 @@ mod tests {
         );
     }
 
+    /// Real time: under a paused clock tokio auto-advances past the 30 s sleep
+    /// before the IO driver reports the queued datagram.
     #[tokio::test]
     async fn a_wake_datagram_cuts_the_sleep_short() {
-        let dir = std::env::temp_dir().join(format!("garret-wake-{}", std::process::id()));
+        let dir = crate::testing::scratch_dir();
         let sock_path = dir.join("watch.sock");
         let socket = bind_wake_socket(&sock_path).unwrap();
 
@@ -614,38 +667,110 @@ mod tests {
 
         // Rebinding over the live socket file is the stale-socket dance.
         bind_wake_socket(&sock_path).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn the_cursor_round_trips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("garret-cursor-{}", std::process::id()));
+        let dir = crate::testing::scratch_dir();
         let file = dir.join("cursor");
-        assert_eq!(read_cursor(&file), None);
+        assert_eq!(read_cursor(&file).unwrap(), None);
         write_cursor(&file, 42).unwrap();
-        assert_eq!(read_cursor(&file), Some(42));
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(read_cursor(&file).unwrap(), Some(42));
+        // A cursor that is there but unreadable is not a first run.
+        std::fs::write(&file, "").unwrap();
+        assert!(read_cursor(&file).is_err());
     }
 
     /// The failed list is what a restart or a drain retries, so it must
     /// survive the process, and an empty one must not linger as a file.
     #[test]
     fn the_failed_list_lives_beside_the_cursor_and_goes_when_empty() {
-        let dir = std::env::temp_dir().join(format!("garret-failed-{}", std::process::id()));
-        let file = failed_path(&dir.join("watcher-cursor"));
-        assert_eq!(file, dir.join("watcher-cursor.failed"));
-        assert!(read_failed(&file).is_empty());
+        let dir = crate::testing::scratch_dir();
+        let cursor = dir.join("watcher-cursor");
+        let file = dir.join("watcher-cursor.failed");
+        let mut list = FailedList::load(&cursor).unwrap();
+        assert!(list.paths.is_empty());
 
-        let list: BTreeSet<String> = ["/nix/store/bbb-y", "/nix/store/aaa-x"]
-            .map(String::from)
-            .into();
-        write_failed(&file, &list).unwrap();
-        assert_eq!(read_failed(&file), list);
+        list.record_failure("/nix/store/bbb-y");
+        list.record_failure("/nix/store/aaa-x");
+        list.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "/nix/store/aaa-x\n/nix/store/bbb-y\n"
+        );
+        assert_eq!(FailedList::load(&cursor).unwrap().paths, list.paths);
 
-        write_failed(&file, &BTreeSet::new()).unwrap();
+        list.record_success("/nix/store/aaa-x");
+        list.record_success("/nix/store/bbb-y");
+        list.save().unwrap();
         assert!(!file.exists());
-        write_failed(&file, &BTreeSet::new()).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
+        list.save().unwrap();
+    }
+
+    /// Each failure spends one of the path's attempts in this process; a
+    /// success clears it, and a reload (a restart or a drain) starts afresh.
+    #[test]
+    fn failed_paths_are_due_until_their_attempts_run_out() {
+        let dir = crate::testing::scratch_dir();
+        let cursor = dir.join("watcher-cursor");
+        let mut list = FailedList::load(&cursor).unwrap();
+        assert_eq!(list.record_failure("/nix/store/aaa-x"), 1);
+        // `max_attempts = 1`: the first failure was the only attempt.
+        assert!(list.due(1).is_empty());
+        assert_eq!(list.due(2), ["/nix/store/aaa-x"]);
+        assert_eq!(list.record_failure("/nix/store/aaa-x"), 2);
+        assert!(list.due(2).is_empty());
+        list.save().unwrap();
+
+        let mut reloaded = FailedList::load(&cursor).unwrap();
+        assert_eq!(reloaded.due(1), ["/nix/store/aaa-x"]);
+        reloaded.record_success("/nix/store/aaa-x");
+        assert!(reloaded.due(5).is_empty());
+        assert_eq!(reloaded.record_failure("/nix/store/aaa-x"), 1);
+    }
+
+    /// A pushed chunk takes its successes off the list and spends an attempt
+    /// on each path that failed again, reporting it with the new count.
+    #[test]
+    fn applying_a_chunk_clears_successes_and_counts_failures() {
+        let dir = crate::testing::scratch_dir();
+        let mut list = FailedList::load(&dir.join("watcher-cursor")).unwrap();
+        list.record_failure("/nix/store/aaa-x");
+        list.record_failure("/nix/store/bbb-y");
+        let chunk = ["/nix/store/aaa-x".to_owned(), "/nix/store/bbb-y".to_owned()];
+        let mut reported = Vec::new();
+        let pushed = list.apply(&chunk, vec!["/nix/store/bbb-y".into()], |path, spent| {
+            reported.push((path.to_owned(), spent))
+        });
+        assert_eq!(pushed, 1);
+        assert_eq!(reported, [("/nix/store/bbb-y".to_owned(), 2)]);
+        assert_eq!(list.due(5), ["/nix/store/bbb-y"]);
+    }
+
+    /// A 403 Negotiation is a policy refusal: the whole batch stays on the
+    /// failed list, to push once the policy is fixed.
+    #[tokio::test]
+    async fn a_refused_negotiation_keeps_the_batch_on_the_failed_list() {
+        let (endpoint, _) = crate::testing::answering(403, r#"{"error":"not authorized"}"#).await;
+        let (pusher, _) = crate::testing::pusher(endpoint);
+        let a = format!("/nix/store/{}-a", "a".repeat(32));
+        let b = format!("/nix/store/{}-b", "b".repeat(32));
+
+        let failed = push_described(&pusher, vec![info(&a, &[]), info(&b, &[&a])]).await;
+        assert_eq!(failed, [a.clone(), b.clone()]);
+
+        let dir = crate::testing::scratch_dir();
+        let mut list = FailedList::load(&dir.join("watcher-cursor")).unwrap();
+        for path in &failed {
+            list.record_failure(path);
+        }
+        list.save().unwrap();
+        assert_eq!(
+            FailedList::load(&dir.join("watcher-cursor"))
+                .unwrap()
+                .due(5),
+            [a, b]
+        );
     }
 
     #[test]
@@ -708,17 +833,10 @@ mod tests {
 
     #[test]
     fn selection_skips_filtered_paths_and_keeps_order() {
-        let watcher = Watcher {
-            nix_db: String::new(),
-            cursor_path: PathBuf::new(),
-            poll_interval: Duration::ZERO,
-            filters: Filters {
-                upstream_keys: vec!["cache.nixos.org-1".into()],
-                own_keys: vec![],
-                exclude_patterns: vec![],
-            },
-            max_attempts: 1,
-            socket_path: PathBuf::new(),
+        let filters = Filters {
+            upstream_keys: vec!["cache.nixos.org-1".into()],
+            own_keys: vec![],
+            exclude_patterns: vec![],
         };
         let batch = [
             path("/nix/store/aaa-one", &[]),
@@ -727,7 +845,7 @@ mod tests {
             path("/nix/store/ddd-four", &[]),
         ];
         assert_eq!(
-            watcher.select(&batch),
+            filters.select(&batch),
             ["/nix/store/aaa-one", "/nix/store/ddd-four"]
         );
     }

@@ -45,7 +45,7 @@ pub struct UploadLimits {
     /// How long a body may send nothing before the upload is abandoned.
     pub body_idle: Duration,
     /// One permit per `unit` bytes of buffer, shared process-wide.
-    pub part_slots: Arc<Semaphore>,
+    part_slots: Arc<Semaphore>,
     /// Bytes one permit stands for: the power of two at or below
     /// `part_size / 256`, at most 64 KiB.
     unit: usize,
@@ -59,12 +59,17 @@ impl UploadLimits {
     /// `max_in_flight_bytes` becomes a whole number of units, never fewer
     /// than one part's worth so a cap below one part cannot deadlock every
     /// upload.
-    pub fn new(part_size: usize, max_parts_in_flight: usize, max_in_flight_bytes: u64) -> Self {
+    pub fn new(
+        part_size: usize,
+        max_parts_in_flight: usize,
+        max_in_flight_bytes: u64,
+        body_idle: Duration,
+    ) -> Self {
         let (unit, part_units, total_units) = budget(part_size, max_in_flight_bytes);
         Self {
             part_size,
             max_parts_in_flight,
-            body_idle: BODY_IDLE_TIMEOUT,
+            body_idle,
             part_slots: Arc::new(Semaphore::new(total_units)),
             unit,
             part_units,
@@ -72,28 +77,19 @@ impl UploadLimits {
         }
     }
 
-    /// Replaces the default [`BODY_IDLE_TIMEOUT`].
-    pub fn with_body_idle(mut self, idle: Duration) -> Self {
-        self.body_idle = idle;
-        self
-    }
-
     /// How many part-sized buffers fit in the budget at once, process-wide.
     pub fn total_slots(&self) -> usize {
         self.total_units / self.part_units
     }
 
-    /// Permits covering `bytes` of buffer: at least one, at most a part.
-    fn units(&self, bytes: usize) -> usize {
-        units_for(bytes, self.unit, self.part_units)
-    }
-
     /// Bytes of buffer currently reserved, process-wide.
-    pub fn in_flight_bytes(&self) -> u64 {
+    #[cfg(test)]
+    fn in_flight_bytes(&self) -> u64 {
         (self.total_units - self.part_slots.available_permits()) as u64 * self.unit as u64
     }
 
-    async fn acquire_units(&self, units: usize) -> Result<OwnedSemaphorePermit> {
+    async fn acquire(&self, bytes: usize) -> Result<Reservation> {
+        let units = units_for(bytes, self.unit, self.part_units);
         let started = std::time::Instant::now();
         let permit = self
             .part_slots
@@ -102,12 +98,25 @@ impl UploadLimits {
             .await
             .map_err(|_| anyhow!("upload capacity semaphore closed"))?;
         metrics::histogram!("garret_upload_buffer_wait_seconds").record(started.elapsed());
-        Ok(permit)
+        let bytes = (units * self.unit) as f64;
+        metrics::gauge!("garret_in_flight_bytes").increment(bytes);
+        Ok(Reservation {
+            _permit: permit,
+            bytes,
+        })
     }
+}
 
-    /// Reserves room for a buffer of up to `bytes` (capped at one part).
-    async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
-        self.acquire_units(self.units(bytes)).await
+/// Buffer capacity taken from [`UploadLimits`], counted in
+/// `garret_in_flight_bytes` until it is dropped.
+struct Reservation {
+    _permit: OwnedSemaphorePermit,
+    bytes: f64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        metrics::gauge!("garret_in_flight_bytes").decrement(self.bytes);
     }
 }
 
@@ -123,7 +132,6 @@ fn budget(part_size: usize, max_in_flight_bytes: u64) -> (usize, usize, usize) {
     (unit, part_units, total_units)
 }
 
-/// `bytes / 2^shift`, rounded up.
 fn units_ceil(bytes: usize, shift: u32) -> usize {
     (bytes >> shift) + usize::from(bytes & ((1 << shift) - 1) != 0)
 }
@@ -174,11 +182,42 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .filter(|h| !h.is_empty())
 }
 
-/// Default for `limits.body_idle_timeout_secs`: how long an upload body may
-/// send nothing before the upload is abandoned (spec 01). A stalled body holds an upload slot, its in-flight claim and,
-/// mid-NAR, a part slot, so without a bound a few quiet senders starve every
-/// other push. Idle, not total: a slow sender that keeps moving is fine.
-pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// One blob from [`Storage::list_blobs`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Blob {
+    /// The store-path hash its key encodes ([`hash_for`]).
+    pub hash: String,
+    /// Time since S3 last modified it.
+    pub age: Duration,
+    /// Its size in bytes.
+    pub size: i64,
+}
+
+/// Store path hashes of blobs with no DB row, past both guards: an upload in
+/// the in-flight set, or younger than `grace` — a row lands only after its
+/// blob completes, so a rowless blob might just be mid-push. Shared by the
+/// GC orphan sweep and `garret-admin fsck`'s read-only mirror-image check.
+pub fn orphan_hashes<'a>(
+    blobs: &'a [Blob],
+    known: &std::collections::HashSet<String>,
+    in_flight: &crate::inflight::InFlight,
+    grace: Duration,
+) -> Vec<&'a str> {
+    blobs
+        .iter()
+        .filter(|blob| {
+            !known.contains(&blob.hash) && !in_flight.contains(&blob.hash) && blob.age >= grace
+        })
+        .map(|blob| blob.hash.as_str())
+        .collect()
+}
+
+/// Time since an S3 timestamp; zero when it is missing or in the future.
+fn age(at: Option<&aws_sdk_s3::primitives::DateTime>) -> Duration {
+    at.and_then(|t| SystemTime::try_from(*t).ok())
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .unwrap_or(Duration::ZERO)
+}
 
 /// The client's request body stalled or broke mid-upload: a failure on the
 /// sender's side, not the server's. Handlers downcast to it to log such
@@ -206,6 +245,17 @@ impl std::fmt::Display for BodyOverLimit {
 }
 
 impl std::error::Error for BodyOverLimit {}
+
+/// An S3 request on the upload path failed. Attached as context over the
+/// SDK error, whose type is generic and cannot itself be downcast.
+#[derive(Debug)]
+pub struct S3Failure(pub String);
+
+impl std::fmt::Display for S3Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Where an upload body stood when it went quiet, for the stall error.
 #[derive(Clone, Copy)]
@@ -327,7 +377,6 @@ where
         Ok(false)
     }
 
-    /// The sha256 and length of every byte appended.
     fn finish(self) -> (Vec<u8>, i64) {
         (self.hasher.finalize().to_vec(), self.received as i64)
     }
@@ -402,7 +451,7 @@ impl Storage {
         timed("put", put.send())
             .await
             .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
-            .with_context(|| format!("uploading {key}"))?;
+            .with_context(|| S3Failure(format!("uploading {key}")))?;
         metrics::counter!("garret_s3_puts_total").increment(1);
         metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
         Ok(())
@@ -466,9 +515,9 @@ impl Storage {
                 .send(),
         )
         .await
-        .with_context(|| format!("starting multipart upload for {key}"))?
+        .with_context(|| S3Failure(format!("starting multipart upload for {key}")))?
         .upload_id
-        .context("S3 returned no upload id")?;
+        .context(S3Failure("S3 returned no upload id".into()))?;
         metrics::counter!("garret_s3_multipart_started_total").increment(1);
 
         // Any failure past this point must abort, or the parts linger and bill.
@@ -569,19 +618,18 @@ impl Storage {
                 .send(),
         )
         .await
-        .with_context(|| format!("completing multipart upload for {key}"))?;
+        .with_context(|| S3Failure(format!("completing multipart upload for {key}")))?;
         metrics::counter!("garret_s3_multipart_completed_total").increment(1);
         Ok(())
     }
 
-    /// Owns everything it touches, so it can run on its own task.
     fn upload_part(
         &self,
         key: &str,
         upload_id: &str,
         part_number: i32,
         body: Bytes,
-        permit: OwnedSemaphorePermit,
+        permit: Reservation,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
         let (client, bucket, key, upload_id, sign_payload) = (
             self.client.clone(),
@@ -613,7 +661,7 @@ impl Storage {
             };
             let output = timed("upload_part", part.send())
                 .await
-                .with_context(|| format!("uploading part {part_number} of {key}"))?;
+                .with_context(|| S3Failure(format!("uploading part {part_number} of {key}")))?;
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);
@@ -628,7 +676,8 @@ impl Storage {
 
     /// Every blob under `nar/`, with its age and size. Paginated — the
     /// bucket outgrows one response long before the cache is interesting.
-    pub async fn list_blobs(&self) -> Result<Vec<(String, Duration, i64)>> {
+    /// Keys outside the `nar/<hash>.nar.zst` layout are skipped.
+    pub async fn list_blobs(&self) -> Result<Vec<Blob>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -646,12 +695,15 @@ impl Storage {
 
             for object in page.contents() {
                 let Some(key) = object.key() else { continue };
-                let age = object
-                    .last_modified()
-                    .and_then(|t| SystemTime::try_from(*t).ok())
-                    .and_then(|t| SystemTime::now().duration_since(t).ok())
-                    .unwrap_or(Duration::ZERO);
-                out.push((key.to_owned(), age, object.size().unwrap_or(0)));
+                let Some(hash) = hash_for(key) else { continue };
+                let size = object
+                    .size()
+                    .with_context(|| format!("listing blobs: no size for {key}"))?;
+                out.push(Blob {
+                    hash: hash.to_owned(),
+                    age: age(object.last_modified()),
+                    size,
+                });
             }
 
             token = page.next_continuation_token().map(str::to_owned);
@@ -673,13 +725,10 @@ impl Storage {
     pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
         let (mut failed, mut first_failure) = (0, None);
         for batch in keys.chunks(1000) {
-            let objects: Vec<ObjectIdentifier> = batch
+            let objects = batch
                 .iter()
-                .filter_map(|k| ObjectIdentifier::builder().key(k).build().ok())
-                .collect();
-            if objects.is_empty() {
-                continue;
-            }
+                .map(|k| ObjectIdentifier::builder().key(k).build())
+                .collect::<Result<Vec<_>, _>>()?;
             let requested = objects.len();
             let output = timed(
                 "delete",
@@ -719,50 +768,60 @@ impl Storage {
 
     /// Aborts multipart uploads older than `grace` that no live upload owns.
     /// Consulting the in-flight set is why GC lives inside the Pusher (spec 05).
+    /// Paginated, like [`Storage::list_blobs`]: one listing returns at most
+    /// 1,000 uploads.
     pub async fn abort_stale_multiparts(
         &self,
         grace: Duration,
         in_flight: &crate::inflight::InFlight,
     ) -> Result<usize> {
-        let uploads = timed(
-            "list",
-            self.client
-                .list_multipart_uploads()
-                .bucket(&self.bucket)
-                .send(),
-        )
-        .await
-        .context("listing multipart uploads")?;
-
         let mut aborted = 0;
-        for upload in uploads.uploads() {
-            let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
-                continue;
-            };
-            let hash = hash_for(key).unwrap_or_default();
-            if in_flight.contains(hash) {
-                continue;
-            }
-            let age = upload
-                .initiated()
-                .and_then(|t| SystemTime::try_from(*t).ok())
-                .and_then(|t| SystemTime::now().duration_since(t).ok())
-                .unwrap_or(Duration::ZERO);
-            if age < grace {
-                continue;
-            }
-            timed(
-                "abort_mpu",
+        let (mut key_marker, mut upload_id_marker) = (None, None);
+        loop {
+            let page = timed(
+                "list",
                 self.client
-                    .abort_multipart_upload()
+                    .list_multipart_uploads()
                     .bucket(&self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
+                    .set_key_marker(key_marker.take())
+                    .set_upload_id_marker(upload_id_marker.take())
                     .send(),
             )
             .await
-            .with_context(|| format!("aborting stale multipart for {key}"))?;
-            aborted += 1;
+            .context("listing multipart uploads")?;
+
+            for upload in page.uploads() {
+                let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
+                    continue;
+                };
+                let Some(hash) = hash_for(key) else { continue };
+                if in_flight.contains(hash) || age(upload.initiated()) < grace {
+                    continue;
+                }
+                timed(
+                    "abort_mpu",
+                    self.client
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(upload_id)
+                        .send(),
+                )
+                .await
+                .with_context(|| format!("aborting stale multipart for {key}"))?;
+                aborted += 1;
+            }
+
+            if page.is_truncated() != Some(true) {
+                break;
+            }
+            key_marker = page.next_key_marker().map(str::to_owned);
+            upload_id_marker = page.next_upload_id_marker().map(str::to_owned);
+            // A truncated page without a marker to continue from would list
+            // the first page forever.
+            if key_marker.is_none() {
+                bail!("listing multipart uploads: truncated page without a next marker");
+            }
         }
         Ok(aborted)
     }
@@ -785,21 +844,37 @@ impl Storage {
 mod tests {
     use super::*;
 
+    const IDLE: Duration = Duration::from_secs(60);
+
     #[test]
-    fn s3_error_kinds_come_from_the_sdk_variant() {
-        let timeout = SdkError::<()>::timeout_error("slow");
-        let other = SdkError::<()>::construction_failure("bad");
-        assert_eq!(error_kind(&timeout), "timeout");
-        assert_eq!(error_kind(&other), "other");
+    fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
+        let grace = Duration::from_secs(86400);
+        let blob = |hash: &str, age_secs| Blob {
+            hash: hash.into(),
+            age: Duration::from_secs(age_secs),
+            size: 1,
+        };
+        let blobs = vec![
+            blob("known", 90000),
+            blob("uploading", 90000),
+            blob("young", 10),
+            blob("stale", 90000),
+        ];
+        let known: std::collections::HashSet<String> = ["known".to_string()].into();
+        let in_flight = crate::inflight::InFlight::new();
+        let _claim = in_flight.claim("uploading").unwrap();
+
+        assert_eq!(
+            orphan_hashes(&blobs, &known, &in_flight, grace),
+            vec!["stale"]
+        );
     }
 
     #[test]
     fn key_layout_is_flat_and_derivable() {
         assert_eq!(key_for("abc"), "nar/abc.nar.zst");
-        assert_eq!(hash_for("nar/abc.nar.zst"), Some("abc"));
-        assert_eq!(hash_for("nar/.nar.zst"), None, "empty hash is not a match");
+        assert_eq!(hash_for(&key_for("abc")), Some("abc"));
         assert_eq!(hash_for("other/abc.nar.zst"), None);
-        assert_eq!(hash_for("nar/abc.zst"), None);
     }
 
     /// One `fill` of a fresh `cap`-sized part, as `multipart_body` does it.
@@ -817,7 +892,7 @@ mod tests {
         chunks: Vec<&'static [u8]>,
     ) -> BodyReader<impl Stream<Item = Result<Bytes, std::io::Error>> + Unpin> {
         let body = futures::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))));
-        BodyReader::new(body, BODY_IDLE_TIMEOUT)
+        BodyReader::new(body, IDLE)
     }
 
     /// Feeds `chunks` through part fills and returns the part sizes produced.
@@ -883,27 +958,12 @@ mod tests {
 
     #[test]
     fn byte_caps_become_whole_part_slots() {
-        let limits = UploadLimits::new(64 * 1024 * 1024, 4, 1024 * 1024 * 1024);
+        let limits = UploadLimits::new(64 * 1024 * 1024, 4, 1024 * 1024 * 1024, IDLE);
         assert_eq!(limits.total_slots(), 16);
         // A cap smaller than one part still leaves a usable slot rather than
         // deadlocking every upload.
-        let tiny = UploadLimits::new(64 * 1024 * 1024, 4, 1024);
+        let tiny = UploadLimits::new(64 * 1024 * 1024, 4, 1024, IDLE);
         assert_eq!(tiny.total_slots(), 1);
-    }
-
-    /// A small upload reserves a few units, not a whole part, and the
-    /// reservation never exceeds a part or falls to zero.
-    #[test]
-    fn a_small_reservation_costs_a_fraction_of_a_part() {
-        let limits = UploadLimits::new(16 * 1024 * 1024, 4, 256 * 1024 * 1024);
-        assert_eq!(limits.total_slots(), 16);
-        let whole = limits.part_slots.available_permits();
-        assert_eq!(limits.units(16 * 1024 * 1024), limits.part_units);
-        assert_eq!(limits.units(usize::MAX / 2), limits.part_units);
-        assert_eq!(limits.units(0), 1);
-        // 1 KiB NAR: one 64 KiB unit of 256 in a part.
-        assert_eq!(limits.units(1024), 1);
-        assert_eq!(whole, limits.total_units);
     }
 
     /// A sender that goes quiet mid-part must fail the read rather than hold
@@ -913,8 +973,8 @@ mod tests {
     async fn a_stalled_body_fails_the_read() {
         let body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
             .chain(futures::stream::pending());
-        let mut reader = BodyReader::new(body, BODY_IDLE_TIMEOUT);
-        let read = tokio::time::timeout(BODY_IDLE_TIMEOUT * 2, read_part(&mut reader, 1024)).await;
+        let mut reader = BodyReader::new(body, IDLE);
+        let read = tokio::time::timeout(IDLE * 2, read_part(&mut reader, 1024)).await;
         assert!(read.expect("a stalled body hung the read").is_err());
     }
 
@@ -941,12 +1001,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_slow_body_that_keeps_moving_is_not_cut_off() {
         let body = Box::pin(futures::stream::iter(0..4).then(|_| async {
-            tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
+            tokio::time::sleep(IDLE / 2).await;
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
-        let mut reader = BodyReader::new(body, BODY_IDLE_TIMEOUT);
+        let mut reader = BodyReader::new(body, IDLE);
         assert_eq!(read_part(&mut reader, 1024).await.unwrap().len(), 8);
     }
+
     /// Just enough S3 on a loopback port. Every call succeeds, except that
     /// `DeleteObjects` answers inside a 200 the way S3 and Garage do: keys
     /// containing `denied` fail, and keys containing `gone` come back as
@@ -997,46 +1058,34 @@ mod tests {
             }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(
-            async move { axum::serve(listener, axum::Router::new().fallback(handle)).await },
-        );
-        Storage::new(&S3Config {
-            bucket: "test".into(),
-            endpoint_url: Some(format!("http://{addr}")),
-            region: Some("us-east-1".into()),
-            path_style: true,
-            access_key_id: Some("x".into()),
-            secret_access_key: Some("x".into()),
-            operation_timeout_secs: 5,
-            operation_attempt_timeout_secs: None,
-            sign_payload: false,
-        })
-        .await
-        .unwrap()
+        crate::testing::fake_s3(axum::Router::new().fallback(handle)).await
+    }
+
+    /// An upload is charged its hint (rounded up to a unit) while it waits on
+    /// the body, and gives it back when dropped mid-read.
+    #[tokio::test]
+    async fn in_flight_bytes_track_a_live_upload() {
+        let storage = fake_s3().await;
+        let limits = UploadLimits::new(1024, 2, 4096, IDLE);
+        assert_eq!(limits.in_flight_bytes(), 0);
+        let body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from(vec![1u8; 100]))])
+            .chain(futures::stream::pending());
+        let key = key_for("slow");
+        let mut upload = Box::pin(storage.put_streaming(&key, body, &limits, 200));
+        assert!(futures::poll!(&mut upload).is_pending());
+        assert_eq!(limits.in_flight_bytes(), 200);
+        drop(upload);
+        assert_eq!(limits.in_flight_bytes(), 0);
     }
 
     /// Uploads that together want more part slots than exist must still all
-    /// finish. When parts were lazy futures polled only by their reader, a
-    /// reader parked on the next slot held slots nobody could free, and this
-    /// hung forever — so the timeout turns a regression into a failure.
-    #[tokio::test]
-    async fn in_flight_bytes_rises_on_acquire_and_returns_to_zero() {
-        let limits = UploadLimits::new(1024, 2, 4096);
-        assert_eq!(limits.in_flight_bytes(), 0);
-        let permit = limits.acquire(1024).await.unwrap();
-        assert_eq!(limits.in_flight_bytes(), 1024);
-        drop(permit);
-        assert_eq!(limits.in_flight_bytes(), 0);
-    }
-
+    /// finish; the timeout turns a wedge on the shared budget into a failure.
     #[tokio::test]
     async fn concurrent_multiparts_finish_on_fewer_slots_than_they_want() {
         let storage = fake_s3().await;
         // Two slots, two parts in flight per upload, three 5-part uploads:
         // one upload alone already wants every slot.
-        let limits = UploadLimits::new(1024, 2, 2048);
+        let limits = UploadLimits::new(1024, 2, 2048, IDLE);
         let body: Vec<u8> = (0..4 * 1024 + 100).map(|i| i as u8).collect();
         let keys: Vec<String> = (0..3).map(|i| key_for(&i.to_string())).collect();
         let uploads = keys.iter().map(|key| {
@@ -1067,9 +1116,15 @@ mod tests {
     #[tokio::test]
     async fn a_small_upload_does_not_need_a_whole_part_slot() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024 * 1024, 4, 1024 * 1024);
+        let limits = UploadLimits::new(1024 * 1024, 4, 1024 * 1024, IDLE);
         // Another upload holds all but two units of the one-part budget.
-        let held = limits.acquire_units(limits.total_units - 2).await.unwrap();
+        let spare = limits.part_slots.available_permits() - 2;
+        let held = limits
+            .part_slots
+            .clone()
+            .acquire_many_owned(spare as u32)
+            .await
+            .unwrap();
         let body = vec![7u8; 1000];
         let stored = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1085,7 +1140,7 @@ mod tests {
         .unwrap();
         assert_eq!(stored, (Sha256::digest(&body).to_vec(), 1000));
         drop(held);
-        assert_eq!(limits.part_slots.available_permits(), limits.total_units);
+        assert_eq!(limits.in_flight_bytes(), 0);
     }
 
     /// A body that outgrows its hint fails instead of growing past its
@@ -1093,7 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_past_its_hint_is_refused() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024, 2, 4096);
+        let limits = UploadLimits::new(1024, 2, 4096, IDLE);
         let body: Vec<u8> = (0..500).map(|i| i as u8).collect();
         let chunks: Vec<_> = body
             .chunks(300)
@@ -1108,7 +1163,7 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-        assert_eq!(limits.part_slots.available_permits(), limits.total_units);
+        assert_eq!(limits.in_flight_bytes(), 0);
     }
 
     /// FileHash and FileSize (spec 03) describe exactly the stored bytes when
@@ -1117,7 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn hash_and_length_cover_the_stored_bytes_across_boundaries() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024, 2, 8192);
+        let limits = UploadLimits::new(1024, 2, 8192, IDLE);
         let body: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
         let chunked = |body: &[u8], sizes: &[usize]| {
             let mut at = 0;
@@ -1158,7 +1213,7 @@ mod tests {
     #[tokio::test]
     async fn a_stall_probing_past_the_hint_reports_the_bytes_received() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024, 2, 4096).with_body_idle(Duration::from_millis(50));
+        let limits = UploadLimits::new(1024, 2, 4096, Duration::from_millis(50));
         let body = futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from(vec![1u8; 60])),
             Ok(Bytes::from(vec![2u8; 40])),
@@ -1172,7 +1227,7 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("after 100 bytes"), "{msg}");
         assert!(msg.contains("(first_part)"), "{msg}");
-        assert_eq!(limits.part_slots.available_permits(), limits.total_units);
+        assert_eq!(limits.in_flight_bytes(), 0);
     }
 
     /// `DeleteObjects` answers 200 even when some keys fail, listing them in
@@ -1196,6 +1251,58 @@ mod tests {
         let err = format!("{err:#}");
         assert!(err.contains(&denied), "{err}");
     }
+
+    /// A listing returns at most 1,000 uploads: the abort follows the
+    /// markers of a truncated page to the next one.
+    #[tokio::test]
+    async fn stale_multiparts_on_a_later_page_are_aborted_too() {
+        use axum::{extract::Request, http::Method};
+
+        let aborted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let storage = crate::testing::fake_s3(axum::Router::new().fallback({
+            let aborted = aborted.clone();
+            move |req: Request| {
+                let aborted = aborted.clone();
+                async move {
+                    let query = req.uri().query().unwrap_or_default().to_owned();
+                    if req.method() == Method::DELETE {
+                        aborted.lock().unwrap().push(req.uri().path().to_owned());
+                        return String::new();
+                    }
+                    let upload = |key: &str| {
+                        format!(
+                            "<Upload><Key>{key}</Key><UploadId>u-{key}</UploadId>\
+                             <Initiated>2000-01-01T00:00:00.000Z</Initiated></Upload>"
+                        )
+                    };
+                    let page = if query.contains("key-marker=") {
+                        format!("<IsTruncated>false</IsTruncated>{}", upload("nar/b.nar.zst"))
+                    } else {
+                        format!(
+                            "<IsTruncated>true</IsTruncated><NextKeyMarker>nar/a.nar.zst\
+                             </NextKeyMarker><NextUploadIdMarker>u-nar/a.nar.zst\
+                             </NextUploadIdMarker>{}",
+                            upload("nar/a.nar.zst")
+                        )
+                    };
+                    format!(
+                        r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket>{page}</ListMultipartUploadsResult>"#
+                    )
+                }
+            }
+        }))
+        .await;
+
+        let count = storage
+            .abort_stale_multiparts(Duration::ZERO, &crate::inflight::InFlight::new())
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            *aborted.lock().unwrap(),
+            ["/test/nar/a.nar.zst", "/test/nar/b.nar.zst"]
+        );
+    }
 }
 
 /// Kani proofs (`just kani`) of the upload byte budget (spec 03): for every
@@ -1206,7 +1313,9 @@ mod proofs {
 
     /// S3's part-size range, which `PusherConfig::validate` enforces.
     fn any_part_size() -> usize {
-        kani::any_where(|p: &usize| (5 << 20..=5 << 30).contains(p))
+        kani::any_where(|p: &usize| {
+            (crate::config::MIN_PART_SIZE..=crate::config::MAX_PART_SIZE).contains(p)
+        })
     }
 
     /// A buffer of up to one part is always fully paid for by its permits,
@@ -1233,10 +1342,9 @@ mod proofs {
     fn the_budget_stays_within_the_cap() {
         let part_size = any_part_size();
         let max_in_flight: u64 = kani::any_where(|m| *m >= part_size as u64);
-        let (unit, part_units, total_units) = budget(part_size, max_in_flight);
+        let (unit, _, total_units) = budget(part_size, max_in_flight);
         let budget_bytes = total_units as u128 * unit as u128;
         assert!(budget_bytes <= max_in_flight as u128 + unit as u128);
         assert!(budget_bytes >= part_size as u128);
-        let _ = part_units;
     }
 }

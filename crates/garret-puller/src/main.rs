@@ -15,41 +15,49 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
+use garret_common::{is_store_hash, unix_now, wire};
 use garret_server::{
-    auth::Authenticator,
+    auth::{self, Authenticator, Rejection},
     browse,
     config::{IssuerConfig, PullerConfig},
-    db, metrics as garret_metrics, narinfo, now,
+    db, metrics as garret_metrics, narinfo,
     storage::{self, Storage},
 };
 use parking_lot::Mutex;
 use serde::Deserialize;
 
+/// A database connection. Sync rusqlite behind an async lock, so requests
+/// queued on it hold no threads; see [`on_conn`].
+type Conn = Arc<tokio::sync::Mutex<rusqlite::Connection>>;
+
+/// The Puller's database connections, opened together once the Pusher has
+/// created the database. Separate connections, so neither a bump flush
+/// waiting on a Pusher write nor a slow browse query (spec 07) ever holds up
+/// a pull-path read.
+struct Db {
+    pull: Conn,
+    bump: Conn,
+    browse: Conn,
+}
+
 struct AppState {
     /// Empty until the Pusher has created the database (spec 02: it owns the
-    /// schema). Every reader goes through `conn`, so a Puller that boots first
-    /// answers 503 instead of dying. Arc'd so pull-path reads can move onto
-    /// the blocking pool under a budget (ticket 25).
-    conn: OnceLock<Arc<Mutex<rusqlite::Connection>>>,
-    /// Browse's own connection, set alongside `conn`. An async lock, so
-    /// browse requests queue without holding blocking threads (spec 07).
-    browse_conn: OnceLock<Arc<tokio::sync::Mutex<rusqlite::Connection>>>,
+    /// schema). Every reader goes through [`AppState::db`], so a Puller that
+    /// boots first answers 503 instead of dying.
+    db: OnceLock<Db>,
     storage: Storage,
     presign_ttl: Duration,
-    bump_debounce: i64,
     bumps: Bumps,
     db_read_budget: Duration,
     presign_budget: Duration,
-    /// The last deep-readiness answer and when it was taken; see
-    /// [`cached_probe`].
     read_probe: ProbeCache,
     /// Fetches the probe's presigned URL, as a substituter would.
     http: reqwest::Client,
 }
 
 impl AppState {
-    fn conn_handle(&self) -> Option<Arc<Mutex<rusqlite::Connection>>> {
-        self.conn.get().cloned()
+    fn db(&self) -> Option<&Db> {
+        self.db.get()
     }
 }
 
@@ -62,65 +70,63 @@ const BUMP_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// their next hit.
 const BUMP_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Last-accessed bumps waiting for the next flush (spec 02). A set, so a
-/// burst of hits on one hash is one write. Only hits on stale rows are
-/// queued, so it is bounded by the object count.
-#[derive(Default)]
-struct Bumps(Mutex<HashSet<String>>);
+/// Last-accessed bumps waiting for the next flush (spec 02). Only hits on
+/// stale rows are queued, so it is bounded by the object count.
+struct Bumps {
+    pending: Mutex<HashSet<String>>,
+    /// Seconds a row's `last_accessed_at` counts as fresh.
+    debounce: i64,
+}
 
 impl Bumps {
-    /// Called on every narinfo hit with the `last_accessed_at` the read
-    /// already fetched. A fresh row, which is nearly every hit, costs no
-    /// write at all: not even the WAL write lock a no-op UPDATE would take.
-    fn hit(&self, hash: &str, last_accessed_at: i64, now: i64, debounce: i64) {
-        if last_accessed_at >= now - debounce {
+    fn new(debounce: i64) -> Self {
+        Self {
+            pending: Mutex::default(),
+            debounce,
+        }
+    }
+
+    /// A fresh row, which is nearly every hit, costs no write at all: not
+    /// even the WAL write lock a no-op UPDATE would take.
+    fn hit(&self, hash: &str, last_accessed_at: i64, now: i64) {
+        if last_accessed_at >= now - self.debounce {
             metrics::counter!("garret_bump_debounced_total").increment(1);
             return;
         }
-        let mut pending = self.0.lock();
+        let mut pending = self.pending.lock();
+        // Not a bare insert: that would allocate the owned key on every repeat hit.
         if !pending.contains(hash) {
             pending.insert(hash.to_owned());
         }
         metrics::gauge!("garret_bump_queue_depth").set(pending.len() as f64);
     }
 
-    /// Writes everything queued so far on `conn`, the Puller's dedicated bump
-    /// connection, and returns how many hashes it wrote. Blocking: callers
-    /// run it on the blocking pool, never under the pull-path lock.
-    fn flush(&self, conn: &mut rusqlite::Connection, now: i64, debounce: i64) -> Result<usize> {
+    fn flush(&self, conn: &mut rusqlite::Connection, now: i64) -> Result<usize> {
         let batch = {
-            let mut pending = self.0.lock();
+            let mut pending = self.pending.lock();
             metrics::gauge!("garret_bump_queue_depth").set(0.0);
             std::mem::take(&mut *pending)
         };
         if batch.is_empty() {
             return Ok(0);
         }
-        db::bump_last_accessed(conn, &batch, now, debounce)?;
+        db::bump_last_accessed(conn, &batch, now, self.debounce)?;
         Ok(batch.len())
     }
 }
 
-/// Flushes queued bumps every [`BUMP_FLUSH_INTERVAL`] for the life of the
-/// process. A failed flush drops its batch; see [`BUMP_BUSY_TIMEOUT`].
-async fn flush_bumps(state: Arc<AppState>, conn: rusqlite::Connection) {
-    let conn = Arc::new(Mutex::new(conn));
+async fn flush_bumps(state: Arc<AppState>, conn: Conn) {
     let mut tick = tokio::time::interval(BUMP_FLUSH_INTERVAL);
     loop {
         tick.tick().await;
-        let (state, conn) = (state.clone(), conn.clone());
-        let flushed = tokio::task::spawn_blocking(move || {
-            let mut conn = lock_timed(&conn, "bump");
-            state.bumps.flush(&mut conn, now(), state.bump_debounce)
+        let state = state.clone();
+        let flushed = on_conn(conn.clone(), "bump", move |conn| {
+            state.bumps.flush(conn, unix_now())
         })
         .await;
-        let error = match flushed {
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => format!("{e:#}"),
-            Err(e) => e.to_string(),
-        };
+        let Err(e) = flushed else { continue };
         metrics::counter!("garret_bump_failures_total").increment(1);
-        tracing::warn!("last-accessed bump flush failed: {error}");
+        tracing::warn!("last-accessed bump flush failed: {e:#}");
     }
 }
 
@@ -141,84 +147,123 @@ fn unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response()
 }
 
-/// Degrade to a miss (ticket 25). A substituter's contract is bounded latency
-/// and harmless failure: nix handles a 404 natively (try the next
-/// substituter, build locally), while a hang stalls builds fleet-wide and a
-/// 500 is noise it isn't built for. Counted by reason so degradation is
-/// observable, never silent.
-fn degraded_miss(reason: &'static str) -> Response {
-    metrics::counter!("garret_degraded_total", "reason" => reason).increment(1);
-    StatusCode::NOT_FOUND.into_response()
+/// Why a pull-path request degraded to a miss: the `reason` label of
+/// `garret_degraded_total` (spec 08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Degraded {
+    DbTimeout,
+    DbError,
+    PresignTimeout,
+    PresignError,
 }
 
-/// A pull-path database read under the configured budget. The read is sync
-/// rusqlite under a Mutex, so it runs on the blocking pool — a wedged read
-/// (or one queued behind a wedged lock holder) then trips the timeout instead
-/// of stalling the request; the orphaned read keeps its blocking thread until
-/// it returns, but the client has its answer. `None` means the budget tripped.
-async fn db_read<T, F>(
-    conn: Arc<Mutex<rusqlite::Connection>>,
-    budget: Duration,
-    read: F,
-) -> Option<anyhow::Result<T>>
-where
-    F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    // A read queued behind a wedged lock holder must not run once its
-    // request has already been answered: check the deadline under the lock.
-    let deadline = Instant::now() + budget;
-    let task = tokio::task::spawn_blocking(move || {
-        let conn = lock_timed(&conn, "pull");
-        if Instant::now() > deadline {
-            anyhow::bail!("db read abandoned: budget elapsed while queued");
+impl Degraded {
+    fn reason(self) -> &'static str {
+        match self {
+            Degraded::DbTimeout => "db_timeout",
+            Degraded::DbError => "db_error",
+            Degraded::PresignTimeout => "presign_timeout",
+            Degraded::PresignError => "presign_error",
         }
-        read(&conn)
-    });
-    match tokio::time::timeout(budget, task).await {
-        Ok(joined) => {
-            Some(joined.unwrap_or_else(|e| Err(anyhow::anyhow!("db read task failed: {e}"))))
-        }
-        Err(_elapsed) => None,
     }
 }
 
-/// Locks a connection, recording the wait as `garret_db_lock_wait_seconds`.
-fn lock_timed<'a>(
-    conn: &'a Mutex<rusqlite::Connection>,
-    which: &'static str,
-) -> parking_lot::MutexGuard<'a, rusqlite::Connection> {
-    let waited = Instant::now();
-    let guard = conn.lock();
-    metrics::histogram!("garret_db_lock_wait_seconds", "conn" => which).record(waited.elapsed());
-    guard
+/// Degrade to a miss (ticket 25). A substituter's contract is bounded latency
+/// and harmless failure: nix handles a 404 natively (try the next
+/// substituter, build locally), while a hang stalls builds fleet-wide and a
+/// 500 is noise it isn't built for.
+fn degraded_miss(degraded: Degraded) -> Response {
+    metrics::counter!("garret_degraded_total", "reason" => degraded.reason()).increment(1);
+    StatusCode::NOT_FOUND.into_response()
 }
 
-/// A browse query (spec 07) on the browse connection: one at a time, on the
-/// blocking pool, never on the pull-path connection, so a big tree walk or a
-/// full-scan search cannot delay a narinfo read. Queued requests wait on the
-/// async lock, not on blocking threads the pull path also needs. `None`
-/// means the budget tripped; the orphaned query keeps the connection until
-/// it returns.
-async fn browse_read<T, F>(
-    conn: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
-    budget: Duration,
-    read: F,
-) -> Option<anyhow::Result<T>>
+/// Records the wait for `conn`'s lock as `garret_db_lock_wait_seconds`, then
+/// runs `run` on the blocking pool. Off the async workers a wedged statement
+/// (or one queued behind it) delays only this future, which a budget can
+/// abandon: queued, it never runs; running, it keeps its blocking thread and
+/// the connection until it returns.
+async fn on_conn<T, F>(conn: Conn, which: &'static str, run: F) -> anyhow::Result<T>
+where
+    F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let waited = Instant::now();
+    let mut conn = conn.lock_owned().await;
+    metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => which)
+        .record(waited.elapsed());
+    tokio::task::spawn_blocking(move || run(&mut conn))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("{which} database task failed: {e}")))
+}
+
+/// A pull-path database read under the configured budget (ticket 25),
+/// queueing for the connection included.
+async fn db_read<T, F>(conn: Conn, budget: Duration, read: F) -> Result<T, Degraded>
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let query = async move {
-        let waited = Instant::now();
-        let conn = conn.lock_owned().await;
-        metrics::histogram!("garret_db_lock_wait_seconds", "conn" => "browse")
-            .record(waited.elapsed());
-        tokio::task::spawn_blocking(move || read(&conn))
-            .await
-            .unwrap_or_else(|e| Err(anyhow::anyhow!("browse task failed: {e}")))
+    match tokio::time::timeout(budget, on_conn(conn, "pull", move |conn| read(conn))).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => {
+            tracing::error!("{e:#}");
+            Err(Degraded::DbError)
+        }
+        Err(_elapsed) => Err(Degraded::DbTimeout),
+    }
+}
+
+/// How a narinfo or NAR request ended; counted once, by [`counted`].
+enum Outcome {
+    /// A narinfo served or a NAR redirect issued.
+    Hit(Response),
+    /// No such object.
+    Miss,
+    /// The database does not exist yet.
+    Unavailable,
+    Degraded(Degraded),
+    /// Not the file name of a store hash: a plain 404 before any database
+    /// read, and not counted, so junk requests cannot inflate the miss rate.
+    Junk,
+}
+
+fn counted(counter: &'static str, outcome: Outcome) -> Response {
+    let (label, response) = match outcome {
+        Outcome::Hit(response) => ("hit", response),
+        Outcome::Miss => ("miss", StatusCode::NOT_FOUND.into_response()),
+        Outcome::Unavailable => ("miss", unavailable()),
+        Outcome::Degraded(degraded) => ("miss", degraded_miss(degraded)),
+        Outcome::Junk => return StatusCode::NOT_FOUND.into_response(),
     };
-    tokio::time::timeout(budget, query).await.ok()
+    metrics::counter!(counter, "outcome" => label).increment(1);
+    response
+}
+
+fn pull_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        // axum 0.8 wants whole-segment params, so the suffix is split here.
+        .route(
+            "/{file}",
+            get(
+                |State(state): State<Arc<AppState>>, Path(file): Path<String>| async move {
+                    counted(
+                        "garret_narinfo_requests_total",
+                        narinfo(&state, &file).await,
+                    )
+                },
+            ),
+        )
+        .route(
+            wire::NAR_FILE,
+            get(
+                |State(state): State<Arc<AppState>>, Path(file): Path<String>| async move {
+                    counted(
+                        "garret_nar_requests_total",
+                        nar_redirect(&state, &file).await,
+                    )
+                },
+            ),
+        )
 }
 
 /// Browse routes are the only authenticated surface here, and they are
@@ -231,11 +276,11 @@ fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>>
     };
     let auth = Arc::new(Authenticator::new(vec![issuer.clone()])?);
     Ok(Router::new()
-        .route("/api/v1/objects", get(list_objects))
-        .route("/api/v1/objects/{hash}", get(object_detail))
-        .route("/api/v1/objects/{hash}/tree", get(object_tree))
-        .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
-        .route("/api/v1/pins", get(list_pins))
+        .route(wire::OBJECTS, get(list_objects))
+        .route(wire::OBJECT, get(object_detail))
+        .route(wire::OBJECT_TREE, get(object_tree))
+        .route(wire::OBJECT_REFERRERS, get(object_referrers))
+        .route(wire::PINS, get(list_pins))
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
             require_browse_oidc,
@@ -244,20 +289,16 @@ fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>>
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    garret_server::runtime::init_tracing();
-    let path = std::env::args()
-        .nth(1)
-        .context("usage: garret-puller <config.toml>")?;
-    let cfg: PullerConfig = garret_server::config::load(&path)?;
-    cfg.validate()?;
+    let garret_server::runtime::Started {
+        config: cfg,
+        listener,
+    } = garret_server::runtime::start::<PullerConfig>("puller").await?;
 
     let state = Arc::new(AppState {
-        conn: OnceLock::new(),
-        browse_conn: OnceLock::new(),
+        db: OnceLock::new(),
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
-        bump_debounce: cfg.bump_debounce_secs,
-        bumps: Bumps::default(),
+        bumps: Bumps::new(cfg.bump_debounce_secs),
         db_read_budget: Duration::from_millis(cfg.db_read_budget_ms),
         presign_budget: Duration::from_millis(cfg.presign_budget_ms),
         read_probe: ProbeCache::default(),
@@ -272,23 +313,27 @@ async fn main() -> Result<()> {
         async move {
             let opened = db::open_when_ready(&db_path, timeout)
                 .await
-                .and_then(|conn| {
+                .and_then(|pull| {
                     // A pull read must not outwait its own budget on SQLite.
-                    conn.busy_timeout(state.db_read_budget)?;
-                    // Bumps and browse get their own connections, so neither
-                    // a flush waiting on a Pusher write nor a slow browse
-                    // query ever holds up a pull-path read.
-                    let bump_conn = db::open(&db_path, false)?;
-                    bump_conn.busy_timeout(BUMP_BUSY_TIMEOUT)?;
-                    Ok((conn, bump_conn, db::open(&db_path, false)?))
+                    pull.busy_timeout(state.db_read_budget)?;
+                    let bump = db::open(&db_path, false)?;
+                    bump.busy_timeout(BUMP_BUSY_TIMEOUT)?;
+                    let conn = |conn| Arc::new(tokio::sync::Mutex::new(conn));
+                    let db = Db {
+                        pull: conn(pull),
+                        bump: conn(bump),
+                        browse: conn(db::open(&db_path, false)?),
+                    };
+                    let bump = db.bump.clone();
+                    state
+                        .db
+                        .set(db)
+                        .map_err(|_| anyhow::anyhow!("database connections opened twice"))?;
+                    Ok(bump)
                 });
             match opened {
-                Ok((conn, bump_conn, browse_conn)) => {
-                    let _ = state
-                        .browse_conn
-                        .set(Arc::new(tokio::sync::Mutex::new(browse_conn)));
-                    let _ = state.conn.set(Arc::new(Mutex::new(conn)));
-                    tokio::spawn(flush_bumps(state.clone(), bump_conn));
+                Ok(bump) => {
+                    tokio::spawn(flush_bumps(state.clone(), bump));
                     tracing::info!("database ready: serving");
                 }
                 // Nothing this process can do but let the supervisor restart it.
@@ -300,25 +345,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    let metrics_handle = garret_metrics::install("puller")?;
-    let metrics_addr: std::net::SocketAddr = cfg
-        .metrics_listen
-        .parse()
-        .context("invalid metrics listen address")?;
-    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-    tracing::info!("metrics listening on {metrics_addr}");
-    tokio::spawn(async move {
-        if let Err(e) = garret_metrics::serve(metrics_handle, metrics_listener, || {}).await {
-            tracing::error!("metrics listener failed: {e:#}");
-        }
-    });
-
     let store_dir = cfg.store_dir.clone();
     let browse_routes = browse_routes(cfg.browse_oidc.as_ref())?;
 
     let app = Router::new()
         .route(
-            "/nix-cache-info",
+            wire::NIX_CACHE_INFO,
             get(move || {
                 let body = format!("StoreDir: {store_dir}\nWantMassQuery: 1\nPriority: 40\n");
                 async move { body }
@@ -327,97 +359,68 @@ async fn main() -> Result<()> {
         .route(
             "/ready",
             get(|State(state): State<Arc<AppState>>| async move {
-                match state.conn.get().is_some() {
+                match state.db().is_some() {
                     true => (StatusCode::OK, "ready").into_response(),
                     false => unavailable(),
                 }
             }),
         )
         .route("/ready/deep", get(ready_deep))
-        // axum 0.8 wants whole-segment params, so the suffix is split here.
-        .route("/{file}", get(narinfo_route))
-        .route("/nar/{file}", get(nar_route))
+        .merge(pull_routes())
         .merge(browse_routes)
         .layer(axum::middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
 
-    let addr: std::net::SocketAddr = cfg.listen.parse().context("invalid listen address")?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("puller listening on {addr}");
     garret_server::runtime::notify_ready();
     garret_server::runtime::serve(listener, app, std::future::pending()).await?;
     Ok(())
 }
 
-/// Counts every narinfo request by outcome: a hit is a narinfo served (200),
-/// anything else (bad suffix, unknown hash, database not ready, degraded
-/// read) is a miss — the same rule as [`nar_route`].
-async fn narinfo_route(state: State<Arc<AppState>>, file: Path<String>) -> Response {
-    let response = narinfo(state, file).await;
-    let outcome = if response.status() == StatusCode::OK {
-        "hit"
-    } else {
-        "miss"
+async fn narinfo(state: &AppState, file: &str) -> Outcome {
+    let Some(hash) = wire::narinfo_hash(file).filter(|hash| is_store_hash(hash)) else {
+        return Outcome::Junk;
     };
-    metrics::counter!("garret_narinfo_requests_total", "outcome" => outcome).increment(1);
-    response
-}
-
-async fn narinfo(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
-    let Some(hash) = file.strip_suffix(".narinfo").map(str::to_owned) else {
-        return StatusCode::NOT_FOUND.into_response();
+    let Some(db) = state.db() else {
+        return Outcome::Unavailable;
     };
-    let Some(conn) = state.conn_handle() else {
-        return unavailable();
+    let read = {
+        let hash = hash.to_owned();
+        move |conn: &rusqlite::Connection| {
+            db::get_object_and_last_accessed(conn, &hash).with_context(|| format!("narinfo {hash}"))
+        }
     };
-    let object = {
-        let hash = hash.clone();
-        db_read(conn, state.db_read_budget, move |conn| {
-            db::get_object_and_last_accessed(conn, &hash)
-        })
-        .await
-    };
-    let Some(object) = object else {
-        return degraded_miss("db_timeout");
-    };
-
-    match object {
+    match db_read(db.pull.clone(), state.db_read_budget, read).await {
         Ok(Some((obj, last_accessed_at))) => {
-            // Queued, never written here: LRU only needs day granularity, so
-            // a bump must never sit on the request path (spec 02-database).
-            state
-                .bumps
-                .hit(&hash, last_accessed_at, now(), state.bump_debounce);
-            (
-                [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
-                narinfo::render(&obj),
+            state.bumps.hit(hash, last_accessed_at, unix_now());
+            Outcome::Hit(
+                (
+                    [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
+                    narinfo::render(&obj),
+                )
+                    .into_response(),
             )
-                .into_response()
         }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => {
-            tracing::error!("narinfo {hash}: {e:#}");
-            degraded_miss("db_error")
-        }
+        Ok(None) => Outcome::Miss,
+        Err(degraded) => Outcome::Degraded(degraded),
     }
 }
 
 /// The last probe answer and when it was taken.
 type ProbeCache = Arc<tokio::sync::Mutex<Option<(Instant, Result<(), String>)>>>;
 
-/// The cached answer while it is younger than `ttl`, else `probe`'s. The
-/// probe runs in its own task holding the cache lock: concurrent callers
-/// wait for it rather than start their own, and a caller that goes away
-/// mid-probe (a client disconnect cancels its handler) still leaves the
-/// answer cached, rather than an empty cache for the next caller to probe
-/// again.
-async fn cached_probe<F>(cache: &ProbeCache, ttl: Duration, probe: F) -> Result<(), String>
+/// The cached answer while it is younger than [`READ_PROBE_TTL`], else
+/// `probe`'s. The probe runs in its own task holding the cache lock:
+/// concurrent callers wait for it rather than start their own, and a caller
+/// that goes away mid-probe (a client disconnect cancels its handler) still
+/// leaves the answer cached, rather than an empty cache for the next caller
+/// to probe again.
+async fn cached_probe<F>(cache: &ProbeCache, probe: F) -> Result<(), String>
 where
     F: Future<Output = Result<(), String>> + Send + 'static,
 {
     let mut cached = Arc::clone(cache).lock_owned().await;
     if let Some((at, outcome)) = &*cached
-        && at.elapsed() < ttl
+        && at.elapsed() < READ_PROBE_TTL
     {
         return outcome.clone();
     }
@@ -437,7 +440,7 @@ where
 /// Cached for [`READ_PROBE_TTL`] by [`cached_probe`], so the public route
 /// cannot be used to hammer S4.
 async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
-    let Some(conn) = state.conn_handle() else {
+    let Some(conn) = state.db().map(|db| db.pull.clone()) else {
         return unavailable();
     };
     let probe = {
@@ -456,7 +459,7 @@ async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
             outcome
         }
     };
-    match cached_probe(&state.read_probe, READ_PROBE_TTL, probe).await {
+    match cached_probe(&state.read_probe, probe).await {
         Ok(()) => (StatusCode::OK, "ready").into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "S3 read path failing").into_response(),
     }
@@ -464,14 +467,13 @@ async fn ready_deep(State(state): State<Arc<AppState>>) -> Response {
 
 /// Fetches the first byte of the most recently accessed blob through a
 /// presigned URL. An empty cache has nothing to read, so it passes.
-async fn probe_read(
-    state: &AppState,
-    conn: Arc<Mutex<rusqlite::Connection>>,
-) -> Result<(), String> {
-    let hash = db_read(conn, state.db_read_budget, db::most_recently_accessed)
+async fn probe_read(state: &AppState, conn: Conn) -> Result<(), String> {
+    let read = |conn: &rusqlite::Connection| {
+        db::most_recently_accessed(conn).context("deep readiness probe")
+    };
+    let hash = db_read(conn, state.db_read_budget, read)
         .await
-        .ok_or("database read over budget")?
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|degraded| format!("database read degraded: {}", degraded.reason()))?;
     let Some(hash) = hash else {
         return Ok(());
     };
@@ -491,8 +493,6 @@ async fn probe_read(
     match response.status() {
         status if status.is_success() => Ok(()),
         status => {
-            // Upstream S3 error code / request id help diagnosis; the URL
-            // itself (a live signature) is never included.
             let request_id = response
                 .headers()
                 .get("x-amz-request-id")
@@ -515,45 +515,25 @@ async fn probe_read(
     }
 }
 
-/// Counts every NAR request by outcome: a hit is a redirect issued, anything
-/// else (bad suffix, unknown blob, database not ready, degraded read, presign
-/// failure) is a miss.
-async fn nar_route(state: State<Arc<AppState>>, file: Path<String>) -> Response {
-    let response = nar_redirect(state, file).await;
-    let outcome = if response.status() == StatusCode::TEMPORARY_REDIRECT {
-        "hit"
-    } else {
-        "miss"
+async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
+    let Some(hash) = wire::nar_file_hash(file).filter(|hash| is_store_hash(hash)) else {
+        return Outcome::Junk;
     };
-    metrics::counter!("garret_nar_requests_total", "outcome" => outcome).increment(1);
-    response
-}
-
-async fn nar_redirect(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
-    let Some(hash) = file.strip_suffix(".nar.zst") else {
-        return StatusCode::NOT_FOUND.into_response();
+    let Some(db) = state.db() else {
+        return Outcome::Unavailable;
     };
-    // Only redirect to blobs we have a row for — row exists ⇒ blob exists.
-    let Some(conn) = state.conn_handle() else {
-        return unavailable();
-    };
-    let exists = {
+    let read = {
         let hash = hash.to_owned();
-        db_read(conn, state.db_read_budget, move |conn| {
-            db::exists(conn, &hash)
-        })
-        .await
-    };
-    match exists {
-        None => return degraded_miss("db_timeout"),
-        Some(Ok(false)) => return StatusCode::NOT_FOUND.into_response(),
-        Some(Err(e)) => {
-            tracing::error!("nar {hash}: {e:#}");
-            return degraded_miss("db_error");
+        move |conn: &rusqlite::Connection| {
+            db::exists(conn, &hash).with_context(|| format!("nar {hash}"))
         }
-        Some(Ok(true)) => {}
+    };
+    match db_read(db.pull.clone(), state.db_read_budget, read).await {
+        Ok(true) => {}
+        Ok(false) => return Outcome::Miss,
+        Err(degraded) => return Outcome::Degraded(degraded),
     }
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     match tokio::time::timeout(
         state.presign_budget,
         state
@@ -564,99 +544,77 @@ async fn nar_redirect(State(state): State<Arc<AppState>>, Path(file): Path<Strin
     {
         Ok(Ok(url)) => {
             metrics::histogram!("garret_presign_duration_seconds").record(started.elapsed());
-            Redirect::temporary(&url).into_response()
+            Outcome::Hit(Redirect::temporary(&url).into_response())
         }
         Ok(Err(e)) => {
             tracing::error!("presigning {hash}: {e:#}");
-            degraded_miss("presign_error")
+            Outcome::Degraded(Degraded::PresignError)
         }
-        Err(_elapsed) => degraded_miss("presign_timeout"),
+        Err(_elapsed) => Outcome::Degraded(Degraded::PresignTimeout),
     }
 }
 
-/// Pocket ID only, and only here — narinfo and NAR stay anonymous so any
-/// machine's nix.conf works untouched (spec 04-auth).
 async fn require_browse_oidc(
-    State(auth): State<Arc<Authenticator>>,
-    request: axum::extract::Request,
+    State(authenticator): State<Arc<Authenticator>>,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let token = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let verdict = match token {
-        Some(token) => Some(auth.authenticate(token).await),
-        None => None,
-    };
-    match verdict {
-        Some(Ok(_)) => next.run(request).await,
-        other => {
-            let mut refused = false;
-            let reason = match other {
+    match auth::bearer(&authenticator, request.headers()).await {
+        Ok(subject) => {
+            request.extensions_mut().insert(subject);
+            next.run(request).await
+        }
+        Err(rejection) => {
+            let reason = match rejection.reason() {
                 None => "missing_bearer",
-                Some(verdict) => {
+                Some(logged) => {
                     // Debug, not warn: browse is a public surface and any
                     // client can flood this line.
-                    if let Err(e) = verdict {
-                        tracing::debug!(
-                            "rejected browse token: {}",
-                            garret_server::auth::loggable(&e)
-                        );
-                        refused = e.is::<garret_server::auth::PolicyRefused>();
-                    }
+                    tracing::debug!("rejected browse token: {logged}");
                     "token_rejected"
                 }
             };
             metrics::counter!("garret_browse_auth_failures_total", "reason" => reason).increment(1);
-            // A verified identity that policy refuses is a 403 (spec 04);
-            // every other failure may be transient and stays a 401.
-            if refused {
-                return (StatusCode::FORBIDDEN, "not authorized").into_response();
-            }
-            (
-                StatusCode::UNAUTHORIZED,
-                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
-                "unauthorized",
-            )
-                .into_response()
+            let body = match &rejection {
+                Rejection::Refused(_) => "not authorized",
+                Rejection::Missing | Rejection::Invalid(_) => "unauthorized",
+            };
+            rejection.respond(body)
         }
     }
 }
 
+/// A malformed `cursor` (or `limit`) fails extraction: a `400` (spec 07).
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     q: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
-    cursor: Option<String>,
+    cursor: Option<browse::Cursor>,
 }
 
 fn default_limit() -> usize {
-    50
+    wire::DEFAULT_LIMIT
 }
 
-/// Answers a browse route: `read` through [`browse_read`], rendered as JSON;
-/// `None` is a 404.
-async fn browse<T, F>(
-    conn: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
-    endpoint: &'static str,
-    read: F,
-) -> Response
+async fn run_browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Option<T>> + Send + 'static,
     T: serde::Serialize + Send + 'static,
 {
+    let Some(db) = state.db() else {
+        return unavailable();
+    };
     metrics::counter!("garret_browse_requests_total", "endpoint" => endpoint).increment(1);
-    match browse_read(conn, BROWSE_BUDGET, read).await {
-        Some(Ok(Some(value))) => axum::Json(value).into_response(),
-        Some(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
-        Some(Err(e)) => {
+    let query = on_conn(db.browse.clone(), "browse", move |conn| read(conn));
+    match tokio::time::timeout(BROWSE_BUDGET, query).await {
+        Ok(Ok(Some(value))) => axum::Json(value).into_response(),
+        Ok(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(e)) => {
             tracing::error!("browse {endpoint}: {e:#}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
-        None => {
+        Err(_elapsed) => {
             tracing::warn!("browse {endpoint}: over its {BROWSE_BUDGET:?} budget");
             (StatusCode::SERVICE_UNAVAILABLE, "browse query timed out").into_response()
         }
@@ -667,79 +625,65 @@ async fn list_objects(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
-    let Some(conn) = state.browse_conn.get().cloned() else {
-        return unavailable();
-    };
-    browse(conn, "objects", move |conn| {
-        browse::list(
-            conn,
-            query.q.as_deref(),
-            query.limit,
-            query.cursor.as_deref(),
-        )
-        .map(Some)
+    run_browse(&state, "objects", move |conn| {
+        browse::list(conn, query.q.as_deref(), query.limit, query.cursor.as_ref()).map(Some)
     })
     .await
 }
 
 async fn object_detail(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    let Some(conn) = state.browse_conn.get().cloned() else {
-        return unavailable();
-    };
-    browse(conn, "object", move |conn| db::get_object(conn, &hash)).await
+    run_browse(&state, "object", move |conn| browse::object(conn, &hash)).await
 }
 
 async fn object_tree(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    let Some(conn) = state.browse_conn.get().cloned() else {
-        return unavailable();
-    };
-    browse(conn, "tree", move |conn| browse::tree(conn, &hash, 64)).await
+    run_browse(&state, "tree", move |conn| {
+        browse::tree(conn, &hash, browse::TREE_DEPTH)
+    })
+    .await
 }
 
 async fn object_referrers(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Response {
-    let Some(conn) = state.browse_conn.get().cloned() else {
-        return unavailable();
-    };
-    browse(conn, "referrers", move |conn| {
+    run_browse(&state, "referrers", move |conn| {
         browse::referrers(conn, &hash).map(Some)
     })
     .await
 }
 
 async fn list_pins(State(state): State<Arc<AppState>>) -> Response {
-    let Some(conn) = state.browse_conn.get().cloned() else {
-        return unavailable();
-    };
-    browse(conn, "pins", |conn| browse::pins(conn).map(Some)).await
+    run_browse(&state, "pins", |conn| browse::pins(conn).map(Some)).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use garret_server::testing::{object, scratch_dir, unreachable_storage};
 
-    fn conn() -> Arc<Mutex<rusqlite::Connection>> {
-        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()))
+    fn wrap(conn: rusqlite::Connection) -> Conn {
+        Arc::new(tokio::sync::Mutex::new(conn))
     }
 
-    #[tokio::test]
-    async fn a_read_within_budget_returns_its_result() {
-        let got = db_read(conn(), Duration::from_secs(5), |_| Ok(42)).await;
-        assert_eq!(got.unwrap().unwrap(), 42);
+    fn conn() -> Conn {
+        wrap(rusqlite::Connection::open_in_memory().unwrap())
     }
 
-    /// The read is sync under the connection Mutex; the budget must still
+    /// Stands in for a wedged statement: blocks its thread until the test
+    /// sends on `gate`'s sender, and fails if that never comes.
+    fn wedge(gate: &std::sync::mpsc::Receiver<()>) -> anyhow::Result<()> {
+        gate.recv_timeout(Duration::from_secs(5))
+            .context("never released")
+    }
+
+    /// The read is sync under the connection lock; the budget must still
     /// trip while it is wedged (ticket 25) — hence the blocking pool.
     #[tokio::test]
     async fn a_wedged_read_trips_the_budget_instead_of_hanging() {
-        let got = db_read(conn(), Duration::from_millis(25), |_| {
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(())
-        })
-        .await;
-        assert!(got.is_none(), "the budget should have tripped");
+        let (release, gate) = std::sync::mpsc::channel();
+        let got = db_read(conn(), Duration::from_millis(25), move |_| wedge(&gate)).await;
+        let _ = release.send(());
+        assert_eq!(got, Err(Degraded::DbTimeout));
     }
 
     /// Same failure mode, different cause: the wedged reader holds the lock,
@@ -748,145 +692,124 @@ mod tests {
     async fn a_read_queued_behind_a_wedged_lock_holder_trips_its_budget() {
         let conn = conn();
         let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
         let wedged = db_read(conn.clone(), Duration::from_millis(25), move |_| {
             // Signal that the lock is held so the queued read provably starts
             // second; otherwise it could win the lock and succeed.
             holding_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(())
+            wedge(&gate)
         });
         let wedged = tokio::spawn(wedged);
         holding_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("wedged read should acquire the lock");
         let queued = db_read(conn, Duration::from_millis(25), |_| Ok(())).await;
+        let _ = release.send(());
         let wedged = wedged.await.unwrap();
-        assert!(wedged.is_none());
-        assert!(queued.is_none(), "queued read should degrade, not wait");
-    }
-
-    fn object(hash: &str) -> db::Object {
-        db::Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: vec![],
-            sigs: vec![],
-            pushed_by: None,
-        }
+        assert_eq!(wedged, Err(Degraded::DbTimeout));
+        assert_eq!(
+            queued,
+            Err(Degraded::DbTimeout),
+            "queued read should degrade, not wait"
+        );
     }
 
     const DAY: i64 = 86400;
 
-    /// The pull-path read of `hash`'s `last_accessed_at`, fed to a hit the
-    /// way `narinfo_route` does.
-    fn hit(bumps: &Bumps, conn: &rusqlite::Connection, hash: &str, now: i64) {
-        let (_, last_accessed_at) = db::get_object_and_last_accessed(conn, hash)
-            .unwrap()
-            .unwrap();
-        bumps.hit(hash, last_accessed_at, now, DAY);
+    /// Flushes `state`'s queued bumps on its pull connection; how many it wrote.
+    async fn flush(state: &AppState) -> usize {
+        let mut conn = state.db().unwrap().pull.lock().await;
+        state.bumps.flush(&mut conn, unix_now()).unwrap()
     }
 
     /// Nearly every hit is on a fresh row, and it must not write: not even
-    /// take the WAL write lock, which is what starved the Pusher. Proved
-    /// against a Pusher holding that lock, where any write attempt fails busy.
-    #[test]
-    fn a_debounced_hit_performs_no_write() {
-        let path = std::env::temp_dir().join(format!("garret-bump-{}.sqlite", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+    /// take the WAL write lock the Pusher needs. Proved against a Pusher
+    /// holding that lock, where any write attempt fails busy.
+    #[tokio::test]
+    async fn a_debounced_hit_performs_no_write() {
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap();
         let mut pusher = db::open(path, true).unwrap();
         db::migrate(&pusher).unwrap();
         let hash = "a".repeat(32);
-        db::insert_object(&mut pusher, &object(&hash), 1000).unwrap();
-        let mut puller = db::open(path, false).unwrap();
+        db::insert_object(&mut pusher, &object(&hash), unix_now()).unwrap();
+        let puller = db::open(path, false).unwrap();
         puller.busy_timeout(Duration::from_millis(10)).unwrap();
+        let state = state_with_db(puller).await;
+        let app = pull_routes().with_state(state.clone());
 
         pusher.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let bumps = Bumps::default();
+        let served = request(&app, &format!("/{hash}.narinfo")).await;
+        assert_eq!(served.status(), StatusCode::OK);
         // The last second of the window, where the UPDATE's WHERE would
         // match nothing: still no write lock.
-        hit(&bumps, &puller, &hash, 1000 + DAY);
-        let flushed = bumps.flush(&mut puller, 1000 + DAY, DAY);
+        state.bumps.hit(&hash, 1000, 1000 + DAY);
+        let flushed = flush(&state).await;
         pusher.execute_batch("ROLLBACK").unwrap();
-        let _ = std::fs::remove_file(path);
-        assert_eq!(flushed.unwrap(), 0, "a fresh row must not be written");
+        assert_eq!(flushed, 0, "a fresh row must not be written");
     }
 
-    #[test]
-    fn a_burst_of_hits_on_one_hash_is_one_write() {
+    #[tokio::test]
+    async fn a_burst_of_hits_on_one_hash_is_one_write() {
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), 1000).unwrap();
-        let now = 1000 + DAY + 1;
+        let state = state_with_db(conn).await;
+        let app = pull_routes().with_state(state.clone());
+        let narinfo = format!("/{hash}.narinfo");
 
-        let bumps = Bumps::default();
         for _ in 0..100 {
-            hit(&bumps, &conn, &hash, now);
+            assert_eq!(request(&app, &narinfo).await.status(), StatusCode::OK);
         }
-        assert_eq!(bumps.flush(&mut conn, now, DAY).unwrap(), 1);
+        assert_eq!(flush(&state).await, 1);
 
         // Written: later hits read the fresh value and queue nothing.
-        hit(&bumps, &conn, &hash, now + 1);
-        assert_eq!(bumps.flush(&mut conn, now + 1, DAY).unwrap(), 0);
+        assert_eq!(request(&app, &narinfo).await.status(), StatusCode::OK);
+        assert_eq!(flush(&state).await, 0);
     }
 
     /// A slow browse query (a big tree walk, a full-scan search) must not
-    /// delay a pull-path read. With one runtime thread, a query run on the
-    /// async worker would stall the narinfo read's own task. (Sharing the
-    /// pull-path connection is ruled out by type: browse's is an async lock.)
+    /// delay a narinfo read: it runs on its own connection, and off the
+    /// async worker, which with one runtime thread would stall every request.
     #[tokio::test(flavor = "current_thread")]
     async fn a_slow_browse_query_does_not_delay_pull_reads() {
-        let browse_conn = Arc::new(tokio::sync::Mutex::new(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        ));
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let hash = "a".repeat(32);
+        db::insert_object(&mut conn, &object(&hash), 1000).unwrap();
+        let state = state_with_db(conn).await;
+
         let (running_tx, running_rx) = tokio::sync::oneshot::channel();
-        let started = std::time::Instant::now();
-        let slow = tokio::spawn(browse_read(browse_conn, Duration::from_secs(5), |_| {
-            running_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_secs(1));
-            Ok(())
-        }));
+        let (release, gate) = std::sync::mpsc::channel();
+        let slow = tokio::spawn({
+            let state = state.clone();
+            async move {
+                run_browse(&state, "tree", move |_| {
+                    running_tx.send(()).unwrap();
+                    wedge(&gate).map(Some)
+                })
+                .await
+            }
+        });
         running_rx.await.unwrap();
 
-        let read = db_read(conn(), Duration::from_millis(900), |_| Ok(42)).await;
-        assert_eq!(read.expect("the pull read tripped its budget").unwrap(), 42);
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "the pull read waited on the browse query: {:?}",
-            started.elapsed()
+        let app = pull_routes().with_state(state);
+        let served = request(&app, &format!("/{hash}.narinfo")).await;
+        let _ = release.send(());
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "the narinfo read waited on the browse query"
         );
-        slow.await.unwrap().unwrap().unwrap();
-    }
-
-    /// The budget covers the wait for the browse lock too: requests queued
-    /// behind a slow query answer 503 instead of piling up.
-    #[tokio::test]
-    async fn a_browse_request_queued_behind_a_slow_one_trips_its_budget() {
-        let browse_conn = Arc::new(tokio::sync::Mutex::new(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        ));
-        let _slow = browse_conn.clone().lock_owned().await;
-        let queued = tokio::time::timeout(
-            Duration::from_secs(5),
-            browse_read(browse_conn, Duration::from_millis(25), |_| Ok(())),
-        )
-        .await
-        .expect("the queued request waited past its budget");
-        assert!(queued.is_none());
+        assert_eq!(slow.await.unwrap().status(), StatusCode::OK);
     }
 
     /// A client that disconnects mid-probe cancels its handler. That must not
     /// leave the cache empty, or a loop of abandoned requests would cost one
     /// S3 read each instead of one per TTL.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_abandoned_probe_still_fills_the_cache() {
         let cache = ProbeCache::default();
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -897,18 +820,19 @@ mod tests {
         };
         let abandoned = tokio::spawn({
             let (cache, probe) = (cache.clone(), probe(probes.clone()));
-            async move { cached_probe(&cache, READ_PROBE_TTL, probe).await }
+            async move { cached_probe(&cache, probe).await }
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         abandoned.abort();
 
-        let next = cached_probe(&cache, READ_PROBE_TTL, probe(probes.clone())).await;
+        let next = cached_probe(&cache, probe(probes.clone())).await;
         assert_eq!(next, Err("presigned GET answered 403".to_owned()));
         assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// One bad row that panics a read must cost that request, not the
-    /// Puller: the process stays up, so nothing would restart it.
+    /// Puller: the process stays up, so nothing would restart it, and the
+    /// connection must keep serving.
     #[tokio::test]
     async fn a_panicked_read_does_not_break_later_reads() {
         let conn = conn();
@@ -918,48 +842,18 @@ mod tests {
             |_| -> anyhow::Result<()> { panic!("boom") },
         )
         .await;
-        assert!(panicked.unwrap().is_err());
+        assert_eq!(panicked, Err(Degraded::DbError));
         let next = db_read(conn, Duration::from_secs(5), |_| Ok(42)).await;
-        assert_eq!(next.unwrap().unwrap(), 42);
-    }
-
-    /// Browse's async lock cannot poison at all; this guards that design
-    /// choice, and the 500 a panicking browse request must still answer.
-    #[tokio::test]
-    async fn a_panicking_browse_request_is_a_500_and_the_next_one_is_served() {
-        let conn = Arc::new(tokio::sync::Mutex::new(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        ));
-        let panicked = browse(conn.clone(), "tree", |_| -> anyhow::Result<Option<()>> {
-            panic!("boom")
-        })
-        .await;
-        assert_eq!(panicked.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let next = browse(conn, "tree", |_| Ok(Some(42))).await;
-        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(next, Ok(42));
     }
 
     async fn state() -> Arc<AppState> {
-        let storage = Storage::new(&garret_server::config::S3Config {
-            bucket: "test".into(),
-            endpoint_url: Some("http://127.0.0.1:1".into()),
-            region: Some("us-east-1".into()),
-            path_style: true,
-            access_key_id: Some("x".into()),
-            secret_access_key: Some("x".into()),
-            operation_timeout_secs: 1,
-            operation_attempt_timeout_secs: None,
-            sign_payload: false,
-        })
-        .await
-        .unwrap();
+        let storage = unreachable_storage().await;
         Arc::new(AppState {
-            conn: OnceLock::new(),
-            browse_conn: OnceLock::new(),
+            db: OnceLock::new(),
             storage,
             presign_ttl: Duration::from_secs(1),
-            bump_debounce: 0,
-            bumps: Bumps::default(),
+            bumps: Bumps::new(DAY),
             db_read_budget: Duration::from_secs(1),
             presign_budget: Duration::from_secs(1),
             read_probe: ProbeCache::default(),
@@ -967,89 +861,130 @@ mod tests {
         })
     }
 
+    /// [`state`] with its database open, `pull` as the pull-path connection.
+    async fn state_with_db(pull: rusqlite::Connection) -> Arc<AppState> {
+        let state = state().await;
+        let db = Db {
+            pull: wrap(pull),
+            bump: conn(),
+            browse: conn(),
+        };
+        assert!(state.db.set(db).is_ok());
+        state
+    }
+
+    async fn request(app: &Router, uri: &str) -> Response {
+        use tower::ServiceExt;
+        let req = axum::http::Request::get(uri)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    /// Each route counts its own hits and misses. A name that is not a
+    /// store hash's file is a 404 before any database read (the state here
+    /// has no database, which would answer 503) and is not counted.
+    #[tokio::test]
+    async fn pull_routes_count_hits_and_misses_but_not_junk_names() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let no_db = pull_routes().with_state(state().await);
+        let invalid = "e".repeat(32);
+        for uri in [
+            "/zzz.narinfo".to_owned(),
+            format!("/{invalid}.narinfo"),
+            format!("/{}.txt", "a".repeat(32)),
+            "/nar/zzz.nar.zst".to_owned(),
+            format!("/nar/{invalid}.nar.zst"),
+        ] {
+            let status = request(&no_db, &uri).await.status();
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+        assert!(
+            !handle.render().contains("requests_total"),
+            "junk was counted"
+        );
+
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let (cached, absent) = ("a".repeat(32), "b".repeat(32));
+        db::insert_object(&mut conn, &object(&cached), 1000).unwrap();
+        let app = pull_routes().with_state(state_with_db(conn).await);
+        for (uri, status) in [
+            (format!("/{cached}.narinfo"), StatusCode::OK),
+            (format!("/{absent}.narinfo"), StatusCode::NOT_FOUND),
+            (
+                format!("/nar/{cached}.nar.zst"),
+                StatusCode::TEMPORARY_REDIRECT,
+            ),
+            (format!("/nar/{absent}.nar.zst"), StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(request(&app, &uri).await.status(), status, "{uri}");
+        }
+        let rendered = handle.render();
+        for line in [
+            r#"garret_narinfo_requests_total{outcome="hit"} 1"#,
+            r#"garret_narinfo_requests_total{outcome="miss"} 1"#,
+            r#"garret_nar_requests_total{outcome="hit"} 1"#,
+            r#"garret_nar_requests_total{outcome="miss"} 1"#,
+        ] {
+            assert!(rendered.contains(line), "{line} not in:\n{rendered}");
+        }
+    }
+
     /// Browse auth wraps only the browse routes: an unmatched path is a plain
     /// 404, not a 401 that counts as a browse auth failure.
     #[tokio::test]
     async fn browse_auth_leaves_unmatched_paths_a_plain_404() {
-        use tower::ServiceExt;
-        let issuer = IssuerConfig {
-            issuer: "https://issuer.example".into(),
-            audience: "aud".into(),
-            extra_audiences: vec![],
-            client_id: None,
-            jwks_url: None,
-            github_owner_id: None,
-            ref_patterns: vec![],
-            ref_protected: None,
-            repository_ids: vec![],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
-        };
-        let app = Router::new()
-            .route("/{file}", get(narinfo_route))
+        let issuer = garret_server::testing::dev_issuer("unused");
+        let app = pull_routes()
             .merge(browse_routes(Some(&issuer)).unwrap())
             .with_state(state().await);
-        let get_status = |uri: &'static str| {
-            let app = app.clone();
-            async move {
-                let req = axum::http::Request::get(uri)
-                    .body(axum::body::Body::empty())
-                    .unwrap();
-                app.oneshot(req).await.unwrap()
-            }
-        };
         for uri in ["/a/b", "/"] {
-            let res = get_status(uri).await;
+            let res = request(&app, uri).await;
             assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
             assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
         }
-        let res = get_status("/api/v1/objects").await;
+        let res = request(&app, wire::OBJECTS).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
-    /// A verified token that a policy gate refuses is a 403; an unverifiable
-    /// one stays a 401 (spec 04).
+    /// A cursor the listing never handed out is a 400, not a silent restart
+    /// at page 1 (spec 07).
     #[tokio::test]
-    async fn browse_answers_403_for_a_policy_refusal_and_401_otherwise() {
+    async fn a_malformed_browse_cursor_is_a_400() {
+        use garret_server::testing::{DEV_ISSUER, dev_issuer, jwks_file, sign};
         use tower::ServiceExt;
-        let jwks = std::env::temp_dir().join(format!("garret-puller-jwks-{}", std::process::id()));
-        std::fs::write(&jwks, garret_server::testing::jwks()).unwrap();
-        let issuer = IssuerConfig {
-            issuer: "https://issuer.example".into(),
-            audience: "aud".into(),
-            extra_audiences: vec![],
-            client_id: None,
-            jwks_url: Some(jwks.to_str().unwrap().into()),
-            github_owner_id: None,
-            ref_patterns: vec![],
-            ref_protected: None,
-            repository_ids: vec!["42".into()],
-            event_names: vec![],
-            job_workflow_refs: vec![],
-            allowed_groups: vec![],
+
+        let jwks = jwks_file();
+        let state = state().await;
+        let browse_conn = db::open(":memory:", true).unwrap();
+        db::migrate(&browse_conn).unwrap();
+        let db = Db {
+            pull: conn(),
+            bump: conn(),
+            browse: wrap(browse_conn),
         };
-        let app = browse_routes(Some(&issuer))
+        assert!(state.db.set(db).is_ok());
+        let app = browse_routes(Some(&dev_issuer(jwks.path())))
             .unwrap()
-            .with_state(state().await);
-        let send = |token: String| {
-            let app = app.clone();
-            async move {
-                let req = axum::http::Request::get("/api/v1/objects")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(axum::body::Body::empty())
-                    .unwrap();
-                app.oneshot(req).await.unwrap()
-            }
-        };
-        let signed = garret_server::testing::sign(
-            r#"{"iss": "https://issuer.example", "sub": "ci", "aud": "aud", "exp": 4102444800, "repository_id": "99"}"#,
-        );
-        let res = send(signed).await;
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
-        let res = send("not-a-jwt".into()).await;
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_file(jwks);
+            .with_state(state);
+        let token = sign(&format!(
+            r#"{{"iss":"{DEV_ISSUER}","sub":"me","aud":"garret","exp":4102444800}}"#
+        ));
+        for (cursor, status) in [
+            ("garbage", StatusCode::BAD_REQUEST),
+            ("x:abc", StatusCode::BAD_REQUEST),
+            ("100:abc", StatusCode::OK),
+        ] {
+            let req = axum::http::Request::get(format!("{}?cursor={cursor}", wire::OBJECTS))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), status, "{cursor}");
+        }
     }
 }

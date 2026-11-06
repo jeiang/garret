@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where `garret-admin` looks for the Pusher's admin socket by default.
+pub const DEFAULT_ADMIN_SOCKET: &str = "/run/garret/admin.sock";
+
 /// A command sent by `garret-admin` to the Pusher's admin socket.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -56,7 +59,8 @@ pub enum Request {
     /// newer push or a live pin still needs (spec 05).
     Prune {
         /// Unix time; objects last pushed before it are candidates. Must be
-        /// at least a day ago, so a push in progress keeps its closure.
+        /// at least [`crate::PUSH_GRACE`] ago, so a push in progress keeps its
+        /// closure.
         before: i64,
         /// Report what would go without deleting anything.
         dry_run: bool,
@@ -95,12 +99,12 @@ pub enum Repair {
     Quiesced,
 }
 
-/// The Pusher's reply to a [`Request`]; variants mirror the request commands,
-/// plus [`Response::Error`] for any failure.
+/// The Pusher's reply to a [`Request`]: the variant named after the command
+/// ([`Response::Gc`] for [`Request::GcRun`]), or [`Response::Error`].
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Response {
-    /// Reply to [`Request::Status`].
+    /// Cache usage now.
     Status {
         /// Number of objects in the cache.
         objects: i64,
@@ -111,7 +115,7 @@ pub enum Response {
         /// Uploads currently being received.
         uploads_in_flight: usize,
     },
-    /// Reply to [`Request::GcRun`].
+    /// One eviction pass's outcome.
     Gc {
         /// Objects evicted by this pass.
         evicted: usize,
@@ -122,7 +126,7 @@ pub enum Response {
         /// is referenced.
         candidates_exhausted: bool,
     },
-    /// Reply to [`Request::Resign`].
+    /// Re-signing tally.
     Resign {
         /// Objects whose narinfo signatures were rewritten.
         resigned: usize,
@@ -131,7 +135,7 @@ pub enum Response {
         /// would otherwise launder tampered metadata into a valid signature.
         refused: usize,
     },
-    /// Reply to [`Request::Delete`].
+    /// What was, or on a dry run would be, deleted.
     Delete {
         /// Objects removed (or, on a dry run, that would be removed).
         deleted: usize,
@@ -141,46 +145,29 @@ pub enum Response {
         /// silently reporting success would hide a typo.
         missing: Vec<String>,
     },
-    /// Reply to [`Request::Pin`].
+    /// The pin is stored.
     Pin,
-    /// Reply to [`Request::Unpin`].
+    /// Whether the named pin existed.
     Unpin {
         /// False when no pin had that name — reported, not swallowed, so a
         /// typo does not look like a successful unpin.
         removed: bool,
     },
-    /// Reply to [`Request::Fsck`].
-    Fsck {
-        /// Rows with no matching blob, past the in-flight and age guards.
-        dangling: Vec<FsckRow>,
-        /// Rows whose blob exists but disagrees on size (`--verify-sizes`
-        /// only) — a third category, not double-reported as dangling.
-        size_mismatches: Vec<FsckSizeMismatch>,
-        /// Blob keys with no matching row, past the same guards. Informational
-        /// only: the existing orphan sweep owns deleting these, on its own
-        /// schedule.
-        orphans: Vec<String>,
-        /// Rows actually deleted this run (dangling + size-mismatch
-        /// combined). Zero unless the request asked for a repair.
-        repaired: usize,
-        /// `None` unless the request was [`Repair::Quiesced`]; then whether
-        /// in-flight uploads reached zero within the timeout. `Some(false)`
-        /// means the drain timed out and no repair happened.
-        quiesce_drained: Option<bool>,
-    },
-    /// Reply to [`Request::Prune`].
+    /// Audit findings and repairs.
+    Fsck(FsckReport),
+    /// What was, or on a dry run would be, pruned.
     Prune {
         /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
         pruned: Vec<String>,
         /// Compressed bytes reclaimed (or reclaimable, on a dry run).
         bytes_freed: i64,
     },
-    /// Reply to [`Request::Backup`].
+    /// The copy is written.
     Backup {
         /// Size of the copy written, in bytes.
         bytes: u64,
     },
-    /// Reply to [`Request::DeletePushedBy`].
+    /// What was, or on a dry run would be, deleted.
     DeletePushedBy {
         /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
         objects: Vec<String>,
@@ -192,6 +179,38 @@ pub enum Response {
         /// Human-readable description of what went wrong.
         message: String,
     },
+}
+
+/// What [`Request::Fsck`] found and repaired.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct FsckReport {
+    /// Rows with no matching blob, past the in-flight and age guards.
+    pub dangling: Vec<FsckRow>,
+    /// Rows whose blob exists but disagrees on size (`--verify-sizes`
+    /// only) — a third category, not double-reported as dangling.
+    pub size_mismatches: Vec<FsckSizeMismatch>,
+    /// Blob keys with no matching row, past the same guards. Informational
+    /// only: the existing orphan sweep owns deleting these, on its own
+    /// schedule.
+    pub orphans: Vec<String>,
+    /// Rows actually deleted this run (dangling + size-mismatch
+    /// combined). Zero unless the request asked for a repair.
+    pub repaired: usize,
+    /// `None` unless the request was [`Repair::Quiesced`]; then whether
+    /// in-flight uploads reached zero within the timeout. `Some(false)`
+    /// means the drain timed out and no repair happened.
+    pub quiesce_drained: Option<bool>,
+}
+
+impl FsckReport {
+    /// Whether `garret-admin fsck` exits zero (spec 10): no dangling or
+    /// size-mismatched rows and no timed-out quiesce. Orphans alone stay
+    /// informational: the orphan sweep owns them on its own schedule.
+    pub fn ok(&self) -> bool {
+        self.dangling.is_empty()
+            && self.size_mismatches.is_empty()
+            && self.quiesce_drained != Some(false)
+    }
 }
 
 /// A dangling row: a store path with no matching blob (spec 02).
@@ -221,90 +240,257 @@ mod tests {
     use super::*;
 
     #[test]
-    fn requests_round_trip_as_one_line() {
-        for request in [
-            Request::Status,
-            Request::GcRun,
-            Request::Resign,
-            Request::Delete {
-                hashes: vec!["a".repeat(32)],
-                dry_run: true,
+    fn requests_have_a_fixed_wire_form() {
+        let hash = "a".repeat(32);
+        for (request, wire) in [
+            (Request::Status, r#"{"command":"status"}"#.to_owned()),
+            (Request::GcRun, r#"{"command":"gc-run"}"#.to_owned()),
+            (Request::Resign, r#"{"command":"resign"}"#.to_owned()),
+            (
+                Request::Delete {
+                    hashes: vec![hash.clone()],
+                    dry_run: true,
+                },
+                format!(r#"{{"command":"delete","hashes":["{hash}"],"dry_run":true}}"#),
+            ),
+            (
+                Request::Pin {
+                    name: "release".into(),
+                    hash: hash.clone(),
+                    expires_at: Some(1234),
+                },
+                format!(r#"{{"command":"pin","name":"release","hash":"{hash}","expires_at":1234}}"#),
+            ),
+            (
+                Request::Pin {
+                    name: "release".into(),
+                    hash: hash.clone(),
+                    expires_at: None,
+                },
+                format!(r#"{{"command":"pin","name":"release","hash":"{hash}","expires_at":null}}"#),
+            ),
+            (
+                Request::Unpin {
+                    name: "release".into(),
+                },
+                r#"{"command":"unpin","name":"release"}"#.to_owned(),
+            ),
+            (
+                Request::Fsck {
+                    verify_sizes: false,
+                    repair: Repair::Live,
+                },
+                r#"{"command":"fsck","verify_sizes":false,"repair":"live"}"#.to_owned(),
+            ),
+            (
+                Request::Fsck {
+                    verify_sizes: true,
+                    repair: Repair::No,
+                },
+                r#"{"command":"fsck","verify_sizes":true,"repair":"no"}"#.to_owned(),
+            ),
+            (
+                Request::Fsck {
+                    verify_sizes: true,
+                    repair: Repair::Quiesced,
+                },
+                r#"{"command":"fsck","verify_sizes":true,"repair":"quiesced"}"#.to_owned(),
+            ),
+            (
+                Request::Prune {
+                    before: 1234,
+                    dry_run: false,
+                },
+                r#"{"command":"prune","before":1234,"dry_run":false}"#.to_owned(),
+            ),
+            (
+                Request::Backup {
+                    path: "/var/lib/garret/backup.db".into(),
+                },
+                r#"{"command":"backup","path":"/var/lib/garret/backup.db"}"#.to_owned(),
+            ),
+            (
+                Request::DeletePushedBy {
+                    subject: "https://issuer#repo:o/r".into(),
+                    since: Some(1234),
+                    dry_run: true,
+                },
+                r#"{"command":"delete-pushed-by","subject":"https://issuer#repo:o/r","since":1234,"dry_run":true}"#
+                    .to_owned(),
+            ),
+            (
+                Request::DeletePushedBy {
+                    subject: "s".into(),
+                    since: None,
+                    dry_run: false,
+                },
+                r#"{"command":"delete-pushed-by","subject":"s","since":null,"dry_run":false}"#
+                    .to_owned(),
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&request).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn responses_have_a_fixed_wire_form() {
+        let hash = "a".repeat(32);
+        for (response, wire) in [
+            (
+                Response::Status {
+                    objects: 3,
+                    total_bytes: 100,
+                    quota_bytes: Some(1000),
+                    uploads_in_flight: 1,
+                },
+                r#"{"status":{"objects":3,"total_bytes":100,"quota_bytes":1000,"uploads_in_flight":1}}"#
+                    .to_owned(),
+            ),
+            (
+                Response::Status {
+                    objects: 0,
+                    total_bytes: 0,
+                    quota_bytes: None,
+                    uploads_in_flight: 0,
+                },
+                r#"{"status":{"objects":0,"total_bytes":0,"quota_bytes":null,"uploads_in_flight":0}}"#
+                    .to_owned(),
+            ),
+            (
+                Response::Gc {
+                    evicted: 2,
+                    bytes_freed: 50,
+                    candidates_exhausted: true,
+                },
+                r#"{"gc":{"evicted":2,"bytes_freed":50,"candidates_exhausted":true}}"#.to_owned(),
+            ),
+            (
+                Response::Resign {
+                    resigned: 4,
+                    refused: 1,
+                },
+                r#"{"resign":{"resigned":4,"refused":1}}"#.to_owned(),
+            ),
+            (
+                Response::Delete {
+                    deleted: 1,
+                    bytes_freed: 10,
+                    missing: vec![hash.clone()],
+                },
+                format!(r#"{{"delete":{{"deleted":1,"bytes_freed":10,"missing":["{hash}"]}}}}"#),
+            ),
+            (Response::Pin, r#""pin""#.to_owned()),
+            (
+                Response::Unpin { removed: false },
+                r#"{"unpin":{"removed":false}}"#.to_owned(),
+            ),
+            (
+                Response::Fsck(FsckReport {
+                    dangling: vec![FsckRow {
+                        store_path_hash: hash.clone(),
+                        name: "x".into(),
+                    }],
+                    size_mismatches: vec![FsckSizeMismatch {
+                        store_path_hash: hash.clone(),
+                        name: "y".into(),
+                        db_size: 5,
+                        s3_size: 6,
+                    }],
+                    orphans: vec!["nar/k.nar.zst".into()],
+                    repaired: 2,
+                    quiesce_drained: Some(true),
+                }),
+                format!(
+                    r#"{{"fsck":{{"dangling":[{{"store_path_hash":"{hash}","name":"x"}}],"size_mismatches":[{{"store_path_hash":"{hash}","name":"y","db_size":5,"s3_size":6}}],"orphans":["nar/k.nar.zst"],"repaired":2,"quiesce_drained":true}}}}"#
+                ),
+            ),
+            (
+                Response::Fsck(FsckReport {
+                    dangling: vec![],
+                    size_mismatches: vec![],
+                    orphans: vec![],
+                    repaired: 0,
+                    quiesce_drained: Some(false),
+                }),
+                r#"{"fsck":{"dangling":[],"size_mismatches":[],"orphans":[],"repaired":0,"quiesce_drained":false}}"#
+                    .to_owned(),
+            ),
+            (
+                Response::Fsck(FsckReport {
+                    dangling: vec![],
+                    size_mismatches: vec![],
+                    orphans: vec![],
+                    repaired: 0,
+                    quiesce_drained: None,
+                }),
+                r#"{"fsck":{"dangling":[],"size_mismatches":[],"orphans":[],"repaired":0,"quiesce_drained":null}}"#
+                    .to_owned(),
+            ),
+            (
+                Response::Prune {
+                    pruned: vec![format!("{hash}-x")],
+                    bytes_freed: 7,
+                },
+                format!(r#"{{"prune":{{"pruned":["{hash}-x"],"bytes_freed":7}}}}"#),
+            ),
+            (
+                Response::Backup { bytes: 4096 },
+                r#"{"backup":{"bytes":4096}}"#.to_owned(),
+            ),
+            (
+                Response::DeletePushedBy {
+                    objects: vec![format!("{hash}-x")],
+                    bytes_freed: 7,
+                },
+                format!(r#"{{"delete-pushed-by":{{"objects":["{hash}-x"],"bytes_freed":7}}}}"#),
+            ),
+            (
+                Response::Error {
+                    message: "no [gc] section".into(),
+                },
+                r#"{"error":{"message":"no [gc] section"}}"#.to_owned(),
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&response).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn fsck_fails_on_dangling_size_mismatch_or_timed_out_quiesce_but_not_orphans() {
+        let clean = FsckReport {
+            dangling: vec![],
+            size_mismatches: vec![],
+            orphans: vec!["nar/k.nar.zst".into()],
+            repaired: 0,
+            quiesce_drained: Some(true),
+        };
+        assert!(clean.ok(), "orphans alone must not fail fsck");
+        let row = || FsckRow {
+            store_path_hash: "a".repeat(32),
+            name: "x".into(),
+        };
+        for bad in [
+            FsckReport {
+                dangling: vec![row()],
+                ..clean.clone()
             },
-            Request::Fsck {
-                verify_sizes: true,
-                repair: Repair::Quiesced,
+            FsckReport {
+                size_mismatches: vec![FsckSizeMismatch {
+                    store_path_hash: "a".repeat(32),
+                    name: "x".into(),
+                    db_size: 1,
+                    s3_size: 2,
+                }],
+                ..clean.clone()
             },
-            Request::Pin {
-                name: "release".into(),
-                hash: "b".repeat(32),
-                expires_at: Some(1234),
-            },
-            Request::Unpin {
-                name: "release".into(),
-            },
-            Request::Prune {
-                before: 1234,
-                dry_run: true,
-            },
-            Request::Backup {
-                path: "/var/lib/garret/backup.db".into(),
-            },
-            Request::DeletePushedBy {
-                subject: "https://token.actions.githubusercontent.com#repo:o/r:ref:refs/heads/main"
-                    .into(),
-                since: Some(1234),
-                dry_run: true,
+            FsckReport {
+                quiesce_drained: Some(false),
+                ..clean.clone()
             },
         ] {
-            let line = serde_json::to_string(&request).unwrap();
-            assert!(!line.contains('\n'), "a request must fit on one line");
-            assert_eq!(serde_json::from_str::<Request>(&line).unwrap(), request);
-        }
-        // The tag is what the wire carries, so it is part of the contract.
-        assert_eq!(
-            serde_json::to_string(&Request::GcRun).unwrap(),
-            r#"{"command":"gc-run"}"#
-        );
-        assert_eq!(
-            serde_json::to_string(&Request::Fsck {
-                verify_sizes: false,
-                repair: Repair::Live,
-            })
-            .unwrap(),
-            r#"{"command":"fsck","verify_sizes":false,"repair":"live"}"#
-        );
-    }
-
-    #[test]
-    fn responses_round_trip() {
-        let response = Response::Status {
-            objects: 3,
-            total_bytes: 100,
-            quota_bytes: Some(1000),
-            uploads_in_flight: 1,
-        };
-        let line = serde_json::to_string(&response).unwrap();
-        assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), response);
-    }
-
-    #[test]
-    fn fsck_responses_round_trip_every_drain_outcome() {
-        for (quiesce_drained, wire) in
-            [(None, "null"), (Some(true), "true"), (Some(false), "false")]
-        {
-            let response = Response::Fsck {
-                dangling: vec![],
-                size_mismatches: vec![],
-                orphans: vec![],
-                repaired: 0,
-                quiesce_drained,
-            };
-            let line = serde_json::to_string(&response).unwrap();
-            assert!(
-                line.contains(&format!(r#""quiesce_drained":{wire}"#)),
-                "{line}"
-            );
-            assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), response);
+            assert!(!bad.ok(), "{bad:?}");
         }
     }
 }

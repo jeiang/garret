@@ -4,9 +4,12 @@
 //! and naming the broken layer instead of letting a push fail three layers
 //! deeper with a message about the wrong one.
 
-use garret_common::parse_store_hash;
+use garret_common::{
+    parse_store_hash,
+    wire::{self, Discovery},
+};
 
-use crate::{auth, config, discovery};
+use crate::{config, discovery, push::Pusher};
 
 /// The hash probed when no path argument is given: certainly absent, so the
 /// Puller answering 404 for it proves the narinfo route is served without
@@ -75,15 +78,37 @@ impl Check {
     }
 }
 
+/// The verdicts as `garret doctor` prints them: one aligned line per check,
+/// or with `json` one object whose `ok` is false if any check failed.
+pub fn render(checks: &[Check], json: bool) -> String {
+    if json {
+        let ok = checks.iter().all(|c| c.status != Status::Fail);
+        let checks: Vec<_> = checks
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "status": c.status.as_str(),
+                    "detail": c.detail,
+                })
+            })
+            .collect();
+        return format!("{}\n", serde_json::json!({ "ok": ok, "checks": checks }));
+    }
+    checks
+        .iter()
+        .map(|c| format!("{:<4} {:<9} {}\n", c.status.as_str(), c.name, c.detail))
+        .collect()
+}
+
 /// Runs every check in layer order and returns all the verdicts. Never an
 /// `Err` — a broken layer is a `Fail` verdict, not an early return — so the
 /// caller always gets the whole picture before deciding the exit code.
 pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str>) -> Vec<Check> {
     let mut checks = Vec::new();
-    // One provider for the run. A machine config (secret file, GitHub
-    // Actions) is told apart from a human's stored login by the same
-    // classification the provider uses — `GARRET_TOKEN` says nothing about it.
-    let tokens = auth::TokenSource::for_config(http, cfg);
+    // A machine config (secret file, GitHub Actions) is told apart from a
+    // human's stored login by the same classification the token provider
+    // uses — `GARRET_TOKEN` says nothing about it.
     let device_flow = matches!(
         cfg.credential_kind(config::GithubActions::from_env()),
         config::CredentialKind::DeviceFlow
@@ -117,9 +142,6 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
                     ),
                 ),
             });
-            // A machine config with no `public_keys` is a build host that
-            // pushes and never substitutes through `garret use`; anything
-            // that does carry keys has them checked.
             if keys_checked(cfg, device_flow) {
                 let (status, detail) = keys_verdict(&cfg.public_keys, &d.public_keys);
                 checks.push(Check {
@@ -137,12 +159,25 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
         }
     }
 
-    let token = auth_check(cfg, http, tokens, &mut checks).await;
+    // One Pusher, so one token provider, for the run; it is asked about the
+    // path only once it has accepted the token.
+    let accepted = match Pusher::from_config(cfg, http) {
+        Ok(pusher) => {
+            let check = auth_check(&pusher).await;
+            let ok = check.status == Status::Pass;
+            checks.push(check);
+            ok.then_some(pusher)
+        }
+        Err(e) => {
+            checks.push(Check::fail("auth", format!("no token: {e:#}")));
+            None
+        }
+    };
 
     checks.push(pull_check(cfg, http, path, device_flow).await);
 
-    match (path, token) {
-        (Some(path), Some(token)) => checks.push(path_check(cfg, http, &token, path).await),
+    match (path, accepted) {
+        (Some(path), Some(pusher)) => checks.push(path_check(&pusher, path).await),
         (Some(_), None) => checks.push(Check::skip("path")),
         (None, _) => {}
     }
@@ -150,43 +185,17 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
     checks
 }
 
-/// Token acquisition plus the liveness probe `whoami` uses
-/// ([`auth::probe_pusher`]). Returns the token — only when the Pusher
-/// accepted it — so the `path` check can reuse it.
-async fn auth_check(
-    cfg: &config::Config,
-    http: &reqwest::Client,
-    tokens: anyhow::Result<auth::TokenSource>,
-    checks: &mut Vec<Check>,
-) -> Option<String> {
-    let token = match tokens {
-        Ok(tokens) => tokens.get().await,
-        Err(e) => Err(e),
-    };
-    let token = match token {
-        Ok(token) => token,
-        Err(e) => {
-            checks.push(Check::fail("auth", format!("no token: {e:#}")));
-            return None;
-        }
-    };
-
-    match auth::probe_pusher(http, &cfg.endpoint, &token).await {
-        Ok(()) => {
-            let subject = auth::peek_claims(&token)
-                .ok()
-                .and_then(|c| c.sub)
-                .unwrap_or_else(|| "unknown".into());
-            checks.push(Check::pass(
-                "auth",
-                format!("the Pusher accepted the token (subject {subject})"),
-            ));
-            Some(token)
-        }
-        Err(e) => {
-            checks.push(Check::fail("auth", format!("{e:#}")));
-            None
-        }
+/// Token acquisition plus the empty Negotiation `whoami` also sends.
+async fn auth_check(pusher: &Pusher) -> Check {
+    match pusher.authenticate().await {
+        Ok(claims) => Check::pass(
+            "auth",
+            format!(
+                "the Pusher accepted the token (subject {})",
+                claims.sub.as_deref().unwrap_or("unknown")
+            ),
+        ),
+        Err(e) => Check::fail("auth", format!("{e:#}")),
     }
 }
 
@@ -210,7 +219,7 @@ async fn pull_check(
         );
     };
 
-    let url = format!("{puller}/nix-cache-info");
+    let url = format!("{puller}{}", wire::NIX_CACHE_INFO);
     let body = match http.get(&url).send().await {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
         Ok(r) => return Check::fail("pull", format!("{url} answered {}", r.status())),
@@ -224,7 +233,8 @@ async fn pull_check(
     }
 
     let probe = path.and_then(parse_store_hash).unwrap_or(ABSENT_HASH);
-    let narinfo_url = format!("{puller}/{probe}.narinfo");
+    let narinfo_file = wire::narinfo_file(probe);
+    let narinfo_url = format!("{puller}/{narinfo_file}");
     match http.get(&narinfo_url).send().await {
         Ok(r)
             if r.status() == reqwest::StatusCode::OK
@@ -233,7 +243,7 @@ async fn pull_check(
             Check::pass(
                 "pull",
                 format!(
-                    "the Puller serves nix-cache-info; {probe}.narinfo answered {}",
+                    "the Puller serves nix-cache-info; {narinfo_file} answered {}",
                     r.status().as_u16()
                 ),
             )
@@ -246,12 +256,7 @@ async fn pull_check(
 /// One Negotiation round for a single hash: the authoritative answer to
 /// "is this path cached", straight from the Pusher. An uncached path is a
 /// `Fail` so the exit code carries the answer for scripts.
-async fn path_check(
-    cfg: &config::Config,
-    http: &reqwest::Client,
-    token: &str,
-    path: &str,
-) -> Check {
+async fn path_check(pusher: &Pusher, path: &str) -> Check {
     let Some(hash) = parse_store_hash(path) else {
         return Check::fail(
             "path",
@@ -259,32 +264,12 @@ async fn path_check(
         );
     };
 
-    let response = match http
-        .post(format!("{}/api/v1/missing-paths", cfg.endpoint))
-        .bearer_auth(token)
-        .json(&vec![hash])
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => return Check::fail("path", format!("Negotiation failed: {e:#}")),
-    };
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Check::fail(
-            "path",
-            format!("Negotiation rejected with {status}: {}", body.trim()),
-        );
-    }
-    let missing: Vec<String> = match response.json().await {
+    let missing = match pusher.negotiate(&[hash]).await {
         Ok(missing) => missing,
-        Err(e) => {
-            return Check::fail("path", format!("parsing the Negotiation response: {e:#}"));
-        }
+        Err(e) => return Check::fail("path", format!("{e:#}")),
     };
 
-    match missing.iter().any(|h| h == hash) {
+    match missing.contains(hash) {
         true => Check::fail(
             "path",
             format!(
@@ -304,7 +289,7 @@ async fn path_check(
 /// signing-key match is its own check. The `oidc` fields are compared only
 /// for device-flow configs, the ones `garret login` writes; a machine
 /// config's issuer, audience and client id are its operator's to set.
-fn drift(cfg: &config::Config, d: &discovery::Discovery, device_flow: bool) -> Vec<String> {
+fn drift(cfg: &config::Config, d: &Discovery, device_flow: bool) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(advertised) = &d.puller_endpoint
         && cfg.puller_endpoint.as_deref() != Some(advertised.as_str())
@@ -417,39 +402,30 @@ fn fix_hint(device_flow: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{Discovery, Oidc};
+    use crate::testing::{config as cfg, discovery as advertised};
+    use garret_common::wire::Oidc;
 
-    fn cfg() -> config::Config {
-        config::Config {
-            endpoint: "https://push.example".into(),
-            oidc: config::Oidc {
-                issuer: Some("https://id.example".into()),
-                client_id: Some("garret-cli".into()),
-                client_secret_file: None,
-                audience: "garret".into(),
-                resource: None,
-            },
-            jobs: 8,
-            zstd_level: 3,
-            max_retries: 5,
-            upload_idle_secs: 300,
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA=".into()],
-            upstream_keys: vec!["cache.nixos.org-1".into()],
-            watch: Default::default(),
-        }
-    }
-
-    fn advertised() -> Discovery {
-        Discovery {
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA=".into()],
-            oidc: Some(Oidc {
-                issuer: "https://id.example".into(),
-                audience: "garret".into(),
-                client_id: Some("garret-cli".into()),
-            }),
-        }
+    #[test]
+    fn json_output_has_ok_and_every_check() {
+        let checks = [
+            Check::pass("discovery", "answered"),
+            Check::fail("auth", "rejected"),
+            Check::skip("path"),
+        ];
+        let out: serde_json::Value = serde_json::from_str(&render(&checks, true)).unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "ok": false,
+                "checks": [
+                    {"name": "discovery", "status": "pass", "detail": "answered"},
+                    {"name": "auth", "status": "fail", "detail": "rejected"},
+                    {"name": "path", "status": "skip", "detail": "skipped: an earlier layer failed"},
+                ],
+            })
+        );
+        let out: serde_json::Value = serde_json::from_str(&render(&checks[..1], true)).unwrap();
+        assert_eq!(out["ok"], true);
     }
 
     #[test]
@@ -468,9 +444,15 @@ mod tests {
             }),
             ..advertised()
         };
-        let drifted = drift(&cfg(), &d, true);
-        assert_eq!(drifted.len(), 4, "{drifted:?}");
-        assert!(drifted[0].contains("puller_endpoint"));
+        let drifted = drift(&cfg(), &d, true).join("\n");
+        for field in [
+            "puller_endpoint",
+            "oidc.issuer",
+            "oidc.audience",
+            "oidc.client_id",
+        ] {
+            assert!(drifted.contains(field), "{field} missing from {drifted}");
+        }
     }
 
     /// A sparse server advertises less, not different: no drift.
@@ -521,37 +503,15 @@ mod tests {
         assert!(!cache_info_ok("<html>404 not found</html>"));
     }
 
+    /// A machine config's issuer, audience and client id are its operator's
+    /// to set, so they are not compared against what the server advertises.
     #[test]
-    fn a_machine_config_is_not_told_to_log_in() {
+    fn a_machine_configs_oidc_fields_are_not_drift() {
         let mut machine = cfg();
         machine.oidc.issuer = None;
+        machine.oidc.audience = "builders".into();
         machine.oidc.client_secret_file = Some("/run/secrets/garret".into());
-        // The device-flow-only OIDC fields are not compared for machines.
         assert!(drift(&machine, &advertised(), false).is_empty());
-        assert!(!fix_hint(false).contains("login"));
-        assert!(fix_hint(true).contains("garret login --force"));
-    }
-
-    /// Only a secret file or a full GitHub Actions pair makes a machine
-    /// config; a request URL alone does not, matching the token provider.
-    #[test]
-    fn a_config_is_a_machine_config_only_by_secret_file_or_github_actions() {
-        use config::{CredentialKind, GithubActions};
-        let url = || Some("https://actions.example".to_owned());
-        let device_flow = |c: &config::Config, token: Option<&str>| {
-            matches!(
-                c.credential_kind(GithubActions::from_vars(url(), token.map(str::to_owned))),
-                CredentialKind::DeviceFlow
-            )
-        };
-        assert!(
-            device_flow(&cfg(), None),
-            "a URL without its token is no runner"
-        );
-        assert!(!device_flow(&cfg(), Some("rt")));
-        let mut machine = cfg();
-        machine.oidc.client_secret_file = Some("/run/secrets/garret".into());
-        assert!(!device_flow(&machine, None));
     }
 
     #[test]

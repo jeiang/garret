@@ -1,8 +1,9 @@
-//! Process plumbing shared by the Pusher and Puller: logging, the HTTP accept
-//! loop, and systemd readiness.
+//! Process plumbing shared by the Pusher and Puller: startup, logging, the
+//! HTTP accept loop, and systemd readiness.
 
-use std::time::Duration;
+use std::{net::SocketAddr, time::Duration};
 
+use anyhow::{Context, Result};
 use axum::Router;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -10,14 +11,58 @@ use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
 
+use crate::config::ServiceConfig;
+
 /// A client that has not sent complete request headers by then is dropped, so
 /// idle connections cannot pin sockets or tasks. Bodies have their own idle
 /// timeout (see `storage`).
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What [`start`] hands a service.
+pub struct Started<C> {
+    /// The loaded and validated config.
+    pub config: C,
+    /// The public listener, bound but not yet serving.
+    pub listener: TcpListener,
+}
+
+/// The startup both services share: logging, the config named by the first
+/// argument (loaded and validated), the metrics recorder (installed first, so
+/// later startup work is recorded), then both listeners bound, each failure
+/// naming the address. The metrics listener serves from here on; the public
+/// one is the caller's to serve once the service is ready.
+pub async fn start<C: ServiceConfig>(service: &str) -> Result<Started<C>> {
+    init_tracing();
+    let path = std::env::args()
+        .nth(1)
+        .with_context(|| format!("usage: garret-{service} <config.toml>"))?;
+    let config: C = crate::config::load(&path)?;
+    let metrics = crate::metrics::install(service)?;
+    let metrics_listener = bind(config.metrics_listen(), "metrics").await?;
+    let listener = bind(config.listen(), service).await?;
+    let metrics_app = crate::metrics::router(metrics);
+    tokio::spawn(async move {
+        if let Err(e) = serve(metrics_listener, metrics_app, std::future::pending()).await {
+            tracing::error!("metrics listener failed: {e:#}");
+        }
+    });
+    Ok(Started { config, listener })
+}
+
+async fn bind(addr: &str, name: &str) -> Result<TcpListener> {
+    let addr: SocketAddr = addr
+        .parse()
+        .with_context(|| format!("invalid {name} listen address {addr:?}"))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {name} listener {addr}"))?;
+    tracing::info!("{name} listening on {addr}");
+    Ok(listener)
+}
+
 /// Logs to stdout at `RUST_LOG` (default `info`), with colour only on a
 /// terminal so journald gets plain text.
-pub fn init_tracing() {
+fn init_tracing() {
     use std::io::IsTerminal;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -91,7 +136,6 @@ pub fn notify_ready() {
     }
 }
 
-#[cfg(unix)]
 fn send_notify(path: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::net::UnixDatagram;
@@ -112,11 +156,6 @@ fn send_notify(path: &std::ffi::OsStr, message: &[u8]) -> std::io::Result<()> {
         }
     }
     socket.send_to(message, path)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn send_notify(_: &std::ffi::OsStr, _: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -144,8 +183,10 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
             .await
             .expect("server did not drop the silent connection");
-        // Closed (EOF) or reset; either way no hang.
-        assert!(matches!(read, Ok(0) | Err(_)) || read.unwrap() > 0);
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF or reset, got {read:?}"
+        );
         let _ = stop.send(());
         server.await.unwrap().unwrap();
     }

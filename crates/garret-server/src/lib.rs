@@ -1,4 +1,5 @@
-//! Shared server internals: config, DB, S3 storage, narinfo/signing.
+//! Shared server internals: config, DB, S3 storage, narinfo/signing, auth,
+//! browse queries, runtime, metrics, in-flight claims.
 #![warn(missing_docs)]
 
 pub mod auth;
@@ -8,7 +9,6 @@ pub mod db;
 pub mod inflight;
 pub mod metrics;
 pub mod narinfo;
-pub mod nix_base32;
 pub mod runtime;
 pub mod storage;
 #[cfg(feature = "test-support")]
@@ -16,23 +16,14 @@ pub mod testing;
 
 use anyhow::Result;
 
-/// Current unix time in seconds, as stored in `created_at`/`last_accessed_at`.
-pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Reads and parses every configured signing key file, failing on the first
 /// unreadable or malformed one — a partial key set would sign with fewer keys
-/// than the rotation plan expects. On Unix a key readable by group or other is
+/// than the rotation plan expects. A key readable by group or other is
 /// refused too (ADR-0009): the Puller's user must not be able to read it.
 pub fn load_signing_keys(paths: &[String]) -> Result<Vec<narinfo::SigningKeyFile>> {
     paths
         .iter()
         .map(|p| {
-            #[cfg(unix)]
             if let Ok(meta) = std::fs::metadata(p) {
                 use std::os::unix::fs::PermissionsExt;
                 let mode = meta.permissions().mode() & 0o777;
@@ -56,16 +47,15 @@ mod tests {
 
     fn key_with_mode(mode: u32) -> (std::path::PathBuf, Result<Vec<narinfo::SigningKeyFile>>) {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("garret-key-{mode:o}-{}", std::process::id()));
+        let dir = testing::scratch_dir();
+        let path = dir.join("key");
         std::fs::write(&path, format!("test-1:{}", "AQEB".repeat(21) + "AQ==")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         let keys = load_signing_keys(&[path.to_str().unwrap().to_owned()]);
-        std::fs::remove_file(&path).unwrap();
         (path, keys)
     }
 
     /// A group- or other-readable key is refused, naming the file, mode and fix.
-    #[cfg(unix)]
     #[test]
     fn group_readable_signing_key_is_refused() {
         let (path, keys) = key_with_mode(0o640);
@@ -75,7 +65,6 @@ mod tests {
     }
 
     /// Owner-only keys load.
-    #[cfg(unix)]
     #[test]
     fn owner_only_signing_key_loads() {
         for mode in [0o400, 0o600] {

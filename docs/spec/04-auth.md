@@ -92,7 +92,9 @@ some causes are transient. A token that verifies but that an issuer policy
 gate refuses (`owner`, `ref`, `ref_protected`, `repository_id`,
 `event_name`, `job_workflow_ref`, `group`) is a `403`
 `{"error":"not authorized"}` with no `WWW-Authenticate`: the identity is
-known and stays refused, so retrying cannot help. The Puller's browse
+known and stays refused until the policy changes, so renewing the token
+cannot help and clients never do (the watcher's bounded retry of a refused
+batch exists only to pick up a policy fix, spec 06). The Puller's browse
 routes use the same split (a `403` body of `not authorized`). A missing
 bearer header is a `401`. Older clients treat the `403` as a plain failure.
 
@@ -134,3 +136,10 @@ A dev-issuer config override points `jwks_url` at a local static JWKS file
 configured `jwks_url`, never as a `jwks_uri` returned by discovery. Every
 other JWKS and discovery URL must be `https`, and redirects are not
 followed. There is deliberately **no auth-disable flag**.
+
+Issuer settings are checked when the config loads, so a bad one fails
+startup rather than the first token: the Pusher refuses an empty `oidc`
+list, and both services refuse an issuer (`oidc` or the Puller's
+`browse_oidc`) with an empty `audience`, an unscoped GitHub issuer, or a
+configured `jwks_url` or issuer URL that breaks the URL rule above. A
+`jwks_uri` returned by discovery is checked when it is fetched.

@@ -25,7 +25,10 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Args, Parser, Subcommand};
 use futures::{StreamExt, stream};
-use garret_common::Preamble;
+use garret_common::{
+    Preamble,
+    wire::{self, UploadAck},
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -131,7 +134,8 @@ struct PullArgs {
 }
 
 /// Where the numbers came from. `label` is the comparison key: the diff
-/// script refuses to silently compare across labels.
+/// script refuses to silently compare across labels, and refuses outright
+/// across corpus versions.
 #[derive(Debug, Serialize)]
 struct Meta {
     os: &'static str,
@@ -139,17 +143,15 @@ struct Meta {
     cpus: usize,
     label: String,
     seed: u64,
+    corpus_version: u32,
     version: &'static str,
-    timestamp_unix: u64,
+    timestamp_unix: i64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 struct Output {
-    #[serde(skip_serializing_if = "Option::is_none")]
     push: Option<PushResults>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<Vec<StreamResult>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pull: Option<Vec<PullResults>>,
 }
 
@@ -236,10 +238,7 @@ struct Counters {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let timestamp = garret_common::unix_now();
     let meta = Meta {
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -249,6 +248,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)),
         seed: cli.seed,
+        corpus_version: corpus::VERSION,
         version: env!("CARGO_PKG_VERSION"),
         timestamp_unix: timestamp,
     };
@@ -278,23 +278,17 @@ async fn main() -> Result<()> {
         output.push = Some(run_push(&cli, args, &http, &token).await?);
     }
     if let Some(args) = stream_args {
-        output.stream = Some(run_stream(&cli, args, &http, &token, timestamp).await?);
+        output.stream = Some(run_stream(&cli, args, &http, &token, timestamp as u64).await?);
     }
     if let Some(args) = pull_args {
         output.pull = Some(run_pull(&cli, args).await?);
     }
 
-    // A single-step pull serializes as the same flat object as always, so the
-    // checked-in baseline keeps its keys; only a sweep emits an array.
-    let pull_json = match output.pull.as_deref() {
-        Some([one]) => serde_json::to_value(one)?,
-        other => serde_json::to_value(other)?,
-    };
     let report = serde_json::json!({
         "meta": meta,
         "push": output.push,
         "stream": output.stream,
-        "pull": pull_json,
+        "pull": output.pull,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(path) = &cli.json {
@@ -349,7 +343,9 @@ async fn run_push(
         cli.seed
     );
 
-    let counters = Arc::new(Counters::default());
+    // Retries are counted per phase: the baseline's must not show up in the
+    // loaded results.
+    let baseline_counters = Counters::default();
 
     // Baseline first, one at a time, over the same corpus under different
     // keys: same sizes and compressibility, so the medians are comparable and
@@ -364,7 +360,7 @@ async fn run_push(
             token,
             entry,
             args.zstd_level,
-            &counters,
+            &baseline_counters,
         )
         .await?;
         // Floored at 1 ms: the ratio below divides by this.
@@ -378,7 +374,7 @@ async fn run_push(
         baseline.len()
     );
 
-    counters.wire.store(0, Ordering::Relaxed);
+    let counters = Arc::new(Counters::default());
     let started = Instant::now();
 
     let latencies: Vec<(usize, Option<Duration>)> = stream::iter(entries.into_iter().enumerate())
@@ -539,11 +535,11 @@ async fn pull_step(
             entries.iter().flat_map(|e| {
                 [
                     (
-                        format!("{}/{}.narinfo", args.puller_endpoint, e.hash),
+                        format!("{}/{}", args.puller_endpoint, wire::narinfo_file(&e.hash)),
                         false,
                     ),
                     (
-                        format!("{}/nar/{}.nar.zst", args.puller_endpoint, e.hash),
+                        format!("{}/{}", args.puller_endpoint, wire::nar_url(&e.hash)),
                         true,
                     ),
                 ]
@@ -662,11 +658,10 @@ async fn push(
     counters
         .wire
         .fetch_add(body.len() as u64, Ordering::Relaxed);
-    // A refcounted handle, so each attempt shares the one buffer.
     let body = bytes::Bytes::from(body);
     put_with_retry(
         http,
-        &format!("{endpoint}/api/v1/nar/{}", entry.hash),
+        &upload_url(endpoint, entry),
         token,
         || Ok(body.clone().into()),
         counters,
@@ -685,48 +680,56 @@ async fn put_with_retry(
 ) -> Result<()> {
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
-        let response = match http
+        let retried = match http
             .put(url)
             .bearer_auth(token)
             .body(make_body()?)
             .send()
             .await
         {
-            Ok(response) => response,
+            Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                &counters.shed
+            }
+            Ok(response) => {
+                if !response.status().is_success() {
+                    bail!(
+                        "{}: {}",
+                        response.status(),
+                        response.text().await.unwrap_or_default()
+                    );
+                }
+                // Each entry has its own key, so another upload of it means the
+                // corpus is being pushed twice at once: not a push this run made.
+                return match response.json().await.context("parsing upload response")? {
+                    UploadAck::Created | UploadAck::Exists => Ok(()),
+                    UploadAck::InProgress => bail!("another upload of this path is in progress"),
+                };
+            }
             // The server answers `exists` and 429 sheds before reading the
             // body, then closes the connection (spec 01) — a client still
             // writing sometimes gets the RST before the response and sees a
             // broken pipe instead. Idempotent by negotiation, so retried on
             // the same schedule as an explicit shed.
-            Err(e) if garret_client::push::connection_dropped(&e) => {
-                counters.dropped.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
-                delay *= 2;
-                continue;
-            }
+            Err(e) if garret_client::push::connection_dropped(&e) => &counters.dropped,
             Err(e) => return Err(e).context("sending the upload"),
         };
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            counters.shed.fetch_add(1, Ordering::Relaxed);
-            tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
-            delay *= 2;
-            continue;
-        }
-        if !response.status().is_success() {
-            bail!(
-                "{}: {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
-            );
-        }
-        return Ok(());
+        retried.fetch_add(1, Ordering::Relaxed);
+        tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
+        delay *= 2;
     }
     bail!("still shed or dropped after 6 attempts")
 }
 
 /// Largest zstd block, and the window the frame header declares.
 const RAW_BLOCK: usize = 128 * 1024;
+
+/// The frame header's window descriptor for a window of exactly
+/// [`RAW_BLOCK`] bytes: exponent above 2^10 in the top five bits, no
+/// mantissa (RFC 8878 section 3.1.1.1.2).
+const WINDOW_DESCRIPTOR: u8 = {
+    assert!(RAW_BLOCK.is_power_of_two());
+    ((RAW_BLOCK.trailing_zeros() - 10) << 3) as u8
+};
 
 /// Wraps NAR chunks, each at most [`RAW_BLOCK`], in one zstd frame of raw
 /// (stored) blocks. The Pusher decompresses and verifies it like any other
@@ -739,9 +742,8 @@ fn raw_zstd_frame(chunks: impl Iterator<Item = Vec<u8>>) -> impl Iterator<Item =
     fn block(len: usize, last: bool) -> Vec<u8> {
         (((len as u32) << 3) | u32::from(last)).to_le_bytes()[..3].to_vec()
     }
-    // Magic, a descriptor with no content size or checksum, and a window
-    // descriptor of 2^17 bytes (one block).
-    let header = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38];
+    // Magic, a descriptor with no content size or checksum, and the window.
+    let header = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, WINDOW_DESCRIPTOR];
     std::iter::once(header)
         .chain(chunks.flat_map(|c| [block(c.len(), false), c]))
         .chain(std::iter::once(block(0, true)))
@@ -767,10 +769,32 @@ async fn push_streaming(
     };
     put_with_retry(
         http,
-        &format!("{endpoint}/api/v1/nar/{}", entry.hash),
+        &upload_url(endpoint, entry),
         token,
         make_body,
         counters,
     )
     .await
+}
+
+fn upload_url(endpoint: &str, entry: &corpus::Entry) -> String {
+    format!(
+        "{endpoint}{}",
+        wire::with_hash(wire::NAR_UPLOAD, &entry.hash)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_zstd_frame_decodes_to_its_chunks() {
+        let entry = corpus::stream_entry(1, 3 * RAW_BLOCK + 17, 0, 0);
+        let chunks: Vec<Vec<u8>> = entry.chunks(RAW_BLOCK).collect();
+        let frame: Vec<u8> = raw_zstd_frame(chunks.clone().into_iter())
+            .flatten()
+            .collect();
+        assert_eq!(zstd::decode_all(&frame[..]).unwrap(), chunks.concat());
+    }
 }

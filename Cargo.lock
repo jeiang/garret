@@ -1370,6 +1370,7 @@ dependencies = [
  "bytes",
  "clap",
  "clap_complete",
+ "fastrand",
  "futures",
  "garret-common",
  "indicatif",
@@ -1399,8 +1400,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "garret-common",
  "garret-server",
  "metrics",
+ "metrics-exporter-prometheus",
  "parking_lot",
  "reqwest",
  "rusqlite",

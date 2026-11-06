@@ -8,8 +8,8 @@ Source: resolved at spec assembly
 ```
 Cargo.toml            # workspace
 crates/
-  garret-common/      # protocol types, narinfo/signing, NAR framing, config
-  garret-server/      # shared server internals: DB, storage, metrics, auth
+  garret-common/      # wire contract (push/API JSON types), store-path grammar, admin socket types
+  garret-server/      # shared server internals: config, DB, storage, narinfo/signing, metrics, auth
   garret-pusher/      # bin: push API + GC
   garret-puller/      # bin: substituter + browse
   garret-client/      # lib (push/watch logic) + bin `garret`
@@ -122,38 +122,45 @@ to docs, scripts or `nix/` rebuild nothing. `GARRET_REVISION` is set on the
 workspace derivation only: on the dependency build it would change every
 commit. The package build does not run the tests; the `test` check does.
 
-Module options (all under `services.garret.*`; defaults in parentheses):
+Module options (all under `services.garret.*`; defaults in parentheses). An
+option marked *null* defaults to `null` and is then left out of the generated
+config, so the binary applies its own default (the TOML defaults in the
+specs and in `config.rs`); the modules restate no Rust default.
 
-- **pusher**: `enable`, `package`, `listen` (`127.0.0.1:8080`),
-  `metricsListen` (`127.0.0.1:9091`), `dbPath`, `storeDir`,
-  `s3.{bucket, endpointUrl, region, pathStyle (true), operationTimeoutSeconds
-  (60), operationAttemptTimeoutSeconds (null: unset), credentialsFile}`, `signingKeyFiles` (list — active + retiring),
-  `pullerEndpoint`, `quotaBytes` (null: no quota), `watermarks.{high (0.95),
-  low (0.85)}`, `gcIntervalSeconds` (300), `orphanGraceSeconds` (86400),
-  `limits.{maxConcurrentUploads (16), maxInFlightBytes (256 MiB), partSize
-  (16 MiB), maxPartsInFlight (4), bodyIdleTimeoutSeconds (60)}`, `oidc` (list of issuer submodules:
-  `issuer`, `audience`, `extra_audiences`, `client_id`, `jwks_url`,
-  `github_owner_id`, `ref_patterns`, `ref_protected`, `repository_ids`,
-  `event_names`, `job_workflow_refs`, `allowed_groups`), `adminSocketPath`
-  (`/run/garret/admin.sock`), `fsck.{calendar (null: no scheduled fsck),
-  extraArgs ([])}`.
-- **puller**: `enable`, `package`, `listen` (`127.0.0.1:8081` — front it with
-  TLS), `metricsListen` (`127.0.0.1:9092`), `s3.{credentialsFile,
-  operationTimeoutSeconds (60)}`, `presignTtlSeconds` (3600),
-  `bumpDebounceSeconds` (86400), `dbWaitTimeoutSeconds` (300),
-  `dbReadBudgetMs` / `presignBudgetMs` (pull-path degrade-to-miss budgets,
-  spec 03; 250 ms), `browseOidc.{issuer, audience, jwks_url, allowed_groups}`
+- **pusher**: `enable`, `package`, `listen` (*null*), `metricsListen`
+  (*null*), `dbPath`, `storeDir` (*null*), `s3.{bucket, endpointUrl,
+  region, pathStyle (*null*), operationTimeoutSeconds (*null*),
+  operationAttemptTimeoutSeconds (*null*: unset), credentialsFile}`,
+  `signingKeyFiles` (list — active + retiring), `pullerEndpoint`,
+  `quotaBytes` (null: no quota), `watermarks.{high, low}` (*null*),
+  `gcIntervalSeconds` (*null*), `orphanGraceSeconds` (*null*),
+  `limits.{maxConcurrentUploads, maxInFlightBytes, partSize,
+  maxPartsInFlight, bodyIdleTimeoutSeconds}` (all *null*), `oidc` (list of
+  issuer submodules: `issuer`, `audience`, `extra_audiences`, `client_id`,
+  `jwks_url`, `github_owner_id`, `ref_patterns`, `ref_protected`,
+  `repository_ids`, `event_names`, `job_workflow_refs`, `allowed_groups`),
+  `adminSocketPath` (`/run/garret/admin.sock`), `fsck.{calendar (null: no
+  scheduled fsck), extraArgs ([])}`.
+- **puller**: `enable`, `package`, `listen` (*null*; front it with TLS),
+  `metricsListen` (*null*), `s3.credentialsFile`, `presignTtlSeconds`,
+  `bumpDebounceSeconds`, `dbWaitTimeoutSeconds`, `dbReadBudgetMs` /
+  `presignBudgetMs` (pull-path degrade-to-miss budgets, spec 03) (all
+  *null*), `browseOidc.{issuer, audience, jwks_url, allowed_groups}`
   (null: no browse API). The Puller has no `dbPath`, `storeDir` or
   `s3.{bucket, endpointUrl, region, pathStyle}` of its own: it serves the
   Pusher's database and bucket on the same host (ADR-0001, ADR-0009), so its
   config takes them from `services.garret.pusher`. Enabling the puller
   without the pusher fails evaluation with an assertion. The puller module
-  imports the pusher module's options, so importing it alone evaluates.
+  imports the pusher module's options, so importing it alone evaluates. The
+  removed `puller.s3.operationTimeoutSeconds` fails evaluation with a pointer
+  to the Pusher's option: the Puller makes no S3 requests.
 - Every module also has `extraSettings` (`{}`): raw TOML merged recursively
   over the generated config, for keys without a typed option (for example
   `browse_oidc.extra_audiences` and `browse_oidc.client_id` on the Puller).
   The watcher adds `oidc.resource` (null: not sent). Enabling the pusher puts
-  `garret-admin` on the system PATH.
+  `garret-admin` on the system PATH. The modules share `nix/common.nix`:
+  config generation, the server daemons' systemd settings and the service
+  users.
 - `services.garret.pusher.fsck.calendar` (a systemd `OnCalendar` expression)
   adds `garret-fsck.service` and `garret-fsck.timer`. It requires
   `quotaBytes`, since fsck reads the orphan grace from the `[gc]` section
@@ -171,21 +178,25 @@ Module options (all under `services.garret.*`; defaults in parentheses):
   and no per-object request (`--verify-sizes` reuses the listed sizes),
   plus one read of every Object row. Repair stays a manual step. The option
   needs `adminSocketPath`; an assertion rejects `calendar` without it.
+- `watermarks.{high, low}`, `gcIntervalSeconds` and `orphanGraceSeconds`
+  configure GC, which runs only with a quota: an assertion rejects any of
+  them set while `quotaBytes` is null, rather than dropping the `[gc]`
+  section silently.
 - Option types reject the values the binaries reject, at evaluation time:
-  the Pusher quota, intervals and `limits.*` are positive integers,
+  the Pusher quota, `gcIntervalSeconds`, `s3.operationTimeoutSeconds` and
+  `limits.*` are positive integers, `orphanGraceSeconds` is not negative,
   watermarks lie in 0 to 1, `presignTtlSeconds` is 1 to 604800 (the SigV4
   maximum), the Puller budgets and `dbWaitTimeoutSeconds` are positive,
-  `bumpDebounceSeconds` is not negative, and the watcher `jobs`,
-  `pollIntervalSeconds` and `maxAttempts` are positive. The binaries check
-  the same ranges at startup for hand-written configs (`quota_bytes = 0`
-  would evict the whole cache). The Puller never calls S3, so its
-  `s3.operationTimeoutSeconds` has no effect and stays only for
-  compatibility.
+  `bumpDebounceSeconds` is not negative, the watcher `jobs`,
+  `pollIntervalSeconds` and `maxAttempts` are positive, and `maxRetries` is
+  not negative. The binaries check the same ranges at startup for
+  hand-written configs (`quota_bytes = 0` would evict the whole cache).
 - **watcher** (client machines): `enable`, `package`, `endpoint`,
-  `oidc.{issuer, clientId, audience, clientSecretFile}`, `nixDb`,
-  `cursorPath`, `pollIntervalSeconds` (30), `jobs` (8), `zstdLevel` (3),
-  `maxRetries` (5), `maxAttempts` (5), `fullSync`, `socketPath` (wake
-  socket, spec 06), `filters.{excludePatterns, upstreamKeys}`.
+  `oidc.{issuer, clientId, audience, clientSecretFile}`, `nixDb` (*null*),
+  `cursorPath`, `pollIntervalSeconds`, `jobs`, `zstdLevel`, `maxRetries`,
+  `maxAttempts` (all *null*), `fullSync`, `socketPath` (wake socket, spec
+  06), `filters.{excludePatterns, upstreamKeys (*null*: the client-wide
+  `upstream_keys` applies)}`.
   `oidc.clientSecretFile` replaces the old `credentialsFile`: it is a
   root-owned file holding only the machine client's secret (the client id is
   `oidc.clientId`). Enabling the watcher also sets

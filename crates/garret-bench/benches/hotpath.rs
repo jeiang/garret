@@ -1,7 +1,9 @@
 //! Micro-benchmarks for the per-byte costs on the push hot path
 //! (spec 09-benchmarks): client-side zstd at the corpus's compressibility
-//! mix, the server's SHA-256 over the stored stream, its NarHash check
-//! (zstd decode + SHA-256 of the NAR), and preamble framing.
+//! mix, plus stand-ins for the Pusher's SHA-256 over the stored stream, its
+//! NarHash check (zstd decode + SHA-256 of the NAR) and preamble framing.
+//! The stand-ins call the same `sha2`/`zstd` primitives, not the server's
+//! code, so they measure a lower bound on the Pusher's cost.
 //!
 //! These run in-process with no server, so they are the "maximum speed this
 //! CPU can reach" probes — the first numbers to compare when the
@@ -9,8 +11,10 @@
 
 // The corpus generator is part of the bin crate, not a library; include it
 // directly rather than growing a lib target for one bench. Only Entry::body
-// is used here, so the rest of the module is dead code in this target.
-#[allow(dead_code)]
+// is used here, so the rest of the module is dead code in this target, and
+// `clippy --all-targets` compiles its test module without the `#[test]` fns
+// (harness = false), leaving the module's `use super::*` unused.
+#[allow(dead_code, unused_imports)]
 #[path = "../src/corpus.rs"]
 mod corpus;
 
@@ -23,7 +27,7 @@ const BODY_SIZE: usize = 4 * 1024 * 1024;
 
 fn body(compressibility: u8) -> Vec<u8> {
     corpus::Entry {
-        hash: "b".repeat(32),
+        hash: "0c9f8k2h5mnyw1zxa7qrl3dsvbg4ip6j".into(),
         name: "bench".into(),
         size: BODY_SIZE,
         compressibility,
@@ -52,8 +56,8 @@ fn compression(c: &mut Criterion) {
     group.finish();
 }
 
-/// The Pusher's SHA-256 over exactly the bytes stored (storage.rs
-/// `put_streaming`).
+/// Stand-in for the Pusher's SHA-256 over the stored bytes: a plain `sha2`
+/// digest, without `put_streaming`'s part buffering or upload.
 fn hashing(c: &mut Criterion) {
     let input = body(0);
     let mut group = c.benchmark_group("sha256");
@@ -68,9 +72,9 @@ fn hashing(c: &mut Criterion) {
     group.finish();
 }
 
-/// The Pusher's other per-byte cost: decompressing the stored stream and
-/// hashing the NAR to check the claimed NarHash (ADR-0010). Throughput is
-/// per uncompressed byte, at the client's default level.
+/// Stand-in for the Pusher's NarHash check (ADR-0010): `zstd` decode piped
+/// into `sha2`, not `verify.rs`'s `VerifiedNar`. Throughput is per
+/// uncompressed byte, at the client's default level.
 fn verifying(c: &mut Criterion) {
     let nar = body(70);
     let compressed = zstd::encode_all(nar.as_slice(), 3).unwrap();
@@ -88,8 +92,10 @@ fn verifying(c: &mut Criterion) {
     group.finish();
 }
 
-/// Preamble encode + decode round-trip — per-request, not per-byte, so this
-/// only matters if it ever shows up at thousands of requests per second.
+/// Preamble encode + decode round-trip with `to_framed` and `serde_json`;
+/// the decode hand-parses the length prefix instead of calling the Pusher's
+/// `take_preamble`. Per-request, not per-byte, so this only matters if it
+/// ever shows up at thousands of requests per second.
 fn framing(c: &mut Criterion) {
     let preamble = Preamble {
         store_path: format!("/nix/store/{}-something-realistic-1.2.3", "a".repeat(32)),

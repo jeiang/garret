@@ -70,7 +70,7 @@ Prefix `garret_`; service distinguished by scrape job.
   commit the binary was built from, `unknown` outside the Nix build).
 - **Pusher — uploads**: in-flight uploads and `garret_in_flight_bytes` gauges
   *versus their configured caps* (saturation visible before it hurts;
-  `garret_in_flight_bytes` is read from the upload budget on each scrape);
+  `garret_in_flight_bytes` moves as upload buffers are reserved and released);
   `garret_upload_buffer_wait_seconds`, the time an upload waited for buffer
   room in that budget;
   upload size histogram; `garret_upload_duration_seconds` by `outcome`
@@ -132,10 +132,12 @@ Prefix `garret_`; service distinguished by scrape job.
   latest run's count per kind; `garret_fsck_rows_repaired_total` counter
   by `reason` (`dangling`, `size_mismatch`).
 - **Puller**: `garret_narinfo_requests_total` and
-  `garret_nar_requests_total` by `outcome`, both counting every request to
-  their route and judged by the final response: `hit` is a narinfo served
-  (200) or a NAR redirect issued; `miss` is anything else — a bad suffix,
-  an unknown hash, a 503 before the database exists, or a degraded request
+  `garret_nar_requests_total` by `outcome`, counting every request to
+  their route whose file name is a store hash's (`<hash>.narinfo`,
+  `<hash>.nar.zst`): `hit` is a narinfo served (200) or a NAR redirect
+  issued; `miss` is an unknown hash, a 503 before the database exists, or
+  a degraded request. Any other name is a plain 404 before any database
+  read and is not counted, so junk requests cannot inflate the miss rate
   (`garret_nar_requests_total` replaces the former
   `garret_nar_redirects_total`); presign duration histogram;
   `garret_degraded_total` by

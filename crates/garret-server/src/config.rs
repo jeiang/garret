@@ -15,8 +15,8 @@ pub struct S3Config {
     pub endpoint_url: Option<String>,
     /// Defaults to `us-east-1`, which S3-compatible stores accept.
     pub region: Option<String>,
-    /// Path-style addressing, default on — S4 and Garage both accept it, and
-    /// it avoids DNS games for dotted buckets.
+    /// Path-style addressing, on unless set — S4 and Garage both accept it,
+    /// and it avoids DNS games for dotted buckets.
     #[serde(default = "yes")]
     pub path_style: bool,
     /// Omitted in production: the NixOS module supplies AWS_* via EnvironmentFile.
@@ -25,18 +25,17 @@ pub struct S3Config {
     pub secret_access_key: Option<String>,
     /// Overall deadline for one S3 call, SDK retries included (ticket 27).
     /// Without it a stalled upstream holds an upload permit and its
-    /// in-flight bytes forever. Default 60; raise on slow uplinks or with
-    /// larger parts.
+    /// in-flight bytes forever. Raise on slow uplinks or with larger parts.
     #[serde(default = "s3_operation_timeout")]
     pub operation_timeout_secs: u64,
-    /// Deadline for each attempt inside the overall one. Unset (default), a
+    /// Deadline for each attempt inside the overall one. Unset, a
     /// hung attempt uses the whole overall deadline and nothing retries. Set
     /// it above the time to send `part_size` on the slowest uplink and below
     /// `operation_timeout_secs`.
     #[serde(default)]
     pub operation_attempt_timeout_secs: Option<u64>,
     /// SigV4-sign upload bodies (a SHA-256 pass over every stored byte).
-    /// Default off: uploads send `UNSIGNED-PAYLOAD` with a CRC32 checksum
+    /// Off unless set: uploads send `UNSIGNED-PAYLOAD` with a CRC32 checksum
     /// S3 verifies, and the blob's own SHA-256 is the FileHash nix checks
     /// on download (spec 03). Turn on for a store that refuses unsigned
     /// payloads.
@@ -45,12 +44,24 @@ pub struct S3Config {
 }
 
 impl S3Config {
-    /// Rejects a half-set credential pair. The S3 client uses explicit
-    /// credentials only when both are present and otherwise falls back to
-    /// the AWS default chain, so one alone would be silently ignored.
-    pub fn validate_credentials(&self) -> Result<()> {
+    /// Rejects a half-set credential pair and timeouts that never fire or
+    /// leave no room for a retry. The S3 client uses explicit credentials
+    /// only when both are present and otherwise falls back to the AWS
+    /// default chain, so one alone would be silently ignored.
+    pub fn validate(&self) -> Result<()> {
         if self.access_key_id.is_some() != self.secret_access_key.is_some() {
             bail!("s3.access_key_id and s3.secret_access_key must be set together or both omitted");
+        }
+        if self.operation_timeout_secs == 0 {
+            bail!("s3.operation_timeout_secs must be at least 1");
+        }
+        if let Some(attempt) = self.operation_attempt_timeout_secs
+            && (attempt == 0 || attempt >= self.operation_timeout_secs)
+        {
+            bail!(
+                "s3.operation_attempt_timeout_secs ({attempt}) must be at least 1 and below s3.operation_timeout_secs ({})",
+                self.operation_timeout_secs
+            );
         }
         Ok(())
     }
@@ -123,60 +134,90 @@ pub struct IssuerConfig {
     pub allowed_groups: Vec<String>,
 }
 
+/// The GitHub Actions OIDC issuer, which any repository can mint tokens from.
+pub(crate) const GITHUB_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+impl IssuerConfig {
+    /// Rejects an issuer that could never verify a token or that would trust
+    /// too much (spec 04), naming the issuer.
+    pub fn validate(&self) -> Result<()> {
+        let issuer = &self.issuer;
+        if self.audience.is_empty() {
+            bail!("issuer {issuer}: audience must not be empty");
+        }
+        if *issuer == GITHUB_ISSUER
+            && self.github_owner_id.is_none()
+            && self.repository_ids.is_empty()
+        {
+            bail!(
+                "issuer {GITHUB_ISSUER} needs github_owner_id or repository_ids: \
+                 any GitHub repository can mint a token for this audience"
+            );
+        }
+        match &self.jwks_url {
+            Some(url) if is_remote_url(url) => check_remote_url(url),
+            // A local JWKS file: the sanctioned dev-issuer override.
+            Some(_) => Ok(()),
+            // Discovery is fetched from the issuer URL itself.
+            None => check_remote_url(issuer),
+        }
+        .with_context(|| format!("issuer {issuer}"))
+    }
+}
+
+/// Whether a JWKS location is a URL to fetch rather than a local file path.
+pub(crate) fn is_remote_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+/// Remote JWKS and discovery URLs must be https; plain http is for a local
+/// dev issuer on a loopback host only.
+pub(crate) fn check_remote_url(url: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid URL {url}"))?;
+    match (parsed.scheme(), parsed.host_str()) {
+        ("https", Some(_)) => Ok(()),
+        ("http", Some("localhost" | "127.0.0.1" | "[::1]")) => Ok(()),
+        _ => bail!("{url} must be https (http only for loopback hosts)"),
+    }
+}
+
+/// S3's smallest accepted part size; `limits.part_size` must be at least this.
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+/// S3's largest accepted part size; `limits.part_size` must be at most this.
+pub const MAX_PART_SIZE: usize = 5 * 1024 * 1024 * 1024;
+
 /// Backpressure caps (spec 01-push-protocol). Server memory is bounded by
 /// these, not by how many clients show up.
 #[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
-    /// Uploads admitted at once; the rest wait. Default 16.
-    #[serde(default = "max_concurrent_uploads")]
+    /// Uploads admitted at once; the rest wait.
     pub max_concurrent_uploads: usize,
-    /// Global cap on buffered upload bytes across all uploads. Default 256 MiB.
-    #[serde(default = "max_in_flight_bytes")]
+    /// Global cap on buffered upload bytes across all uploads.
     pub max_in_flight_bytes: u64,
-    /// S3 part size, and the single-`PutObject` threshold. Default 16 MiB;
-    /// at least 5 MiB (the S3 minimum).
-    #[serde(default = "part_size")]
+    /// S3 part size, and the single-`PutObject` threshold; within
+    /// [`MIN_PART_SIZE`]..=[`MAX_PART_SIZE`].
     pub part_size: usize,
-    /// Concurrent part uploads per NAR. Default 4.
-    #[serde(default = "max_parts_in_flight")]
+    /// Concurrent part uploads per NAR.
     pub max_parts_in_flight: usize,
     /// Seconds an upload body may send nothing before the upload is
-    /// abandoned. Raising it holds upload slots longer. Default 60.
-    #[serde(default = "body_idle_timeout")]
+    /// abandoned (spec 01). A stalled body holds an upload slot, its
+    /// in-flight claim and, mid-NAR, a part slot, so without a bound a few
+    /// quiet senders starve every other push. Idle, not total: a slow
+    /// sender that keeps moving is fine. Raising it holds upload slots longer.
     pub body_idle_timeout_secs: u64,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            max_concurrent_uploads: max_concurrent_uploads(),
-            max_in_flight_bytes: max_in_flight_bytes(),
-            part_size: part_size(),
-            max_parts_in_flight: max_parts_in_flight(),
-            body_idle_timeout_secs: body_idle_timeout(),
+            max_concurrent_uploads: 16,
+            max_in_flight_bytes: 256 * 1024 * 1024,
+            part_size: 16 * 1024 * 1024,
+            max_parts_in_flight: 4,
+            body_idle_timeout_secs: 60,
         }
     }
-}
-
-fn body_idle_timeout() -> u64 {
-    crate::storage::BODY_IDLE_TIMEOUT.as_secs()
-}
-
-fn max_concurrent_uploads() -> usize {
-    16
-}
-
-fn max_in_flight_bytes() -> u64 {
-    256 * 1024 * 1024
-}
-
-fn part_size() -> usize {
-    16 * 1024 * 1024
-}
-
-fn max_parts_in_flight() -> usize {
-    4
 }
 
 fn pusher_metrics_listen() -> String {
@@ -193,14 +234,13 @@ fn puller_metrics_listen() -> String {
 pub struct GcConfig {
     /// The Quota: the storage budget eviction defends.
     pub quota_bytes: u64,
-    /// Fraction of quota at which eviction starts. Default 0.95.
+    /// Fraction of quota at which eviction starts.
     #[serde(default = "high_watermark")]
     pub high_watermark: f64,
-    /// Fraction of quota eviction frees down to. Default 0.85.
+    /// Fraction of quota eviction frees down to.
     #[serde(default = "low_watermark")]
     pub low_watermark: f64,
     /// Seconds between GC timer ticks (each tick is a cheap counter check).
-    /// Default 300.
     #[serde(default = "gc_interval")]
     pub interval_secs: u64,
     /// How long a blob with no row, or an idle multipart, must persist before
@@ -241,14 +281,14 @@ fn orphan_grace() -> u64 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PusherConfig {
-    /// Listen address. Default `127.0.0.1:8080`.
+    /// Listen address.
     #[serde(default = "pusher_listen")]
     pub listen: String,
     /// SQLite path. The Pusher creates and migrates it; the Puller waits.
     pub db_path: String,
     /// Blob storage.
     pub s3: S3Config,
-    /// Store prefix used in signed fingerprints. Default `/nix/store`.
+    /// Store prefix used in signed fingerprints.
     #[serde(default = "store_dir")]
     pub store_dir: String,
     /// Nix secret-key files; every object is signed with all of them
@@ -268,22 +308,22 @@ pub struct PusherConfig {
     /// Unix socket for garret-admin, mode 0600 under the Pusher's user. Absent
     /// means no admin surface.
     pub admin_socket: Option<String>,
-    /// Internal metrics listener (spec 08). Default `127.0.0.1:9091`.
+    /// Internal metrics listener (spec 08).
     #[serde(default = "pusher_metrics_listen")]
     pub metrics_listen: String,
 }
 
-impl PusherConfig {
+impl ServiceConfig for PusherConfig {
     /// Rejects values that would wedge or silently disable the service
     /// (a part size S3 refuses, a zero permit count, a watermark that never
     /// triggers), naming the key so the operator can fix it at startup.
-    pub fn validate(&self) -> Result<()> {
-        const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
-        const MAX_PART_SIZE: usize = 5 * 1024 * 1024 * 1024;
+    fn validate(&self) -> Result<()> {
         let l = &self.limits;
         if !(MIN_PART_SIZE..=MAX_PART_SIZE).contains(&l.part_size) {
             bail!(
-                "limits.part_size must be between 5 MiB and 5 GiB (S3's part size range), got {}",
+                "limits.part_size must be between {} MiB and {} GiB (S3's part size range), got {}",
+                MIN_PART_SIZE >> 20,
+                MAX_PART_SIZE >> 30,
                 l.part_size
             );
         }
@@ -300,20 +340,9 @@ impl PusherConfig {
         if l.max_parts_in_flight == 0 {
             bail!("limits.max_parts_in_flight must be at least 1");
         }
-        self.s3.validate_credentials()?;
-        if self.s3.operation_timeout_secs == 0 {
-            bail!("s3.operation_timeout_secs must be at least 1");
-        }
+        self.s3.validate()?;
         if l.body_idle_timeout_secs == 0 {
             bail!("limits.body_idle_timeout_secs must be at least 1");
-        }
-        if let Some(attempt) = self.s3.operation_attempt_timeout_secs
-            && (attempt == 0 || attempt >= self.s3.operation_timeout_secs)
-        {
-            bail!(
-                "s3.operation_attempt_timeout_secs ({attempt}) must be at least 1 and below s3.operation_timeout_secs ({})",
-                self.s3.operation_timeout_secs
-            );
         }
         if let Some(gc) = &self.gc {
             // A zero quota puts every Blob over the high watermark, so GC would
@@ -345,7 +374,23 @@ impl PusherConfig {
                 );
             }
         }
+        if self.oidc.is_empty() {
+            bail!(
+                "oidc: at least one issuer is required; garret has no auth-disable mode (spec 04)"
+            );
+        }
+        for issuer in &self.oidc {
+            issuer.validate().context("oidc")?;
+        }
         Ok(())
+    }
+
+    fn listen(&self) -> &str {
+        &self.listen
+    }
+
+    fn metrics_listen(&self) -> &str {
+        &self.metrics_listen
     }
 }
 
@@ -353,20 +398,20 @@ impl PusherConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PullerConfig {
-    /// Listen address. Default `127.0.0.1:8081`.
+    /// Listen address.
     #[serde(default = "puller_listen")]
     pub listen: String,
     /// SQLite path — the same file the Pusher writes.
     pub db_path: String,
     /// Blob storage, used only to presign GETs (ADR-0005).
     pub s3: S3Config,
-    /// Store prefix; advertised in `nix-cache-info`. Default `/nix/store`.
+    /// Store prefix; advertised in `nix-cache-info`.
     #[serde(default = "store_dir")]
     pub store_dir: String,
-    /// Lifetime of presigned NAR URLs. Default 3600.
+    /// Lifetime of presigned NAR URLs.
     #[serde(default = "presign_ttl")]
     pub presign_ttl_secs: u64,
-    /// Internal metrics listener (spec 08). Default `127.0.0.1:9092`.
+    /// Internal metrics listener (spec 08).
     #[serde(default = "puller_metrics_listen")]
     pub metrics_listen: String,
     /// Browse routes require Pocket ID; narinfo/NAR stay anonymous (spec 04).
@@ -381,21 +426,21 @@ pub struct PullerConfig {
     pub db_wait_timeout_secs: u64,
     /// Budget for a pull-path database read before the request degrades to a
     /// miss (ticket 25). Measured p99 is ~1.6 ms, so a trip means something
-    /// is genuinely wrong. Default 250.
+    /// is genuinely wrong.
     #[serde(default = "db_read_budget")]
     pub db_read_budget_ms: u64,
     /// Budget for presigning a NAR redirect before the request degrades to a
-    /// miss (ticket 25). Measured p99 is ~2.4 ms. Default 250.
+    /// miss (ticket 25). Measured p99 is ~2.4 ms.
     #[serde(default = "presign_budget")]
     pub presign_budget_ms: u64,
 }
 
-impl PullerConfig {
+impl ServiceConfig for PullerConfig {
     /// Rejects values that would break every pull (a zero or over-long presign
     /// lifetime, a zero budget that degrades every request to a miss) naming
     /// the key, at startup.
-    pub fn validate(&self) -> Result<()> {
-        self.s3.validate_credentials()?;
+    fn validate(&self) -> Result<()> {
+        self.s3.validate()?;
         // 7 days is the SigV4 presigned-URL maximum.
         if !(1..=604_800).contains(&self.presign_ttl_secs) {
             bail!(
@@ -415,7 +460,18 @@ impl PullerConfig {
         if self.db_wait_timeout_secs == 0 {
             bail!("db_wait_timeout_secs must be at least 1");
         }
+        if let Some(issuer) = &self.browse_oidc {
+            issuer.validate().context("browse_oidc")?;
+        }
         Ok(())
+    }
+
+    fn listen(&self) -> &str {
+        &self.listen
+    }
+
+    fn metrics_listen(&self) -> &str {
+        &self.metrics_listen
     }
 }
 
@@ -443,33 +499,25 @@ fn presign_ttl() -> u64 {
     3600
 }
 
-/// Parses a TOML config file. Unknown or misplaced keys are errors
-/// (`deny_unknown_fields`), so typos fail loudly instead of doing nothing.
-pub fn load<T: serde::de::DeserializeOwned>(path: &str) -> Result<T> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
-    toml::from_str(&text).with_context(|| format!("parsing config {path}"))
+/// A service's config file: what [`load`] parses and validates, and what
+/// `runtime::start` binds.
+pub trait ServiceConfig: serde::de::DeserializeOwned {
+    /// Rejects values that would break the service, naming the key.
+    fn validate(&self) -> Result<()>;
+    /// Public listen address.
+    fn listen(&self) -> &str;
+    /// Internal metrics listen address (spec 08).
+    fn metrics_listen(&self) -> &str;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn watermarks_are_fractions_of_the_quota() {
-        let cfg = GcConfig {
-            quota_bytes: 1000,
-            high_watermark: 0.95,
-            low_watermark: 0.85,
-            interval_secs: 300,
-            orphan_grace_secs: 86400,
-        };
-        assert_eq!(cfg.high(), 950);
-        assert_eq!(cfg.low(), 850);
-        // Nothing is evicted while usage stays below the high watermark.
-        assert!(949 < cfg.high());
-        // And a pass always frees a margin, so passes stay infrequent.
-        assert!(cfg.low() < cfg.high());
-    }
+/// Parses and validates a TOML config file. Unknown or misplaced keys are
+/// errors (`deny_unknown_fields`), so typos fail loudly instead of doing
+/// nothing.
+pub fn load<T: ServiceConfig>(path: &str) -> Result<T> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
+    let config: T = toml::from_str(&text).with_context(|| format!("parsing config {path}"))?;
+    config.validate()?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -493,20 +541,17 @@ mod validate_tests {
         .unwrap()
     }
 
+    /// The defaults validate, and `edit` alone makes them fail, naming `key`.
     fn rejects(edit: impl FnOnce(&mut PusherConfig), key: &str) {
         let mut c = cfg();
+        c.validate().unwrap();
         edit(&mut c);
         let e = c.validate().unwrap_err();
         assert!(format!("{e:#}").contains(key), "{e:#}");
     }
 
     #[test]
-    fn defaults_are_valid() {
-        cfg().validate().unwrap();
-    }
-
-    #[test]
-    fn limits_boundaries() {
+    fn part_size_stays_within_s3_limits() {
         const MIB: usize = 1024 * 1024;
         let mut c = cfg();
         c.limits.part_size = 5 * MIB;
@@ -515,27 +560,6 @@ mod validate_tests {
 
         rejects(|c| c.limits.part_size = 5 * MIB - 1, "part_size");
         rejects(|c| c.limits.part_size = 5 * 1024 * MIB + 1, "part_size");
-        rejects(
-            |c| c.limits.max_in_flight_bytes = c.limits.part_size as u64 - 1,
-            "max_in_flight_bytes",
-        );
-        rejects(
-            |c| c.limits.max_concurrent_uploads = 0,
-            "max_concurrent_uploads",
-        );
-        rejects(|c| c.limits.max_parts_in_flight = 0, "max_parts_in_flight");
-        rejects(|c| c.gc.as_mut().unwrap().quota_bytes = 0, "quota_bytes");
-        rejects(
-            |c| c.limits.body_idle_timeout_secs = 0,
-            "body_idle_timeout_secs",
-        );
-    }
-
-    #[test]
-    fn timeout_defaults_keep_current_behavior() {
-        let c = cfg();
-        assert_eq!(c.limits.body_idle_timeout_secs, 60);
-        assert_eq!(c.s3.operation_attempt_timeout_secs, None);
     }
 
     #[test]
@@ -553,16 +577,11 @@ mod validate_tests {
         );
     }
 
+    /// A zero quota or a watermark outside (0, 1] would evict the whole
+    /// cache or never evict at all.
     #[test]
-    fn gc_and_s3_boundaries() {
-        rejects(
-            |c| c.gc.as_mut().unwrap().interval_secs = 0,
-            "interval_secs",
-        );
-        rejects(
-            |c| c.s3.operation_timeout_secs = 0,
-            "operation_timeout_secs",
-        );
+    fn gc_quota_and_watermarks_are_sane() {
+        rejects(|c| c.gc.as_mut().unwrap().quota_bytes = 0, "quota_bytes");
         rejects(
             |c| c.gc.as_mut().unwrap().high_watermark = 0.0,
             "high_watermark",
@@ -570,10 +589,6 @@ mod validate_tests {
         rejects(
             |c| c.gc.as_mut().unwrap().high_watermark = 1.01,
             "high_watermark",
-        );
-        rejects(
-            |c| c.gc.as_mut().unwrap().low_watermark = 0.0,
-            "low_watermark",
         );
         rejects(
             |c| c.gc.as_mut().unwrap().low_watermark = f64::NAN,
@@ -606,14 +621,60 @@ mod validate_tests {
         c.s3.secret_access_key = Some("secret".into());
         c.validate().unwrap();
     }
+
+    /// Issuer mistakes fail at startup, not at the first token (spec 04).
+    #[test]
+    fn issuers_are_validated_at_load() {
+        rejects(|c| c.oidc.clear(), "no auth-disable mode");
+        rejects(|c| c.oidc[0].audience.clear(), "audience");
+        rejects(
+            |c| c.oidc[0].issuer = "http://id.example".into(),
+            "must be https",
+        );
+        rejects(
+            |c| c.oidc[0].jwks_url = Some("http://id.example/jwks".into()),
+            "must be https",
+        );
+        rejects(
+            |c| c.oidc[0].issuer = GITHUB_ISSUER.into(),
+            "github_owner_id",
+        );
+
+        let mut c = cfg();
+        c.oidc[0].issuer = GITHUB_ISSUER.into();
+        c.oidc[0].repository_ids = vec!["42".into()];
+        c.validate().unwrap();
+        c.oidc[0].repository_ids.clear();
+        c.oidc[0].github_owner_id = Some("1234".into());
+        c.validate().unwrap();
+
+        // The dev overrides: a JWKS file under any issuer URL, or http on a
+        // loopback host.
+        let mut c = cfg();
+        c.oidc[0].issuer = "http://dev.garret.test".into();
+        c.oidc[0].jwks_url = Some("/etc/garret/jwks.json".into());
+        c.validate().unwrap();
+        c.oidc[0].jwks_url = Some("http://127.0.0.1:8090/jwks".into());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn remote_jwks_urls_must_be_https_or_loopback() {
+        assert!(check_remote_url("https://id.example/jwks").is_ok());
+        assert!(check_remote_url("http://127.0.0.1:8080/jwks").is_ok());
+        assert!(check_remote_url("http://localhost/jwks").is_ok());
+        assert!(check_remote_url("http://[::1]/jwks").is_ok());
+        assert!(check_remote_url("http://id.example/jwks").is_err());
+        assert!(check_remote_url("http://127.0.0.1.evil.example/jwks").is_err());
+        assert!(check_remote_url("ftp://id.example/jwks").is_err());
+    }
 }
 
 #[cfg(test)]
 mod strictness_tests {
     use super::*;
 
-    /// A misplaced or mistyped key must fail loudly. Silently ignoring one is
-    /// how `admin_socket` ended up inside `[limits]` and did nothing.
+    /// A misplaced or mistyped key must fail loudly, not be ignored.
     #[test]
     fn unknown_keys_are_rejected() {
         let good = r#"
@@ -653,41 +714,47 @@ mod puller_validate_tests {
         .unwrap()
     }
 
+    /// The defaults validate, and `edit` alone makes them fail, naming `key`.
     fn rejects(edit: impl FnOnce(&mut PullerConfig), key: &str) {
         let mut c = cfg();
+        c.validate().unwrap();
         edit(&mut c);
         let e = c.validate().unwrap_err();
         assert!(format!("{e:#}").contains(key), "{e:#}");
     }
 
+    /// 7 days is the SigV4 presigned-URL maximum.
     #[test]
-    fn defaults_are_valid() {
-        cfg().validate().unwrap();
-    }
-
-    #[test]
-    fn rejects_bad_values() {
+    fn presign_ttl_stays_within_the_sigv4_maximum() {
         rejects(|c| c.presign_ttl_secs = 0, "presign_ttl_secs");
         rejects(|c| c.presign_ttl_secs = 604_801, "presign_ttl_secs");
-        rejects(|c| c.db_read_budget_ms = 0, "db_read_budget_ms");
-        rejects(|c| c.presign_budget_ms = 0, "presign_budget_ms");
-        rejects(|c| c.bump_debounce_secs = -1, "bump_debounce_secs");
-        rejects(|c| c.db_wait_timeout_secs = 0, "db_wait_timeout_secs");
+        let mut c = cfg();
+        c.presign_ttl_secs = 604_800;
+        c.validate().unwrap();
     }
 
     #[test]
-    fn s3_credentials_are_all_or_nothing() {
+    fn s3_settings_are_validated_for_the_puller_too() {
         rejects(
-            |c| c.s3.access_key_id = Some("id".into()),
-            "s3.access_key_id and s3.secret_access_key",
+            |c| c.s3.operation_timeout_secs = 0,
+            "operation_timeout_secs",
         );
-        rejects(
-            |c| c.s3.secret_access_key = Some("secret".into()),
-            "s3.access_key_id and s3.secret_access_key",
-        );
+    }
+
+    #[test]
+    fn browse_oidc_is_validated_at_load() {
+        let issuer = |c: &mut PullerConfig| {
+            c.browse_oidc = Some(crate::testing::dev_issuer("/etc/garret/jwks.json"));
+        };
         let mut c = cfg();
-        c.s3.access_key_id = Some("id".into());
-        c.s3.secret_access_key = Some("secret".into());
+        issuer(&mut c);
         c.validate().unwrap();
+        rejects(
+            |c| {
+                issuer(c);
+                c.browse_oidc.as_mut().unwrap().audience.clear();
+            },
+            "browse_oidc",
+        );
     }
 }

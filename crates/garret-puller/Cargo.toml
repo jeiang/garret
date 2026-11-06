@@ -8,6 +8,7 @@ license.workspace = true
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 metrics = "0.24"
+garret-common.workspace = true
 garret-server.workspace = true
 anyhow = "1"
 axum = { version = "0.8", features = ["query"] }
@@ -19,3 +20,5 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 [dev-dependencies]
 garret-server = { workspace = true, features = ["test-support"] }
 tower = { version = "0.5", features = ["util"] }
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+tokio = { version = "1", features = ["test-util"] }

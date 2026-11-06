@@ -8,63 +8,59 @@ use std::{collections::HashSet, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use garret_common::admin::{Request, Response};
-use garret_server::{
-    db,
-    inflight::{Claim, InFlight, Kind, Refused},
-    narinfo,
-};
+use garret_server::{db, narinfo};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
 };
 
-use crate::{AppState, fsck, gc::Gc};
+use crate::{
+    deletion::Deletion,
+    fsck,
+    gc::Gc,
+    state::{AppState, db_run},
+};
 
 /// Binds the admin socket (0600), replacing a stale one, so a bind failure
 /// fails startup instead of a background task.
 pub fn bind(path: &str) -> Result<UnixListener> {
-    // A socket left behind by a crashed process would block the bind.
-    let _ = std::fs::remove_file(path);
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent).ok();
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
+    // A socket left behind by a crashed process would block the bind.
+    garret_common::remove_stale_socket(Path::new(path))
+        .with_context(|| format!("removing stale socket {path}"))?;
     let listener = UnixListener::bind(path).with_context(|| format!("binding {path}"))?;
     restrict(path)?;
     tracing::info!("admin socket listening on {path}");
     Ok(listener)
 }
 
-/// Accept loop over a socket from [`bind`].
-pub async fn serve(
-    listener: UnixListener,
-    state: Arc<AppState>,
-    gc: Option<Arc<Gc>>,
-) -> Result<()> {
+pub async fn serve(listener: UnixListener, state: Arc<AppState>) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
-        let (state, gc) = (state.clone(), gc.clone());
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, state, gc).await {
+            if let Err(e) = handle(stream, state).await {
                 tracing::warn!("admin connection failed: {e:#}");
             }
         });
     }
 }
 
-/// 0600: the file mode *is* the authorization for this socket.
-#[cfg(unix)]
 fn restrict(path: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
-async fn handle(stream: UnixStream, state: Arc<AppState>, gc: Option<Arc<Gc>>) -> Result<()> {
+async fn handle(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => dispatch(request, &state, gc.as_deref()).await,
+            Ok(request) => dispatch(request, &state).await,
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
@@ -76,7 +72,8 @@ async fn handle(stream: UnixStream, state: Arc<AppState>, gc: Option<Arc<Gc>>) -
     Ok(())
 }
 
-async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Response {
+async fn dispatch(request: Request, state: &AppState) -> Response {
+    let gc = state.gc.as_deref();
     let result = match request {
         Request::Status => status(state, gc).await,
         Request::GcRun => match gc {
@@ -85,9 +82,7 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
                 bytes_freed: pass.bytes_freed,
                 candidates_exhausted: pass.candidates_exhausted,
             }),
-            None => Ok(Response::Error {
-                message: "no [gc] section is configured".into(),
-            }),
+            None => Ok(no_gc()),
         },
         Request::Resign => resign(state).await,
         Request::Delete { hashes, dry_run } => {
@@ -104,14 +99,14 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             hash,
             expires_at,
         } => {
-            crate::db_run(&state.conn, move |conn| {
-                db::pin(conn, &name, &hash, expires_at, garret_server::now())
+            db_run(&state.conn, move |conn| {
+                db::pin(conn, &name, &hash, expires_at, garret_common::unix_now())
                     .map(|()| Response::Pin)
             })
             .await
         }
         Request::Unpin { name } => {
-            crate::db_run(&state.conn, move |conn| {
+            db_run(&state.conn, move |conn| {
                 db::unpin(conn, &name).map(|removed| Response::Unpin { removed })
             })
             .await
@@ -120,10 +115,17 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             verify_sizes,
             repair,
         } => match gc {
-            Some(gc) => fsck::run(state, gc, verify_sizes, repair).await,
-            None => Ok(Response::Error {
-                message: "no [gc] section is configured".into(),
-            }),
+            Some(gc) => {
+                fsck::run(
+                    state,
+                    gc.orphan_grace(),
+                    fsck::QUIESCE_TIMEOUT,
+                    verify_sizes,
+                    repair,
+                )
+                .await
+            }
+            None => Ok(no_gc()),
         },
         Request::Prune { before, dry_run } => prune(state, before, dry_run).await,
         Request::DeletePushedBy {
@@ -138,12 +140,19 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
     })
 }
 
+/// The reply to a command that needs the `[gc]` section: `gc run`, and
+/// `fsck`, whose guards use the orphan grace.
+fn no_gc() -> Response {
+    Response::Error {
+        message: "no [gc] section is configured".into(),
+    }
+}
+
 async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
-    let (quota_bytes, uploads_in_flight) =
-        (gc.map(|gc| gc.cfg.quota_bytes), state.in_flight.uploads());
-    crate::db_run(&state.conn, move |conn| {
+    let (quota_bytes, uploads_in_flight) = (gc.map(Gc::quota_bytes), state.in_flight.uploads());
+    db_run(&state.conn, move |conn| {
         Ok(Response::Status {
-            objects: conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?,
+            objects: db::object_count(conn)?,
             total_bytes: db::total_bytes(conn)?,
             quota_bytes,
             uploads_in_flight,
@@ -152,7 +161,6 @@ async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
     .await
 }
 
-/// What [`delete`] removed (or, on a dry run, would remove).
 #[derive(Debug)]
 struct Deleted {
     deleted: usize,
@@ -177,41 +185,43 @@ async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<De
         .collect();
     // A dry run deletes nothing, so it claims nothing and cannot collide with
     // an upload or a GC pass.
-    let _claims = if dry_run {
-        Vec::new()
+    let mut deletion = if dry_run {
+        None
     } else {
-        claim_deletions(&state.in_flight, &hashes)?
+        Some(Deletion::claim_all(&state.in_flight, &hashes)?)
     };
     let mut done = Deleted {
         deleted: 0,
         bytes_freed: 0,
         missing: Vec::new(),
     };
-    let mut keys = Vec::new();
 
     for hash in hashes {
         // One lock hold per path: whether the row exists is decided by the
         // delete itself, so a row fsck repair removed meanwhile is missing,
         // not a zero-byte delete.
-        let freed = {
-            let mut conn = state.conn.lock();
+        let owned = hash.to_owned();
+        let freed = db_run(&state.conn, move |conn| {
             if dry_run {
-                db::file_size(&conn, hash)?
+                db::file_size(conn, &owned)
             } else {
-                db::delete_object(&mut conn, hash)?
+                db::delete_object(conn, &owned)
             }
-        };
+        })
+        .await?;
         let Some(freed) = freed else {
             done.missing.push(hash.to_owned());
             continue;
         };
         done.deleted += 1;
         done.bytes_freed += freed;
-        keys.push(garret_server::storage::key_for(hash));
+        if let Some(deletion) = &mut deletion {
+            deletion.queue_blob(hash);
+        }
     }
 
-    if !dry_run && !keys.is_empty() {
-        state.storage.delete_objects(&keys).await?;
+    if let Some(deletion) = deletion {
+        deletion.finish(&state.storage).await?;
     }
     Ok(done)
 }
@@ -226,8 +236,11 @@ async fn delete_pushed_by(
     dry_run: bool,
 ) -> Result<Response> {
     let matched = {
-        let conn = state.conn.lock();
-        pushed_by(&conn, subject, since)?
+        let subject = subject.to_owned();
+        db_run(&state.conn, move |conn| {
+            db::pushed_by(conn, &subject, since)
+        })
+        .await?
     };
     let (matched, bytes_freed) = delete_listed(state, matched, dry_run).await?;
     if !dry_run {
@@ -240,12 +253,15 @@ async fn delete_pushed_by(
         );
     }
     Ok(Response::DeletePushedBy {
-        objects: matched
-            .into_iter()
-            .map(|row| format!("{}-{}", row.store_path_hash, row.name))
-            .collect(),
+        objects: basenames(matched),
         bytes_freed,
     })
+}
+
+fn basenames(rows: Vec<db::ObjectBrief>) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| format!("{}-{}", row.store_path_hash, row.name))
+        .collect()
 }
 
 /// Deletes the listed objects through [`delete`]; returns those it actually
@@ -271,54 +287,31 @@ async fn delete_listed(
     Ok((matched, done.bytes_freed))
 }
 
-/// Every object first pushed by `subject`, at or after `since` when given.
-/// Exact match: a subject is `<issuer>#<sub>`, and a prefix of one GitHub
-/// ref's subject can be another's.
-fn pushed_by(
-    conn: &rusqlite::Connection,
-    subject: &str,
-    since: Option<i64>,
-) -> Result<Vec<db::ObjectBrief>> {
-    let mut stmt = conn.prepare(
-        "SELECT store_path_hash, name, created_at, file_size FROM objects
-         WHERE pushed_by = ?1 AND created_at >= ?2
-         ORDER BY created_at, store_path_hash",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![subject, since.unwrap_or(i64::MIN)],
-        db::ObjectBrief::from_row,
-    )?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
-/// chose the cutoff. Row first, blob second, as everywhere else.
+/// chose the cutoff.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
     let in_flight = state.in_flight.clone();
     // One closure, so listing and deleting stay atomic under the lock.
-    let (pruned, claims) = crate::db_run(&state.conn, move |conn| {
-        let doomed = db::prunable(conn, before, garret_server::now())?;
+    let (pruned, deletion) = db_run(&state.conn, move |conn| {
+        let doomed = db::prunable(conn, before, garret_common::unix_now())?;
         if dry_run {
-            Ok((doomed, Vec::new()))
-        } else {
-            let hashes: Vec<&str> = doomed
-                .iter()
-                .map(|row| row.store_path_hash.as_str())
-                .collect();
-            let claims = claim_deletions(&in_flight, &hashes)?;
-            db::delete_pruned(conn, &doomed)?;
-            Ok((doomed, claims))
+            return Ok((doomed, None));
         }
+        let hashes: Vec<&str> = doomed
+            .iter()
+            .map(|row| row.store_path_hash.as_str())
+            .collect();
+        let mut deletion = Deletion::claim_all(&in_flight, &hashes)?;
+        db::delete_pruned(conn, &doomed)?;
+        for hash in hashes {
+            deletion.queue_blob(hash);
+        }
+        Ok((doomed, Some(deletion)))
     })
     .await?;
     let bytes_freed = pruned.iter().map(|row| row.file_size).sum();
-    if !dry_run {
-        let keys: Vec<String> = pruned
-            .iter()
-            .map(|row| garret_server::storage::key_for(&row.store_path_hash))
-            .collect();
-        state.storage.delete_objects(&keys).await?;
-        drop(claims);
+    if let Some(deletion) = deletion {
+        deletion.finish(&state.storage).await?;
         tracing::info!(
             before,
             objects = pruned.len(),
@@ -327,32 +320,9 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
         );
     }
     Ok(Response::Prune {
-        pruned: pruned
-            .into_iter()
-            .map(|row| format!("{}-{}", row.store_path_hash, row.name))
-            .collect(),
+        pruned: basenames(pruned),
         bytes_freed,
     })
-}
-
-/// Claims every path before the first row goes, for the caller to hold until
-/// the blob delete returns (spec 05): an upload of one in between would write
-/// a blob that delete then removes. A path already being uploaded or deleted
-/// fails the whole command before anything is deleted.
-fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> {
-    hashes
-        .iter()
-        .map(|hash| {
-            in_flight.claim(hash, Kind::Delete).map_err(|refused| {
-                let doing = match refused {
-                    Refused::Uploading => "uploaded",
-                    Refused::Deleting => "deleted",
-                    Refused::Quiescing => unreachable!("quiescing refuses only uploads"),
-                };
-                anyhow::anyhow!("{hash} is being {doing}; nothing was deleted, retry")
-            })
-        })
-        .collect()
 }
 
 /// Backfills signatures after a key is added, so both the old and new key
@@ -365,7 +335,7 @@ fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> 
 async fn resign(state: &AppState) -> Result<Response> {
     /// Rows per lock hold: pushes wait at most one chunk's reads or writes.
     const CHUNK: usize = 500;
-    let hashes: Vec<String> = crate::db_run(&state.conn, |conn| db::all_hashes(conn))
+    let hashes: Vec<String> = db_run(&state.conn, |conn| db::all_hashes(conn))
         .await?
         .into_iter()
         .collect();
@@ -373,14 +343,13 @@ async fn resign(state: &AppState) -> Result<Response> {
     let mut refused = 0;
     for chunk in hashes.chunks(CHUNK) {
         let chunk = chunk.to_vec();
-        let objects = crate::db_run(&state.conn, move |conn| {
+        let objects = db_run(&state.conn, move |conn| {
             chunk
                 .iter()
                 .filter_map(|hash| db::get_object(conn, hash).transpose())
                 .collect::<Result<Vec<_>>>()
         })
         .await?;
-        // Verify and sign without the lock.
         let mut updates = Vec::new();
         for object in objects {
             if !narinfo::verify(&object, &state.store_dir, &state.keys) {
@@ -397,7 +366,7 @@ async fn resign(state: &AppState) -> Result<Response> {
             }
         }
         resigned += updates.len();
-        crate::db_run(&state.conn, move |conn| {
+        db_run(&state.conn, move |conn| {
             let tx = conn.transaction()?;
             for (hash, sigs) in &updates {
                 db::update_sigs(&tx, hash, sigs)?;
@@ -410,18 +379,10 @@ async fn resign(state: &AppState) -> Result<Response> {
 }
 
 /// The online backup: a consistent copy of the whole database, taken while
-/// both services keep running (spec 10-packaging). Takes the source path from
-/// the shared connection and copies on a connection of its own, so pushes
-/// wait on nothing longer than that lookup.
+/// both services keep running (spec 10-packaging). Copies on a connection of
+/// its own, so pushes never wait on it.
 async fn backup(state: &AppState, dest: String) -> Result<Response> {
-    let source = state
-        .conn
-        .lock()
-        .path()
-        // rusqlite reports an in-memory database as an empty path.
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .context("the database is in memory; there is no file to back up")?;
+    let source = state.db_path.clone();
     let bytes = tokio::task::spawn_blocking(move || backup_to(&source, Path::new(&dest))).await??;
     Ok(Response::Backup { bytes })
 }
@@ -468,24 +429,8 @@ fn backup_to(source: &str, dest: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{open_db, storage_at, test_state, test_state_with_storage};
-
-    fn object(hash: &str) -> db::Object {
-        db::Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: vec![],
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
+    use crate::state::testing::{open_db, test_state, test_state_with_storage};
+    use garret_server::testing::{S3_DELETED, fake_s3, object, scratch_dir};
 
     fn push(conn: &mut rusqlite::Connection, hash: &str, subject: &str, at: i64) {
         let object = db::Object {
@@ -495,56 +440,13 @@ mod tests {
         db::insert_object(conn, &object, at).unwrap();
     }
 
-    /// Matches only the exact subject -- never one it is a prefix of -- and
-    /// `since` is inclusive, so the first push after a leak is not missed.
-    #[test]
-    fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
-        let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
-        let (a, b, c, d) = (
-            "a".repeat(32),
-            "b".repeat(32),
-            "c".repeat(32),
-            "d".repeat(32),
-        );
-        push(&mut conn, &a, leaked, 100);
-        push(&mut conn, &b, leaked, 200);
-        push(&mut conn, &c, &format!("{leaked}-other"), 200);
-        push(&mut conn, &d, "https://issuer#someone-else", 300);
-        // Negotiation refreshes pushed_at, never who pushed first or when.
-        conn.execute("UPDATE objects SET pushed_at = 500", [])
-            .unwrap();
-
-        let hashes = |since| -> Vec<String> {
-            pushed_by(&conn, leaked, since)
-                .unwrap()
-                .into_iter()
-                .map(|row| {
-                    assert_eq!((row.name.as_str(), row.file_size), ("thing", 5));
-                    row.store_path_hash
-                })
-                .collect()
-        };
-        assert_eq!(hashes(None), [a, b.clone()]);
-        assert_eq!(hashes(Some(200)), [b]);
-        assert!(hashes(Some(201)).is_empty());
-    }
-
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("garret-backup-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// The copy must hold rows that so far live only in the WAL: copying the
     /// main file's bytes would silently drop everything since the last
     /// checkpoint.
     #[test]
     fn backup_copies_uncheckpointed_rows_with_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("wal");
+        let dir = scratch_dir();
         let source = dir.join("garret.db");
         let mut conn = db::open(source.to_str().unwrap(), true).unwrap();
         db::migrate(&conn).unwrap();
@@ -559,14 +461,13 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         let copy = db::open(dest.to_str().unwrap(), false).unwrap();
         assert!(db::exists(&copy, &"a".repeat(32)).unwrap());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An existing file is never overwritten, and never removed either -- it
     /// may be yesterday's good backup.
     #[test]
     fn backup_refuses_to_overwrite() {
-        let dir = scratch("exists");
+        let dir = scratch_dir();
         let source = dir.join("garret.db");
         db::migrate(&db::open(source.to_str().unwrap(), true).unwrap()).unwrap();
         let dest = dir.join("backup.db");
@@ -574,7 +475,6 @@ mod tests {
 
         assert!(backup_to(source.to_str().unwrap(), &dest).is_err());
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "yesterday");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// GC is between the row and blob delete of `b` (or an upload of it is
@@ -588,14 +488,14 @@ mod tests {
             db::insert_object(&mut conn, &object(h), 100).unwrap();
         }
         let state = test_state(conn).await;
-        let _gc = state.in_flight.claim(&b, Kind::Delete).unwrap();
+        let _gc = state.in_flight.claim_delete(&b).unwrap();
 
         let err = delete(&state, &[a.clone(), a.clone(), b.clone()], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains(&b), "{err:#}");
         assert!(db::exists(&state.conn.lock(), &a).unwrap());
-        assert!(state.in_flight.claim(&a, Kind::Upload).is_ok());
+        assert!(state.in_flight.claim(&a).is_ok());
     }
 
     #[tokio::test]
@@ -604,8 +504,8 @@ mod tests {
         let mut conn = open_db();
         db::insert_object(&mut conn, &object(&a), 100).unwrap();
         let state = test_state(conn).await;
-        let _gc = state.in_flight.claim(&a, Kind::Delete).unwrap();
-        let before = garret_server::now() - 2 * 86400;
+        let _gc = state.in_flight.claim_delete(&a).unwrap();
+        let before = garret_common::unix_now() - 2 * garret_common::PUSH_GRACE;
 
         let Response::Prune { pruned, .. } = prune(&state, before, true).await.unwrap() else {
             panic!("not a prune response");
@@ -717,9 +617,10 @@ mod tests {
         let mut conn = open_db();
         push(&mut conn, &a, leaked, 100);
         push(&mut conn, &b, leaked, 200);
-        let listed = pushed_by(&conn, leaked, None).unwrap();
+        let listed = db::pushed_by(&conn, leaked, None).unwrap();
         db::delete_object(&mut conn, &a).unwrap();
-        let state = test_state_with_storage(conn, acking_s3().await).await;
+        let acking = fake_s3(axum::Router::new().fallback(|| async { S3_DELETED })).await;
+        let state = test_state_with_storage(conn, acking).await;
 
         let (deleted, bytes_freed) = delete_listed(&state, listed, false).await.unwrap();
         let deleted: Vec<&str> = deleted
@@ -728,16 +629,5 @@ mod tests {
             .collect();
         assert_eq!((deleted, bytes_freed), (vec![b.as_str()], 5));
         assert!(!db::exists(&state.conn.lock(), &b).unwrap());
-    }
-
-    /// An S3 stand-in that acknowledges every `DeleteObjects`.
-    async fn acking_s3() -> garret_server::storage::Storage {
-        let app = axum::Router::new().fallback(|| async {
-            r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        storage_at(&endpoint).await
     }
 }

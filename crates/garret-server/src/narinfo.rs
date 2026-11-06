@@ -42,9 +42,6 @@ impl SigningKeyFile {
         )
     }
 
-    /// Whether `sig` (`<name>:<base64>`) is this key's signature over
-    /// `fingerprint`. A different key name, malformed base64 or a bad
-    /// signature all answer false.
     fn verifies(&self, sig: &str, fingerprint: &str) -> bool {
         let Some((name, b64)) = sig.split_once(':') else {
             return false;
@@ -79,41 +76,39 @@ impl SigningKeyFile {
 /// so everything is normalised here, on the way in.
 ///
 /// Content-addressed paths hide this: nix trusts their hash directly and never
-/// checks the signature. Only input-addressed paths fail, which is why this
-/// survived until the e2e pushed a built derivation.
+/// checks the signature, so only input-addressed paths fail.
 pub fn normalize_hash(hash: &str) -> Result<String> {
-    if let Some(rest) = hash.strip_prefix("sha256:") {
-        return Ok(format!("sha256:{}", normalize_digest(rest)?));
-    }
-    if let Some(rest) = hash.strip_prefix("sha256-") {
-        return Ok(format!("sha256:{}", normalize_digest(rest)?));
-    }
-    bail!("unsupported hash format: {hash}")
-}
-
-fn normalize_digest(digest: &str) -> Result<String> {
-    // 52 base32 characters is an already-canonical sha256.
-    if digest.len() == 52 && garret_common::is_nix_base32(digest) {
-        return Ok(digest.to_owned());
+    const SHA256_BYTES: usize = 32;
+    let Some(digest) = hash
+        .strip_prefix("sha256:")
+        .or_else(|| hash.strip_prefix("sha256-"))
+    else {
+        bail!("unsupported hash format: {hash}")
+    };
+    if digest.len() == garret_common::nix_base32_len(SHA256_BYTES)
+        && garret_common::is_nix_base32(digest)
+    {
+        return Ok(format!("sha256:{digest}"));
     }
     let bytes = B64
         .decode(digest)
         .with_context(|| format!("hash is neither nix-base32 nor base64: {digest}"))?;
-    if bytes.len() != 32 {
+    if bytes.len() != SHA256_BYTES {
         bail!("expected a 32-byte sha256, got {} bytes", bytes.len());
     }
-    Ok(crate::nix_base32::encode(&bytes))
+    Ok(garret_common::sha256_nix32(&bytes))
 }
 
 /// Nix's signed fingerprint. References are full store paths, sorted — nix
 /// holds them in a sorted set, so any other order verifies as a bad signature.
 fn fingerprint(obj: &Object, store_dir: &str) -> String {
-    let refs = obj
+    let mut refs: Vec<String> = obj
         .references
         .iter()
         .map(|r| format!("{store_dir}/{r}"))
-        .collect::<Vec<_>>()
-        .join(",");
+        .collect();
+    refs.sort_unstable();
+    let refs = refs.join(",");
     format!(
         "1;{};{};{};{}",
         obj.store_path, obj.nar_hash, obj.nar_size, refs
@@ -148,7 +143,11 @@ pub fn render(obj: &Object) -> String {
     );
     // Writing to a String cannot fail.
     let _ = writeln!(out, "StorePath: {}", obj.store_path);
-    let _ = writeln!(out, "URL: nar/{}.nar.zst", obj.store_path_hash);
+    let _ = writeln!(
+        out,
+        "URL: {}",
+        garret_common::wire::nar_url(&obj.store_path_hash)
+    );
     out.push_str("Compression: zstd\n");
     let _ = writeln!(out, "FileHash: {}", obj.file_hash);
     let _ = writeln!(out, "FileSize: {}", obj.file_size);
@@ -181,35 +180,31 @@ mod tests {
 
     fn object() -> Object {
         Object {
-            store_path_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0".into(),
-            name: "hello-1.0".into(),
             nar_hash: "sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73".into(),
             nar_size: 4096,
             file_hash: "sha256:1q6zw3dd7l2vnwk06rlnzwl8g1582sbagj6hccngspc7yvhrip52".into(),
             file_size: 1024,
-            deriver: None,
-            ca: None,
-            // deliberately unsorted: sign() must not depend on caller order
-            references: vec!["cccccccccccccccccccccccccccccccc-b".into()],
-            sigs: vec![],
-            pushed_by: None,
+            ..crate::testing::object("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .named("hello-1.0")
+                // deliberately unsorted: sign() must not depend on caller order
+                .referencing(&[
+                    "cccccccccccccccccccccccccccccccc-b",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-a",
+                ])
         }
     }
 
-    #[test]
-    fn signature_verifies_over_the_fingerprint() {
-        let key = SigningKey::from_bytes(&[7u8; 32]);
-        let keypair: Vec<u8> = key
-            .to_bytes()
-            .iter()
-            .chain(key.verifying_key().to_bytes().iter())
-            .copied()
-            .collect();
-        let file = SigningKeyFile::parse(&format!("test-1:{}", B64.encode(&keypair))).unwrap();
+    /// What nix verifies a signature of `object()` against: full store paths,
+    /// references sorted.
+    const FINGERPRINT: &str = "1;/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0;\
+        sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73;4096;\
+        /nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-a,\
+        /nix/store/cccccccccccccccccccccccccccccccc-b";
 
-        let obj = object();
-        let sigs = sign(&obj, "/nix/store", std::slice::from_ref(&file)).unwrap();
+    #[test]
+    fn signature_verifies_over_the_nix_fingerprint() {
+        let file = test_key();
+        let sigs = sign(&object(), "/nix/store", std::slice::from_ref(&file)).unwrap();
         let (name, b64) = sigs[0].split_once(':').unwrap();
         assert_eq!(name, "test-1");
 
@@ -221,21 +216,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert!(
-            public
-                .verify(fingerprint(&obj, "/nix/store").as_bytes(), &sig)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn fingerprint_uses_full_store_paths() {
-        assert_eq!(
-            fingerprint(&object(), "/nix/store"),
-            "1;/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0;\
-             sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73;4096;\
-             /nix/store/cccccccccccccccccccccccccccccccc-b"
-        );
+        assert!(public.verify(FINGERPRINT.as_bytes(), &sig).is_ok());
     }
 
     #[test]
@@ -291,23 +272,25 @@ mod tests {
     }
 
     #[test]
-    fn narinfo_has_the_fields_nix_requires() {
+    fn narinfo_renders_the_fields_nix_reads() {
         let mut obj = object();
-        obj.sigs = vec!["test-1:abc".into()];
-        let text = render(&obj);
-        for field in [
-            "StorePath:",
-            "URL: nar/",
-            "Compression: zstd",
-            "FileHash:",
-            "FileSize:",
-            "NarHash:",
-            "NarSize:",
-            "References:",
-            "Sig:",
-        ] {
-            assert!(text.contains(field), "narinfo missing {field}:\n{text}");
-        }
-        assert!(!text.contains("Deriver:"));
+        obj.deriver = Some("dddddddddddddddddddddddddddddddd-hello-1.0.drv".into());
+        obj.sigs = sign(&obj, "/nix/store", &[test_key()]).unwrap();
+        assert_eq!(
+            render(&obj),
+            format!(
+                "StorePath: /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0\n\
+                 URL: nar/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.nar.zst\n\
+                 Compression: zstd\n\
+                 FileHash: sha256:1q6zw3dd7l2vnwk06rlnzwl8g1582sbagj6hccngspc7yvhrip52\n\
+                 FileSize: 1024\n\
+                 NarHash: sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73\n\
+                 NarSize: 4096\n\
+                 References: cccccccccccccccccccccccccccccccc-b bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-a\n\
+                 Deriver: dddddddddddddddddddddddddddddddd-hello-1.0.drv\n\
+                 Sig: {}\n",
+                obj.sigs[0]
+            )
+        );
     }
 }

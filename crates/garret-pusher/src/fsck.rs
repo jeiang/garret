@@ -5,43 +5,38 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::Result;
-use garret_common::admin::{FsckRow, FsckSizeMismatch, Repair, Response};
-use garret_server::{db, inflight::InFlight, now, storage};
+use garret_common::{
+    admin::{FsckReport, FsckRow, FsckSizeMismatch, Repair, Response},
+    unix_now,
+};
+use garret_server::{db, inflight::InFlight, storage};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::{AppState, gc};
+use crate::state::{AppState, db_run};
 
 /// Ceiling on how long `--quiesce` waits for in-flight uploads to drain.
 /// ponytail: fixed timeout, add a CLI/config knob if an operator ever needs
 /// to wait longer than 5 minutes for uploads to drain.
-const QUIESCE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const QUIESCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Runs one fsck pass: lists S3 keys, then DB rows (in that order — a push
 /// landing in the gap between the two listings looks exactly like the
 /// dangling-row race the in-flight/age guards exist to close), classifies
-/// the difference, and repairs if asked.
+/// the difference, and repairs if asked. Rows and blobs younger than `grace`
+/// (the GC orphan grace) may be mid-push and are never findings; a quiesced
+/// repair waits at most `quiesce_timeout` for uploads to drain.
 pub async fn run(
     state: &AppState,
-    gc: &gc::Gc,
-    verify_sizes: bool,
-    repair: Repair,
-) -> Result<Response> {
-    run_within(state, gc, verify_sizes, repair, QUIESCE_TIMEOUT).await
-}
-
-/// [`run`] with the drain timeout as a parameter, so a test need not wait
-/// out the real one.
-async fn run_within(
-    state: &AppState,
-    gc: &gc::Gc,
-    verify_sizes: bool,
-    repair: Repair,
+    grace: Duration,
     quiesce_timeout: Duration,
+    verify_sizes: bool,
+    repair: Repair,
 ) -> Result<Response> {
     metrics::counter!("garret_fsck_runs_total").increment(1);
 
@@ -53,24 +48,23 @@ async fn run_within(
         None => None,
     };
 
-    let grace = Duration::from_secs(gc.cfg.orphan_grace_secs);
     let blobs = state.storage.list_blobs().await?;
-    let db_rows = {
-        let conn = state.conn.lock();
-        db::all_objects_brief(&conn)?
-    };
+    let db_rows = db_run(&state.conn, |conn| db::all_objects_brief(conn)).await?;
 
     let findings = classify_rows(
         &db_rows,
         &blobs,
         &state.in_flight,
         grace,
-        now(),
+        unix_now(),
         verify_sizes,
     );
     let (dangling, size_mismatches) = to_wire(&findings);
     let known: HashSet<String> = db_rows.iter().map(|r| r.store_path_hash.clone()).collect();
-    let orphans = gc::orphan_keys(&blobs, &known, &state.in_flight, grace);
+    let orphans: Vec<String> = storage::orphan_hashes(&blobs, &known, &state.in_flight, grace)
+        .into_iter()
+        .map(storage::key_for)
+        .collect();
 
     metrics::gauge!("garret_fsck_findings", "kind" => "dangling").set(dangling.len() as f64);
     metrics::gauge!("garret_fsck_findings", "kind" => "orphan").set(orphans.len() as f64);
@@ -80,18 +74,18 @@ async fn run_within(
     // A timed-out drain means the live signal was never trustworthy enough
     // to delete rows on — report the findings, but repair nothing.
     let repaired = if repair != Repair::No && quiesce_drained != Some(false) {
-        apply_repair(&state.conn, &findings)?
+        apply_repair(&state.conn, &findings).await?
     } else {
         0
     };
 
-    Ok(Response::Fsck {
+    Ok(Response::Fsck(FsckReport {
         dangling,
         size_mismatches,
         orphans,
         repaired,
         quiesce_drained,
-    })
+    }))
 }
 
 /// A row fsck would repair, carrying the `created_at` it was listed with so
@@ -118,7 +112,7 @@ enum Drift {
 /// in flight, older than the grace).
 fn classify_rows<'a>(
     db_rows: &'a [db::ObjectBrief],
-    blobs: &[(String, Duration, i64)],
+    blobs: &[storage::Blob],
     in_flight: &InFlight,
     grace: Duration,
     now: i64,
@@ -126,7 +120,7 @@ fn classify_rows<'a>(
 ) -> Vec<Finding<'a>> {
     let s3_sizes: HashMap<&str, i64> = blobs
         .iter()
-        .filter_map(|(key, _age, size)| storage::hash_for(key).map(|h| (h, *size)))
+        .map(|blob| (blob.hash.as_str(), blob.size))
         .collect();
 
     db_rows
@@ -157,7 +151,6 @@ fn classify_rows<'a>(
         .collect()
 }
 
-/// The findings as the admin reply reports them, in listing order.
 fn to_wire(findings: &[Finding<'_>]) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
     let mut dangling = Vec::new();
     let mut size_mismatches = Vec::new();
@@ -185,13 +178,16 @@ fn to_wire(findings: &[Finding<'_>]) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
 /// blob is back) is skipped, not counted. A re-push rewrites `created_at`,
 /// so an unchanged `created_at` is the listed row (found by the TLA+ model,
 /// `verification/tla`). Returns the count actually deleted.
-fn apply_repair(conn: &Mutex<Connection>, findings: &[Finding<'_>]) -> Result<usize> {
+async fn apply_repair(conn: &Arc<Mutex<Connection>>, findings: &[Finding<'_>]) -> Result<usize> {
     let (mut dangling, mut mismatched) = (0, 0);
     for f in findings {
-        let mut conn = conn.lock();
-        if db::created_at(&conn, f.hash)? == Some(f.listed_at)
-            && db::delete_object(&mut conn, f.hash)?.is_some()
-        {
+        let (hash, listed_at) = (f.hash.to_owned(), f.listed_at);
+        let deleted = db_run(conn, move |conn| {
+            Ok(db::created_at(conn, &hash)? == Some(listed_at)
+                && db::delete_object(conn, &hash)?.is_some())
+        })
+        .await?;
+        if deleted {
             match f.drift {
                 Drift::Dangling => dangling += 1,
                 Drift::SizeMismatch { .. } => mismatched += 1,
@@ -208,6 +204,8 @@ fn apply_repair(conn: &Mutex<Connection>, findings: &[Finding<'_>]) -> Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::testing::{open_db, test_state_with_storage};
+    use garret_server::testing::object;
 
     fn row(hash: &str, name: &str, created_at: i64, file_size: i64) -> db::ObjectBrief {
         db::ObjectBrief {
@@ -218,14 +216,17 @@ mod tests {
         }
     }
 
-    fn blob(hash: &str, age_secs: u64, size: i64) -> (String, Duration, i64) {
-        (storage::key_for(hash), Duration::from_secs(age_secs), size)
+    fn blob(hash: &str, age_secs: u64, size: i64) -> storage::Blob {
+        storage::Blob {
+            hash: hash.into(),
+            age: Duration::from_secs(age_secs),
+            size,
+        }
     }
 
-    /// [`classify_rows`] at `GRACE` and `NOW`, as the reply reports it.
     fn classified(
         rows: &[db::ObjectBrief],
-        blobs: &[(String, Duration, i64)],
+        blobs: &[storage::Blob],
         in_flight: &InFlight,
         verify_sizes: bool,
     ) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
@@ -263,9 +264,7 @@ mod tests {
         let rows = vec![row("a", "thing", NOW - 2 * 86400, 5)];
         let blobs = vec![];
         let in_flight = InFlight::new();
-        let _claim = in_flight
-            .claim("a", garret_server::inflight::Kind::Upload)
-            .unwrap();
+        let _claim = in_flight.claim("a").unwrap();
         let (dangling, _) = classified(&rows, &blobs, &in_flight, false);
         assert!(dangling.is_empty(), "in-flight upload reported as dangling");
     }
@@ -303,8 +302,8 @@ mod tests {
     }
 
     /// An upload that overwrote an orphan blob of another size since the S3
-    /// listing (review of #72): its fresh row would read as a mismatch and
-    /// `--repair` would delete it, so the guards apply here too.
+    /// listing: its fresh row would read as a mismatch and `--repair` would
+    /// delete it, so the guards apply here too.
     #[test]
     fn a_young_or_in_flight_row_is_not_reported_as_a_size_mismatch() {
         let blobs = vec![blob("a", 90000, 9)];
@@ -314,9 +313,7 @@ mod tests {
 
         let old = vec![row("a", "thing", NOW - 2 * 86400, 5)];
         let in_flight = InFlight::new();
-        let _claim = in_flight
-            .claim("a", garret_server::inflight::Kind::Upload)
-            .unwrap();
+        let _claim = in_flight.claim("a").unwrap();
         let (_, mismatches) = classified(&old, &blobs, &in_flight, true);
         assert!(
             mismatches.is_empty(),
@@ -334,36 +331,10 @@ mod tests {
         assert!(mismatches.is_empty());
     }
 
-    /// The full classify → repair round trip against a real in-memory
-    /// connection, not fabricated tuples: a dangling row is found, deleted,
-    /// and gone from the database.
-    #[test]
-    fn end_to_end_against_a_real_in_memory_connection() {
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
-        let hash = "a".repeat(32);
-        db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
-        let conn = Mutex::new(conn);
-
-        let db_rows = {
-            let c = conn.lock();
-            db::all_objects_brief(&c).unwrap()
-        };
-        let in_flight = InFlight::new();
-        let findings = classify_rows(&db_rows, &[], &in_flight, GRACE, NOW, false);
-        assert_eq!(findings.len(), 1);
-
-        let repaired = apply_repair(&conn, &findings).unwrap();
-        assert_eq!(repaired, 1);
-        let c = conn.lock();
-        assert!(!db::exists(&c, &hash).unwrap());
-    }
-
-    #[test]
-    fn a_row_gone_before_the_repair_is_skipped_and_the_rest_repaired() {
+    #[tokio::test]
+    async fn a_row_gone_before_the_repair_is_skipped_and_the_rest_repaired() {
         // GC evicts `a` between fsck's listing and its repair.
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = open_db();
         let [a, b, c] = ["a", "b", "c"].map(|h| h.repeat(32));
         for hash in [&a, &b, &c] {
             db::insert_object(&mut conn, &object(hash), NOW - 2 * 86400).unwrap();
@@ -375,9 +346,9 @@ mod tests {
         let (dangling, mismatches) = to_wire(&findings);
         assert_eq!((dangling.len(), mismatches.len()), (2, 1));
         db::delete_object(&mut conn, &a).unwrap();
-        let conn = Mutex::new(conn);
+        let conn = Arc::new(Mutex::new(conn));
 
-        let repaired = apply_repair(&conn, &findings).unwrap();
+        let repaired = apply_repair(&conn, &findings).await.unwrap();
         assert_eq!(repaired, 2, "the vanished row counted as repaired");
         let conn = conn.lock();
         assert!(!db::exists(&conn, &b).unwrap());
@@ -387,10 +358,9 @@ mod tests {
     /// The TLA+ model's counterexample (`verification/tla/fsck_race.cfg`):
     /// a dangling row is deleted and pushed again, blob and all, between
     /// fsck's listing and its repair. The healthy new row must survive.
-    #[test]
-    fn a_row_pushed_again_since_the_listing_is_not_repaired() {
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+    #[tokio::test]
+    async fn a_row_pushed_again_since_the_listing_is_not_repaired() {
+        let mut conn = open_db();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
         let rows = db::all_objects_brief(&conn).unwrap();
@@ -398,39 +368,19 @@ mod tests {
         assert_eq!(findings.len(), 1);
         db::delete_object(&mut conn, &hash).unwrap();
         db::insert_object(&mut conn, &object(&hash), NOW).unwrap();
-        let conn = Mutex::new(conn);
+        let conn = Arc::new(Mutex::new(conn));
 
-        let repaired = apply_repair(&conn, &findings).unwrap();
+        let repaired = apply_repair(&conn, &findings).await.unwrap();
         assert_eq!(repaired, 0);
         assert!(db::exists(&conn.lock(), &hash).unwrap());
     }
 
-    fn object(hash: &str) -> db::Object {
-        db::Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: vec![],
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
-
     /// An S3 stand-in whose bucket lists no blobs.
     async fn empty_bucket() -> storage::Storage {
-        let app = axum::Router::new().fallback(|| async {
+        garret_server::testing::fake_s3(axum::Router::new().fallback(|| async {
             r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"#
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        crate::tests::storage_at(&endpoint).await
+        }))
+        .await
     }
 
     /// A quiesced repair whose drain times out reports it and deletes
@@ -438,34 +388,19 @@ mod tests {
     /// reports no drain at all.
     #[tokio::test]
     async fn a_quiesce_that_cannot_drain_repairs_nothing() {
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let hash = "a".repeat(32);
-        db::insert_object(&mut conn, &object(&hash), now() - 2 * 86400).unwrap();
-        let state = crate::tests::test_state_with_storage(conn, empty_bucket().await).await;
-        let gc = gc::Gc::new(
-            state.conn.clone(),
-            state.storage.clone(),
-            state.in_flight.clone(),
-            garret_server::config::GcConfig {
-                quota_bytes: 1 << 30,
-                high_watermark: 0.95,
-                low_watermark: 0.85,
-                interval_secs: 300,
-                orphan_grace_secs: 86400,
-            },
-        );
-        let fsck = |repair| run_within(&state, &gc, false, repair, Duration::from_millis(50));
+        db::insert_object(&mut conn, &object(&hash), unix_now() - 2 * 86400).unwrap();
+        let state = test_state_with_storage(conn, empty_bucket().await).await;
+        let fsck = |repair| run(&state, GRACE, Duration::from_millis(50), false, repair);
 
-        let upload = state
-            .in_flight
-            .claim(&"b".repeat(32), garret_server::inflight::Kind::Upload)
-            .unwrap();
-        let Response::Fsck {
+        let upload = state.in_flight.claim(&"b".repeat(32)).unwrap();
+        let Response::Fsck(FsckReport {
             dangling,
             repaired,
             quiesce_drained,
             ..
-        } = fsck(Repair::Quiesced).await.unwrap()
+        }) = fsck(Repair::Quiesced).await.unwrap()
         else {
             panic!("not an fsck response");
         };
@@ -474,11 +409,11 @@ mod tests {
         assert!(db::exists(&state.conn.lock(), &hash).unwrap());
         drop(upload);
 
-        let Response::Fsck {
+        let Response::Fsck(FsckReport {
             repaired,
             quiesce_drained,
             ..
-        } = fsck(Repair::Live).await.unwrap()
+        }) = fsck(Repair::Live).await.unwrap()
         else {
             panic!("not an fsck response");
         };

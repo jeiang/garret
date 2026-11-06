@@ -6,14 +6,14 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use garret_common::{
-    admin::{Repair, Request, Response},
-    human_bytes,
+    PUSH_GRACE_HOURS,
+    admin::{DEFAULT_ADMIN_SOCKET, FsckReport, Repair, Request, Response},
+    human_bytes, unix_now,
 };
-use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
@@ -23,7 +23,7 @@ use tokio::{
 #[command(name = "garret-admin", about = "Administer a garret cache")]
 struct Cli {
     /// Pusher admin socket
-    #[arg(long, default_value = "/run/garret/admin.sock", global = true)]
+    #[arg(long, default_value = DEFAULT_ADMIN_SOCKET, global = true)]
     socket: String,
     #[command(subcommand)]
     command: Command,
@@ -99,7 +99,8 @@ enum Command {
     /// Delete every closure last pushed before a cutoff, keeping anything a
     /// newer push or a live pin still needs (spec 05); dry-run by default
     Prune {
-        /// Cutoff: a UTC date (`2026-06-01`) or an age (`90d`); at least a day ago
+        /// Cutoff: a UTC date (`2026-06-01`) or an age (`90d`); older than
+        /// the push grace (spec 05)
         #[arg(long)]
         before: String,
         /// Delete; without this, only list what would be deleted
@@ -180,7 +181,7 @@ async fn main() -> Result<()> {
                 }
                 println!("uploads in flight: {uploads_in_flight}");
             }
-            other => print_unexpected(other),
+            other => return Err(unexpected(other)),
         },
 
         Command::Gc {
@@ -198,11 +199,12 @@ async fn main() -> Result<()> {
                 if candidates_exhausted {
                     println!(
                         "warning: still above the low watermark with nothing evictable — \
-                         everything left is referenced, pinned, or pushed in the last day"
+                         everything left is referenced, pinned, or pushed in the last {} hours",
+                        PUSH_GRACE_HOURS
                     );
                 }
             }
-            other => print_unexpected(other),
+            other => return Err(unexpected(other)),
         },
 
         Command::Resign => match request(&cli.socket, Request::Resign).await? {
@@ -215,7 +217,7 @@ async fn main() -> Result<()> {
                     );
                 }
             }
-            other => print_unexpected(other),
+            other => return Err(unexpected(other)),
         },
 
         Command::Delete {
@@ -241,18 +243,8 @@ async fn main() -> Result<()> {
                 Response::DeletePushedBy {
                     objects,
                     bytes_freed,
-                } => {
-                    let verb = if dry_run { "would delete" } else { "deleted" };
-                    for basename in &objects {
-                        println!("{verb} {basename}");
-                    }
-                    println!(
-                        "{verb} {} object(s), {}",
-                        objects.len(),
-                        human_bytes(bytes_freed)
-                    );
-                }
-                other => print_unexpected(other),
+                } => print_listing(dry_run, &objects, bytes_freed),
+                other => return Err(unexpected(other)),
             }
         }
 
@@ -266,13 +258,11 @@ async fn main() -> Result<()> {
                 } => {
                     let verb = if dry_run { "would delete" } else { "deleted" };
                     println!("{verb} {deleted} object(s), {}", human_bytes(bytes_freed));
-                    // Reported, not swallowed: a mistyped hash would otherwise
-                    // look exactly like a successful delete.
                     if !missing.is_empty() {
                         println!("not in the cache: {}", missing.join(", "));
                     }
                 }
-                other => print_unexpected(other),
+                other => return Err(unexpected(other)),
             }
         }
 
@@ -283,7 +273,11 @@ async fn main() -> Result<()> {
         } => {
             let expires_at = expires
                 .as_deref()
-                .map(|d| parse_duration(d).map(|secs| unix_now() + secs))
+                .map(|d| {
+                    parse_duration(d)?
+                        .checked_add(unix_now())
+                        .with_context(|| format!("--expires {d:?} is too far in the future"))
+                })
                 .transpose()?;
             match request(
                 &cli.socket,
@@ -296,18 +290,16 @@ async fn main() -> Result<()> {
             .await?
             {
                 Response::Pin => println!("pinned {name}"),
-                other => print_unexpected(other),
+                other => return Err(unexpected(other)),
             }
         }
 
         Command::Unpin { name } => match request(&cli.socket, Request::Unpin { name }).await? {
             Response::Unpin { removed: true } => println!("unpinned"),
-            // Reported, not swallowed: a mistyped name would otherwise look
-            // exactly like a successful unpin.
             Response::Unpin { removed: false } => {
                 bail!("no pin has that name");
             }
-            other => print_unexpected(other),
+            other => return Err(unexpected(other)),
         },
 
         Command::Fsck {
@@ -328,45 +320,19 @@ async fn main() -> Result<()> {
         )
         .await?
         {
-            Response::Fsck {
-                dangling,
-                size_mismatches,
-                orphans,
-                repaired,
-                quiesce_drained,
-            } => {
-                // Orphans alone stay informational: the orphan sweep already
-                // owns them on its own schedule.
-                let ok = dangling.is_empty()
-                    && size_mismatches.is_empty()
-                    && quiesce_drained != Some(false);
-
+            Response::Fsck(report) => {
                 if json {
-                    println!(
-                        "{}",
-                        json!({
-                            "ok": ok,
-                            "dangling": dangling,
-                            "size_mismatches": size_mismatches,
-                            "orphans": orphans,
-                            "repaired": repaired,
-                            "quiesce_drained": quiesce_drained,
-                        })
-                    );
+                    let mut value = serde_json::to_value(&report)?;
+                    value["ok"] = report.ok().into();
+                    println!("{value}");
                 } else {
-                    print_fsck_report(&dangling, &size_mismatches, &orphans, repair, repaired);
-                    if quiesce_drained == Some(false) {
-                        println!(
-                            "quiesce timed out waiting for uploads to drain — no repair was performed"
-                        );
-                    }
+                    print_fsck_report(&report, repair);
                 }
-
-                if !ok {
+                if !report.ok() {
                     std::process::exit(1);
                 }
             }
-            other => print_unexpected(other),
+            other => return Err(unexpected(other)),
         },
 
         Command::Prune { before, apply } => {
@@ -376,18 +342,8 @@ async fn main() -> Result<()> {
                 Response::Prune {
                     pruned,
                     bytes_freed,
-                } => {
-                    let verb = if dry_run { "would delete" } else { "deleted" };
-                    for basename in &pruned {
-                        println!("{verb} {basename}");
-                    }
-                    println!(
-                        "{verb} {} object(s), {}",
-                        pruned.len(),
-                        human_bytes(bytes_freed)
-                    );
-                }
-                other => print_unexpected(other),
+                } => print_listing(dry_run, &pruned, bytes_freed),
+                other => return Err(unexpected(other)),
             }
         }
 
@@ -402,20 +358,35 @@ async fn main() -> Result<()> {
                 Response::Backup { bytes } => {
                     println!("wrote {path} ({})", human_bytes(bytes as i64))
                 }
-                other => print_unexpected(other),
+                other => return Err(unexpected(other)),
             }
         }
     }
     Ok(())
 }
 
-fn print_fsck_report(
-    dangling: &[garret_common::admin::FsckRow],
-    size_mismatches: &[garret_common::admin::FsckSizeMismatch],
-    orphans: &[String],
-    repair: bool,
-    repaired: usize,
-) {
+/// `would delete`/`deleted` per basename, then the total: `prune` and
+/// `delete --pushed-by` report alike.
+fn print_listing(dry_run: bool, basenames: &[String], bytes_freed: i64) {
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    for basename in basenames {
+        println!("{verb} {basename}");
+    }
+    println!(
+        "{verb} {} object(s), {}",
+        basenames.len(),
+        human_bytes(bytes_freed)
+    );
+}
+
+fn print_fsck_report(report: &FsckReport, repair: bool) {
+    let FsckReport {
+        dangling,
+        size_mismatches,
+        orphans,
+        repaired,
+        quiesce_drained,
+    } = report;
     if dangling.is_empty() {
         println!("dangling rows: none");
     } else {
@@ -452,6 +423,9 @@ fn print_fsck_report(
     if repair {
         println!("repaired {repaired} row(s)");
     }
+    if *quiesce_drained == Some(false) {
+        println!("quiesce timed out waiting for uploads to drain — no repair was performed");
+    }
 }
 
 #[derive(Subcommand)]
@@ -460,6 +434,7 @@ enum GcCommand {
     Run,
 }
 
+/// One request, one reply; a [`Response::Error`] comes back as `Err`.
 async fn request(socket: &str, request: Request) -> Result<Response> {
     let stream = UnixStream::connect(socket)
         .await
@@ -473,17 +448,15 @@ async fn request(socket: &str, request: Request) -> Result<Response> {
     if line.is_empty() {
         bail!("the Pusher closed the connection without answering");
     }
-    serde_json::from_str(&line).context("parsing the admin response")
+    match serde_json::from_str(&line).context("parsing the admin response")? {
+        Response::Error { message } => Err(anyhow!(message)),
+        response => Ok(response),
+    }
 }
 
-fn print_unexpected(response: Response) {
-    match response {
-        Response::Error { message } => eprintln!("error: {message}"),
-        other => eprintln!("unexpected response: {other:?}"),
-    }
-    // A failed command must fail the process: scripts branch on the exit
-    // code, and a printed error with status 0 reads as success.
-    std::process::exit(1);
+/// A reply of the wrong variant for the request sent.
+fn unexpected(response: Response) -> anyhow::Error {
+    anyhow!("unexpected response: {response:?}")
 }
 
 /// Creates `path` holding `contents`, mode 0600 from the moment it exists:
@@ -519,8 +492,7 @@ fn parse_store_hash(text: &str) -> Result<String> {
     }
 }
 
-/// `<number><s|m|h|d>` → seconds. ponytail: four suffixes cover release
-/// retention; reach for a duration crate only if operators ask for more.
+/// `<number><s|m|h|d>` → seconds.
 fn parse_duration(text: &str) -> Result<i64> {
     let (digits, suffix) = text.split_at(text.len().saturating_sub(1));
     let scale = match suffix {
@@ -535,38 +507,48 @@ fn parse_duration(text: &str) -> Result<i64> {
         .ok()
         .filter(|n| *n > 0)
         .with_context(|| format!("bad duration {text:?} — use e.g. 90s, 30m, 36h, 30d"))?;
-    Ok(n * scale)
-}
-
-fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
+    n.checked_mul(scale)
+        .with_context(|| format!("duration {text:?} is too long"))
 }
 
 /// A prune cutoff: `YYYY-MM-DD` (UTC midnight) or an age understood by
 /// [`parse_duration`], counted back from `now`.
 fn parse_cutoff(text: &str, now: i64) -> Result<i64> {
     if !text.contains('-') {
-        return Ok(now - parse_duration(text)?);
+        return now
+            .checked_sub(parse_duration(text)?)
+            .with_context(|| format!("age {text:?} reaches before the clock's range"));
     }
-    let bad = || anyhow::anyhow!("bad date {text:?} — use YYYY-MM-DD or an age like 90d");
+    let bad = || anyhow!("bad date {text:?} — use YYYY-MM-DD or an age like 90d");
     let mut parts = text.splitn(3, '-').map(|p| p.parse::<i64>().ok());
     let (Some(Some(y)), Some(Some(m)), Some(Some(d))) = (parts.next(), parts.next(), parts.next())
     else {
         return Err(bad());
     };
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if !(1..=9999).contains(&y) || !(1..=12).contains(&m) || d < 1 {
         return Err(bad());
     }
-    // Days since the epoch (Howard Hinnant's days_from_civil).
+    let first = days_from_civil(y, m, 1);
+    let next_first = if m == 12 {
+        days_from_civil(y + 1, 1, 1)
+    } else {
+        days_from_civil(y, m + 1, 1)
+    };
+    if d > next_first - first {
+        return Err(bad());
+    }
+    Ok((first + d - 1) * 86400)
+}
+
+/// Days since the epoch (Howard Hinnant's days_from_civil). Assumes a valid
+/// date; out-of-range days roll into the next month.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Ok((era * 146_097 + doe - 719_468) * 86400)
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -579,7 +561,7 @@ mod tests {
         assert_eq!(parse_duration("30m").unwrap(), 1800);
         assert_eq!(parse_duration("36h").unwrap(), 129600);
         assert_eq!(parse_duration("30d").unwrap(), 2_592_000);
-        for bad in ["", "d", "30", "-1d", "0h", "1w"] {
+        for bad in ["", "d", "30", "-1d", "0h", "1w", "106751991167301d"] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
         }
     }
@@ -593,16 +575,45 @@ mod tests {
             parse_cutoff("30d", 3_000_000).unwrap(),
             3_000_000 - 2_592_000
         );
-        for bad in ["2026-13-01", "2026-06", "2026-06-00", "yesterday", "-1d"] {
+        assert_eq!(parse_cutoff("2024-02-29", 0).unwrap(), 1_709_164_800);
+        assert_eq!(parse_cutoff("2026-12-31", 0).unwrap(), 1_798_675_200);
+        for bad in [
+            "2026-13-01",
+            "2026-06",
+            "2026-06-00",
+            "2026-02-31",
+            "2026-02-29",
+            "2026-04-31",
+            "yesterday",
+            "-1d",
+        ] {
             assert!(parse_cutoff(bad, 0).is_err(), "{bad:?} should be rejected");
+        }
+        assert!(parse_cutoff("1s", i64::MIN).is_err(), "underflow accepted");
+    }
+
+    /// A per-test directory under the temp dir, removed when dropped so a
+    /// failing assertion does not leave it behind.
+    struct Scratch(std::path::PathBuf);
+
+    impl std::ops::Deref for Scratch {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
         }
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
         let dir = std::env::temp_dir().join(format!("garret-admin-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        Scratch(dir)
     }
 
     #[test]
@@ -614,7 +625,6 @@ mod tests {
         let mode = std::fs::metadata(&key).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(std::fs::read_to_string(&key).unwrap(), "k:secret\n");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Existing keys and planted symlinks are both refused: following a
@@ -632,6 +642,5 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(write_secret(&link, "new").is_err());
         assert!(!target.exists(), "the write followed the symlink");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 }

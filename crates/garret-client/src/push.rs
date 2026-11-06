@@ -14,7 +14,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use async_compression::{Level, tokio::bufread::ZstdEncoder, zstd::CParameter};
 use futures::{StreamExt, stream};
-use garret_common::{Preamble, hash_of_store_path};
+use garret_common::{
+    Preamble, hash_of_store_path,
+    wire::{self, UploadAck},
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressBarIter, ProgressStyle};
 use reqwest::{Body, StatusCode};
 use serde::Deserialize;
@@ -26,6 +29,8 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 
+use crate::http::{ensure_success, error_detail};
+
 /// Where push output goes.
 ///
 /// The bar draws to stderr (via the shared `MultiProgress`, which also carries
@@ -34,7 +39,7 @@ use tokio_util::io::ReaderStream;
 /// `garret push --json > events.ndjson` show a live bar and still write clean
 /// JSON.
 #[derive(Clone)]
-pub struct Report {
+pub(crate) struct Report {
     json: bool,
     mp: MultiProgress,
     bar: Option<ProgressBar>,
@@ -51,14 +56,14 @@ impl Report {
     /// `upstream`; the human output only counts them, since a closure routinely
     /// holds thousands. Either way `closure` minus `upstream` is what was
     /// negotiated and the counts stay honest.
-    pub fn start(
+    fn start(
         json: bool,
         mp: &MultiProgress,
         closure: usize,
         upstream: &[PathInfo],
         missing: &[PathInfo],
     ) -> Self {
-        let nar_bytes: u64 = missing.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        let nar_bytes = nar_bytes(missing);
         let mut report = Self {
             json,
             mp: mp.clone(),
@@ -66,16 +71,7 @@ impl Report {
             started: Instant::now(),
         };
         if json {
-            report.event(json!({
-                "event": "negotiated",
-                "closure": closure,
-                "upstream": upstream.len(),
-                "missing": missing.len(),
-                "nar_bytes": nar_bytes,
-            }));
-            for info in upstream {
-                report.path(info, &Outcome::Upstream);
-            }
+            report.negotiated(closure, upstream, missing.len(), nar_bytes);
             return report;
         }
         report.out(&Self::negotiated_line(
@@ -104,10 +100,68 @@ impl Report {
         report
     }
 
-    /// The human Negotiation summary, shared with `--dry-run`. The upstream
-    /// count appears only when the filter dropped something — the common case
-    /// has nothing to say.
-    pub fn negotiated_line(closure: usize, upstream: usize, missing: usize) -> String {
+    /// `--dry-run`'s whole output: the Negotiation result, what would be
+    /// uploaded, and, under `--json`, the same `negotiated`/`path`/`done`
+    /// events a push emits, with status `would-push`.
+    fn dry_run(
+        json: bool,
+        mp: &MultiProgress,
+        closure: usize,
+        upstream: &[PathInfo],
+        missing: &[PathInfo],
+    ) {
+        let nar_bytes = nar_bytes(missing);
+        let report = Self {
+            json,
+            mp: mp.clone(),
+            bar: None,
+            started: Instant::now(),
+        };
+        if json {
+            report.negotiated(closure, upstream, missing.len(), nar_bytes);
+            for info in missing {
+                report.path(info, &Outcome::WouldPush);
+            }
+            report.finish(&Summary {
+                nar_bytes,
+                ..Summary::default()
+            });
+            return;
+        }
+        report.out(&Self::negotiated_line(
+            closure,
+            upstream.len(),
+            missing.len(),
+        ));
+        for info in upstream {
+            report.out(&format!("  upstream   {}", info.path));
+        }
+        for info in missing {
+            report.out(&format!("  would-push {}", info.path));
+        }
+        report.out(&format!(
+            "{} to upload (uncompressed)",
+            garret_common::human_bytes(nar_bytes.min(i64::MAX as u64) as i64)
+        ));
+    }
+
+    /// The `negotiated` event, then a `path` event per upstream-filtered path.
+    fn negotiated(&self, closure: usize, upstream: &[PathInfo], missing: usize, nar_bytes: u64) {
+        self.event(json!({
+            "event": "negotiated",
+            "closure": closure,
+            "upstream": upstream.len(),
+            "missing": missing,
+            "nar_bytes": nar_bytes,
+        }));
+        for info in upstream {
+            self.path(info, &Outcome::Upstream);
+        }
+    }
+
+    /// The human Negotiation summary. The upstream count appears only when
+    /// the filter dropped something — the common case has nothing to say.
+    fn negotiated_line(closure: usize, upstream: usize, missing: usize) -> String {
         match upstream {
             0 => format!("{closure} path(s) in closure, {missing} missing"),
             u => format!("{closure} path(s) in closure, {u} served upstream, {missing} missing"),
@@ -116,7 +170,7 @@ impl Report {
 
     /// The daemon's reporter: per-path lines to the journal, no bar (the
     /// journal is not a TTY anyway), no events.
-    pub fn plain() -> Self {
+    pub(crate) fn plain() -> Self {
         Self {
             json: false,
             mp: MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden()),
@@ -149,8 +203,8 @@ impl Report {
 
     /// The closing Negotiation found `gone` missing again after a clean run;
     /// they are pushed next and their events follow this one.
-    pub fn rechecked(&self, gone: &[PathInfo]) {
-        let nar_bytes: u64 = gone.iter().map(|p| p.nar_size.max(0) as u64).sum();
+    fn rechecked(&self, gone: &[PathInfo]) {
+        let nar_bytes = nar_bytes(gone);
         if let Some(bar) = &self.bar {
             bar.inc_length(nar_bytes);
         }
@@ -170,7 +224,7 @@ impl Report {
 
     /// Clears the bar and emits the totals — the `done` event under `--json`,
     /// which is what makes a truncated NDJSON stream detectable.
-    pub fn finish(&self, summary: &Summary) {
+    fn finish(&self, summary: &Summary) {
         if let Some(bar) = &self.bar {
             bar.finish_and_clear();
         }
@@ -225,6 +279,11 @@ fn path_event(info: &PathInfo, outcome: &Outcome) -> serde_json::Value {
     event
 }
 
+/// Uncompressed NAR bytes across `paths`, the bar's and the events' unit.
+fn nar_bytes(paths: &[PathInfo]) -> u64 {
+    paths.iter().map(|p| p.nar_size.max(0) as u64).sum()
+}
+
 /// How one path ended up. The status strings are the NDJSON `path` event
 /// contract (spec 06).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +294,8 @@ enum Outcome {
     Failed(String),
     /// Signed by an upstream key, so never negotiated or uploaded.
     Upstream,
+    /// Missing from the cache, under `--dry-run`, which uploads nothing.
+    WouldPush,
 }
 
 impl Outcome {
@@ -244,23 +305,7 @@ impl Outcome {
             Self::Deduped => "deduped",
             Self::Failed(_) => "failed",
             Self::Upstream => "upstream",
-        }
-    }
-}
-
-/// What a successful upload attempt achieved: the server stored the path, or
-/// already held it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stored {
-    Pushed,
-    Deduped,
-}
-
-impl From<Stored> for Outcome {
-    fn from(stored: Stored) -> Self {
-        match stored {
-            Stored::Pushed => Self::Pushed,
-            Stored::Deduped => Self::Deduped,
+            Self::WouldPush => "would-push",
         }
     }
 }
@@ -280,7 +325,7 @@ fn tally(outcomes: Vec<(String, Outcome)>, nar_bytes: u64) -> (Summary, Vec<Stri
                 summary.failed += 1;
                 failed.push(path);
             }
-            Outcome::Upstream => {}
+            Outcome::Upstream | Outcome::WouldPush => {}
         }
     }
     (summary, failed)
@@ -318,21 +363,21 @@ impl std::ops::AddAssign for Summary {
 /// [`push_all`]: Pusher::push_all
 pub struct Pusher {
     /// Shared HTTP client, reused across the negotiation and every PUT.
-    pub http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     /// Pusher base URL.
-    pub endpoint: String,
+    pub(crate) endpoint: String,
     /// Bearer tokens, asked for per request: a run can outlive any one token.
     pub tokens: crate::auth::TokenSource,
     /// Maximum concurrent uploads.
     pub jobs: usize,
     /// zstd level for compressing NARs on the way out.
-    pub zstd_level: i32,
+    pub(crate) zstd_level: i32,
     /// Retries per path on 5xx and dropped connections, with exponential
     /// jittered backoff; 429s wait out `Retry-After` instead.
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
     /// How long an upload may go without progress before it is abandoned as
     /// [`Stalled`] and retried.
-    pub upload_idle: Duration,
+    pub(crate) upload_idle: Duration,
 }
 
 /// The subset of `nix path-info --json` garret needs. Shelling out to nix
@@ -360,13 +405,21 @@ pub struct PathInfo {
     pub signatures: Vec<String>,
 }
 
-/// True when any signature's key name (the part before `:`) is one of the
-/// configured upstream keys. Exact name equality, not substring: a key merely
-/// *containing* `cache.nixos.org-1` must not match.
-pub fn signed_upstream(signatures: &[String], upstream_keys: &[String]) -> bool {
+/// The key name of a signature or public key: the part before `:`.
+pub(crate) fn key_name(key: &str) -> &str {
+    key.split_once(':').map_or(key, |(name, _)| name)
+}
+
+/// True when any signature's key name is one of `key_names`. Exact name
+/// equality, not substring: a key merely *containing* `cache.nixos.org-1`
+/// must not match.
+pub(crate) fn signed_by<'a>(
+    signatures: &[String],
+    key_names: impl Iterator<Item = &'a str> + Clone,
+) -> bool {
     signatures.iter().any(|sig| {
-        let key = sig.split(':').next().unwrap_or_default();
-        upstream_keys.iter().any(|u| u == key)
+        let signer = key_name(sig);
+        key_names.clone().any(|name| name == signer)
     })
 }
 
@@ -374,24 +427,79 @@ pub fn signed_upstream(signatures: &[String], upstream_keys: &[String]) -> bool 
 /// already served elsewhere: pushing it would spend bandwidth and Quota on
 /// bytes Eviction would happily reclaim but the cache never needed to hold. It
 /// never enters the Negotiation, so the batch shrinks for free (spec 06).
-pub fn partition_upstream(
+fn partition_upstream(
     closure: Vec<PathInfo>,
     upstream_keys: &[String],
 ) -> (Vec<PathInfo>, Vec<PathInfo>) {
     closure
         .into_iter()
-        .partition(|p| !signed_upstream(&p.signatures, upstream_keys))
+        .partition(|p| !signed_by(&p.signatures, upstream_keys.iter().map(String::as_str)))
 }
 
-/// Whole closure of the given installables, roots included.
-pub async fn closure(paths: &[String]) -> Result<Vec<PathInfo>> {
-    path_info(paths, true).await
+/// `garret push`: the closure of `paths`, minus what an upstream key signs
+/// (`upstream_keys` empty disables the filter), negotiated, then reported
+/// (`dry_run`) or uploaded. Failed paths are counted in the [`Summary`], not
+/// returned as an error: the report is finished either way, and the caller
+/// turns `failed` into the exit code.
+pub async fn run(
+    pusher: &Pusher,
+    paths: &[String],
+    upstream_keys: &[String],
+    dry_run: bool,
+    json: bool,
+    mp: &MultiProgress,
+) -> Result<Summary> {
+    let closure = path_info(paths, true).await?;
+    push_closure(pusher, closure, upstream_keys, dry_run, json, mp).await
+}
+
+/// [`run`] from the closure on.
+async fn push_closure(
+    pusher: &Pusher,
+    closure: Vec<PathInfo>,
+    upstream_keys: &[String],
+    dry_run: bool,
+    json: bool,
+    mp: &MultiProgress,
+) -> Result<Summary> {
+    let closure_len = closure.len();
+    let (own, upstream) = partition_upstream(closure, upstream_keys);
+    let missing = pusher.missing(&own).await?;
+
+    if dry_run {
+        Report::dry_run(json, mp, closure_len, &upstream, &missing);
+        return Ok(Summary::default());
+    }
+
+    let report = Report::start(json, mp, closure_len, &upstream, &missing);
+    let pushed_any = !missing.is_empty();
+    let mut summary = pusher.push_all(missing, &report).await;
+    // A closure is only substitutable whole, and a path the Negotiation
+    // found present can be gone by the end of the run (evicted, deleted,
+    // or another pusher's upload that never finished). One more
+    // Negotiation after a clean run catches it, and pushes it.
+    let mut recheck = Ok(());
+    if pushed_any && summary.failed == 0 {
+        match pusher.missing(&own).await {
+            Ok(gone) if gone.is_empty() => {}
+            Ok(gone) => {
+                report.rechecked(&gone);
+                summary += pusher.push_all(gone, &report).await;
+            }
+            Err(e) => recheck = Err(e.context("re-checking the closure after pushing")),
+        }
+    }
+    report.finish(&summary);
+    // Reported first, so a --json consumer always sees `done`, then the
+    // error carries the failure.
+    recheck?;
+    Ok(summary)
 }
 
 /// `nix path-info --json` over `paths`: with `recursive`, their whole closure;
 /// without, just the paths themselves (their direct references are named in
 /// each entry's `references`).
-pub async fn path_info(paths: &[String], recursive: bool) -> Result<Vec<PathInfo>> {
+pub(crate) async fn path_info(paths: &[String], recursive: bool) -> Result<Vec<PathInfo>> {
     let mut command = Command::new("nix");
     command.args(["path-info", "--json", "--json-format", "1"]);
     if recursive {
@@ -448,7 +556,7 @@ fn parse_path_info(stdout: &[u8]) -> Result<Vec<PathInfo>> {
 
 /// The entries of `infos` whose hash is in `missing`, in order. A set lookup
 /// per entry: Negotiations over thousands of paths must not go quadratic.
-pub fn retain_missing(infos: &[PathInfo], missing: &HashSet<String>) -> Vec<PathInfo> {
+pub(crate) fn retain_missing(infos: &[PathInfo], missing: &HashSet<String>) -> Vec<PathInfo> {
     infos
         .iter()
         .filter(|p| missing.contains(hash_of_store_path(&p.path)))
@@ -457,6 +565,19 @@ pub fn retain_missing(infos: &[PathInfo], missing: &HashSet<String>) -> Vec<Path
 }
 
 impl Pusher {
+    /// The Pusher `cfg` describes, with its token provider.
+    pub fn from_config(cfg: &crate::config::Config, http: &reqwest::Client) -> Result<Self> {
+        Ok(Self {
+            tokens: crate::auth::TokenSource::for_config(http, cfg)?,
+            http: http.clone(),
+            endpoint: cfg.endpoint.clone(),
+            jobs: cfg.jobs,
+            zstd_level: cfg.zstd_level,
+            max_retries: cfg.max_retries,
+            upload_idle: Duration::from_secs(cfg.upload_idle_secs),
+        })
+    }
+
     /// The one pre-upload round-trip (spec 01): the subset of `closure` the
     /// cache does not hold.
     pub async fn missing(&self, closure: &[PathInfo]) -> Result<Vec<PathInfo>> {
@@ -467,11 +588,13 @@ impl Pusher {
         Ok(retain_missing(closure, &self.negotiate(&hashes).await?))
     }
 
-    /// One Negotiation over `hashes`: the subset the cache does not hold.
+    /// One Negotiation over `hashes`: the subset the cache does not hold. An
+    /// empty `hashes` asks nothing, and so only proves the Pusher accepts the
+    /// token.
     pub async fn negotiate(&self, hashes: &[&str]) -> Result<HashSet<String>> {
         let send = |token: &str| {
             self.http
-                .post(format!("{}/api/v1/missing-paths", self.endpoint))
+                .post(format!("{}{}", self.endpoint, wire::MISSING_PATHS))
                 .bearer_auth(token)
                 .json(&hashes)
                 // Small and quick when healthy; without a cap a stalled
@@ -493,17 +616,10 @@ impl Pusher {
             response = send(&token).await.context("negotiating missing paths")?;
         }
 
-        // `error_for_status` drops the body, which is where the server explains
-        // itself; a bare "403 Forbidden" says nothing a log can act on.
-        let status = response.status();
-        if status == StatusCode::FORBIDDEN {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Refused(body.trim().to_owned()).into());
+        if response.status() == StatusCode::FORBIDDEN {
+            return Err(Refused(error_detail(response).await).into());
         }
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("negotiation rejected with {status}: {}", body.trim());
-        }
+        let response = ensure_success(response, "negotiation rejected").await?;
         let missing: HashSet<String> = response
             .json()
             .await
@@ -512,27 +628,39 @@ impl Pusher {
         Ok(missing)
     }
 
+    /// Proves the Pusher accepts this machine's token with an empty
+    /// Negotiation, which crosses exactly the authentication path `push` uses
+    /// (a 401 renews the token once). Returns the accepted token's claims,
+    /// unverified ([`peek_claims`](crate::auth::peek_claims)); empty when
+    /// they cannot be read.
+    pub async fn authenticate(&self) -> Result<crate::auth::Claims> {
+        self.tokens.get().await.context("no token")?;
+        self.negotiate(&[]).await?;
+        // After the Negotiation, which may have replaced a rejected token.
+        Ok(crate::auth::peek_claims(&self.tokens.get().await?).unwrap_or_default())
+    }
+
     /// Uploads every path with at most `jobs` in flight, references first.
     ///
     /// A failure does not abort the run: every path is attempted and reported,
     /// and the caller decides the exit code from `Summary::failed`. That way a
     /// `--json` consumer always receives the terminating `done` event.
-    pub async fn push_all(&self, paths: Vec<PathInfo>, report: &Report) -> Summary {
+    pub(crate) async fn push_all(&self, paths: Vec<PathInfo>, report: &Report) -> Summary {
         self.push_tracked(paths, report).await.0
     }
 
     /// [`push_all`](Self::push_all), also naming the paths that failed — what
     /// the Watcher puts on its failed list.
-    pub async fn push_tracked(
+    pub(crate) async fn push_tracked(
         &self,
         paths: Vec<PathInfo>,
         report: &Report,
     ) -> (Summary, Vec<String>) {
-        let nar_bytes: u64 = paths.iter().map(|p| p.nar_size.max(0) as u64).sum();
+        let nar_bytes = nar_bytes(&paths);
         let outcomes = stream::iter(references_first(paths))
             .map(|info| async move {
                 let outcome = match self.push_one(&info, report).await {
-                    Ok(stored) => Outcome::from(stored),
+                    Ok(outcome) => outcome,
                     Err(e) => Outcome::Failed(format!("{e:#}")),
                 };
                 report.path(&info, &outcome);
@@ -544,14 +672,20 @@ impl Pusher {
         tally(outcomes, nar_bytes)
     }
 
-    async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<Stored> {
+    async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<Outcome> {
         let mut backoff = Backoff::new(self.max_retries);
         let mut renewed = false;
         loop {
             let token = self.tokens.get().await?;
             let error = match self.attempt(info, report, &token).await {
-                Ok(Attempt::Stored(stored)) => return Ok(stored),
-                Ok(Attempt::InProgress) => match backoff.in_progress() {
+                // "deduped", not "skipped": the bytes were uploaded and only
+                // then found redundant, so the bandwidth was spent either way.
+                Ok(UploadAck::Exists) => return Ok(Outcome::Deduped),
+                Ok(UploadAck::Created) => return Ok(Outcome::Pushed),
+                // Not success yet: the other upload may still fail, and then
+                // nobody would have pushed it. Wait until the server answers
+                // `exists`, or lets this one through.
+                Ok(UploadAck::InProgress) => match backoff.in_progress() {
                     Some(wait) => {
                         tokio::time::sleep(wait).await;
                         continue;
@@ -563,7 +697,9 @@ impl Pusher {
             // The token expired or was revoked mid-run: replace it once and go
             // again straight away. A second 401 is a real refusal.
             if !renewed
-                && error.is::<Unauthorized>()
+                && error
+                    .downcast_ref::<Rejected>()
+                    .is_some_and(|r| r.status == StatusCode::UNAUTHORIZED)
                 && self
                     .tokens
                     .renew(&token)
@@ -581,7 +717,7 @@ impl Pusher {
         }
     }
 
-    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<Attempt> {
+    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<UploadAck> {
         let preamble = Preamble {
             store_path: info.path.clone(),
             nar_hash: info.nar_hash.clone(),
@@ -603,9 +739,9 @@ impl Pusher {
         let request = self
             .http
             .put(format!(
-                "{}/api/v1/nar/{}",
+                "{}{}",
                 self.endpoint,
-                hash_of_store_path(&info.path)
+                wire::with_hash(wire::NAR_UPLOAD, hash_of_store_path(&info.path))
             ))
             .bearer_auth(token);
         let response = send_watched(request, body, self.upload_idle)
@@ -616,34 +752,19 @@ impl Pusher {
         if let Some(after) = retry_after(status, &response) {
             return Err(Shed(after).into());
         }
-        if status == StatusCode::UNAUTHORIZED {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Unauthorized(body.trim().to_owned()).into());
-        }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(Rejected {
-                status,
-                body: body.trim().to_owned(),
-            }
-            .into());
+            let body = error_detail(response).await;
+            return Err(Rejected { status, body }.into());
         }
 
-        #[derive(Deserialize)]
-        struct Ack {
-            status: String,
-        }
-        let ack: Ack = response.json().await.context("parsing upload response")?;
-        match ack.status.as_str() {
-            // "deduped", not "skipped": the bytes were uploaded and only then
-            // found redundant, so the bandwidth was spent either way.
-            "exists" => Ok(Attempt::Stored(Stored::Deduped)),
-            // Not success yet: the other upload may still fail. Wait until
-            // the server answers `exists`, or lets this one through.
-            "in-progress" => Ok(Attempt::InProgress),
-            _ => Ok(Attempt::Stored(Stored::Pushed)),
-        }
+        parse_ack(&response.bytes().await.context("reading upload response")?)
     }
+}
+
+/// The Pusher's upload ack. An unknown status is an error: counting it as
+/// pushed would report a path stored that the server never confirmed.
+fn parse_ack(body: &[u8]) -> Result<UploadAck> {
+    serde_json::from_slice(body).context("parsing upload response")
 }
 
 /// Orders `paths` so each comes after the paths in the batch it references.
@@ -781,25 +902,8 @@ async fn unless_stalled<T>(
     }
 }
 
-/// The Pusher refused the token. Typed so [`Pusher::push_one`] can tell it
-/// apart from other rejections and renew the token instead of failing.
-#[derive(Debug)]
-struct Unauthorized(String);
-
-impl std::fmt::Display for Unauthorized {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "upload rejected with {}: {}",
-            StatusCode::UNAUTHORIZED,
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for Unauthorized {}
-
-/// The Pusher refused an upload with a status other than 401 or 429. Typed so
+/// The Pusher refused an upload with a non-2xx status other than a shed.
+/// Typed so [`Pusher::push_one`] renews the token on a 401 and
 /// [`is_retryable`] reads the status instead of searching the message.
 #[derive(Debug)]
 struct Rejected {
@@ -816,13 +920,13 @@ impl std::fmt::Display for Rejected {
 impl std::error::Error for Rejected {}
 
 /// The Negotiation got a 403: the Pusher's policy refuses this identity, now
-/// and on every retry. Typed so the watcher logs it once and drops the batch
-/// instead of retrying. A 401 that survives renewal is not this: it can be
-/// transient (JWKS outage), so it is an ordinary failure.
+/// and on every retry. Typed so the watcher can say so loudly. A 401 that
+/// survives renewal is not this: it can be transient (JWKS outage), so it is
+/// an ordinary failure.
 #[derive(Debug)]
-pub struct Refused(
+pub(crate) struct Refused(
     /// The Pusher's explanation, as sent.
-    pub String,
+    pub(crate) String,
 );
 
 impl std::fmt::Display for Refused {
@@ -838,26 +942,19 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// The server shed the upload (429) and said when to come back. Typed so
-/// [`Backoff`] waits out `Retry-After` instead of parsing the message.
+/// The server turned the upload away (429, or a 503 with `Retry-After`) and
+/// said when to come back. Typed so [`Backoff`] waits out `Retry-After`
+/// instead of parsing the message.
 #[derive(Debug)]
 struct Shed(Duration);
 
 impl std::fmt::Display for Shed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "server is shedding load (429), retry after {:?}", self.0)
+        write!(f, "server asked to retry after {:?}", self.0)
     }
 }
 
 impl std::error::Error for Shed {}
-
-/// What one upload attempt got back: the path stored, or another pusher
-/// uploading it right now. The latter is waited out rather than counted as
-/// pushed: that upload may yet fail, and then nobody would have pushed it.
-enum Attempt {
-    Stored(Stored),
-    InProgress,
-}
 
 /// How long one path keeps waiting out 429s and other pushers' uploads before
 /// it fails: long enough to queue behind several multi-minute uploads, short
@@ -904,7 +1001,7 @@ impl Backoff {
         if self.retries >= self.max_retries || !is_retryable(error) {
             return None;
         }
-        let wait = self.delay + Duration::from_millis(fastrand_millis(self.delay));
+        let wait = self.delay + jitter(self.delay);
         self.retries += 1;
         self.delay *= 2;
         Some(wait)
@@ -923,7 +1020,7 @@ impl Backoff {
     fn queued(&mut self, base: Duration) -> Option<Duration> {
         self.retries = 0;
         self.delay = Duration::from_millis(250);
-        let wait = base + Duration::from_millis(fastrand_millis(base));
+        let wait = base + jitter(base);
         (self.started.elapsed() + wait <= WAIT_DEADLINE).then_some(wait)
     }
 }
@@ -997,18 +1094,22 @@ fn compressed_nar(
     Ok(ReaderStream::with_capacity(encoder, 256 * 1024).chain(exit))
 }
 
+/// How long the server asked us to wait: a 429 shed, or a 503 that carries
+/// `Retry-After` (a path being deleted, spec 01). A 503 without one is an
+/// ordinary server error.
 fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Duration> {
-    (status == StatusCode::TOO_MANY_REQUESTS).then(|| {
-        shed_for(
-            response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok()),
-        )
-    })
+    let header = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok());
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some(shed_for(header)),
+        StatusCode::SERVICE_UNAVAILABLE => header.map(|v| shed_for(Some(v))),
+        _ => None,
+    }
 }
 
-/// A 429's `Retry-After`, in seconds; absent or unparseable (an HTTP date)
+/// A `Retry-After`, in seconds; absent or unparseable (an HTTP date)
 /// means 1 s. Clamped to at least 1 s, so a `0` cannot spin, and at most
 /// [`WAIT_DEADLINE`], so an absurd value cannot overflow the wait arithmetic.
 fn shed_for(retry_after: Option<&str>) -> Duration {
@@ -1020,7 +1121,8 @@ fn shed_for(retry_after: Option<&str>) -> Duration {
 }
 
 /// 5xx and dropped, timed-out or stalled connections are retryable; 4xx are
-/// the client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
+/// the client's fault (spec 01). 429, and a 503 with `Retry-After`, never
+/// reach here: they are a [`Shed`].
 fn is_retryable(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<Rejected>()
@@ -1062,15 +1164,9 @@ pub fn connection_dropped(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Jitter without a rand dependency: sub-second clock noise, capped at the
-/// delay. Microseconds, not nanoseconds: macOS clocks tick in whole
-/// microseconds, so nanoseconds modulo a whole second would always be 0.
-fn fastrand_millis(delay: Duration) -> u64 {
-    let micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_micros() as u64)
-        .unwrap_or(0);
-    micros % delay.as_millis().max(1) as u64
+/// A random wait below `delay`, in whole milliseconds.
+fn jitter(delay: Duration) -> Duration {
+    Duration::from_millis(fastrand::u64(..delay.as_millis().max(1) as u64))
 }
 
 #[cfg(test)]
@@ -1088,6 +1184,18 @@ mod tests {
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"
         );
         assert_eq!(infos[0].nar_size, 12);
+    }
+
+    #[test]
+    fn upload_acks_parse_and_an_unknown_one_is_an_error() {
+        for (body, ack) in [
+            (r#"{"status":"created"}"#, UploadAck::Created),
+            (r#"{"status":"exists"}"#, UploadAck::Exists),
+            (r#"{"status":"in-progress"}"#, UploadAck::InProgress),
+        ] {
+            assert_eq!(parse_ack(body.as_bytes()).unwrap(), ack, "{body}");
+        }
+        assert!(parse_ack(br#"{"status":"stored"}"#).is_err());
     }
 
     #[test]
@@ -1163,18 +1271,6 @@ mod tests {
     }
 
     #[test]
-    fn the_negotiated_line_mentions_upstream_only_when_nonzero() {
-        assert_eq!(
-            Report::negotiated_line(2, 0, 2),
-            "2 path(s) in closure, 2 missing"
-        );
-        assert_eq!(
-            Report::negotiated_line(5, 3, 1),
-            "5 path(s) in closure, 3 served upstream, 1 missing"
-        );
-    }
-
-    #[test]
     fn tally_counts_each_outcome_and_names_the_failures() {
         let outcomes = vec![
             ("/nix/store/a".to_owned(), Outcome::Pushed),
@@ -1210,6 +1306,7 @@ mod tests {
             (Outcome::Pushed, "pushed"),
             (Outcome::Deduped, "deduped"),
             (Outcome::Upstream, "upstream"),
+            (Outcome::WouldPush, "would-push"),
         ] {
             let event = path_event(&path, &outcome);
             assert_eq!(event["status"], status);
@@ -1408,7 +1505,10 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let endless = stream::repeat_with(|| Ok(bytes::Bytes::from_static(&CHUNK)));
-        let request = reqwest::Client::new().put(format!("http://{addr}/api/v1/nar/x"));
+        let request = reqwest::Client::new().put(format!(
+            "http://{addr}{}",
+            wire::with_hash(wire::NAR_UPLOAD, "x")
+        ));
         let watched = send_watched(request, endless, Duration::from_millis(500));
         let error = tokio::time::timeout(Duration::from_secs(30), watched)
             .await
@@ -1448,14 +1548,6 @@ mod tests {
         ))));
         // No io::Error anywhere in the chain: not a drop.
         assert!(!connection_dropped(&std::fmt::Error));
-    }
-
-    #[test]
-    fn jitter_never_exceeds_the_delay() {
-        for ms in [1u64, 250, 4000] {
-            let delay = Duration::from_millis(ms);
-            assert!(fastrand_millis(delay) < ms.max(1));
-        }
     }
 
     fn sh(script: &str) -> Command {
@@ -1510,53 +1602,13 @@ mod tests {
         );
     }
 
-    /// Serves `status` with `body` to every request, counting them.
-    async fn answering(
-        status: u16,
-        body: &'static str,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = hits.clone();
-        tokio::spawn(async move {
-            loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buf = [0u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                counter.fetch_add(1, Ordering::SeqCst);
-                let reply = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(reply.as_bytes()).await;
-            }
-        });
-        (endpoint, hits)
-    }
-
-    fn pusher(endpoint: String) -> (Pusher, Arc<std::sync::atomic::AtomicUsize>) {
-        let (tokens, mints) = crate::auth::TokenSource::counting();
-        let pusher = Pusher {
-            http: reqwest::Client::new(),
-            endpoint,
-            tokens,
-            jobs: 1,
-            zstd_level: 3,
-            max_retries: 0,
-            upload_idle: Duration::from_secs(5),
-        };
-        (pusher, mints)
-    }
-
     /// 403 is a permanent refusal: no renewal, one request, typed `Refused`.
     #[tokio::test]
     async fn a_403_negotiation_is_refused_without_renewing_the_token() {
         use std::sync::atomic::Ordering;
-        let (endpoint, requests) = answering(403, r#"{"error":"not authorized"}"#).await;
-        let (pusher, mints) = pusher(endpoint);
+        let (endpoint, requests) =
+            crate::testing::answering(403, r#"{"error":"not authorized"}"#).await;
+        let (pusher, mints) = crate::testing::pusher(endpoint);
         let error = pusher.negotiate(&["h"]).await.unwrap_err();
         let refused = error.downcast_ref::<Refused>().expect("typed Refused");
         assert!(refused.0.contains("not authorized"), "{}", refused.0);
@@ -1569,12 +1621,29 @@ mod tests {
     #[tokio::test]
     async fn a_persistent_401_renews_once_and_is_not_a_refusal() {
         use std::sync::atomic::Ordering;
-        let (endpoint, requests) = answering(401, r#"{"error":"invalid token"}"#).await;
-        let (pusher, mints) = pusher(endpoint);
+        let (endpoint, requests) =
+            crate::testing::answering(401, r#"{"error":"invalid token"}"#).await;
+        let (pusher, mints) = crate::testing::pusher(endpoint);
         let error = pusher.negotiate(&["h"]).await.unwrap_err();
         assert!(!error.is::<Refused>());
         assert!(format!("{error:#}").contains("401"), "{error:#}");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(mints.load(Ordering::SeqCst), 2);
+    }
+
+    /// The closing re-check follows only a run that uploaded something: with
+    /// nothing missing there is exactly one Negotiation, and no failure.
+    #[tokio::test]
+    async fn a_run_with_nothing_missing_negotiates_once() {
+        use std::sync::atomic::Ordering;
+        let (endpoint, requests) = crate::testing::answering(200, "[]").await;
+        let (pusher, _) = crate::testing::pusher(endpoint);
+        let mp = MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+        let closure = vec![info(&format!("/nix/store/{}-x", "a".repeat(32)), &[])];
+        let summary = push_closure(&pusher, closure, &[], false, false, &mp)
+            .await
+            .unwrap();
+        assert_eq!(summary, Summary::default());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 }

@@ -1,118 +1,36 @@
-//! `garret list` / `garret tree` — thin clients over the Puller's browse API
-//! (spec 07). Rendering only; every query is the server's to answer.
+//! `garret list` / `garret tree` / `garret pins` — thin clients over the
+//! Puller's browse API (spec 07). Rendering only; every query is the server's
+//! to answer.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use garret_common::{
+    human_bytes,
+    wire::{self, TreeNode},
+};
 
-use crate::auth::ensure_success;
+use crate::http::ensure_success;
 
-/// One Object in a `garret list` page, as the browse API summarizes it.
-#[derive(Debug, Deserialize)]
-pub struct Summary {
-    /// The store path hash — the Object's key in the cache.
-    pub hash: String,
-    /// The store path's name part (everything after `<hash>-`).
-    pub name: String,
-    /// Uncompressed NAR size in bytes.
-    pub nar_size: i64,
-    /// Size of the stored Blob — the compressed NAR — in bytes.
-    pub file_size: i64,
-}
-
-/// One page of `garret list` results.
-#[derive(Debug, Deserialize)]
-pub struct Page {
-    /// The Objects on this page.
-    pub objects: Vec<Summary>,
-    /// Opaque cursor for the next page; `None` on the last one.
-    pub next_cursor: Option<String>,
-}
-
-/// One node of a `garret tree` dependency tree.
-#[derive(Debug, Deserialize)]
-pub struct TreeNode {
-    /// The store path's name part.
-    pub name: String,
-    /// The cache does not hold this dependency (referenced but never pushed,
-    /// or evicted).
-    pub missing: bool,
-    /// The server pruned this subtree because the node already appeared
-    /// elsewhere in the tree; [`render`] marks it `(…)`.
-    pub truncated: bool,
-    /// Direct dependencies; empty when missing or truncated.
-    pub children: Vec<TreeNode>,
-}
-
-/// Both queries return the server's JSON verbatim rather than a re-shaped
-/// struct. `--json` then passes it straight through — the browse API already
-/// has a schema (spec 07), and mirroring it client-side would create a second
-/// one to keep in sync. Human rendering deserializes it into the types below.
-pub async fn list(
+/// One authenticated GET to the Puller's browse API, returning the server's
+/// JSON verbatim, so `--json` passes it straight through; human rendering
+/// deserializes it into the [`garret_common::wire`] types the server
+/// serialises. `what` names the answer in errors ("the pin list").
+pub async fn get(
     http: &reqwest::Client,
-    puller: &str,
+    url: reqwest::Url,
     token: &str,
-    query: Option<&str>,
-    limit: usize,
-) -> Result<serde_json::Value> {
-    let mut request = http
-        .get(format!("{puller}/api/v1/objects"))
-        .bearer_auth(token)
-        .query(&[("limit", limit.to_string())]);
-    if let Some(q) = query {
-        request = request.query(&[("q", q)]);
-    }
-    let response = request.send().await?;
-    ensure_success(response, "listing objects")
-        .await?
-        .json()
-        .await
-        .context("parsing the object list")
-}
-
-/// Fetches an Object's dependency tree, verbatim — see [`list`] for why.
-pub async fn tree(
-    http: &reqwest::Client,
-    puller: &str,
-    token: &str,
-    hash: &str,
+    what: &str,
 ) -> Result<serde_json::Value> {
     let response = http
-        .get(format!("{puller}/api/v1/objects/{hash}/tree"))
+        .get(url)
         .bearer_auth(token)
         .send()
-        .await?;
-    ensure_success(response, "fetching the dependency tree")
+        .await
+        .with_context(|| format!("fetching {what}"))?;
+    ensure_success(response, &format!("fetching {what}"))
         .await?
         .json()
         .await
-        .context("parsing the dependency tree")
-}
-
-/// One pin in a `garret pins` listing (ticket 22).
-#[derive(Debug, Deserialize)]
-pub struct Pin {
-    /// Operator-chosen pin name.
-    pub name: String,
-    /// Store path hash of the pinned root.
-    pub store_path_hash: String,
-    /// The store path's name part is not sent separately; render from the path.
-    pub store_path: String,
-    /// Unix time the pin stops protecting; `None` = permanent.
-    pub expires_at: Option<i64>,
-}
-
-/// Fetches the pin listing, verbatim — see [`list`] for why.
-pub async fn pins(http: &reqwest::Client, puller: &str, token: &str) -> Result<serde_json::Value> {
-    let response = http
-        .get(format!("{puller}/api/v1/pins"))
-        .bearer_auth(token)
-        .send()
-        .await?;
-    ensure_success(response, "listing pins")
-        .await?
-        .json()
-        .await
-        .context("parsing the pin list")
+        .with_context(|| format!("parsing {what}"))
 }
 
 /// Renders the tree as indented lines, marking what the cache does not hold
@@ -129,12 +47,57 @@ pub fn render(node: &TreeNode, depth: usize, out: &mut String) {
     }
 }
 
+/// Renders a listing page fetched with `limit`, one Object per line, noting
+/// when more remain.
+pub fn render_page(page: &wire::Page, limit: usize) -> String {
+    let mut out = String::new();
+    for object in &page.objects {
+        out.push_str(&format!(
+            "{}  {:<40} {:>12} on disk\n",
+            object.hash,
+            object.name,
+            human_bytes(object.file_size),
+        ));
+    }
+    if page.next_cursor.is_some() {
+        out.push_str(if limit < wire::MAX_LIMIT {
+            "… more results; narrow the query or raise --limit\n"
+        } else {
+            "… more results; narrow the query\n"
+        });
+    }
+    out
+}
+
+/// Renders the pins, one per line, each with its expiry as of `now` (Unix
+/// seconds).
+pub fn render_pins(pins: &[wire::Pin], now: i64) -> String {
+    let mut out = String::new();
+    for pin in pins {
+        let expiry = match pin.expires_at {
+            None => "permanent".to_owned(),
+            Some(t) if t <= now => "expired".to_owned(),
+            // Unix seconds, not a formatted date: no date dependency
+            // for one column, and --json is the machine surface.
+            Some(t) => format!("expires at {t}"),
+        };
+        out.push_str(&format!(
+            "{:<20} {}  {} ({expiry})\n",
+            pin.name,
+            &pin.store_path_hash[..8.min(pin.store_path_hash.len())],
+            pin.store_path,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn node(name: &str, missing: bool, truncated: bool, children: Vec<TreeNode>) -> TreeNode {
         TreeNode {
+            hash: String::new(),
             name: name.into(),
             missing,
             truncated,
@@ -165,5 +128,58 @@ mod tests {
             out,
             "root\n  dep\n    deep\n  gone (missing)\n  seen-before (…)\n"
         );
+    }
+
+    #[test]
+    fn a_page_lists_objects_and_notes_that_more_remain() {
+        let object = wire::Summary {
+            hash: "aaaa".into(),
+            name: "hello-1.0".into(),
+            store_path: "/nix/store/aaaa-hello-1.0".into(),
+            nar_size: 4096,
+            file_size: 2048,
+            created_at: 0,
+        };
+        let mut page = wire::Page {
+            objects: vec![object],
+            next_cursor: None,
+        };
+        let out = render_page(&page, wire::DEFAULT_LIMIT);
+        assert!(out.starts_with("aaaa  hello-1.0 "), "{out:?}");
+        assert!(out.ends_with(" 2.0 KiB on disk\n"), "{out:?}");
+        assert_eq!(out.lines().count(), 1);
+        page.next_cursor = Some("c".into());
+        assert!(
+            render_page(&page, wire::DEFAULT_LIMIT)
+                .ends_with("on disk\n… more results; narrow the query or raise --limit\n")
+        );
+        assert!(
+            render_page(&page, wire::MAX_LIMIT)
+                .ends_with("on disk\n… more results; narrow the query\n")
+        );
+    }
+
+    #[test]
+    fn pins_show_permanent_expired_and_future_expiry() {
+        let pin = |name: &str, expires_at| wire::Pin {
+            name: name.into(),
+            store_path_hash: "abcdefghijklmnop".into(),
+            store_path: "/nix/store/abcdefghijklmnop-x".into(),
+            expires_at,
+            created_at: 0,
+        };
+        let pins = [
+            pin("forever", None),
+            pin("past", Some(100)),
+            pin("edge", Some(1000)),
+            pin("later", Some(1001)),
+        ];
+        let out = render_pins(&pins, 1000);
+        let expiries: Vec<&str> = out.lines().map(|l| &l[l.rfind('(').unwrap()..]).collect();
+        assert_eq!(
+            expiries,
+            ["(permanent)", "(expired)", "(expired)", "(expires at 1001)"]
+        );
+        assert!(out.starts_with("forever              abcdefgh  /nix/store/abcdefghijklmnop-x"));
     }
 }

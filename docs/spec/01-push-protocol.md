@@ -7,7 +7,8 @@ fully parallel, self-contained, idempotent uploads. All endpoints are
 versioned under `/api/v1` on the Pusher and require a valid OIDC bearer
 token (see [04-auth.md](04-auth.md)). A token that fails verification gets
 `401`; a verified token that policy refuses gets `403`, which is permanent
-(clients do not renew or retry it).
+until the policy changes (clients never renew the token or retry within a
+push; see [06-client.md](06-client.md) for the watcher).
 
 ## Negotiation
 
@@ -26,8 +27,9 @@ for `garret-admin prune` (spec 05).
 Body layout (streamed, never buffered whole):
 
 1. A 4-byte little-endian length prefix.
-2. A JSON metadata preamble of that length: `storePath`, `narHash`,
-   `narSize`, `references` (**full store paths**), `deriver?`, `ca?`.
+2. A JSON metadata preamble of that length, keys in snake_case:
+   `store_path`, `nar_hash`, `nar_size`, `references` (**full store
+   paths**), `deriver?`, `ca?` (optional: absent or `null`).
 3. The zstd-compressed NAR stream (one or more complete frames) to EOF.
 
 The length-prefixed preamble avoids header-size limits for long reference
@@ -49,7 +51,7 @@ answers anything else with `400`:
 
 - `{storePathHash}` is exactly 32 nix-base32 characters. It is checked
   before the body is read — it keys the DB row and the blob.
-- `storePath` is exactly `{store_dir}/{storePathHash}-{name}`, with a
+- `store_path` is exactly `{store_dir}/{storePathHash}-{name}`, with a
   name of 1–211 characters from `[A-Za-z0-9+-._?=]`.
 - Each reference and the `deriver` are store paths under `store_dir` by
   the same rule.
@@ -65,7 +67,7 @@ stored.
   19; higher levels need a window over 8 MiB, which the server refuses).
 - The server hashes the compressed bytes as it relays them to S3 — this
   becomes the stored `FileHash`/`FileSize` — and **verifies the claimed
-  `narHash`/`narSize`** on the same pass: it decompresses the stream as
+  `nar_hash`/`nar_size`** on the same pass: it decompresses the stream as
   it goes by, never buffering the NAR, and hashes the result
   ([ADR-0010](../adr/0010-pusher-verifies-nar-hash.md)). The NAR must
   be complete zstd frames whose content matches both claims exactly. A
@@ -85,7 +87,7 @@ stored.
   describes, not that they are the real build output: a push token can
   still sign any self-consistent NAR for an input-addressed path, so
   token scope ([04-auth.md](04-auth.md)) stays the primary control.
-- A re-push that claims a different `narHash` for a present path is not
+- A re-push that claims a different `nar_hash` for a present path is not
   detected: `exists` is answered before the preamble is read (see
   Idempotency), by design.
 
@@ -107,7 +109,14 @@ normal operation:
   row but not yet the blob; spec 05) → `503` + `Retry-After: 1`. An
   upload now would lose its blob to the pending delete; by the retry the
   path is simply missing.
+- Quiescing (`garret-admin fsck --repair --quiesce` holds the upload
+  gate; spec 05) → `503` + `Retry-After: 1`, answered before any other
+  check. The client waits it out on its deadline instead of spending
+  retries, so pushes resume once the repair (at most a few minutes)
+  returns.
 - Completed → `201 {"status":"created"}`.
+- Any other `status` is a protocol error: the client fails that attempt
+  rather than counting the path as pushed.
 
 ## Parallelism and transport
 
@@ -154,13 +163,14 @@ broken client body is the sender's failure, so the Pusher logs it as a
 warning (still with the `error_id`), not an error. There is
 deliberately no per-NAR size cap: every pusher is authenticated, and the
 GC quota bounds what the cache holds. The compressed body itself is capped
-at zstd's worst-case size for the claimed `narSize` plus 64 KiB; past
+at zstd's worst-case size for the claimed `nar_size` plus 64 KiB; past
 that it is `400`.
 
 ## Errors, retry, versioning
 
 `5xx` and `429` are retryable; other `4xx` are not. So is `in-progress`,
-which is waited out on the same deadline as a `429`. Error bodies are
+which is waited out on the same deadline as a `429`, as is a `503` that
+carries `Retry-After` (its value honored like a `429`'s). Error bodies are
 JSON (`{"error": "…"}`). A `4xx` body explains what the request got
 wrong. An unexpected `500` says only `internal error (id …)`: the error
 chain (S3, SQLite, filesystem detail) is logged by the Pusher under that
