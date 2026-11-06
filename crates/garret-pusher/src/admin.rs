@@ -14,7 +14,12 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 
-use crate::{AppState, deletion::Deletion, fsck, gc::Gc};
+use crate::{
+    deletion::Deletion,
+    fsck,
+    gc::Gc,
+    state::{AppState, db_run},
+};
 
 /// Binds the admin socket (0600), replacing a stale one, so a bind failure
 /// fails startup instead of a background task.
@@ -104,14 +109,14 @@ async fn dispatch(request: Request, state: &AppState) -> Response {
             hash,
             expires_at,
         } => {
-            crate::db_run(&state.conn, move |conn| {
+            db_run(&state.conn, move |conn| {
                 db::pin(conn, &name, &hash, expires_at, garret_common::unix_now())
                     .map(|()| Response::Pin)
             })
             .await
         }
         Request::Unpin { name } => {
-            crate::db_run(&state.conn, move |conn| {
+            db_run(&state.conn, move |conn| {
                 db::unpin(conn, &name).map(|removed| Response::Unpin { removed })
             })
             .await
@@ -155,7 +160,7 @@ fn no_gc() -> Response {
 
 async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
     let (quota_bytes, uploads_in_flight) = (gc.map(Gc::quota_bytes), state.in_flight.uploads());
-    crate::db_run(&state.conn, move |conn| {
+    db_run(&state.conn, move |conn| {
         Ok(Response::Status {
             objects: db::object_count(conn)?,
             total_bytes: db::total_bytes(conn)?,
@@ -206,7 +211,7 @@ async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<De
         // delete itself, so a row fsck repair removed meanwhile is missing,
         // not a zero-byte delete.
         let owned = hash.to_owned();
-        let freed = crate::db_run(&state.conn, move |conn| {
+        let freed = db_run(&state.conn, move |conn| {
             if dry_run {
                 db::file_size(conn, &owned)
             } else {
@@ -242,7 +247,7 @@ async fn delete_pushed_by(
 ) -> Result<Response> {
     let matched = {
         let subject = subject.to_owned();
-        crate::db_run(&state.conn, move |conn| {
+        db_run(&state.conn, move |conn| {
             db::pushed_by(conn, &subject, since)
         })
         .await?
@@ -297,7 +302,7 @@ async fn delete_listed(
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
     let in_flight = state.in_flight.clone();
     // One closure, so listing and deleting stay atomic under the lock.
-    let (pruned, deletion) = crate::db_run(&state.conn, move |conn| {
+    let (pruned, deletion) = db_run(&state.conn, move |conn| {
         let doomed = db::prunable(conn, before, garret_common::unix_now())?;
         if dry_run {
             return Ok((doomed, None));
@@ -340,7 +345,7 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
 async fn resign(state: &AppState) -> Result<Response> {
     /// Rows per lock hold: pushes wait at most one chunk's reads or writes.
     const CHUNK: usize = 500;
-    let hashes: Vec<String> = crate::db_run(&state.conn, |conn| db::all_hashes(conn))
+    let hashes: Vec<String> = db_run(&state.conn, |conn| db::all_hashes(conn))
         .await?
         .into_iter()
         .collect();
@@ -348,7 +353,7 @@ async fn resign(state: &AppState) -> Result<Response> {
     let mut refused = 0;
     for chunk in hashes.chunks(CHUNK) {
         let chunk = chunk.to_vec();
-        let objects = crate::db_run(&state.conn, move |conn| {
+        let objects = db_run(&state.conn, move |conn| {
             chunk
                 .iter()
                 .filter_map(|hash| db::get_object(conn, hash).transpose())
@@ -371,7 +376,7 @@ async fn resign(state: &AppState) -> Result<Response> {
             }
         }
         resigned += updates.len();
-        crate::db_run(&state.conn, move |conn| {
+        db_run(&state.conn, move |conn| {
             let tx = conn.transaction()?;
             for (hash, sigs) in &updates {
                 db::update_sigs(&tx, hash, sigs)?;
@@ -434,7 +439,7 @@ fn backup_to(source: &str, dest: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{open_db, test_state, test_state_with_storage};
+    use crate::state::testing::{open_db, test_state, test_state_with_storage};
     use garret_server::testing::{S3_DELETED, fake_s3, object, scratch_dir};
 
     fn push(conn: &mut rusqlite::Connection, hash: &str, subject: &str, at: i64) {

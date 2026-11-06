@@ -18,7 +18,10 @@ use garret_server::{db, inflight::InFlight, storage};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::{AppState, gc};
+use crate::{
+    gc,
+    state::{AppState, db_run},
+};
 
 /// Ceiling on how long `--quiesce` waits for in-flight uploads to drain.
 /// ponytail: fixed timeout, add a CLI/config knob if an operator ever needs
@@ -49,7 +52,7 @@ pub async fn run(
     };
 
     let blobs = state.storage.list_blobs().await?;
-    let db_rows = crate::db_run(&state.conn, |conn| db::all_objects_brief(conn)).await?;
+    let db_rows = db_run(&state.conn, |conn| db::all_objects_brief(conn)).await?;
 
     let findings = classify_rows(
         &db_rows,
@@ -182,7 +185,7 @@ async fn apply_repair(conn: &Arc<Mutex<Connection>>, findings: &[Finding<'_>]) -
     let (mut dangling, mut mismatched) = (0, 0);
     for f in findings {
         let (hash, listed_at) = (f.hash.to_owned(), f.listed_at);
-        let deleted = crate::db_run(conn, move |conn| {
+        let deleted = db_run(conn, move |conn| {
             Ok(db::created_at(conn, &hash)? == Some(listed_at)
                 && db::delete_object(conn, &hash)?.is_some())
         })
@@ -204,6 +207,7 @@ async fn apply_repair(conn: &Arc<Mutex<Connection>>, findings: &[Finding<'_>]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::testing::{open_db, test_state_with_storage};
     use garret_server::testing::object;
 
     fn row(hash: &str, name: &str, created_at: i64, file_size: i64) -> db::ObjectBrief {
@@ -333,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn a_row_gone_before_the_repair_is_skipped_and_the_rest_repaired() {
         // GC evicts `a` between fsck's listing and its repair.
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let [a, b, c] = ["a", "b", "c"].map(|h| h.repeat(32));
         for hash in [&a, &b, &c] {
             db::insert_object(&mut conn, &object(hash), NOW - 2 * 86400).unwrap();
@@ -359,7 +363,7 @@ mod tests {
     /// fsck's listing and its repair. The healthy new row must survive.
     #[tokio::test]
     async fn a_row_pushed_again_since_the_listing_is_not_repaired() {
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
         let rows = db::all_objects_brief(&conn).unwrap();
@@ -387,10 +391,10 @@ mod tests {
     /// reports no drain at all.
     #[tokio::test]
     async fn a_quiesce_that_cannot_drain_repairs_nothing() {
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), unix_now() - 2 * 86400).unwrap();
-        let state = crate::tests::test_state_with_storage(conn, empty_bucket().await).await;
+        let state = test_state_with_storage(conn, empty_bucket().await).await;
         let fsck = |repair| run(&state, GRACE, Duration::from_millis(50), false, repair);
 
         let upload = state.in_flight.claim(&"b".repeat(32)).unwrap();

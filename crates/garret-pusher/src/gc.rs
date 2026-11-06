@@ -18,7 +18,7 @@ use garret_server::{
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
-use crate::deletion::Deletion;
+use crate::{deletion::Deletion, state::db_run};
 
 /// Candidates are re-queried after each batch: deleting a root frees its
 /// dependencies, which the next query then surfaces.
@@ -100,7 +100,7 @@ impl Gc {
     async fn tick(&self) -> Result<()> {
         let usage = counted(
             "pass",
-            crate::db_run(&self.conn, |conn| db::total_bytes(conn)).await,
+            db_run(&self.conn, |conn| db::total_bytes(conn)).await,
         )?;
         metrics::gauge!("garret_gc_usage_bytes").set(usage as f64);
         metrics::gauge!("garret_gc_quota_bytes").set(self.cfg.quota_bytes as f64);
@@ -128,12 +128,11 @@ impl Gc {
         let mut result = PassResult::default();
         let low = self.cfg.low();
 
-        let mut usage = crate::db_run(&self.conn, |conn| db::reconcile_total_bytes(conn)).await?;
+        let mut usage = db_run(&self.conn, |conn| db::reconcile_total_bytes(conn)).await?;
 
         while usage > low {
             let at = unix_now();
-            let candidates =
-                crate::db_run(&self.conn, move |conn| db::evictable(conn, BATCH, at)).await?;
+            let candidates = db_run(&self.conn, move |conn| db::evictable(conn, BATCH, at)).await?;
             if candidates.is_empty() {
                 result.candidates_exhausted = true;
                 metrics::counter!("garret_gc_candidates_exhausted_total").increment(1);
@@ -158,8 +157,7 @@ impl Gc {
                 // stays; the next query no longer returns it.
                 let owned = hash.clone();
                 let Some(freed) =
-                    crate::db_run(&self.conn, move |conn| db::evict_object(conn, &owned, at))
-                        .await?
+                    db_run(&self.conn, move |conn| db::evict_object(conn, &owned, at)).await?
                 else {
                     continue;
                 };
@@ -202,7 +200,7 @@ impl Gc {
 
     async fn sweep(&self) -> Result<usize> {
         let grace = self.orphan_grace();
-        let known = crate::db_run(&self.conn, |conn| db::all_hashes(conn)).await?;
+        let known = db_run(&self.conn, |conn| db::all_hashes(conn)).await?;
         let blobs = self.storage.list_blobs().await?;
         // Before the orphans are claimed: the abort skips in-flight paths.
         let aborted = self
@@ -215,7 +213,7 @@ impl Gc {
         // whose row landed since `known` was read is no orphan.
         let deletion = {
             let in_flight = self.in_flight.clone();
-            crate::db_run(&self.conn, move |conn| {
+            db_run(&self.conn, move |conn| {
                 let mut deletion = Deletion::default();
                 for hash in orphan_hashes(&blobs, &known, &in_flight, grace) {
                     let Ok(claim) = in_flight.claim_delete(hash) else {
@@ -278,6 +276,7 @@ pub(crate) fn orphan_hashes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::testing::open_db;
     use garret_server::inflight;
     use garret_server::testing::{S3_DELETED, fake_s3, gc_config, object, unreachable_storage};
 
@@ -347,7 +346,7 @@ mod tests {
     #[tokio::test]
     async fn failed_passes_and_sweeps_are_counted() {
         let (passes, sweeps) = (gc_failures("pass"), gc_failures("sweep"));
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         db::insert_object(&mut conn, &object(&"a".repeat(32)).sized(100), 0).unwrap();
         let gc = Gc::new(
             Arc::new(Mutex::new(conn)),
@@ -368,7 +367,7 @@ mod tests {
         // Over quota with one candidate, d. A push negotiates d, is told it
         // is present, and will upload d's referrers next: evicting d now
         // would leave them with a hole. The pass must stop and alarm instead.
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let d = "d".repeat(32);
         db::insert_object(&mut conn, &object(&d).sized(100), 0).unwrap();
         let reported = db::missing(&mut conn, std::slice::from_ref(&d), unix_now()).unwrap();
@@ -391,7 +390,7 @@ mod tests {
         // Between the row delete and the blob delete, an upload of the same
         // path would write a blob the pending delete then removes, under the
         // row that upload inserts.
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let r = "r".repeat(32);
         db::insert_object(&mut conn, &object(&r).sized(100), 0).unwrap();
         let (storage, held, release) = gated_s3().await;
@@ -467,7 +466,7 @@ mod tests {
         // Between the orphan check and the blob delete, an upload re-pushing
         // the path would land a row whose blob the pending delete removes.
         let o = "o".repeat(32);
-        let conn = crate::tests::open_db();
+        let conn = open_db();
         let (storage, held, release) = orphan_s3(&o, || {}).await;
         let in_flight = InFlight::new();
         let gc = Arc::new(Gc::new(
@@ -498,7 +497,7 @@ mod tests {
         // An upload of the path completes, row and all, after the sweep read
         // the rows but before it claims the path: its blob is no orphan.
         let o = "o".repeat(32);
-        let conn = crate::tests::open_db();
+        let conn = open_db();
         let conn = Arc::new(Mutex::new(conn));
         let (storage, mut held, _release) = orphan_s3(&o, {
             let (conn, o) = (conn.clone(), o.clone());
@@ -518,7 +517,7 @@ mod tests {
         // `garret-admin delete` holds the only candidate. The candidate query
         // keeps returning it until that delete commits, so a pass that only
         // skipped it would spin.
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let r = "r".repeat(32);
         db::insert_object(&mut conn, &object(&r).sized(100), 0).unwrap();
         let in_flight = InFlight::new();
@@ -547,7 +546,7 @@ mod tests {
         // Quota 100, low watermark 85. A pinned 70-byte filler plus the chain
         // r → d → y of 10-byte objects: one pass evicts r, then (next batch)
         // d, and stops at 80 with y kept.
-        let mut conn = crate::tests::open_db();
+        let mut conn = open_db();
         let [filler, r, d, y] = ["f", "r", "d", "y"].map(|c| c.repeat(32));
         db::insert_object(&mut conn, &object(&filler).sized(70), 0).unwrap();
         db::pin(&conn, "filler", &filler, None, 0).unwrap();
