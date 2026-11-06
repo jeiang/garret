@@ -103,6 +103,8 @@ hardware, which is a decision for after the first production runs.
    `--pull-concurrency` takes a comma list (e.g. `20,100,300`): each
    step runs back to back over the same corpus and is reported
    separately, so the output is a latency curve rather than one point.
+   `pull` in the report is always an array with one entry per step, a
+   single step included.
    `--no-pull-keepalive` disables HTTP connection reuse for the run.
    `just bench-pull-sweep` provisions locally and runs the
    c=20/100/300 sweep with keep-alive on and off. Sweep results stay
@@ -143,5 +145,8 @@ against the checked-in baseline (`benchmarks/baseline.json`, promoted
 via `just bench-baseline`), failing only on failed requests, an
 environment-label mismatch or a corpus-version mismatch — latency and
 throughput judgement stays
-with a human. Rerun before merging performance-relevant changes. No CI
+with a human. The diff pairs `stream` and `pull` entries by their step
+parameters (size; concurrency and keep-alive), not by position, so runs
+that swept different steps still line up. Rerun before merging
+performance-relevant changes. No CI
 gating in v1.

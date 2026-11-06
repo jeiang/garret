@@ -713,7 +713,7 @@ print('  stream MiB/s:', [round(r['mib_per_sec'], 1) for r in runs])
   --count 12 --passes 1 --json "$root/bench-pull.json" | tail -5
 python3 -c "
 import json
-r = json.load(open('$root/bench-pull.json'))['pull']
+[r] = json.load(open('$root/bench-pull.json'))['pull']
 assert r['zero_failures'], r
 assert r['requests'] == 24, r
 print('  pull narinfo p50:', r['narinfo_p50_ms'], 'ms, redirect p50:', r['redirect_p50_ms'], 'ms')

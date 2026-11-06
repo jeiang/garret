@@ -10,13 +10,27 @@ import json
 import sys
 
 
+# Fields that tell the entries of a scenario's result array apart, so a step
+# is diffed against the same step even when the runs swept different steps.
+STEP_KEYS = {"stream": ("size_bytes",), "pull": ("concurrency", "keepalive")}
+
+
+def step_label(entry, keys):
+    return ",".join(f"{k}={json.dumps(entry.get(k))}" for k in keys)
+
+
 def flatten(value, prefix=""):
     if isinstance(value, dict):
         for k, v in value.items():
             yield from flatten(v, f"{prefix}{k}.")
     elif isinstance(value, list):
+        keys = STEP_KEYS.get(prefix.rstrip("."))
         for i, v in enumerate(value):
-            yield from flatten(v, f"{prefix}{i}.")
+            if keys and isinstance(v, dict):
+                rest = {k: x for k, x in v.items() if k not in keys}
+                yield from flatten(rest, f"{prefix.rstrip('.')}[{step_label(v, keys)}].")
+            else:
+                yield from flatten(v, f"{prefix}{i}.")
     elif isinstance(value, bool):
         pass
     elif isinstance(value, (int, float)):
@@ -49,18 +63,18 @@ def main():
     curr = dict(flatten(current))
     skip = ("meta.seed", "meta.corpus_version", "meta.timestamp_unix", "meta.cpus")
 
-    print(f"{'metric':<38} {'baseline':>14} {'current':>14} {'delta':>9}")
+    print(f"{'metric':<52} {'baseline':>14} {'current':>14} {'delta':>9}")
     for key in sorted(set(base) | set(curr)):
         if key.startswith(skip):
             continue
         b, c = base.get(key), curr.get(key)
         if b is None or c is None:
-            print(f"{key:<38} {b if b is not None else '—':>14} "
+            print(f"{key:<52} {b if b is not None else '—':>14} "
                   f"{c if c is not None else '—':>14} {'new' if b is None else 'gone':>9}")
             continue
         delta = f"{(c - b) / b:+8.1%}" if b else "     n/a"
         fmt = lambda v: f"{v:>14.2f}" if isinstance(v, float) else f"{v:>14}"
-        print(f"{key:<38} {fmt(b)} {fmt(c)} {delta}")
+        print(f"{key:<52} {fmt(b)} {fmt(c)} {delta}")
 
     failures = sum(v for k, v in curr.items() if k.endswith(".failed"))
     if failures:

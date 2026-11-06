@@ -284,17 +284,11 @@ async fn main() -> Result<()> {
         output.pull = Some(run_pull(&cli, args).await?);
     }
 
-    // A single-step pull serializes as the same flat object as always, so the
-    // checked-in baseline keeps its keys; only a sweep emits an array.
-    let pull_json = match output.pull.as_deref() {
-        Some([one]) => serde_json::to_value(one)?,
-        other => serde_json::to_value(other)?,
-    };
     let report = serde_json::json!({
         "meta": meta,
         "push": output.push,
         "stream": output.stream,
-        "pull": pull_json,
+        "pull": output.pull,
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     if let Some(path) = &cli.json {
