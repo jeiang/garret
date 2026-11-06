@@ -76,15 +76,16 @@ impl Gc {
     }
 
     /// The GC schedule (spec 05): an orphan sweep at startup and then every
-    /// [`SWEEP_INTERVAL`], and a tick every `interval_secs`.
+    /// [`SWEEP_INTERVAL`], and a tick every `interval_secs`. A failed sweep
+    /// is retried on the next tick.
     pub async fn run_forever(self: Arc<Self>) {
         let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
         let mut last_sweep: Option<Instant> = None;
         loop {
             if last_sweep.is_none_or(|at| at.elapsed() >= SWEEP_INTERVAL) {
-                last_sweep = Some(Instant::now());
-                if let Err(e) = self.sweep_orphans().await {
-                    tracing::error!("orphan sweep failed: {e:#}");
+                match self.sweep_orphans().await {
+                    Ok(_) => last_sweep = Some(Instant::now()),
+                    Err(e) => tracing::error!("orphan sweep failed: {e:#}"),
                 }
             }
             ticker.tick().await;
@@ -459,6 +460,49 @@ mod tests {
         }))
         .await;
         (storage, held_rx, release_tx)
+    }
+
+    #[tokio::test]
+    async fn a_failed_sweep_is_retried_on_the_next_tick() {
+        use axum::response::IntoResponse;
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (retried_tx, retried_rx) = tokio::sync::oneshot::channel();
+        let retried = Arc::new(Mutex::new(Some(retried_tx)));
+        let storage = fake_s3(axum::Router::new().fallback({
+            let lists = lists.clone();
+            move |uri: axum::http::Uri| {
+                let query = uri.query().unwrap_or_default().to_owned();
+                let (lists, retried) = (lists.clone(), retried.clone());
+                async move {
+                    if query.contains("uploads") {
+                        return r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"#.into_response();
+                    }
+                    if lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        return axum::http::StatusCode::FORBIDDEN.into_response();
+                    }
+                    if let Some(tx) = retried.lock().take() {
+                        let _ = tx.send(());
+                    }
+                    r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><Prefix>nar/</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#.into_response()
+                }
+            }
+        }))
+        .await;
+        let gc = Arc::new(Gc::new(
+            Arc::new(Mutex::new(open_db())),
+            storage,
+            InFlight::new(),
+            gc_config(100),
+        ));
+
+        let timer = tokio::spawn(gc.run_forever());
+        // The first tick fires at once; the next sweep comes right after it,
+        // well before the configured interval.
+        tokio::time::timeout(Duration::from_secs(10), retried_rx)
+            .await
+            .expect("the failed startup sweep was not retried")
+            .unwrap();
+        timer.abort();
     }
 
     #[tokio::test]
