@@ -788,9 +788,14 @@ mod tests {
     /// touches a real S3 endpoint — safe as long as the test never actually
     /// calls a storage method.
     async fn unreachable_storage() -> Storage {
+        storage_at("http://127.0.0.1:1").await
+    }
+
+    /// A `Storage` for an S3 stand-in at `endpoint`.
+    pub(crate) async fn storage_at(endpoint: &str) -> Storage {
         Storage::new(&S3Config {
             bucket: "test".into(),
-            endpoint_url: Some("http://127.0.0.1:1".into()),
+            endpoint_url: Some(endpoint.into()),
             region: Some("us-east-1".into()),
             path_style: true,
             access_key_id: Some("x".into()),
@@ -804,9 +809,16 @@ mod tests {
     }
 
     pub(crate) async fn test_state(conn: rusqlite::Connection) -> Arc<AppState> {
+        test_state_with_storage(conn, unreachable_storage().await).await
+    }
+
+    pub(crate) async fn test_state_with_storage(
+        conn: rusqlite::Connection,
+        storage: Storage,
+    ) -> Arc<AppState> {
         Arc::new(AppState {
             conn: Arc::new(Mutex::new(conn)),
-            storage: unreachable_storage().await,
+            storage,
             keys: vec![],
             store_dir: "/nix/store".into(),
             auth: Authenticator::new(vec![IssuerConfig {

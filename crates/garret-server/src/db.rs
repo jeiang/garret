@@ -372,6 +372,14 @@ pub fn created_at(conn: &Connection, hash: &str) -> Result<Option<i64>> {
         .optional()?)
 }
 
+/// The object's blob size (`file_size`), if it has a row.
+pub fn file_size(conn: &Connection, hash: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached("SELECT file_size FROM objects WHERE store_path_hash = ?1")?
+        .query_row(params![hash], |r| r.get(0))
+        .optional()?)
+}
+
 /// Current cache usage from the maintained `stats` counter — a cheap read,
 /// which is what lets every GC tick check quota without summing rows.
 pub fn total_bytes(conn: &Connection) -> Result<i64> {
@@ -465,14 +473,7 @@ pub fn evict_object(conn: &mut Connection, hash: &str, now: i64) -> Result<Optio
         )
         .optional()?;
     if let Some(size) = size {
-        tx.execute(
-            "DELETE FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-        )?;
-        tx.execute(
-            "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
-            params![size],
-        )?;
+        remove_row(&tx, hash, size)?;
         tx.commit()?;
     }
     Ok(size)
@@ -511,29 +512,37 @@ pub fn unpin(conn: &Connection, name: &str) -> Result<bool> {
 }
 
 /// Removes the row and its refs, and debits the usage counter, in one
-/// transaction. The blob is deleted after this returns — row-then-blob, so a
-/// failure leaves an orphan for the sweep rather than a row with no blob.
-/// IMMEDIATE for the same reason as [`insert_object`].
-pub fn delete_object(conn: &mut Connection, hash: &str) -> Result<i64> {
+/// transaction; `None` means there was no row. The blob is deleted after
+/// this returns — row-then-blob, so a failure leaves an orphan for the sweep
+/// rather than a row with no blob. IMMEDIATE for the same reason as
+/// [`insert_object`].
+pub fn delete_object(conn: &mut Connection, hash: &str) -> Result<Option<i64>> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let size: i64 = tx
-        .query_row(
-            "SELECT file_size FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
+    let size = file_size(&tx, hash)?;
+    if let Some(size) = size {
+        remove_row(&tx, hash, size)?;
+        tx.commit()?;
+    }
+    Ok(size)
+}
+
+/// Deletes one row (refs and pins cascade) and debits its `size`, inside
+/// the caller's write transaction.
+fn remove_row(tx: &rusqlite::Transaction<'_>, hash: &str, size: i64) -> Result<()> {
     tx.execute(
         "DELETE FROM objects WHERE store_path_hash = ?1",
         params![hash],
     )?;
+    debit(tx, size)
+}
+
+/// Takes `bytes` of deleted rows off the usage counter, never below zero.
+fn debit(tx: &rusqlite::Transaction<'_>, bytes: i64) -> Result<()> {
     tx.execute(
         "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
-        params![size],
+        params![bytes],
     )?;
-    tx.commit()?;
-    Ok(size)
+    Ok(())
 }
 
 /// Replaces an object's stored signatures (`garret-admin resign`).
@@ -720,11 +729,7 @@ pub fn delete_pruned(conn: &mut Connection, doomed: &[ObjectBrief]) -> Result<()
                 delete.execute(params![doomed[i].store_path_hash])?;
             }
         }
-        let freed: i64 = batch.iter().map(|&i| doomed[i].file_size).sum();
-        tx.execute(
-            "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
-            params![freed],
-        )?;
+        debit(&tx, batch.iter().map(|&i| doomed[i].file_size).sum())?;
         tx.commit()?;
     }
     Ok(())
@@ -1022,7 +1027,10 @@ mod tests {
         insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
         assert_eq!(total_bytes(&conn).unwrap(), 10);
 
-        assert_eq!(delete_object(&mut conn, &a).unwrap(), 5);
+        assert_eq!(delete_object(&mut conn, &a).unwrap(), Some(5));
+        assert_eq!(total_bytes(&conn).unwrap(), 5);
+        // Absent is not a zero-byte delete: nothing is reported or debited.
+        assert_eq!(delete_object(&mut conn, &a).unwrap(), None);
         assert_eq!(total_bytes(&conn).unwrap(), 5);
 
         // Drift in the counter is corrected from the rows, not compounded.
@@ -1061,7 +1069,7 @@ mod tests {
         holder.join().unwrap();
 
         let holder = hold_write_lock();
-        assert_eq!(delete_object(&mut conn, &a).unwrap(), 5);
+        assert_eq!(delete_object(&mut conn, &a).unwrap(), Some(5));
         holder.join().unwrap();
 
         drop(conn);

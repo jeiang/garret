@@ -180,8 +180,9 @@ fn repair_rows<'a>(
     let mut repaired = 0;
     for hash in hashes {
         let mut conn = conn.lock();
-        if db::created_at(&conn, hash)?.is_some_and(|at| listed.get(hash) == Some(&at)) {
-            db::delete_object(&mut conn, hash)?;
+        if db::created_at(&conn, hash)?.is_some_and(|at| listed.get(hash) == Some(&at))
+            && db::delete_object(&mut conn, hash)?.is_some()
+        {
             repaired += 1;
         }
     }
