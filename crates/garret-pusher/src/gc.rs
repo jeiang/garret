@@ -308,9 +308,7 @@ mod tests {
         ];
         let known: std::collections::HashSet<String> = ["known".to_string()].into();
         let in_flight = InFlight::new();
-        let _claim = in_flight
-            .claim("uploading", garret_server::inflight::Kind::Upload)
-            .unwrap();
+        let _claim = in_flight.claim("uploading").unwrap();
 
         assert_eq!(
             orphan_hashes(&blobs, &known, &in_flight, grace),
@@ -427,14 +425,14 @@ mod tests {
         held.await.unwrap();
         assert!(!db::exists(&gc.conn.lock(), &r).unwrap());
         assert_eq!(
-            in_flight.claim(&r, inflight::Kind::Upload).err(),
+            in_flight.claim(&r).err(),
             Some(inflight::Refused::Deleting),
             "an upload got in before the blob delete"
         );
 
         release.send(()).unwrap();
         assert_eq!(pass.await.unwrap().evicted, 1);
-        assert!(in_flight.claim(&r, inflight::Kind::Upload).is_ok());
+        assert!(in_flight.claim(&r).is_ok());
     }
 
     /// An S3 stand-in whose bucket holds one blob, `nar/<hash>.nar.zst`, long
@@ -501,14 +499,14 @@ mod tests {
         });
         held.await.unwrap();
         assert_eq!(
-            in_flight.claim(&o, inflight::Kind::Upload).err(),
+            in_flight.claim(&o).err(),
             Some(inflight::Refused::Deleting),
             "an upload got in before the blob delete"
         );
 
         release.send(()).unwrap();
         assert_eq!(sweep.await.unwrap(), 1);
-        assert!(in_flight.claim(&o, inflight::Kind::Upload).is_ok());
+        assert!(in_flight.claim(&o).is_ok());
     }
 
     #[tokio::test]
@@ -542,7 +540,7 @@ mod tests {
         let r = "r".repeat(32);
         db::insert_object(&mut conn, &object(&r).sized(100), 0).unwrap();
         let in_flight = InFlight::new();
-        let _deleting = in_flight.claim(&r, inflight::Kind::Delete).unwrap();
+        let _deleting = in_flight.claim_delete(&r).unwrap();
         let gc = Gc::new(
             Arc::new(Mutex::new(conn)),
             unreachable_storage().await,

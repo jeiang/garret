@@ -569,12 +569,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains(&b), "{err:#}");
         assert!(db::exists(&state.conn.lock(), &a).unwrap());
-        assert!(
-            state
-                .in_flight
-                .claim(&a, garret_server::inflight::Kind::Upload)
-                .is_ok()
-        );
+        assert!(state.in_flight.claim(&a).is_ok());
     }
 
     #[tokio::test]
