@@ -47,7 +47,6 @@ struct AppState {
     db: OnceLock<Db>,
     storage: Storage,
     presign_ttl: Duration,
-    bump_debounce: i64,
     bumps: Bumps,
     db_read_budget: Duration,
     presign_budget: Duration,
@@ -73,18 +72,28 @@ const BUMP_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Last-accessed bumps waiting for the next flush (spec 02). Only hits on
 /// stale rows are queued, so it is bounded by the object count.
-#[derive(Default)]
-struct Bumps(Mutex<HashSet<String>>);
+struct Bumps {
+    pending: Mutex<HashSet<String>>,
+    /// Seconds a row's `last_accessed_at` counts as fresh.
+    debounce: i64,
+}
 
 impl Bumps {
+    fn new(debounce: i64) -> Self {
+        Self {
+            pending: Mutex::default(),
+            debounce,
+        }
+    }
+
     /// A fresh row, which is nearly every hit, costs no write at all: not
     /// even the WAL write lock a no-op UPDATE would take.
-    fn hit(&self, hash: &str, last_accessed_at: i64, now: i64, debounce: i64) {
-        if last_accessed_at >= now - debounce {
+    fn hit(&self, hash: &str, last_accessed_at: i64, now: i64) {
+        if last_accessed_at >= now - self.debounce {
             metrics::counter!("garret_bump_debounced_total").increment(1);
             return;
         }
-        let mut pending = self.0.lock();
+        let mut pending = self.pending.lock();
         // Not a bare insert: that would allocate the owned key on every repeat hit.
         if !pending.contains(hash) {
             pending.insert(hash.to_owned());
@@ -92,16 +101,16 @@ impl Bumps {
         metrics::gauge!("garret_bump_queue_depth").set(pending.len() as f64);
     }
 
-    fn flush(&self, conn: &mut rusqlite::Connection, now: i64, debounce: i64) -> Result<usize> {
+    fn flush(&self, conn: &mut rusqlite::Connection, now: i64) -> Result<usize> {
         let batch = {
-            let mut pending = self.0.lock();
+            let mut pending = self.pending.lock();
             metrics::gauge!("garret_bump_queue_depth").set(0.0);
             std::mem::take(&mut *pending)
         };
         if batch.is_empty() {
             return Ok(0);
         }
-        db::bump_last_accessed(conn, &batch, now, debounce)?;
+        db::bump_last_accessed(conn, &batch, now, self.debounce)?;
         Ok(batch.len())
     }
 }
@@ -112,7 +121,7 @@ async fn flush_bumps(state: Arc<AppState>, conn: Conn) {
         tick.tick().await;
         let state = state.clone();
         let flushed = on_conn(conn.clone(), "bump", move |conn| {
-            state.bumps.flush(conn, unix_now(), state.bump_debounce)
+            state.bumps.flush(conn, unix_now())
         })
         .await;
         let Err(e) = flushed else { continue };
@@ -180,7 +189,8 @@ where
 {
     let waited = Instant::now();
     let mut conn = conn.lock_owned().await;
-    metrics::histogram!("garret_db_lock_wait_seconds", "conn" => which).record(waited.elapsed());
+    metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => which)
+        .record(waited.elapsed());
     tokio::task::spawn_blocking(move || run(&mut conn))
         .await
         .unwrap_or_else(|e| Err(anyhow::anyhow!("{which} database task failed: {e}")))
@@ -288,8 +298,7 @@ async fn main() -> Result<()> {
         db: OnceLock::new(),
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
-        bump_debounce: cfg.bump_debounce_secs,
-        bumps: Bumps::default(),
+        bumps: Bumps::new(cfg.bump_debounce_secs),
         db_read_budget: Duration::from_millis(cfg.db_read_budget_ms),
         presign_budget: Duration::from_millis(cfg.presign_budget_ms),
         read_probe: ProbeCache::default(),
@@ -382,9 +391,7 @@ async fn narinfo(state: &AppState, file: &str) -> Outcome {
     };
     match db_read(db.pull.clone(), state.db_read_budget, read).await {
         Ok(Some((obj, last_accessed_at))) => {
-            state
-                .bumps
-                .hit(hash, last_accessed_at, unix_now(), state.bump_debounce);
+            state.bumps.hit(hash, last_accessed_at, unix_now());
             Outcome::Hit(
                 (
                     [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
@@ -587,10 +594,10 @@ struct ListQuery {
 }
 
 fn default_limit() -> usize {
-    50
+    browse::DEFAULT_LIMIT
 }
 
-async fn browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response
+async fn run_browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Option<T>> + Send + 'static,
     T: serde::Serialize + Send + 'static,
@@ -618,32 +625,35 @@ async fn list_objects(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<ListQuery>,
 ) -> Response {
-    browse(&state, "objects", move |conn| {
+    run_browse(&state, "objects", move |conn| {
         browse::list(conn, query.q.as_deref(), query.limit, query.cursor.as_ref()).map(Some)
     })
     .await
 }
 
 async fn object_detail(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    browse(&state, "object", move |conn| browse::object(conn, &hash)).await
+    run_browse(&state, "object", move |conn| browse::object(conn, &hash)).await
 }
 
 async fn object_tree(State(state): State<Arc<AppState>>, Path(hash): Path<String>) -> Response {
-    browse(&state, "tree", move |conn| browse::tree(conn, &hash, 64)).await
+    run_browse(&state, "tree", move |conn| {
+        browse::tree(conn, &hash, browse::TREE_DEPTH)
+    })
+    .await
 }
 
 async fn object_referrers(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
 ) -> Response {
-    browse(&state, "referrers", move |conn| {
+    run_browse(&state, "referrers", move |conn| {
         browse::referrers(conn, &hash).map(Some)
     })
     .await
 }
 
 async fn list_pins(State(state): State<Arc<AppState>>) -> Response {
-    browse(&state, "pins", |conn| browse::pins(conn).map(Some)).await
+    run_browse(&state, "pins", |conn| browse::pins(conn).map(Some)).await
 }
 
 #[cfg(test)]
@@ -709,10 +719,7 @@ mod tests {
     /// Flushes `state`'s queued bumps on its pull connection; how many it wrote.
     async fn flush(state: &AppState) -> usize {
         let mut conn = state.db().unwrap().pull.lock().await;
-        state
-            .bumps
-            .flush(&mut conn, unix_now(), state.bump_debounce)
-            .unwrap()
+        state.bumps.flush(&mut conn, unix_now()).unwrap()
     }
 
     /// Nearly every hit is on a fresh row, and it must not write: not even
@@ -737,7 +744,7 @@ mod tests {
         assert_eq!(served.status(), StatusCode::OK);
         // The last second of the window, where the UPDATE's WHERE would
         // match nothing: still no write lock.
-        state.bumps.hit(&hash, 1000, 1000 + DAY, DAY);
+        state.bumps.hit(&hash, 1000, 1000 + DAY);
         let flushed = flush(&state).await;
         pusher.execute_batch("ROLLBACK").unwrap();
         assert_eq!(flushed, 0, "a fresh row must not be written");
@@ -779,7 +786,7 @@ mod tests {
         let slow = tokio::spawn({
             let state = state.clone();
             async move {
-                browse(&state, "tree", move |_| {
+                run_browse(&state, "tree", move |_| {
                     running_tx.send(()).unwrap();
                     wedge(&gate).map(Some)
                 })
@@ -846,8 +853,7 @@ mod tests {
             db: OnceLock::new(),
             storage,
             presign_ttl: Duration::from_secs(1),
-            bump_debounce: DAY,
-            bumps: Bumps::default(),
+            bumps: Bumps::new(DAY),
             db_read_budget: Duration::from_secs(1),
             presign_budget: Duration::from_secs(1),
             read_probe: ProbeCache::default(),

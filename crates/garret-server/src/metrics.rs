@@ -13,6 +13,9 @@ use axum::{
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
+/// Histogram of waits for a SQLite connection's lock, labelled by `conn`.
+pub const DB_LOCK_WAIT_SECONDS: &str = "garret_db_lock_wait_seconds";
+
 /// Bucket bounds from spec 08: bytes 64 KiB…8 GiB, latency 100 us…15 min.
 fn byte_buckets() -> Vec<f64> {
     (16..=33).map(|p| (1u64 << p) as f64).collect()

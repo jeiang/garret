@@ -10,6 +10,13 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::db;
 
+/// Page size when a listing names none (spec 07).
+pub const DEFAULT_LIMIT: usize = 50;
+/// Largest page a listing returns; [`list`] clamps to it (spec 07).
+pub const MAX_LIMIT: usize = 500;
+/// Levels below the root the Puller's tree expands (spec 07).
+pub const TREE_DEPTH: usize = 64;
+
 /// The listing query. Its order is exactly the `objects_created` index, so a
 /// page walks the index and stops, instead of sorting every row per request.
 const LIST: &str = "SELECT store_path_hash, name, store_path, nar_size, file_size, created_at
@@ -66,7 +73,7 @@ pub fn list(
     limit: usize,
     cursor: Option<&Cursor>,
 ) -> Result<Page> {
-    let limit = limit.clamp(1, 500);
+    let limit = limit.clamp(1, MAX_LIMIT);
     let (after_time, after_hash) = match cursor {
         Some(c) => (c.created_at, c.hash.as_str()),
         None => (i64::MAX, ""),

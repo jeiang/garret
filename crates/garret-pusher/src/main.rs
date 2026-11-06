@@ -352,7 +352,7 @@ where
     tokio::task::spawn_blocking(move || {
         let waited = std::time::Instant::now();
         let mut conn = conn.lock();
-        metrics::histogram!("garret_db_lock_wait_seconds", "conn" => "pusher")
+        metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => "pusher")
             .record(waited.elapsed());
         f(&mut conn)
     })
