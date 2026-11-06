@@ -83,7 +83,8 @@ hardware, which is a decision for after the first production runs.
    ([ADR-0010](../adr/0010-pusher-verifies-nar-hash.md)), but not
    compressed, since compressing random filler would only measure the
    bench client's CPU. The NarHash is computed in a pass before the
-   timed push. Reported as median wall time and payload MiB/s per size;
+   timed push. Reported as median wall time and payload MiB/s per size,
+   with the size's `shed_retries` and `dropped_retries` as in `push`;
    PASS = zero failures. (Pulls no longer stream through us — see below.)
 3. **Pull side** (`garret-bench pull`) — concurrent cold narinfo + NAR
    requests up to the redirect (never following it): flat Puller memory
