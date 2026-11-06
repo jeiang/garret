@@ -23,7 +23,7 @@ const BODY_SIZE: usize = 4 * 1024 * 1024;
 
 fn body(compressibility: u8) -> Vec<u8> {
     corpus::Entry {
-        hash: "b".repeat(32),
+        hash: "0c9f8k2h5mnyw1zxa7qrl3dsvbg4ip6j".into(),
         name: "bench".into(),
         size: BODY_SIZE,
         compressibility,
