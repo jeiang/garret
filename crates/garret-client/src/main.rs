@@ -117,23 +117,6 @@ enum Command {
     },
 }
 
-impl Command {
-    /// `login` must run before a config exists — that is the whole point of it —
-    /// and `completions`/`logout` have nothing to read one for. `enqueue` runs
-    /// inside the post-build-hook as whatever user nix says, so it must not
-    /// depend on a readable config either — the socket default is its contract.
-    /// Everything else still requires a config, and says so.
-    fn needs_config(&self) -> bool {
-        !matches!(
-            self,
-            Command::Login { .. }
-                | Command::Logout
-                | Command::Completions { .. }
-                | Command::Enqueue { .. }
-        )
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -149,10 +132,12 @@ async fn main() -> Result<()> {
         >::new(progress.clone()))
         .init();
 
-    let cfg = match cli.command.needs_config() {
-        true => Some(config::load(cli.config.as_deref())?),
-        false => None,
-    };
+    // Only the arms that use a config load it, first thing. `login` must run
+    // before a config exists — that is the whole point of it — and
+    // `completions`/`logout` have nothing to read one for. `enqueue` runs
+    // inside the post-build-hook as whatever user nix says, so it must not
+    // depend on a readable config either — the socket default is its contract.
+    let load = || config::load(cli.config.as_deref());
     // A server that never accepts becomes an error instead of a hang. A
     // connection that stalls once open is `push`'s to catch: reqwest's read
     // timeout cannot tell a slow upload from a stuck one.
@@ -176,9 +161,10 @@ async fn main() -> Result<()> {
             println!("logged out; removed {}", path.display());
         }
 
-        Command::Whoami => whoami(&cfg.unwrap(), &http, cli.json).await?,
+        Command::Whoami => whoami(&load()?, &http, cli.json).await?,
 
         Command::Doctor { path } => {
+            let cfg = load()?;
             // A diagnostic that hangs is a diagnostic that failed: every probe
             // gets a hard timeout, unlike the push path, which gives up only
             // on a stalled connection, never on a slow one.
@@ -186,7 +172,7 @@ async fn main() -> Result<()> {
                 .user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(15))
                 .build()?;
-            let checks = doctor::run(&cfg.unwrap(), &timed, path.as_deref()).await;
+            let checks = doctor::run(&cfg, &timed, path.as_deref()).await;
             let failed = checks
                 .iter()
                 .filter(|c| c.status == doctor::Status::Fail)
@@ -220,7 +206,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Use { print } => use_cache(&cfg.unwrap(), print)?,
+        Command::Use { print } => use_cache(&load()?, print)?,
 
         Command::Push {
             paths,
@@ -228,6 +214,8 @@ async fn main() -> Result<()> {
             dry_run,
             no_upstream_filter,
         } => {
+            // Before stdin is read, so a missing config fails without waiting on it.
+            let cfg = load()?;
             let stdin = match paths.is_empty() && !std::io::stdin().is_terminal() {
                 true => Some(
                     std::io::read_to_string(std::io::stdin())
@@ -239,7 +227,6 @@ async fn main() -> Result<()> {
             if paths.is_empty() {
                 anyhow::bail!("nothing to push");
             }
-            let cfg = cfg.unwrap();
             let pusher = pusher(&cfg, &http, jobs)?;
             let closure = push::closure(&paths).await?;
             let closure_len = closure.len();
@@ -288,7 +275,7 @@ async fn main() -> Result<()> {
             cursor,
             socket,
         } => {
-            let cfg = cfg.unwrap();
+            let cfg = load()?;
             let pusher = pusher(&cfg, &http, None)?;
             // Minted once up front so a daemon that cannot authenticate exits
             // saying so, rather than failing every path it sees.
@@ -332,7 +319,7 @@ async fn main() -> Result<()> {
         Command::Enqueue { paths, socket } => enqueue(paths, &socket).await,
 
         Command::List { query, limit } => {
-            let cfg = cfg.unwrap();
+            let cfg = load()?;
             let (puller, token) = browse_target(&cfg, &http).await?;
             let raw = browse::list(&http, &puller, &token, query.as_deref(), limit).await?;
             if cli.json {
@@ -355,10 +342,10 @@ async fn main() -> Result<()> {
         }
 
         Command::Tree { hash } => {
+            let cfg = load()?;
             let hash = garret_common::parse_store_hash(&hash).with_context(|| {
                 format!("`{hash}` is not a 32-character store hash or a store path")
             })?;
-            let cfg = cfg.unwrap();
             let (puller, token) = browse_target(&cfg, &http).await?;
             let raw = browse::tree(&http, &puller, &token, hash).await?;
             if cli.json {
@@ -373,7 +360,7 @@ async fn main() -> Result<()> {
         }
 
         Command::Pins => {
-            let cfg = cfg.unwrap();
+            let cfg = load()?;
             let (puller, token) = browse_target(&cfg, &http).await?;
             let raw = browse::pins(&http, &puller, &token).await?;
             if cli.json {
