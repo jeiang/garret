@@ -283,6 +283,7 @@ pub(crate) fn orphan_hashes<'a>(
 mod tests {
     use super::*;
     use garret_server::inflight;
+    use garret_server::testing::{S3_DELETED, fake_s3, gc_config, object, unreachable_storage};
 
     #[test]
     fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
@@ -328,36 +329,18 @@ mod tests {
         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let gate = Arc::new(Mutex::new(Some((held_tx, release_rx))));
-        let app = axum::Router::new().fallback(move || {
+        let storage = fake_s3(axum::Router::new().fallback(move || {
             let gate = gate.lock().take();
             async move {
                 if let Some((held, release)) = gate {
                     let _ = held.send(());
                     let _ = release.await;
                 }
-                r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#
+                S3_DELETED
             }
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (storage_at(&endpoint, 30).await, held_rx, release_tx)
-    }
-
-    async fn storage_at(endpoint: &str, timeout_secs: u64) -> Storage {
-        Storage::new(&garret_server::config::S3Config {
-            bucket: "test".into(),
-            endpoint_url: Some(endpoint.into()),
-            region: Some("us-east-1".into()),
-            path_style: true,
-            access_key_id: Some("x".into()),
-            secret_access_key: Some("x".into()),
-            operation_timeout_secs: timeout_secs,
-            operation_attempt_timeout_secs: None,
-            sign_payload: false,
-        })
-        .await
-        .unwrap()
+        }))
+        .await;
+        (storage, held_rx, release_tx)
     }
 
     /// The process-wide recorder, installed on first use and shared by every
@@ -380,12 +363,12 @@ mod tests {
         let (passes, sweeps) = (gc_failures("pass"), gc_failures("sweep"));
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
-        db::insert_object(&mut conn, &object(&"a".repeat(32), 100, &[]), 0).unwrap();
+        db::insert_object(&mut conn, &object(&"a".repeat(32)).sized(100), 0).unwrap();
         let gc = Gc::new(
             Arc::new(Mutex::new(conn)),
-            storage_at("http://127.0.0.1:1", 1).await,
+            unreachable_storage().await,
             InFlight::new(),
-            config(100),
+            gc_config(100),
         );
 
         // Over quota, so the pass evicts and then fails on the blob delete.
@@ -403,14 +386,14 @@ mod tests {
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         let d = "d".repeat(32);
-        db::insert_object(&mut conn, &object(&d, 100, &[]), 0).unwrap();
+        db::insert_object(&mut conn, &object(&d).sized(100), 0).unwrap();
         let reported = db::missing(&mut conn, std::slice::from_ref(&d), now()).unwrap();
         assert!(reported.is_empty(), "d should be reported present");
         let gc = Gc::new(
             Arc::new(Mutex::new(conn)),
-            storage_at("http://127.0.0.1:1", 1).await,
+            unreachable_storage().await,
             InFlight::new(),
-            config(100),
+            gc_config(100),
         );
 
         let pass = gc.run().await.unwrap();
@@ -427,14 +410,14 @@ mod tests {
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         let r = "r".repeat(32);
-        db::insert_object(&mut conn, &object(&r, 100, &[]), 0).unwrap();
+        db::insert_object(&mut conn, &object(&r).sized(100), 0).unwrap();
         let (storage, held, release) = gated_s3().await;
         let in_flight = InFlight::new();
         let gc = Arc::new(Gc::new(
             Arc::new(Mutex::new(conn)),
             storage,
             in_flight.clone(),
-            config(100),
+            gc_config(100),
         ));
 
         let pass = tokio::spawn({
@@ -473,7 +456,7 @@ mod tests {
             storage::key_for(hash)
         );
         let on_list = Arc::new(on_list);
-        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let storage = fake_s3(axum::Router::new().fallback(move |uri: axum::http::Uri| {
             let query = uri.query().unwrap_or_default().to_owned();
             let (gate, listing, on_list) = (gate.clone(), listing.clone(), on_list.clone());
             async move {
@@ -489,13 +472,11 @@ mod tests {
                     let _ = held.send(());
                     let _ = release.await;
                 }
-                r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#.to_owned()
+                S3_DELETED.to_owned()
             }
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (storage_at(&endpoint, 30).await, held_rx, release_tx)
+        }))
+        .await;
+        (storage, held_rx, release_tx)
     }
 
     #[tokio::test]
@@ -511,7 +492,7 @@ mod tests {
             Arc::new(Mutex::new(conn)),
             storage,
             in_flight.clone(),
-            config(100),
+            gc_config(100),
         ));
 
         let sweep = tokio::spawn({
@@ -541,11 +522,11 @@ mod tests {
         let (storage, mut held, _release) = orphan_s3(&o, {
             let (conn, o) = (conn.clone(), o.clone());
             move || {
-                db::insert_object(&mut conn.lock(), &object(&o, 1, &[]), 0).unwrap();
+                db::insert_object(&mut conn.lock(), &object(&o).sized(1), 0).unwrap();
             }
         })
         .await;
-        let gc = Gc::new(conn, storage, InFlight::new(), config(100));
+        let gc = Gc::new(conn, storage, InFlight::new(), gc_config(100));
 
         assert_eq!(gc.sweep_orphans().await.unwrap(), 0);
         assert!(held.try_recv().is_err(), "the blob was deleted");
@@ -559,14 +540,14 @@ mod tests {
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         let r = "r".repeat(32);
-        db::insert_object(&mut conn, &object(&r, 100, &[]), 0).unwrap();
+        db::insert_object(&mut conn, &object(&r).sized(100), 0).unwrap();
         let in_flight = InFlight::new();
         let _deleting = in_flight.claim(&r, inflight::Kind::Delete).unwrap();
         let gc = Gc::new(
             Arc::new(Mutex::new(conn)),
-            storage_at("http://127.0.0.1:1", 1).await,
+            unreachable_storage().await,
             in_flight,
-            config(100),
+            gc_config(100),
         );
 
         let pass = tokio::time::timeout(Duration::from_secs(5), gc.run())
@@ -581,33 +562,6 @@ mod tests {
         assert!(db::exists(&gc.conn.lock(), &r).unwrap());
     }
 
-    fn config(quota_bytes: u64) -> GcConfig {
-        GcConfig {
-            quota_bytes,
-            high_watermark: 0.95,
-            low_watermark: 0.85,
-            interval_secs: 300,
-            orphan_grace_secs: 86400,
-        }
-    }
-
-    fn object(hash: &str, size: i64, refs: &[&str]) -> db::Object {
-        db::Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-x"),
-            name: "x".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: size,
-            file_hash: "sha256:y".into(),
-            file_size: size,
-            deriver: None,
-            ca: None,
-            references: refs.iter().map(|r| format!("{r}-x")).collect(),
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
-
     #[tokio::test]
     async fn a_pass_requested_mid_pass_does_not_evict_past_the_low_watermark() {
         // Quota 100, low watermark 85. A pinned 70-byte filler plus the chain
@@ -616,18 +570,20 @@ mod tests {
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         let [filler, r, d, y] = ["f", "r", "d", "y"].map(|c| c.repeat(32));
-        db::insert_object(&mut conn, &object(&filler, 70, &[]), 0).unwrap();
+        db::insert_object(&mut conn, &object(&filler).sized(70), 0).unwrap();
         db::pin(&conn, "filler", &filler, None, 0).unwrap();
-        db::insert_object(&mut conn, &object(&r, 10, &[&d]), 0).unwrap();
-        db::insert_object(&mut conn, &object(&d, 10, &[&y]), 0).unwrap();
-        db::insert_object(&mut conn, &object(&y, 10, &[]), 0).unwrap();
+        let r_object = object(&r).sized(10).referencing(&[&format!("{d}-thing")]);
+        db::insert_object(&mut conn, &r_object, 0).unwrap();
+        let d_object = object(&d).sized(10).referencing(&[&format!("{y}-thing")]);
+        db::insert_object(&mut conn, &d_object, 0).unwrap();
+        db::insert_object(&mut conn, &object(&y).sized(10), 0).unwrap();
 
         let (storage, held, release) = gated_s3().await;
         let gc = Arc::new(Gc::new(
             Arc::new(Mutex::new(conn)),
             storage,
             InFlight::new(),
-            config(100),
+            gc_config(100),
         ));
         let run = |gc: Arc<Gc>| tokio::spawn(async move { gc.run().await.unwrap() });
 

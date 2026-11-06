@@ -183,19 +183,14 @@ mod tests {
 
     fn object() -> Object {
         Object {
-            store_path_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            store_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-1.0".into(),
-            name: "hello-1.0".into(),
             nar_hash: "sha256:0mdqa9w1p6cmli6976v4wi0sw9r4p5prkj7lzfd1877wk11c9c73".into(),
             nar_size: 4096,
             file_hash: "sha256:1q6zw3dd7l2vnwk06rlnzwl8g1582sbagj6hccngspc7yvhrip52".into(),
             file_size: 1024,
-            deriver: None,
-            ca: None,
-            // deliberately unsorted: sign() must not depend on caller order
-            references: vec!["cccccccccccccccccccccccccccccccc-b".into()],
-            sigs: vec![],
-            pushed_by: None,
+            ..crate::testing::object("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                .named("hello-1.0")
+                // deliberately unsorted: sign() must not depend on caller order
+                .referencing(&["cccccccccccccccccccccccccccccccc-b"])
         }
     }
 

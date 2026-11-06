@@ -54,11 +54,11 @@ mod tests {
 
     fn key_with_mode(mode: u32) -> (std::path::PathBuf, Result<Vec<narinfo::SigningKeyFile>>) {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("garret-key-{mode:o}-{}", std::process::id()));
+        let dir = testing::scratch_dir();
+        let path = dir.join("key");
         std::fs::write(&path, format!("test-1:{}", "AQEB".repeat(21) + "AQ==")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         let keys = load_signing_keys(&[path.to_str().unwrap().to_owned()]);
-        std::fs::remove_file(&path).unwrap();
         (path, keys)
     }
 

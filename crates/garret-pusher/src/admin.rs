@@ -467,24 +467,8 @@ fn backup_to(source: &str, dest: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{open_db, storage_at, test_state, test_state_with_storage};
-
-    fn object(hash: &str) -> db::Object {
-        db::Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: vec![],
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
+    use crate::tests::{open_db, test_state, test_state_with_storage};
+    use garret_server::testing::{S3_DELETED, fake_s3, object, scratch_dir};
 
     fn push(conn: &mut rusqlite::Connection, hash: &str, subject: &str, at: i64) {
         let object = db::Object {
@@ -530,20 +514,13 @@ mod tests {
         assert!(hashes(Some(201)).is_empty());
     }
 
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("garret-backup-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// The copy must hold rows that so far live only in the WAL: copying the
     /// main file's bytes would silently drop everything since the last
     /// checkpoint.
     #[test]
     fn backup_copies_uncheckpointed_rows_with_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("wal");
+        let dir = scratch_dir();
         let source = dir.join("garret.db");
         let mut conn = db::open(source.to_str().unwrap(), true).unwrap();
         db::migrate(&conn).unwrap();
@@ -558,14 +535,13 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         let copy = db::open(dest.to_str().unwrap(), false).unwrap();
         assert!(db::exists(&copy, &"a".repeat(32)).unwrap());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// An existing file is never overwritten, and never removed either -- it
     /// may be yesterday's good backup.
     #[test]
     fn backup_refuses_to_overwrite() {
-        let dir = scratch("exists");
+        let dir = scratch_dir();
         let source = dir.join("garret.db");
         db::migrate(&db::open(source.to_str().unwrap(), true).unwrap()).unwrap();
         let dest = dir.join("backup.db");
@@ -573,7 +549,6 @@ mod tests {
 
         assert!(backup_to(source.to_str().unwrap(), &dest).is_err());
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "yesterday");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// GC is between the row and blob delete of `b` (or an upload of it is
@@ -723,7 +698,8 @@ mod tests {
         push(&mut conn, &b, leaked, 200);
         let listed = pushed_by(&conn, leaked, None).unwrap();
         db::delete_object(&mut conn, &a).unwrap();
-        let state = test_state_with_storage(conn, acking_s3().await).await;
+        let acking = fake_s3(axum::Router::new().fallback(|| async { S3_DELETED })).await;
+        let state = test_state_with_storage(conn, acking).await;
 
         let (deleted, bytes_freed) = delete_listed(&state, listed, false).await.unwrap();
         let deleted: Vec<&str> = deleted
@@ -732,16 +708,5 @@ mod tests {
             .collect();
         assert_eq!((deleted, bytes_freed), (vec![b.as_str()], 5));
         assert!(!db::exists(&state.conn.lock(), &b).unwrap());
-    }
-
-    /// An S3 stand-in that acknowledges every `DeleteObjects`.
-    async fn acking_s3() -> garret_server::storage::Storage {
-        let app = axum::Router::new().fallback(|| async {
-            r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>"#
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        storage_at(&endpoint).await
     }
 }

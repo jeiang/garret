@@ -606,7 +606,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wake_datagram_cuts_the_sleep_short() {
-        let dir = std::env::temp_dir().join(format!("garret-wake-{}", std::process::id()));
+        let dir = crate::testing::scratch_dir();
         let sock_path = dir.join("watch.sock");
         let socket = bind_wake_socket(&sock_path).unwrap();
 
@@ -633,12 +633,11 @@ mod tests {
 
         // Rebinding over the live socket file is the stale-socket dance.
         bind_wake_socket(&sock_path).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn the_cursor_round_trips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("garret-cursor-{}", std::process::id()));
+        let dir = crate::testing::scratch_dir();
         let file = dir.join("cursor");
         assert_eq!(read_cursor(&file).unwrap(), None);
         write_cursor(&file, 42).unwrap();
@@ -646,14 +645,13 @@ mod tests {
         // A cursor that is there but unreadable is not a first run.
         std::fs::write(&file, "").unwrap();
         assert!(read_cursor(&file).is_err());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The failed list is what a restart or a drain retries, so it must
     /// survive the process, and an empty one must not linger as a file.
     #[test]
     fn the_failed_list_lives_beside_the_cursor_and_goes_when_empty() {
-        let dir = std::env::temp_dir().join(format!("garret-failed-{}", std::process::id()));
+        let dir = crate::testing::scratch_dir();
         let file = failed_path(&dir.join("watcher-cursor"));
         assert_eq!(file, dir.join("watcher-cursor.failed"));
         assert!(read_failed(&file).unwrap().is_empty());
@@ -667,7 +665,6 @@ mod tests {
         write_failed(&file, &BTreeSet::new()).unwrap();
         assert!(!file.exists());
         write_failed(&file, &BTreeSet::new()).unwrap();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

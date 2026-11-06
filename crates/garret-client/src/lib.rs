@@ -12,4 +12,6 @@ pub mod files;
 mod http;
 pub mod nixconf;
 pub mod push;
+#[cfg(test)]
+mod testing;
 pub mod watcher;

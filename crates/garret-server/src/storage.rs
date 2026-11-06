@@ -1003,24 +1003,7 @@ mod tests {
             }
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(
-            async move { axum::serve(listener, axum::Router::new().fallback(handle)).await },
-        );
-        Storage::new(&S3Config {
-            bucket: "test".into(),
-            endpoint_url: Some(format!("http://{addr}")),
-            region: Some("us-east-1".into()),
-            path_style: true,
-            access_key_id: Some("x".into()),
-            secret_access_key: Some("x".into()),
-            operation_timeout_secs: 5,
-            operation_attempt_timeout_secs: None,
-            sign_payload: false,
-        })
-        .await
-        .unwrap()
+        crate::testing::fake_s3(axum::Router::new().fallback(handle)).await
     }
 
     /// Uploads that together want more part slots than exist must still all

@@ -696,34 +696,10 @@ fn build_object(
 
 #[cfg(test)]
 mod tests {
-    use garret_server::config::{IssuerConfig, S3Config};
+    use garret_server::config::IssuerConfig;
+    use garret_server::testing::unreachable_storage;
 
     use super::*;
-
-    /// A `Storage` pointed at an address nothing listens on. `Storage::new`
-    /// only builds a client (no network call), so this is fast and never
-    /// touches a real S3 endpoint; a storage call fails with connection
-    /// refused.
-    async fn unreachable_storage() -> Storage {
-        storage_at("http://127.0.0.1:1").await
-    }
-
-    /// A `Storage` for an S3 stand-in at `endpoint`.
-    pub(crate) async fn storage_at(endpoint: &str) -> Storage {
-        Storage::new(&S3Config {
-            bucket: "test".into(),
-            endpoint_url: Some(endpoint.into()),
-            region: Some("us-east-1".into()),
-            path_style: true,
-            access_key_id: Some("x".into()),
-            secret_access_key: Some("x".into()),
-            operation_timeout_secs: 1,
-            operation_attempt_timeout_secs: None,
-            sign_payload: false,
-        })
-        .await
-        .unwrap()
-    }
 
     pub(crate) async fn test_state(conn: rusqlite::Connection) -> Arc<AppState> {
         test_state_with_storage(conn, unreachable_storage().await).await

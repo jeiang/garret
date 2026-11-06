@@ -187,24 +187,8 @@ fn name_of(conn: &Connection, hash: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{self, Object};
-
-    fn object(hash: &str, name: &str, refs: &[&str]) -> Object {
-        Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-{name}"),
-            name: name.into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_size: 5,
-            file_hash: "sha256:y".into(),
-            deriver: None,
-            ca: None,
-            references: refs.iter().map(|r| (*r).to_owned()).collect(),
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
+    use crate::db;
+    use crate::testing::object;
 
     fn h(c: char) -> String {
         std::iter::repeat_n(c, 32).collect()
@@ -222,7 +206,7 @@ mod tests {
         // `b` and `c` share a timestamp, and the page boundary falls between
         // them: the hash tiebreak must carry the walk across it.
         for (c, at) in [('a', 100), ('b', 101), ('c', 101), ('d', 102)] {
-            db::insert_object(&mut conn, &object(&h(c), "thing", &[]), at).unwrap();
+            db::insert_object(&mut conn, &object(&h(c)), at).unwrap();
         }
 
         let first = list(&conn, None, 2, None).unwrap();
@@ -263,8 +247,8 @@ mod tests {
     #[test]
     fn search_filters_by_name() {
         let mut conn = db();
-        db::insert_object(&mut conn, &object(&h('a'), "hello-1.0", &[]), 100).unwrap();
-        db::insert_object(&mut conn, &object(&h('b'), "ripgrep", &[]), 101).unwrap();
+        db::insert_object(&mut conn, &object(&h('a')).named("hello-1.0"), 100).unwrap();
+        db::insert_object(&mut conn, &object(&h('b')).named("ripgrep"), 101).unwrap();
 
         let page = list(&conn, Some("hell"), 10, None).unwrap();
         assert_eq!(page.objects.len(), 1);
@@ -280,7 +264,7 @@ mod tests {
     #[test]
     fn pin_listing_joins_the_store_path_and_keeps_expired_pins_visible() {
         let mut conn = db();
-        db::insert_object(&mut conn, &object(&h('a'), "hello-1.0", &[]), 100).unwrap();
+        db::insert_object(&mut conn, &object(&h('a')).named("hello-1.0"), 100).unwrap();
         db::pin(&conn, "release", &h('a'), Some(50), 10).unwrap();
 
         let got = pins(&conn).unwrap();
@@ -303,25 +287,21 @@ mod tests {
         let (root, mid, shared, gone) = (h('a'), h('b'), h('c'), h('d'));
         db::insert_object(
             &mut conn,
-            &object(
-                &root,
-                "root",
-                &[&format!("{mid}-mid"), &format!("{shared}-shared")],
-            ),
+            &object(&root)
+                .named("root")
+                .referencing(&[&format!("{mid}-mid"), &format!("{shared}-shared")]),
             100,
         )
         .unwrap();
         db::insert_object(
             &mut conn,
-            &object(
-                &mid,
-                "mid",
-                &[&format!("{shared}-shared"), &format!("{gone}-gone")],
-            ),
+            &object(&mid)
+                .named("mid")
+                .referencing(&[&format!("{shared}-shared"), &format!("{gone}-gone")]),
             100,
         )
         .unwrap();
-        db::insert_object(&mut conn, &object(&shared, "shared", &[]), 100).unwrap();
+        db::insert_object(&mut conn, &object(&shared).named("shared"), 100).unwrap();
 
         let tree = tree(&conn, &root, 10).unwrap().unwrap();
         let mid_node = &tree.children[0];
@@ -347,11 +327,18 @@ mod tests {
         let (root_ref, dep_ref) = (format!("{root}-root"), format!("{dep}-dep"));
         db::insert_object(
             &mut conn,
-            &object(&root, "root", &[&root_ref, &dep_ref]),
+            &object(&root)
+                .named("root")
+                .referencing(&[&root_ref, &dep_ref]),
             100,
         )
         .unwrap();
-        db::insert_object(&mut conn, &object(&dep, "dep", &[&dep_ref]), 100).unwrap();
+        db::insert_object(
+            &mut conn,
+            &object(&dep).named("dep").referencing(&[&dep_ref]),
+            100,
+        )
+        .unwrap();
 
         let tree = tree(&conn, &root, 10).unwrap().unwrap();
         let hashes: Vec<&str> = tree.children.iter().map(|c| c.hash.as_str()).collect();
@@ -390,8 +377,18 @@ mod tests {
         let mut conn = db();
         let (a, b) = (h('a'), h('b'));
         let (a_ref, b_ref) = (format!("{a}-a"), format!("{b}-b"));
-        db::insert_object(&mut conn, &object(&a, "a", &[&b_ref]), 100).unwrap();
-        db::insert_object(&mut conn, &object(&b, "b", &[&a_ref]), 100).unwrap();
+        db::insert_object(
+            &mut conn,
+            &object(&a).named("a").referencing(&[&b_ref]),
+            100,
+        )
+        .unwrap();
+        db::insert_object(
+            &mut conn,
+            &object(&b).named("b").referencing(&[&a_ref]),
+            100,
+        )
+        .unwrap();
 
         let tree = tree(&conn, &a, 10).unwrap().unwrap();
         let b_node = &tree.children[..];
@@ -418,11 +415,13 @@ mod tests {
         let (root, dep) = (h('a'), h('b'));
         db::insert_object(
             &mut conn,
-            &object(&root, "root", &[&format!("{dep}-dep")]),
+            &object(&root)
+                .named("root")
+                .referencing(&[&format!("{dep}-dep")]),
             100,
         )
         .unwrap();
-        db::insert_object(&mut conn, &object(&dep, "dep", &[]), 100).unwrap();
+        db::insert_object(&mut conn, &object(&dep).named("dep"), 100).unwrap();
 
         let found = referrers(&conn, &dep).unwrap();
         assert_eq!(found.len(), 1);

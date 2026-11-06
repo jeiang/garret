@@ -626,8 +626,7 @@ mod tests {
     #[test]
     fn the_token_file_is_private_from_creation_and_replaced_whole() {
         use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!("garret-token-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::testing::scratch_dir();
         let path = root.join("garret").join("token.json");
         let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
 
@@ -653,7 +652,6 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             2
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A JWT-shaped token declaring `lifetime` seconds; `n` tells mints apart.
@@ -761,8 +759,7 @@ mod tests {
     /// `GARRET_TOKEN` > `client_secret_file` > GitHub Actions > stored login.
     #[test]
     fn the_token_provider_follows_the_documented_precedence() {
-        let dir = std::env::temp_dir().join(format!("garret-secret-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::testing::scratch_dir();
         let secret = dir.join("secret");
         std::fs::write(&secret, "s3cret\n").unwrap();
         let with_file = cfg(&format!(
@@ -792,7 +789,6 @@ mod tests {
             &select(&plain, None, false).unwrap().mint,
             Mint::Stored { .. }
         ));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A secret file needs an issuer to ask and a client id to be: both are

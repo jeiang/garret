@@ -680,6 +680,7 @@ async fn list_pins(State(state): State<Arc<AppState>>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use garret_server::testing::{object, scratch_dir, unreachable_storage};
 
     fn wrap(conn: rusqlite::Connection) -> Conn {
         Arc::new(tokio::sync::Mutex::new(conn))
@@ -734,23 +735,6 @@ mod tests {
         );
     }
 
-    fn object(hash: &str) -> db::Object {
-        db::Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: vec![],
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
-
     const DAY: i64 = 86400;
 
     /// The pull-path read of `hash`'s `last_accessed_at`, fed to a hit the
@@ -767,8 +751,8 @@ mod tests {
     /// against a Pusher holding that lock, where any write attempt fails busy.
     #[test]
     fn a_debounced_hit_performs_no_write() {
-        let path = std::env::temp_dir().join(format!("garret-bump-{}.sqlite", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap();
         let mut pusher = db::open(path, true).unwrap();
         db::migrate(&pusher).unwrap();
@@ -784,7 +768,6 @@ mod tests {
         hit(&bumps, &puller, &hash, 1000 + DAY);
         let flushed = bumps.flush(&mut puller, 1000 + DAY, DAY);
         pusher.execute_batch("ROLLBACK").unwrap();
-        let _ = std::fs::remove_file(path);
         assert_eq!(flushed.unwrap(), 0, "a fresh row must not be written");
     }
 
@@ -886,19 +869,7 @@ mod tests {
     }
 
     async fn state() -> Arc<AppState> {
-        let storage = Storage::new(&garret_server::config::S3Config {
-            bucket: "test".into(),
-            endpoint_url: Some("http://127.0.0.1:1".into()),
-            region: Some("us-east-1".into()),
-            path_style: true,
-            access_key_id: Some("x".into()),
-            secret_access_key: Some("x".into()),
-            operation_timeout_secs: 1,
-            operation_attempt_timeout_secs: None,
-            sign_payload: false,
-        })
-        .await
-        .unwrap();
+        let storage = unreachable_storage().await;
         Arc::new(AppState {
             db: OnceLock::new(),
             storage,

@@ -803,23 +803,7 @@ fn referrers_first(conn: &Connection, doomed: &[ObjectBrief]) -> Result<Vec<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn object(hash: &str, refs: &[&str]) -> Object {
-        Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: refs.iter().map(|r| (*r).to_owned()).collect(),
-            sigs: vec!["k:sig".into()],
-            pushed_by: Some("someone".into()),
-        }
-    }
+    use crate::testing::{object, scratch_dir};
 
     fn db() -> Connection {
         let conn = open(":memory:", true).unwrap();
@@ -835,13 +819,13 @@ mod tests {
     fn round_trips_an_object_with_sorted_references() {
         let mut conn = db();
         let a = "a".repeat(32);
-        let obj = object(
-            &a,
-            &[
+        let obj = Object {
+            sigs: vec!["k:sig".into()],
+            ..object(&a).referencing(&[
                 &format!("{}-zed", "c".repeat(32)),
                 &format!("{}-abe", "b".repeat(32)),
-            ],
-        );
+            ])
+        };
         insert_object(&mut conn, &obj, 100).unwrap();
 
         let got = get_object(&conn, &a).unwrap().unwrap();
@@ -871,7 +855,7 @@ mod tests {
         let mut conn = db();
         let a = "a".repeat(32);
         let own = format!("{a}-thing");
-        insert_object(&mut conn, &object(&a, &[&own]), 100).unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&own]), 100).unwrap();
 
         assert_eq!(
             get_object(&conn, &a).unwrap().unwrap().references,
@@ -894,8 +878,8 @@ mod tests {
     fn reinserting_does_not_double_count_usage() {
         let mut conn = db();
         let a = "a".repeat(32);
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&a, &[]), 200).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 200).unwrap();
         let total: i64 = conn
             .query_row("SELECT total_bytes FROM stats", [], |r| r.get(0))
             .unwrap();
@@ -907,9 +891,14 @@ mod tests {
         let mut conn = db();
         let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
         // a → b, so b is pinned by a. c is loose.
-        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 300).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&c, &[]), 200).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&a).referencing(&[&format!("{b}-dep")]),
+            300,
+        )
+        .unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
+        insert_object(&mut conn, &object(&c), 200).unwrap();
 
         let candidates = evictable(&conn, 10, LATER).unwrap();
         let hashes: Vec<&str> = candidates.iter().map(|(h, _)| h.as_str()).collect();
@@ -937,8 +926,13 @@ mod tests {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
         // a → b: pinning a must keep b too, via root-first eviction.
-        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&a).referencing(&[&format!("{b}-dep")]),
+            100,
+        )
+        .unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
 
         pin(&conn, "release", &a, None, 500).unwrap();
         assert!(
@@ -971,7 +965,7 @@ mod tests {
         // client's referrers are not in the cache yet to protect it.
         let mut conn = db();
         let d = "d".repeat(32);
-        insert_object(&mut conn, &object(&d, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&d), 100).unwrap();
         assert_eq!(evictable(&conn, 10, LATER).unwrap(), vec![(d.clone(), 5)]);
 
         assert!(
@@ -994,10 +988,15 @@ mod tests {
     fn a_referrer_uploaded_after_the_candidate_snapshot_keeps_its_dependency() {
         let mut conn = db();
         let (d, x) = ("d".repeat(32), "x".repeat(32));
-        insert_object(&mut conn, &object(&d, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&d), 100).unwrap();
         assert_eq!(evictable(&conn, 10, LATER).unwrap(), vec![(d.clone(), 5)]);
 
-        insert_object(&mut conn, &object(&x, &[&format!("{d}-dep")]), LATER).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&x).referencing(&[&format!("{d}-dep")]),
+            LATER,
+        )
+        .unwrap();
         assert_eq!(evict_object(&mut conn, &d, LATER).unwrap(), None);
         assert!(exists(&conn, &d).unwrap(), "evicted a referenced path");
     }
@@ -1013,11 +1012,11 @@ mod tests {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
         let dep = format!("{b}-dep");
-        insert_object(&mut conn, &object(&a, &[&dep]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&dep]), 100).unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
         pin(&conn, "release", &a, None, 100).unwrap();
 
-        insert_object(&mut conn, &object(&a, &[&dep]), 200).unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&dep]), 200).unwrap();
         assert!(
             evictable(&conn, 10, LATER).unwrap().is_empty(),
             "re-push dropped the pin: the pinned closure became evictable"
@@ -1034,7 +1033,7 @@ mod tests {
         // must not linger pointing at nothing (FK cascade).
         let mut conn = db();
         let a = "a".repeat(32);
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
         pin(&conn, "release", &a, None, 100).unwrap();
         delete_object(&mut conn, &a).unwrap();
         let pins: i64 = conn
@@ -1047,8 +1046,8 @@ mod tests {
     fn deleting_debits_usage_and_reconciles() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
+        insert_object(&mut conn, &object(&b), 100).unwrap();
         assert_eq!(total_bytes(&conn).unwrap(), 10);
 
         assert_eq!(delete_object(&mut conn, &a).unwrap(), Some(5));
@@ -1071,9 +1070,7 @@ mod tests {
         // for it: SQLite fails the read-to-write upgrade with SQLITE_BUSY at
         // once, ignoring busy_timeout, so uploads and GC failed under pull
         // load. Needs a real file: WAL does not apply to `:memory:`.
-        let dir = std::env::temp_dir().join(format!("garret-db-busy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap();
         let mut conn = open(path, true).unwrap();
@@ -1089,15 +1086,12 @@ mod tests {
         let a = "a".repeat(32);
 
         let holder = hold_write_lock();
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
         holder.join().unwrap();
 
         let holder = hold_write_lock();
         assert_eq!(delete_object(&mut conn, &a).unwrap(), Some(5));
         holder.join().unwrap();
-
-        drop(conn);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1110,12 +1104,17 @@ mod tests {
         // Old root a (self-referencing) → b (exclusive) and s (shared with
         // the new root n). Old root p is pinned, keeping q. Old c is
         // re-negotiated today, which is a push as far as prune is concerned.
-        insert_object(&mut conn, &object(&a, &[&dep(&a), &dep(&b), &dep(&s)]), 100).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&a).referencing(&[&dep(&a), &dep(&b), &dep(&s)]),
+            100,
+        )
+        .unwrap();
         for h in [&b, &s, &q, &c] {
-            insert_object(&mut conn, &object(h, &[]), 100).unwrap();
+            insert_object(&mut conn, &object(h), 100).unwrap();
         }
-        insert_object(&mut conn, &object(&p, &[&dep(&q)]), 100).unwrap();
-        insert_object(&mut conn, &object(&n, &[&dep(&s)]), 10 * DAY).unwrap();
+        insert_object(&mut conn, &object(&p).referencing(&[&dep(&q)]), 100).unwrap();
+        insert_object(&mut conn, &object(&n).referencing(&[&dep(&s)]), 10 * DAY).unwrap();
         pin(&conn, "release", &p, None, 100).unwrap();
         let now = 10 * DAY + 1;
         missing(&mut conn, std::slice::from_ref(&c), now).unwrap();
@@ -1151,10 +1150,15 @@ mod tests {
         let [a, b, c, d] = ['a', 'b', 'c', 'd'].map(|x| x.to_string().repeat(32));
         let dep = |h: &str| format!("{h}-dep");
         // c ← b ← a, c ← d, and b refers to itself.
-        insert_object(&mut conn, &object(&c, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[&dep(&b), &dep(&c)]), 100).unwrap();
-        insert_object(&mut conn, &object(&a, &[&dep(&b)]), 100).unwrap();
-        insert_object(&mut conn, &object(&d, &[&dep(&c)]), 100).unwrap();
+        insert_object(&mut conn, &object(&c), 100).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&b).referencing(&[&dep(&b), &dep(&c)]),
+            100,
+        )
+        .unwrap();
+        insert_object(&mut conn, &object(&a).referencing(&[&dep(&b)]), 100).unwrap();
+        insert_object(&mut conn, &object(&d).referencing(&[&dep(&c)]), 100).unwrap();
         let doomed = [&c, &b, &a, &d].map(|h| brief(h, 100));
         let order: Vec<&str> = referrers_first(&conn, &doomed)
             .unwrap()
@@ -1192,7 +1196,7 @@ mod tests {
     fn corrupt_sigs_are_an_error_not_an_unsigned_object() {
         let mut conn = db();
         let a = "a".repeat(32);
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
         conn.execute("UPDATE objects SET sigs = 'not json'", [])
             .unwrap();
         assert!(get_object(&conn, &a).is_err());
@@ -1202,8 +1206,8 @@ mod tests {
     fn last_accessed_bumps_are_debounced() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[]), 1000).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 1000).unwrap();
+        insert_object(&mut conn, &object(&a), 1000).unwrap();
+        insert_object(&mut conn, &object(&b), 1000).unwrap();
 
         // Within the debounce window: the row stays put.
         bump_last_accessed(&mut conn, [&a], 1001, 86400).unwrap();
@@ -1232,8 +1236,8 @@ mod tests {
     fn brief_listing_carries_what_fsck_needs() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[]), 100).unwrap();
-        insert_object(&mut conn, &object(&b, &[]), 200).unwrap();
+        insert_object(&mut conn, &object(&a), 100).unwrap();
+        insert_object(&mut conn, &object(&b), 200).unwrap();
 
         let mut rows = all_objects_brief(&conn).unwrap();
         rows.sort_by(|x, y| x.store_path_hash.cmp(&y.store_path_hash));
@@ -1254,7 +1258,12 @@ mod tests {
     fn reverse_lookup_finds_referrers_by_hash() {
         let mut conn = db();
         let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(&mut conn, &object(&a, &[&format!("{b}-dep")]), 100).unwrap();
+        insert_object(
+            &mut conn,
+            &object(&a).referencing(&[&format!("{b}-dep")]),
+            100,
+        )
+        .unwrap();
         let referrers: Vec<String> = conn
             .prepare("SELECT referrer FROM object_refs WHERE reference_hash = ?1")
             .unwrap()
@@ -1265,20 +1274,13 @@ mod tests {
         assert_eq!(referrers, vec![a]);
     }
 
-    /// A database and its WAL sidecars, which outlive every connection.
-    fn remove_db(path: &str) {
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{path}{suffix}"));
-        }
-    }
-
     #[test]
     fn closing_leaves_the_wal_sidecars_for_the_puller() {
-        let path = std::env::temp_dir().join("garret-persist-wal.sqlite");
-        let path = path.to_str().unwrap().to_owned();
-        remove_db(&path);
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
+        let path = path.to_str().unwrap();
 
-        let conn = open(&path, true).unwrap();
+        let conn = open(path, true).unwrap();
         migrate(&conn).unwrap();
         drop(conn);
         // The Puller cannot create them (spec 10), so the last close must not
@@ -1289,15 +1291,13 @@ mod tests {
                 "{suffix} was removed on close"
             );
         }
-        remove_db(&path);
     }
 
     #[tokio::test]
     async fn open_when_ready_waits_for_the_pusher_to_create_the_schema() {
-        let path = std::env::temp_dir().join("garret-open-when-ready.sqlite");
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap().to_owned();
-        // Sidecars outlive every connection, so clear an earlier run's too.
-        remove_db(&path);
 
         let waiter = tokio::spawn({
             let path = path.clone();
@@ -1317,7 +1317,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!exists(&conn, "nope").unwrap());
-        remove_db(&path);
     }
 
     #[tokio::test]
@@ -1333,9 +1332,9 @@ mod tests {
 
     #[tokio::test]
     async fn open_when_ready_fails_at_once_on_a_file_that_is_not_a_database() {
-        let path = std::env::temp_dir().join("garret-open-when-ready-garbage.sqlite");
+        let dir = scratch_dir();
+        let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap().to_owned();
-        remove_db(&path);
         std::fs::write(&path, b"not a sqlite database, just bytes").unwrap();
         let opened = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1343,7 +1342,6 @@ mod tests {
         )
         .await
         .expect("a corrupt database must not be waited on");
-        remove_db(&path);
         assert!(opened.is_err());
     }
 }

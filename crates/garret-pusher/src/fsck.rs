@@ -201,6 +201,7 @@ fn apply_repair(conn: &Mutex<Connection>, findings: &[Finding<'_>]) -> Result<us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use garret_server::testing::object;
 
     fn row(hash: &str, name: &str, created_at: i64, file_size: i64) -> db::ObjectBrief {
         db::ObjectBrief {
@@ -398,32 +399,12 @@ mod tests {
         assert!(db::exists(&conn.lock(), &hash).unwrap());
     }
 
-    fn object(hash: &str) -> db::Object {
-        db::Object {
-            store_path_hash: hash.into(),
-            store_path: format!("/nix/store/{hash}-thing"),
-            name: "thing".into(),
-            nar_hash: "sha256:x".into(),
-            nar_size: 10,
-            file_hash: "sha256:y".into(),
-            file_size: 5,
-            deriver: None,
-            ca: None,
-            references: vec![],
-            sigs: vec![],
-            pushed_by: None,
-        }
-    }
-
     /// An S3 stand-in whose bucket lists no blobs.
     async fn empty_bucket() -> storage::Storage {
-        let app = axum::Router::new().fallback(|| async {
+        garret_server::testing::fake_s3(axum::Router::new().fallback(|| async {
             r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"#
-        });
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        crate::tests::storage_at(&endpoint).await
+        }))
+        .await
     }
 
     /// A quiesced repair whose drain times out reports it and deletes

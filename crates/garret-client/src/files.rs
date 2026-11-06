@@ -61,8 +61,7 @@ mod tests {
 
     #[test]
     fn only_a_missing_file_reads_as_absent() {
-        let dir = std::env::temp_dir().join(format!("garret-files-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testing::scratch_dir();
         assert!(read_optional(&dir.join("missing")).unwrap().is_none());
 
         write_atomic(&dir.join("text"), b"hello", 0o666).unwrap();
@@ -76,6 +75,5 @@ mod tests {
         let err = read_optional(&dir.join("binary")).unwrap_err();
         assert!(format!("{err:#}").contains("binary"), "{err:#}");
         assert!(read_optional(&dir).is_err(), "a directory read as absent");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
