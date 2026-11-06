@@ -361,7 +361,6 @@ pub fn get_object_and_last_accessed(
         .optional()?;
 
     if let Some((obj, _)) = obj.as_mut() {
-        // Sorted: narinfo References order is part of what the signature covers.
         let mut stmt = conn.prepare_cached(
             "SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference",
         )?;
