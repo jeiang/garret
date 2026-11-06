@@ -204,6 +204,9 @@ struct StreamResult {
     /// HTTP/2 flow-control regression number.
     mib_per_sec: f64,
     failed: u64,
+    /// 429s and dropped connections retried across the reps, as in `push`.
+    shed_retries: u64,
+    dropped_retries: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -222,7 +225,7 @@ struct PullResults {
     zero_failures: bool,
 }
 
-/// Push-scenario tallies shared across concurrent workers.
+/// Upload tallies shared across concurrent workers.
 #[derive(Default)]
 struct Counters {
     shed: AtomicU64,
@@ -468,12 +471,13 @@ async fn run_stream(
     for (size, reps) in sizes {
         let mut walls = Vec::new();
         let mut failed = 0u64;
+        let counters = Counters::default();
         for rep in 0..reps {
             let entry = corpus::stream_entry(cli.seed, size as usize, rep, salt);
             // A second pass over the generated body, kept out of the timing.
             let nar_hash = nar_hash(entry.chunks(RAW_BLOCK));
             let started = Instant::now();
-            match push_streaming(http, &cli.endpoint, token, &entry, &nar_hash).await {
+            match push_streaming(http, &cli.endpoint, token, &entry, &nar_hash, &counters).await {
                 Ok(()) => walls.push(started.elapsed().as_secs_f64()),
                 Err(e) => {
                     eprintln!("stream {} ({size} B) failed: {e:#}", entry.name);
@@ -495,6 +499,8 @@ async fn run_stream(
             median_seconds,
             mib_per_sec,
             failed,
+            shed_retries: counters.shed.load(Ordering::Relaxed),
+            dropped_retries: counters.dropped.load(Ordering::Relaxed),
         });
     }
     Ok(results)
@@ -656,13 +662,33 @@ async fn push(
     counters
         .wire
         .fetch_add(body.len() as u64, Ordering::Relaxed);
+    // A refcounted handle, so each attempt shares the one buffer.
+    let body = bytes::Bytes::from(body);
+    put_with_retry(
+        http,
+        &format!("{endpoint}/api/v1/nar/{}", entry.hash),
+        token,
+        || Ok(body.clone().into()),
+        counters,
+    )
+    .await
+}
 
+/// PUTs `make_body()` to `url`, retrying 429s and dropped connections up to
+/// six attempts on a doubling schedule, and tallying each in `counters`.
+async fn put_with_retry(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    mut make_body: impl FnMut() -> Result<reqwest::Body>,
+    counters: &Counters,
+) -> Result<()> {
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
         let response = match http
-            .put(format!("{endpoint}/api/v1/nar/{}", entry.hash))
+            .put(url)
             .bearer_auth(token)
-            .body(body.clone())
+            .body(make_body()?)
             .send()
             .await
         {
@@ -729,47 +755,22 @@ async fn push_streaming(
     token: &str,
     entry: &corpus::Entry,
     nar_hash: &str,
+    counters: &Counters,
 ) -> Result<()> {
-    let mut delay = Duration::from_millis(100);
-    for attempt in 0..6 {
-        // Rebuilt per attempt: a streamed body cannot be cloned.
+    // Rebuilt per attempt: a streamed body cannot be cloned.
+    let make_body = || -> Result<reqwest::Body> {
         let framed = preamble_for(entry, nar_hash.to_owned()).to_framed()?;
         let chunks = std::iter::once(framed).chain(raw_zstd_frame(entry.chunks(RAW_BLOCK)));
-        let body = reqwest::Body::wrap_stream(stream::iter(
+        Ok(reqwest::Body::wrap_stream(stream::iter(
             chunks.map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c))),
-        ));
-
-        let response = match http
-            .put(format!("{endpoint}/api/v1/nar/{}", entry.hash))
-            .bearer_auth(token)
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            // Same early-reply race as push(); the rebuilt-per-attempt body
-            // makes the retry cheap and idempotent.
-            Err(e) if garret_client::push::connection_dropped(&e) => {
-                tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
-                delay *= 2;
-                continue;
-            }
-            Err(e) => return Err(e).context("sending the upload"),
-        };
-
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            tokio::time::sleep(delay + Duration::from_millis(attempt * 17)).await;
-            delay *= 2;
-            continue;
-        }
-        if !response.status().is_success() {
-            bail!(
-                "{}: {}",
-                response.status(),
-                response.text().await.unwrap_or_default()
-            );
-        }
-        return Ok(());
-    }
-    bail!("still shed or dropped after 6 attempts")
+        )))
+    };
+    put_with_retry(
+        http,
+        &format!("{endpoint}/api/v1/nar/{}", entry.hash),
+        token,
+        make_body,
+        counters,
+    )
+    .await
 }
