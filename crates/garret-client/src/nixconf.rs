@@ -51,20 +51,27 @@ pub enum Outcome {
 /// includes, `extra-` merging and per-file precedence.
 pub fn apply(puller: &str, public_keys: &[String]) -> Result<Outcome> {
     let path = path()?;
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    if existing.contains(puller) {
+    let existing = crate::files::read_optional(&path)?;
+    if existing
+        .as_deref()
+        .is_some_and(|text| text.contains(puller))
+    {
         return Ok(Outcome::AlreadyPresent(path));
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let mut out = existing;
+    // Home Manager and dotfile managers make nix.conf a symlink; write where
+    // it points (failing on a read-only store link) instead of replacing it.
+    let target = match &existing {
+        Some(_) => {
+            std::fs::canonicalize(&path).with_context(|| format!("resolving {}", path.display()))?
+        }
+        None => path.clone(),
+    };
+    let mut out = existing.unwrap_or_default();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
     }
     out.push_str(&lines(puller, public_keys));
-    std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
+    crate::files::write_atomic(&target, out.as_bytes(), 0o666)?;
     Ok(Outcome::Added(path))
 }
 

@@ -108,7 +108,7 @@ pub fn open_nix_db(path: &str) -> Result<Connection> {
             |row| row.get::<_, i64>(0),
         )
         .map(|n| n > 0)
-        .unwrap_or(false);
+        .with_context(|| format!("reading the schema of the nix database at {path}"))?;
     if !has_valid_paths {
         bail!("{path} has no ValidPaths table — is this a nix database?");
     }
@@ -146,15 +146,24 @@ pub fn max_id(conn: &Connection) -> Result<i64> {
     )
 }
 
-/// Reads the persisted cursor; `None` (missing or unparseable file) means
-/// first run and triggers the bootstrap in [`Watcher::run`].
-pub fn read_cursor(path: &std::path::Path) -> Option<i64> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Reads the persisted cursor; `None` (no file) means first run and triggers
+/// the bootstrap in [`Watcher::run`]. A cursor that is there but unreadable is
+/// an error: bootstrapping past it would silently skip the backlog.
+pub fn read_cursor(path: &Path) -> Result<Option<i64>> {
+    crate::files::read_optional(path)?
+        .map(|text| {
+            text.trim()
+                .parse()
+                .with_context(|| format!("cursor {path:?} holds {text:?}, not a ValidPaths id"))
+        })
+        .transpose()
 }
 
-/// Persists the cursor, creating its directory on first write.
+/// Persists the cursor, replaced whole: the daemon is stopped by a signal (CI
+/// kills it before draining), and a kill mid-write must not leave an empty
+/// cursor that bootstraps past the backlog.
 pub fn write_cursor(path: &Path, cursor: i64) -> Result<()> {
-    write_atomic(path, &cursor.to_string()).with_context(|| format!("writing cursor {path:?}"))
+    crate::files::write_atomic(path, cursor.to_string().as_bytes(), 0o666)
 }
 
 /// Where the failed list lives: beside the cursor, as `<cursor>.failed`.
@@ -168,16 +177,17 @@ pub fn failed_path(cursor_path: &Path) -> PathBuf {
     cursor_path.with_file_name(name)
 }
 
-/// Reads the failed list; a missing file is an empty list.
-pub fn read_failed(path: &Path) -> BTreeSet<String> {
-    std::fs::read_to_string(path)
+/// Reads the failed list; a missing file is an empty list, an unreadable one
+/// an error, since the next write would erase it.
+pub fn read_failed(path: &Path) -> Result<BTreeSet<String>> {
+    Ok(crate::files::read_optional(path)?
         .map(|text| {
             text.lines()
                 .filter(|l| !l.is_empty())
                 .map(str::to_owned)
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Persists the failed list, removing the file once it is empty.
@@ -191,23 +201,7 @@ pub fn write_failed(path: &Path, failed: &BTreeSet<String>) -> Result<()> {
         };
     }
     let text: String = failed.iter().map(|p| format!("{p}\n")).collect();
-    write_atomic(path, &text).with_context(|| format!("writing failed list {path:?}"))
-}
-
-/// Replaces `path` whole: the daemon is stopped by a signal (CI kills it before
-/// draining), and a kill between truncate and write would leave an empty
-/// cursor that bootstraps past the backlog. The temporary file is named per
-/// process, so a drain overlapping a daemon cannot rename the other's
-/// half-written file into place.
-fn write_atomic(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::files::write_atomic(path, text.as_bytes(), 0o666)
 }
 
 /// Binds the wake socket `garret enqueue` datagrams land on. A stale file from
@@ -258,7 +252,7 @@ impl Watcher {
     /// times, then loudly giving up until a restart or a drain (spec 06).
     pub async fn run(&self, pusher: &Pusher, full_sync: bool) -> Result<()> {
         let conn = open_nix_db(&self.nix_db)?;
-        let mut cursor = match read_cursor(&self.cursor_path) {
+        let mut cursor = match read_cursor(&self.cursor_path)? {
             Some(cursor) => cursor,
             // Bootstrap at the end of history: only new paths push, unless
             // --full-sync opts into walking everything.
@@ -286,7 +280,7 @@ impl Watcher {
         };
 
         let failed_file = failed_path(&self.cursor_path);
-        let mut failed = read_failed(&failed_file);
+        let mut failed = read_failed(&failed_file)?;
         // Attempts spent in this process. The list itself outlives it, so a
         // restart or a drain gives every failed path a fresh budget.
         let mut attempts: HashMap<String, u32> = HashMap::new();
@@ -367,7 +361,7 @@ impl Watcher {
     pub async fn drain(&self, pusher: &Pusher, full_sync: bool) -> Result<Vec<String>> {
         let conn = open_nix_db(&self.nix_db)?;
         let target = max_id(&conn)?;
-        let mut cursor = match read_cursor(&self.cursor_path) {
+        let mut cursor = match read_cursor(&self.cursor_path)? {
             Some(cursor) => cursor,
             None if full_sync => 0,
             // Nothing recorded where to start, so "nothing to push" would be
@@ -379,7 +373,7 @@ impl Watcher {
             ),
         };
         let failed_file = failed_path(&self.cursor_path);
-        let mut failed = read_failed(&failed_file);
+        let mut failed = read_failed(&failed_file)?;
         let mut todo: Vec<String> = failed.iter().cloned().collect();
         while cursor < target {
             let mut batch = paths_after(&conn, cursor, BATCH_SIZE)?;
@@ -455,17 +449,17 @@ impl Watcher {
         let hashes = negotiation_hashes(&infos);
         let missing = match pusher.negotiate(&hashes).await {
             Ok(missing) => missing,
-            // A 403 is a permanent policy refusal: retrying cannot succeed,
-            // so say it once and leave the paths off the failed list.
-            Err(e) if e.is::<Refused>() => {
-                tracing::error!(paths = infos.len(), "{e:#}; dropping the batch");
-                return failed;
-            }
-            // Any other failure keeps the paths on the failed list, a 401
-            // that survives renewal included: the Pusher answers 401 for
-            // transient causes too (JWKS fetch failure, key rotation).
+            // Every failure keeps the paths on the failed list. A 403 is a
+            // policy refusal no retry fixes until the policy changes, so it is
+            // said loudly with the Pusher's reason; `max_attempts` bounds the
+            // retries. A 401 that survives renewal is transient (JWKS fetch
+            // failure, key rotation) and stays a warning.
             Err(e) => {
-                tracing::warn!(paths = infos.len(), "negotiation failed: {e:#}");
+                if e.is::<Refused>() {
+                    tracing::error!(paths = infos.len(), "negotiation refused: {e:#}");
+                } else {
+                    tracing::warn!(paths = infos.len(), "negotiation failed: {e:#}");
+                }
                 failed.extend(infos.into_iter().map(|info| info.path));
                 return failed;
             }
@@ -621,9 +615,12 @@ mod tests {
     fn the_cursor_round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!("garret-cursor-{}", std::process::id()));
         let file = dir.join("cursor");
-        assert_eq!(read_cursor(&file), None);
+        assert_eq!(read_cursor(&file).unwrap(), None);
         write_cursor(&file, 42).unwrap();
-        assert_eq!(read_cursor(&file), Some(42));
+        assert_eq!(read_cursor(&file).unwrap(), Some(42));
+        // A cursor that is there but unreadable is not a first run.
+        std::fs::write(&file, "").unwrap();
+        assert!(read_cursor(&file).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -634,13 +631,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("garret-failed-{}", std::process::id()));
         let file = failed_path(&dir.join("watcher-cursor"));
         assert_eq!(file, dir.join("watcher-cursor.failed"));
-        assert!(read_failed(&file).is_empty());
+        assert!(read_failed(&file).unwrap().is_empty());
 
         let list: BTreeSet<String> = ["/nix/store/bbb-y", "/nix/store/aaa-x"]
             .map(String::from)
             .into();
         write_failed(&file, &list).unwrap();
-        assert_eq!(read_failed(&file), list);
+        assert_eq!(read_failed(&file).unwrap(), list);
 
         write_failed(&file, &BTreeSet::new()).unwrap();
         assert!(!file.exists());

@@ -39,8 +39,8 @@ pub fn logout() -> Result<PathBuf> {
     }
 }
 
-/// The claims the client reads from a token it holds: `sub`, `aud` and `exp`
-/// for `garret whoami`, `iat` and `exp` for when [`TokenSource`] re-mints.
+/// The claims the client reads from a token it holds: `sub` and `exp` for
+/// `garret whoami`, `iat` and `exp` for when [`TokenSource`] re-mints.
 #[derive(Debug, Default, Deserialize)]
 pub struct Claims {
     /// Subject — who the issuer says this token belongs to.
@@ -49,9 +49,6 @@ pub struct Claims {
     pub exp: Option<i64>,
     /// Issue time as a Unix timestamp; `None` if the issuer omitted it.
     pub iat: Option<i64>,
-    /// `aud` is a string or an array of strings depending on the issuer.
-    #[serde(default)]
-    pub aud: serde_json::Value,
 }
 
 /// Reads a JWT's payload **without verifying its signature**. Verification is
@@ -76,33 +73,12 @@ pub fn save_token(token: &StoredToken) -> Result<()> {
 }
 
 /// A refresh token is a credential (spec 04-auth), so its file is never
-/// readable by anyone else, not even for a moment: the bytes go to a fresh
-/// sibling created mode 0600 in the same open (`O_EXCL`, so nothing already
-/// there is written through), which is then renamed over `path`. The rename
-/// also makes a rotation atomic — a crash mid-write leaves the previous token,
-/// not a truncated one — and replaces a symlink planted at `path` rather than
-/// following it.
+/// readable by anyone else, not even for a moment: it is created mode 0600 in
+/// a 0700 directory, and replaced whole by a rename.
 fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
-    use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let dir = path.parent().context("the token path has no directory")?;
     crate::config::create_private_dir(dir)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    let written = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written.with_context(|| format!("writing {}", path.display()))
+    crate::files::write_atomic(path, contents, 0o600)
 }
 
 /// The OIDC endpoints the client uses, out of everything discovery offers.
@@ -653,12 +629,15 @@ impl TokenSource {
             } => github_token(http, url, request_token, audience).await?,
             Mint::Stored { resource } => {
                 let path = token_path()?;
-                let stored: StoredToken = std::fs::read(&path)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice(&b).ok())
-                    .ok_or_else(|| {
-                        anyhow!("not logged in — run `garret login` (looked in {path:?})")
-                    })?;
+                let text = crate::files::read_optional(&path)?.ok_or_else(|| {
+                    anyhow!("not logged in — run `garret login` (looked in {path:?})")
+                })?;
+                let stored: StoredToken = serde_json::from_str(&text).with_context(|| {
+                    format!(
+                        "{} is corrupt — run `garret login` to replace it",
+                        path.display()
+                    )
+                })?;
                 refresh(http, &stored, resource.as_deref()).await?
             }
             Mint::ClientCredentials {

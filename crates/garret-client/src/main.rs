@@ -460,7 +460,7 @@ async fn login(
         (Some(url), _) => {
             let discovered = discovery::fetch(http, url).await?;
             let rendered = config::render(url.trim_end_matches('/'), &discovered)?;
-            let current = exists.then(|| std::fs::read_to_string(&path).unwrap_or_default());
+            let current = garret_client::files::read_optional(&path)?;
             match current {
                 // Re-running against the server that wrote this config: nothing
                 // to replace, so nothing to refuse.
