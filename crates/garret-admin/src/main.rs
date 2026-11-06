@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use garret_common::{
-    PUSH_GRACE,
+    PUSH_GRACE_HOURS,
     admin::{DEFAULT_ADMIN_SOCKET, FsckReport, Repair, Request, Response},
     human_bytes, unix_now,
 };
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
                     println!(
                         "warning: still above the low watermark with nothing evictable — \
                          everything left is referenced, pinned, or pushed in the last {} hours",
-                        PUSH_GRACE / 3600
+                        PUSH_GRACE_HOURS
                     );
                 }
             }

@@ -147,8 +147,14 @@ pub fn human_bytes(bytes: i64) -> String {
 }
 
 /// Seconds a Negotiation protects the paths it reported present: neither GC
-/// nor prune removes an object pushed more recently (spec 05).
+/// nor prune removes an object pushed more recently (spec 05). The client
+/// relies on those paths until its push finishes, and their debounced
+/// `pushed_at` is at most an hour behind that Negotiation, which leaves a
+/// push up to 23 hours long room to finish against a complete closure.
 pub const PUSH_GRACE: i64 = 86400;
+
+/// [`PUSH_GRACE`] in whole hours, for operator messages.
+pub const PUSH_GRACE_HOURS: i64 = PUSH_GRACE / 3600;
 
 /// Current unix time in seconds; 0 if the clock reads before the epoch.
 pub fn unix_now() -> i64 {

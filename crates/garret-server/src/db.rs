@@ -1,6 +1,7 @@
 //! SQLite access. Schema per spec 02-database; the Pusher owns all writes.
 
 use anyhow::{Context, Result};
+use garret_common::{PUSH_GRACE, PUSH_GRACE_HOURS};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, TransactionBehavior, named_params, params,
 };
@@ -164,14 +165,6 @@ fn persist_wal(conn: &Connection) -> Result<()> {
 /// pushed from several CI jobs in one run costs one write per path, not one
 /// per job.
 const PUSHED_AT_DEBOUNCE: i64 = 3600;
-
-/// How long a Negotiation protects the paths it reported present. The client
-/// was told it need not upload them and relies on them until its push
-/// finishes; their debounced `pushed_at` is at most `PUSHED_AT_DEBOUNCE`
-/// behind that Negotiation. Neither GC ([`evictable`]) nor prune ([`prunable`]) removes
-/// an object pushed more recently than this, which leaves a push up to 23
-/// hours long room to finish against a complete closure.
-pub use garret_common::PUSH_GRACE;
 
 /// Applies the schema (idempotent `IF NOT EXISTS`). Pusher-only, like every
 /// other write.
@@ -734,7 +727,7 @@ pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<ObjectBr
     anyhow::ensure!(
         before <= now - PUSH_GRACE,
         "the cutoff must be at least {} hours ago, so a push in progress keeps its closure",
-        PUSH_GRACE / 3600
+        PUSH_GRACE_HOURS
     );
     Ok(conn
         .prepare(

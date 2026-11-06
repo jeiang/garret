@@ -9,6 +9,7 @@ mod admin;
 mod deletion;
 mod fsck;
 mod gc;
+mod state;
 mod verify;
 
 use anyhow::{Context, Result};
@@ -31,29 +32,13 @@ use garret_server::{
     config::PusherConfig,
     db::{self, Object},
     inflight::{self, InFlight},
-    metrics as garret_metrics,
-    narinfo::{self, SigningKeyFile},
+    metrics as garret_metrics, narinfo,
     storage::{self, Storage, UploadLimits},
 };
 use serde_json::json;
+use state::{AppState, db_run};
 use tokio::sync::Semaphore;
 use verify::VerifiedNar;
-
-pub(crate) struct AppState {
-    pub conn: Arc<Mutex<rusqlite::Connection>>,
-    /// The database file, for `garret-admin backup` to copy on a connection
-    /// of its own.
-    pub db_path: String,
-    pub storage: Storage,
-    pub keys: Vec<SigningKeyFile>,
-    pub store_dir: String,
-    pub auth: Authenticator,
-    pub limits: UploadLimits,
-    pub uploads: Arc<Semaphore>,
-    pub in_flight: InFlight,
-    /// `None` without a `[gc]` section.
-    pub gc: Option<Arc<gc::Gc>>,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -339,26 +324,6 @@ impl From<anyhow::Error> for Error {
 /// Largest preamble accepted (spec 01). Real ones are a few KiB of JSON; the
 /// body is buffered whole until the preamble is complete.
 const MAX_PREAMBLE: usize = 1024 * 1024;
-
-/// Runs a blocking database call on the blocking pool, holding the
-/// connection lock only inside it. SQLite can wait seconds on another
-/// writer's lock; that must park a blocking thread, not a Tokio worker.
-pub(crate) async fn db_run<T, F>(conn: &Arc<Mutex<rusqlite::Connection>>, f: F) -> Result<T>
-where
-    F: FnOnce(&mut rusqlite::Connection) -> Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    let conn = conn.clone();
-    tokio::task::spawn_blocking(move || {
-        let waited = std::time::Instant::now();
-        let mut conn = conn.lock();
-        metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => "pusher")
-            .record(waited.elapsed());
-        f(&mut conn)
-    })
-    .await
-    .context("database task failed")?
-}
 
 async fn already_stored(state: &AppState, hash: &str) -> Result<bool, Error> {
     let hash = hash.to_owned();
@@ -709,34 +674,7 @@ mod tests {
     use garret_server::testing::unreachable_storage;
 
     use super::*;
-
-    pub(crate) async fn test_state(conn: rusqlite::Connection) -> Arc<AppState> {
-        test_state_with_storage(conn, unreachable_storage().await).await
-    }
-
-    pub(crate) async fn test_state_with_storage(
-        conn: rusqlite::Connection,
-        storage: Storage,
-    ) -> Arc<AppState> {
-        Arc::new(AppState {
-            conn: Arc::new(Mutex::new(conn)),
-            db_path: ":memory:".into(),
-            storage,
-            keys: vec![],
-            store_dir: "/nix/store".into(),
-            auth: Authenticator::new(vec![garret_server::testing::dev_issuer("unused")]).unwrap(),
-            limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024, Duration::from_secs(60)),
-            uploads: Arc::new(Semaphore::new(1)),
-            in_flight: InFlight::new(),
-            gc: None,
-        })
-    }
-
-    pub(crate) fn open_db() -> rusqlite::Connection {
-        let conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
-        conn
-    }
+    use crate::state::testing::{open_db, test_state};
 
     /// The quiescing check sits before the idempotency check, the upload
     /// semaphore and the in-flight claim — this exercises it in isolation,
