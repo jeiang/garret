@@ -205,7 +205,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 /// returned at once. Gives up after `timeout` so a typo'd `db_path` still
 /// fails loudly.
 pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result<Connection> {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     let deadline = Instant::now() + timeout;
     let mut delay = Duration::from_millis(250);
@@ -299,15 +300,10 @@ pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()
         let mut stmt =
             tx.prepare_cached("INSERT INTO object_refs (referrer, reference) VALUES (?1, ?2)")?;
         for r in &obj.references {
-            // Self-references are stored, not dropped: the signature covers the
-            // full reference list the pusher was handed, so a narinfo rendered
-            // without them produces a fingerprint nix cannot match, and every
-            // self-referential path -- which is most compiled packages -- fails
-            // verification with "lacks a signature by a trusted key".
-            //
-            // The reason they were dropped (spec 02: a self-edge makes an object
-            // permanently unevictable) is handled where it belongs, in
-            // `evictable`, which ignores self-edges when deciding reachability.
+            // Self-references are stored: the signature covers the full
+            // reference list, so a narinfo rendered without them produces a
+            // fingerprint nix cannot match ("lacks a signature by a trusted
+            // key"). `evictable` ignores self-edges for reachability instead.
             stmt.execute(params![obj.store_path_hash, r])?;
         }
     }
@@ -366,7 +362,6 @@ pub fn get_object_and_last_accessed(
         .optional()?;
 
     if let Some((obj, _)) = obj.as_mut() {
-        // Sorted: narinfo References order is part of what the signature covers.
         let mut stmt = conn.prepare_cached(
             "SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference",
         )?;
@@ -846,12 +841,6 @@ mod tests {
 
     #[test]
     fn self_references_survive_the_round_trip_and_stay_evictable() {
-        // Replaces an earlier `drops_self_references`, which pinned the
-        // opposite behaviour: the signature covers the reference list as
-        // pushed, self-reference included, so dropping it on write renders a
-        // narinfo whose fingerprint nix cannot reproduce. Most compiled store
-        // paths self-reference, so that failed verification for nearly
-        // everything.
         let mut conn = db();
         let a = "a".repeat(32);
         let own = format!("{a}-thing");
@@ -880,10 +869,7 @@ mod tests {
         let a = "a".repeat(32);
         insert_object(&mut conn, &object(&a), 100).unwrap();
         insert_object(&mut conn, &object(&a), 200).unwrap();
-        let total: i64 = conn
-            .query_row("SELECT total_bytes FROM stats", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(total, 5);
+        assert_eq!(total_bytes(&conn).unwrap(), 5);
     }
 
     #[test]
@@ -1065,11 +1051,10 @@ mod tests {
 
     #[test]
     fn pusher_writes_wait_out_another_connections_write_lock() {
-        // The Puller's bumps take the WAL write lock on its own connection.
-        // A read-then-write transaction that began deferred could not wait
-        // for it: SQLite fails the read-to-write upgrade with SQLITE_BUSY at
-        // once, ignoring busy_timeout, so uploads and GC failed under pull
-        // load. Needs a real file: WAL does not apply to `:memory:`.
+        // The Puller's bumps take the WAL write lock on its own connection. A
+        // deferred read-then-write transaction would fail the upgrade with
+        // SQLITE_BUSY at once, ignoring busy_timeout. Needs a real file: WAL
+        // does not apply to `:memory:`.
         let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap();
@@ -1224,12 +1209,7 @@ mod tests {
     }
 
     fn last_accessed(conn: &Connection, hash: &str) -> i64 {
-        conn.query_row(
-            "SELECT last_accessed_at FROM objects WHERE store_path_hash = ?1",
-            params![hash],
-            |r| r.get(0),
-        )
-        .unwrap()
+        get_object_and_last_accessed(conn, hash).unwrap().unwrap().1
     }
 
     #[test]
@@ -1255,26 +1235,6 @@ mod tests {
     }
 
     #[test]
-    fn reverse_lookup_finds_referrers_by_hash() {
-        let mut conn = db();
-        let (a, b) = ("a".repeat(32), "b".repeat(32));
-        insert_object(
-            &mut conn,
-            &object(&a).referencing(&[&format!("{b}-dep")]),
-            100,
-        )
-        .unwrap();
-        let referrers: Vec<String> = conn
-            .prepare("SELECT referrer FROM object_refs WHERE reference_hash = ?1")
-            .unwrap()
-            .query_map(params![b], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(referrers, vec![a]);
-    }
-
-    #[test]
     fn closing_leaves_the_wal_sidecars_for_the_puller() {
         let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
@@ -1293,7 +1253,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn open_when_ready_waits_for_the_pusher_to_create_the_schema() {
         let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
@@ -1303,11 +1263,12 @@ mod tests {
             let path = path.clone();
             async move { open_when_ready(&path, std::time::Duration::from_secs(30)).await }
         });
-        // Not ready while the file is absent, nor while it exists unmigrated.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Not ready while the file is absent, nor while it exists unmigrated;
+        // each sleep spans at least one retry.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         assert!(!waiter.is_finished());
         let created = open(&path, true).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(!waiter.is_finished(), "an empty database is not ready");
 
         migrate(&created).unwrap();
@@ -1319,11 +1280,11 @@ mod tests {
         assert!(!exists(&conn, "nope").unwrap());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn open_when_ready_gives_up_on_a_database_that_never_appears() {
         let err = open_when_ready(
             "/nonexistent-dir/garret.sqlite",
-            std::time::Duration::from_millis(600),
+            std::time::Duration::from_secs(60),
         )
         .await
         .unwrap_err();

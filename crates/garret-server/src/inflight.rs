@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 
 /// What a claim on a store path is for. One claim per path at a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
+enum Kind {
     /// An upload is streaming the blob; its row lands once the blob does.
     Upload,
     /// GC, `garret-admin delete` or prune is removing the object: held from
@@ -22,7 +22,7 @@ pub enum Kind {
     Delete,
 }
 
-/// Why [`InFlight::claim`] turned a claim away.
+/// Why [`InFlight::claim`] turned an upload claim away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
     /// The path is already claimed by an upload.
@@ -91,19 +91,19 @@ impl InFlight {
         Self::default()
     }
 
-    /// First claimer wins; `Err` names why not. Upload claims are also
-    /// refused while quiescing — checked under the same lock as the claim,
-    /// so no upload is admitted that a drain cannot see.
-    pub fn claim(&self, hash: &str, kind: Kind) -> Result<Claim, Refused> {
+    /// An upload claim: first claimer wins; `Err` names why not. Refused
+    /// while quiescing — checked under the same lock as the claim, so no
+    /// upload is admitted that a drain cannot see.
+    pub fn claim(&self, hash: &str) -> Result<Claim, Refused> {
         let mut state = self.0.state.lock();
-        if kind == Kind::Upload && state.quiescers > 0 {
+        if state.quiescers > 0 {
             return Err(Refused::Quiescing);
         }
-        Ok(self.take(&mut state, hash, kind)?)
+        Ok(self.take(&mut state, hash, Kind::Upload)?)
     }
 
-    /// A [`Kind::Delete`] claim: first claimer wins, and the quiesce gate
-    /// does not apply.
+    /// A delete claim: first claimer wins, and the quiesce gate does not
+    /// apply.
     pub fn claim_delete(&self, hash: &str) -> Result<Claim, Busy> {
         self.take(&mut self.0.state.lock(), hash, Kind::Delete)
     }
@@ -207,45 +207,34 @@ mod tests {
     #[test]
     fn only_the_first_claimer_wins_and_the_claim_is_released() {
         let set = InFlight::new();
-        let first = set
-            .claim("abc", Kind::Upload)
-            .expect("first claim should succeed");
-        assert_eq!(
-            set.claim("abc", Kind::Upload).err(),
-            Some(Refused::Uploading)
-        );
+        let first = set.claim("abc").expect("first claim should succeed");
+        assert_eq!(set.claim("abc").err(), Some(Refused::Uploading));
         assert!(set.contains("abc"));
         // A different path is unaffected.
-        assert!(set.claim("def", Kind::Upload).is_ok());
+        assert!(set.claim("def").is_ok());
 
         drop(first);
         assert!(!set.contains("abc"));
-        assert!(set.claim("abc", Kind::Upload).is_ok());
+        assert!(set.claim("abc").is_ok());
     }
 
     #[test]
     fn a_deletion_turns_an_upload_away_and_is_not_counted_as_one() {
         let set = InFlight::new();
-        let deleting = set.claim("abc", Kind::Delete).unwrap();
-        assert_eq!(
-            set.claim("abc", Kind::Upload).err(),
-            Some(Refused::Deleting)
-        );
+        let deleting = set.claim_delete("abc").unwrap();
+        assert_eq!(set.claim("abc").err(), Some(Refused::Deleting));
         assert_eq!(set.uploads(), 0, "a deletion counted as an upload");
 
         drop(deleting);
-        let _uploading = set.claim("abc", Kind::Upload).unwrap();
-        assert_eq!(
-            set.claim("abc", Kind::Delete).err(),
-            Some(Refused::Uploading)
-        );
+        let _uploading = set.claim("abc").unwrap();
+        assert_eq!(set.claim_delete("abc").err(), Some(Busy::Uploading));
         assert_eq!(set.uploads(), 1);
     }
 
     #[test]
     fn a_dropped_claim_cannot_wedge_the_path() {
         let set = InFlight::new();
-        drop(set.claim("abc", Kind::Delete));
+        drop(set.claim_delete("abc"));
         assert!(!set.contains("abc"));
     }
 
@@ -254,16 +243,13 @@ mod tests {
         let set = InFlight::new();
         let guard = set.quiesce();
         assert!(set.is_quiescing());
-        assert_eq!(
-            set.claim("abc", Kind::Upload).err(),
-            Some(Refused::Quiescing)
-        );
+        assert_eq!(set.claim("abc").err(), Some(Refused::Quiescing));
         assert_eq!(set.uploads(), 0);
         assert!(set.claim_delete("abc").is_ok());
 
         drop(guard);
         assert!(!set.is_quiescing());
-        assert!(set.claim("abc", Kind::Upload).is_ok());
+        assert!(set.claim("abc").is_ok());
     }
 
     #[test]
@@ -272,20 +258,17 @@ mod tests {
         let first = set.quiesce();
         let second = set.quiesce();
         drop(first);
-        assert_eq!(
-            set.claim("abc", Kind::Upload).err(),
-            Some(Refused::Quiescing)
-        );
+        assert_eq!(set.claim("abc").err(), Some(Refused::Quiescing));
         drop(second);
-        assert!(set.claim("abc", Kind::Upload).is_ok());
+        assert!(set.claim("abc").is_ok());
     }
 
     #[tokio::test(start_paused = true)]
     async fn drain_wakes_when_the_last_upload_drops_and_times_out_otherwise() {
         let set = InFlight::new();
-        let first = set.claim("a", Kind::Upload).unwrap();
-        let second = set.claim("b", Kind::Upload).unwrap();
-        let _deleting = set.claim("c", Kind::Delete).unwrap();
+        let first = set.claim("a").unwrap();
+        let second = set.claim("b").unwrap();
+        let _deleting = set.claim_delete("c").unwrap();
         let guard = set.quiesce();
 
         assert!(!guard.drain(Duration::from_secs(1)).await);

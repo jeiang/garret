@@ -312,12 +312,17 @@ mod tests {
         assert!(gone_node.missing);
         assert!(gone_node.children.is_empty());
 
-        // `shared` is reached twice; the second occurrence does not re-expand.
+        // `shared` is reached twice. Depth-first in reference order, the copy
+        // under `mid` comes first and expands; the later one is truncated.
         let shared_under_mid = mid_node.children.iter().find(|c| c.hash == shared).unwrap();
         let shared_under_root = tree.children.iter().find(|c| c.hash == shared).unwrap();
-        assert!(shared_under_mid.truncated ^ shared_under_root.truncated);
+        assert!(!shared_under_mid.truncated);
+        assert!(shared_under_root.truncated);
+    }
 
-        assert!(tree_of_unknown_hash(&conn));
+    #[test]
+    fn tree_of_an_unknown_hash_is_none() {
+        assert!(tree(&db(), "nope", 10).unwrap().is_none());
     }
 
     #[test]
@@ -403,10 +408,6 @@ mod tests {
         assert_eq!(a_again[0].name, a_ref);
         assert!(a_again[0].truncated && !a_again[0].missing);
         assert!(a_again[0].children.is_empty());
-    }
-
-    fn tree_of_unknown_hash(conn: &Connection) -> bool {
-        tree(conn, "nope", 10).unwrap().is_none()
     }
 
     #[test]

@@ -255,9 +255,7 @@ mod tests {
         let rows = vec![row("a", "thing", NOW - 2 * 86400, 5)];
         let blobs = vec![];
         let in_flight = InFlight::new();
-        let _claim = in_flight
-            .claim("a", garret_server::inflight::Kind::Upload)
-            .unwrap();
+        let _claim = in_flight.claim("a").unwrap();
         let (dangling, _) = classified(&rows, &blobs, &in_flight, false);
         assert!(dangling.is_empty(), "in-flight upload reported as dangling");
     }
@@ -306,9 +304,7 @@ mod tests {
 
         let old = vec![row("a", "thing", NOW - 2 * 86400, 5)];
         let in_flight = InFlight::new();
-        let _claim = in_flight
-            .claim("a", garret_server::inflight::Kind::Upload)
-            .unwrap();
+        let _claim = in_flight.claim("a").unwrap();
         let (_, mismatches) = classified(&old, &blobs, &in_flight, true);
         assert!(
             mismatches.is_empty(),
@@ -389,10 +385,7 @@ mod tests {
         let state = crate::tests::test_state_with_storage(conn, empty_bucket().await).await;
         let fsck = |repair| run(&state, GRACE, Duration::from_millis(50), false, repair);
 
-        let upload = state
-            .in_flight
-            .claim(&"b".repeat(32), garret_server::inflight::Kind::Upload)
-            .unwrap();
+        let upload = state.in_flight.claim(&"b".repeat(32)).unwrap();
         let Response::Fsck {
             dangling,
             repaired,

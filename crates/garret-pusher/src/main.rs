@@ -474,7 +474,7 @@ async fn upload(
         ));
     };
     let _gauge = UploadGauge::enter();
-    let claim = match state.in_flight.claim(&hash, inflight::Kind::Upload) {
+    let claim = match state.in_flight.claim(&hash) {
         Ok(claim) => claim,
         // Second pusher for the same path: first writer wins. The loser is
         // told `in-progress` and asks again later (spec 01) — this upload may
@@ -768,10 +768,7 @@ mod tests {
     async fn an_upload_meeting_a_deletion_is_told_to_retry() {
         let state = test_state(open_db()).await;
         let hash = "a".repeat(32);
-        let _deleting = state
-            .in_flight
-            .claim(&hash, inflight::Kind::Delete)
-            .unwrap();
+        let _deleting = state.in_flight.claim_delete(&hash).unwrap();
 
         let response = upload(
             State(state),

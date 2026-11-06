@@ -182,8 +182,10 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
             .await
             .expect("server did not drop the silent connection");
-        // Closed (EOF) or reset; either way no hang.
-        assert!(matches!(read, Ok(0) | Err(_)) || read.unwrap() > 0);
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "expected EOF or reset, got {read:?}"
+        );
         let _ = stop.send(());
         server.await.unwrap().unwrap();
     }
