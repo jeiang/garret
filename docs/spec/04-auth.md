@@ -136,3 +136,10 @@ A dev-issuer config override points `jwks_url` at a local static JWKS file
 configured `jwks_url`, never as a `jwks_uri` returned by discovery. Every
 other JWKS and discovery URL must be `https`, and redirects are not
 followed. There is deliberately **no auth-disable flag**.
+
+Issuer settings are checked when the config loads, so a bad one fails
+startup rather than the first token: the Pusher refuses an empty `oidc`
+list, and both services refuse an issuer (`oidc` or the Puller's
+`browse_oidc`) with an empty `audience`, an unscoped GitHub issuer, or a
+configured `jwks_url` or issuer URL that breaks the URL rule above. A
+`jwks_uri` returned by discovery is checked when it is fetched.
