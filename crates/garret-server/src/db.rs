@@ -553,16 +553,40 @@ pub fn all_hashes(conn: &Connection) -> Result<std::collections::HashSet<String>
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// One row per object: hash, name, creation time and blob size — exactly
-/// what `garret-admin fsck` needs to classify rows, without an N+1 fetch
-/// through [`get_object`] per hash.
-pub fn all_objects_brief(conn: &Connection) -> Result<Vec<(String, String, i64, i64)>> {
+/// The columns of one object row that listings act on, without the narinfo
+/// fields a full [`get_object`] reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectBrief {
+    /// The store path's hash part, the row's key.
+    pub store_path_hash: String,
+    /// The store path's name part.
+    pub name: String,
+    /// When the row was inserted; a re-push rewrites it, so fsck repair uses
+    /// it to tell the listed row from a newer one.
+    pub created_at: i64,
+    /// The blob's size in bytes, as debited from the total on delete.
+    pub file_size: i64,
+}
+
+impl ObjectBrief {
+    /// Reads a row selecting at least these four columns, by name.
+    pub fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            store_path_hash: row.get("store_path_hash")?,
+            name: row.get("name")?,
+            created_at: row.get("created_at")?,
+            file_size: row.get("file_size")?,
+        })
+    }
+}
+
+/// Every object row — exactly what `garret-admin fsck` needs to classify
+/// rows, without an N+1 fetch through [`get_object`] per hash.
+pub fn all_objects_brief(conn: &Connection) -> Result<Vec<ObjectBrief>> {
     let mut stmt =
         conn.prepare("SELECT store_path_hash, name, created_at, file_size FROM objects")?;
     Ok(stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
+        .query_map([], ObjectBrief::from_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 
@@ -645,9 +669,6 @@ pub fn missing(conn: &mut Connection, hashes: &[String], now: i64) -> Result<Vec
     Ok(missing)
 }
 
-/// One object [`prunable`] marks for deletion: hash, name, blob size.
-pub type Pruned = (String, String, i64);
-
 /// Rows [`delete_pruned`] deletes per write transaction, like GC's batches:
 /// the Puller's last-accessed writes interleave between them instead of
 /// waiting out one long transaction.
@@ -664,7 +685,7 @@ const PRUNE_BATCH: usize = 500;
 /// written only by the Pusher; the caller holds the Pusher's connection from
 /// here through [`delete_pruned`], so no Negotiation can refresh a doomed
 /// path in between.
-pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<Pruned>> {
+pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<ObjectBrief>> {
     anyhow::ensure!(
         before <= now - PUSH_GRACE,
         "the cutoff must be at least {} hours ago, so a push in progress keeps its closure",
@@ -679,29 +700,27 @@ pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<Pruned>>
                  UNION
                  SELECT r.reference_hash FROM object_refs r JOIN keep ON r.referrer = keep.hash
              )
-             SELECT store_path_hash, name, file_size FROM objects
+             SELECT store_path_hash, name, created_at, file_size FROM objects
              WHERE store_path_hash NOT IN (SELECT hash FROM keep)
              ORDER BY name, store_path_hash",
         )?
-        .query_map(params![before, now], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
+        .query_map(params![before, now], ObjectBrief::from_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Prune's delete: the rows [`prunable`] marked, in short batches, referrers
 /// before their references, so the cache is closed after every commit. The
 /// caller deletes the blobs afterwards: row first, blob second (spec 05).
-pub fn delete_pruned(conn: &mut Connection, doomed: &[Pruned]) -> Result<()> {
+pub fn delete_pruned(conn: &mut Connection, doomed: &[ObjectBrief]) -> Result<()> {
     for batch in referrers_first(conn, doomed)?.chunks(PRUNE_BATCH) {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         {
             let mut delete = tx.prepare("DELETE FROM objects WHERE store_path_hash = ?1")?;
             for &i in batch {
-                delete.execute(params![doomed[i].0])?;
+                delete.execute(params![doomed[i].store_path_hash])?;
             }
         }
-        let freed: i64 = batch.iter().map(|&i| doomed[i].2).sum();
+        let freed: i64 = batch.iter().map(|&i| doomed[i].file_size).sum();
         tx.execute(
             "UPDATE stats SET total_bytes = MAX(0, total_bytes - ?1) WHERE id = 1",
             params![freed],
@@ -713,17 +732,19 @@ pub fn delete_pruned(conn: &mut Connection, doomed: &[Pruned]) -> Result<()> {
 
 /// Indexes into `doomed`, every referrer before the objects it references
 /// (Kahn's algorithm over the edges inside the set; self-edges ignored).
-fn referrers_first(conn: &Connection, doomed: &[Pruned]) -> Result<Vec<usize>> {
+fn referrers_first(conn: &Connection, doomed: &[ObjectBrief]) -> Result<Vec<usize>> {
     let index: std::collections::HashMap<&str, usize> = doomed
         .iter()
         .enumerate()
-        .map(|(i, (hash, _, _))| (hash.as_str(), i))
+        .map(|(i, row)| (row.store_path_hash.as_str(), i))
         .collect();
     let mut references = vec![Vec::new(); doomed.len()];
     let mut referrers = vec![0usize; doomed.len()];
     let mut stmt = conn.prepare("SELECT reference_hash FROM object_refs WHERE referrer = ?1")?;
-    for (i, (hash, _, _)) in doomed.iter().enumerate() {
-        for reference in stmt.query_map(params![hash], |row| row.get::<_, String>(0))? {
+    for (i, object) in doomed.iter().enumerate() {
+        for reference in stmt.query_map(params![object.store_path_hash], |row| {
+            row.get::<_, String>(0)
+        })? {
             if let Some(&j) = index.get(reference?.as_str())
                 && j != i
             {
@@ -1072,10 +1093,7 @@ mod tests {
             "a cutoff inside the in-progress-push window was accepted"
         );
 
-        let expected = vec![
-            (a.clone(), "thing".into(), 5),
-            (b.clone(), "thing".into(), 5),
-        ];
+        let expected = vec![brief(&a, 100), brief(&b, 100)];
         assert_eq!(prunable(&conn, 5 * DAY, now).unwrap(), expected);
         assert_eq!(
             total_bytes(&conn).unwrap(),
@@ -1105,13 +1123,11 @@ mod tests {
         insert_object(&mut conn, &object(&b, &[&dep(&b), &dep(&c)]), 100).unwrap();
         insert_object(&mut conn, &object(&a, &[&dep(&b)]), 100).unwrap();
         insert_object(&mut conn, &object(&d, &[&dep(&c)]), 100).unwrap();
-        let doomed: Vec<Pruned> = [&c, &b, &a, &d]
-            .map(|h| (h.clone(), "thing".into(), 5))
-            .into();
+        let doomed = [&c, &b, &a, &d].map(|h| brief(h, 100));
         let order: Vec<&str> = referrers_first(&conn, &doomed)
             .unwrap()
             .into_iter()
-            .map(|i| doomed[i].0.as_str())
+            .map(|i| doomed[i].store_path_hash.as_str())
             .collect();
         let at = |h: &str| order.iter().position(|x| *x == h).unwrap();
         assert_eq!(order.len(), 4);
@@ -1178,14 +1194,18 @@ mod tests {
         insert_object(&mut conn, &object(&b, &[]), 200).unwrap();
 
         let mut rows = all_objects_brief(&conn).unwrap();
-        rows.sort_by(|x, y| x.0.cmp(&y.0));
-        assert_eq!(
-            rows,
-            vec![
-                (a, "thing".to_string(), 100, 5),
-                (b, "thing".to_string(), 200, 5),
-            ]
-        );
+        rows.sort_by(|x, y| x.store_path_hash.cmp(&y.store_path_hash));
+        assert_eq!(rows, vec![brief(&a, 100), brief(&b, 200)]);
+    }
+
+    /// The listing of a row the `object` fixture inserted at `created_at`.
+    fn brief(hash: &str, created_at: i64) -> ObjectBrief {
+        ObjectBrief {
+            store_path_hash: hash.to_string(),
+            name: "thing".into(),
+            created_at,
+            file_size: 5,
+        }
     }
 
     #[test]
