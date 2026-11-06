@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use garret_common::admin::{Request, Response};
 use garret_server::{
     db,
-    inflight::{Claim, InFlight, Kind},
+    inflight::{Claim, InFlight, Kind, Refused},
     narinfo,
 };
 use tokio::{
@@ -326,10 +326,11 @@ fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> 
     hashes
         .iter()
         .map(|hash| {
-            in_flight.claim(hash, Kind::Delete).map_err(|held| {
-                let doing = match held {
-                    Kind::Upload => "uploaded",
-                    Kind::Delete => "deleted",
+            in_flight.claim(hash, Kind::Delete).map_err(|refused| {
+                let doing = match refused {
+                    Refused::Uploading => "uploaded",
+                    Refused::Deleting => "deleted",
+                    Refused::Quiescing => unreachable!("quiescing refuses only uploads"),
                 };
                 anyhow::anyhow!("{hash} is being {doing}; nothing was deleted, retry")
             })

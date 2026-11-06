@@ -424,7 +424,7 @@ mod tests {
         assert!(!db::exists(&gc.conn.lock(), &r).unwrap());
         assert_eq!(
             in_flight.claim(&r, inflight::Kind::Upload).err(),
-            Some(inflight::Kind::Delete),
+            Some(inflight::Refused::Deleting),
             "an upload got in before the blob delete"
         );
 
@@ -500,7 +500,7 @@ mod tests {
         held.await.unwrap();
         assert_eq!(
             in_flight.claim(&o, inflight::Kind::Upload).err(),
-            Some(inflight::Kind::Delete),
+            Some(inflight::Refused::Deleting),
             "an upload got in before the blob delete"
         );
 

@@ -5,7 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, atomic::Ordering},
+    sync::Arc,
     time::Duration,
 };
 
@@ -21,7 +21,6 @@ use crate::{AppState, gc};
 /// ponytail: fixed timeout, add a CLI/config knob if an operator ever needs
 /// to wait longer than 5 minutes for uploads to drain.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(300);
-const QUIESCE_POLL: Duration = Duration::from_millis(250);
 
 /// Runs one fsck pass: lists S3 keys, then DB rows (in that order — a push
 /// landing in the gap between the two listings looks exactly like the
@@ -36,15 +35,13 @@ pub async fn run(
 ) -> Result<Response> {
     metrics::counter!("garret_fsck_runs_total").increment(1);
 
-    let quiesce_drained = if quiesce {
-        state.quiescing.store(true, Ordering::SeqCst);
-        wait_for_drain(&state.in_flight, QUIESCE_TIMEOUT, QUIESCE_POLL).await
-    } else {
-        true
+    // Held to the end of `run`, however it returns: dropping the guard
+    // reopens the gate unless another quiesce still holds it.
+    let guard = quiesce.then(|| state.in_flight.quiesce());
+    let quiesce_drained = match &guard {
+        Some(guard) => guard.drain(QUIESCE_TIMEOUT).await,
+        None => true,
     };
-    // Always cleared, even if classification below returns early via `?` —
-    // a wedged flag would reject pushes forever.
-    let _clear_quiescing = quiesce.then(|| ClearOnDrop(state));
 
     let grace = Duration::from_secs(gc.cfg.orphan_grace_secs);
     let blobs = state.storage.list_blobs().await?;
@@ -188,29 +185,6 @@ fn repair_rows<'a>(
     metrics::counter!("garret_fsck_rows_repaired_total", "reason" => reason)
         .increment(repaired as u64);
     Ok(repaired)
-}
-
-/// Polls until no upload is in progress or `timeout` elapses.
-async fn wait_for_drain(in_flight: &InFlight, timeout: Duration, poll: Duration) -> bool {
-    tokio::time::timeout(timeout, async {
-        while in_flight.uploads() > 0 {
-            tokio::time::sleep(poll).await;
-        }
-    })
-    .await
-    .is_ok()
-}
-
-/// RAII: clears the quiescing flag no matter how `run` returns, so an
-/// error partway through classification cannot wedge pushes rejected
-/// forever. Mirrors [`garret_server::inflight::Claim`]'s drop-releases
-/// pattern.
-struct ClearOnDrop<'a>(&'a AppState);
-
-impl Drop for ClearOnDrop<'_> {
-    fn drop(&mut self) {
-        self.0.quiescing.store(false, Ordering::SeqCst);
-    }
 }
 
 #[cfg(test)]
@@ -411,34 +385,5 @@ mod tests {
             sigs: vec![],
             pushed_by: None,
         }
-    }
-
-    #[tokio::test]
-    async fn a_drain_that_finishes_in_time_reports_success() {
-        let in_flight = InFlight::new();
-        assert!(
-            wait_for_drain(
-                &in_flight,
-                Duration::from_millis(200),
-                Duration::from_millis(10)
-            )
-            .await
-        );
-    }
-
-    #[tokio::test]
-    async fn a_drain_that_never_finishes_times_out() {
-        let in_flight = InFlight::new();
-        let _claim = in_flight
-            .claim("a", garret_server::inflight::Kind::Upload)
-            .unwrap();
-        assert!(
-            !wait_for_drain(
-                &in_flight,
-                Duration::from_millis(100),
-                Duration::from_millis(10)
-            )
-            .await
-        );
     }
 }
