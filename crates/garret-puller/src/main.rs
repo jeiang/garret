@@ -51,8 +51,6 @@ struct AppState {
     bumps: Bumps,
     db_read_budget: Duration,
     presign_budget: Duration,
-    /// The last deep-readiness answer and when it was taken; see
-    /// [`cached_probe`].
     read_probe: ProbeCache,
     /// Fetches the probe's presigned URL, as a substituter would.
     http: reqwest::Client,
@@ -73,16 +71,14 @@ const BUMP_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// their next hit.
 const BUMP_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Last-accessed bumps waiting for the next flush (spec 02). A set, so a
-/// burst of hits on one hash is one write. Only hits on stale rows are
-/// queued, so it is bounded by the object count.
+/// Last-accessed bumps waiting for the next flush (spec 02). Only hits on
+/// stale rows are queued, so it is bounded by the object count.
 #[derive(Default)]
 struct Bumps(Mutex<HashSet<String>>);
 
 impl Bumps {
-    /// Called on every narinfo hit with the `last_accessed_at` the read
-    /// already fetched. A fresh row, which is nearly every hit, costs no
-    /// write at all: not even the WAL write lock a no-op UPDATE would take.
+    /// A fresh row, which is nearly every hit, costs no write at all: not
+    /// even the WAL write lock a no-op UPDATE would take.
     fn hit(&self, hash: &str, last_accessed_at: i64, now: i64, debounce: i64) {
         if last_accessed_at >= now - debounce {
             metrics::counter!("garret_bump_debounced_total").increment(1);
@@ -96,9 +92,6 @@ impl Bumps {
         metrics::gauge!("garret_bump_queue_depth").set(pending.len() as f64);
     }
 
-    /// Writes everything queued so far on `conn`, the Puller's dedicated bump
-    /// connection, and returns how many hashes it wrote. Blocking: callers
-    /// run it on the blocking pool, never on the pull-path connection.
     fn flush(&self, conn: &mut rusqlite::Connection, now: i64, debounce: i64) -> Result<usize> {
         let batch = {
             let mut pending = self.0.lock();
@@ -113,8 +106,6 @@ impl Bumps {
     }
 }
 
-/// Flushes queued bumps every [`BUMP_FLUSH_INTERVAL`] for the life of the
-/// process. A failed flush drops its batch; see [`BUMP_BUSY_TIMEOUT`].
 async fn flush_bumps(state: Arc<AppState>, conn: Conn) {
     let mut tick = tokio::time::interval(BUMP_FLUSH_INTERVAL);
     loop {
@@ -171,19 +162,17 @@ impl Degraded {
 /// Degrade to a miss (ticket 25). A substituter's contract is bounded latency
 /// and harmless failure: nix handles a 404 natively (try the next
 /// substituter, build locally), while a hang stalls builds fleet-wide and a
-/// 500 is noise it isn't built for. Counted by reason so degradation is
-/// observable, never silent.
+/// 500 is noise it isn't built for.
 fn degraded_miss(degraded: Degraded) -> Response {
     metrics::counter!("garret_degraded_total", "reason" => degraded.reason()).increment(1);
     StatusCode::NOT_FOUND.into_response()
 }
 
-/// Runs `run` on `conn` on the blocking pool once the connection's lock is
-/// free, recording the wait as `garret_db_lock_wait_seconds`. The statement
-/// is sync rusqlite, so off the async workers a wedged one (or one queued
-/// behind it) delays only this future, which a budget can abandon: queued,
-/// it never runs; running, it keeps its blocking thread and the connection
-/// until it returns.
+/// Records the wait for `conn`'s lock as `garret_db_lock_wait_seconds`, then
+/// runs `run` on the blocking pool. Off the async workers a wedged statement
+/// (or one queued behind it) delays only this future, which a budget can
+/// abandon: queued, it never runs; running, it keeps its blocking thread and
+/// the connection until it returns.
 async fn on_conn<T, F>(conn: Conn, which: &'static str, run: F) -> anyhow::Result<T>
 where
     F: FnOnce(&mut rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
@@ -198,7 +187,7 @@ where
 }
 
 /// A pull-path database read under the configured budget (ticket 25),
-/// queueing for the connection included. A failed read is logged here.
+/// queueing for the connection included.
 async fn db_read<T, F>(conn: Conn, budget: Duration, read: F) -> Result<T, Degraded>
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
@@ -228,8 +217,6 @@ enum Outcome {
     Junk,
 }
 
-/// The response for `outcome`, counted on `counter` (spec 08): a hit, or a
-/// miss for anything else but junk.
 fn counted(counter: &'static str, outcome: Outcome) -> Response {
     let (label, response) = match outcome {
         Outcome::Hit(response) => ("hit", response),
@@ -242,7 +229,6 @@ fn counted(counter: &'static str, outcome: Outcome) -> Response {
     response
 }
 
-/// The substituter routes: narinfo and NAR.
 fn pull_routes() -> Router<Arc<AppState>> {
     Router::new()
         // axum 0.8 wants whole-segment params, so the suffix is split here.
@@ -396,8 +382,6 @@ async fn narinfo(state: &AppState, file: &str) -> Outcome {
     };
     match db_read(db.pull.clone(), state.db_read_budget, read).await {
         Ok(Some((obj, last_accessed_at))) => {
-            // Queued, never written here: LRU only needs day granularity, so
-            // a bump must never sit on the request path (spec 02-database).
             state
                 .bumps
                 .hit(hash, last_accessed_at, now(), state.bump_debounce);
@@ -502,8 +486,6 @@ async fn probe_read(state: &AppState, conn: Conn) -> Result<(), String> {
     match response.status() {
         status if status.is_success() => Ok(()),
         status => {
-            // Upstream S3 error code / request id help diagnosis; the URL
-            // itself (a live signature) is never included.
             let request_id = response
                 .headers()
                 .get("x-amz-request-id")
@@ -533,7 +515,6 @@ async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
     let Some(db) = state.db() else {
         return Outcome::Unavailable;
     };
-    // Only redirect to blobs we have a row for — row exists ⇒ blob exists.
     let read = {
         let hash = hash.to_owned();
         move |conn: &rusqlite::Connection| {
@@ -566,8 +547,6 @@ async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
     }
 }
 
-/// Pocket ID only, and only here — narinfo and NAR stay anonymous so any
-/// machine's nix.conf works untouched (spec 04-auth).
 async fn require_browse_oidc(
     State(authenticator): State<Arc<Authenticator>>,
     mut request: axum::extract::Request,
@@ -610,11 +589,6 @@ fn default_limit() -> usize {
     50
 }
 
-/// Answers a browse route (spec 07): `read` on the browse connection, one
-/// query at a time and never on the pull-path connection, so a big tree walk
-/// or a full-scan search cannot delay a narinfo read. Rendered as JSON;
-/// `None` is a 404. Over [`BROWSE_BUDGET`] it answers 503; the abandoned
-/// query keeps the connection until it returns.
 async fn browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Option<T>> + Send + 'static,
@@ -747,8 +721,8 @@ mod tests {
     }
 
     /// Nearly every hit is on a fresh row, and it must not write: not even
-    /// take the WAL write lock, which is what starved the Pusher. Proved
-    /// against a Pusher holding that lock, where any write attempt fails busy.
+    /// take the WAL write lock the Pusher needs. Proved against a Pusher
+    /// holding that lock, where any write attempt fails busy.
     #[test]
     fn a_debounced_hit_performs_no_write() {
         let dir = scratch_dir();
