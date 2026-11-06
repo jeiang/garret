@@ -61,7 +61,7 @@ pub async fn run(
         now(),
         verify_sizes,
     );
-    let known: HashSet<String> = db_rows.iter().map(|r| r.0.clone()).collect();
+    let known: HashSet<String> = db_rows.iter().map(|r| r.store_path_hash.clone()).collect();
     let orphans = gc::orphan_keys(&blobs, &known, &state.in_flight, grace);
 
     metrics::gauge!("garret_fsck_findings", "kind" => "dangling").set(dangling.len() as f64);
@@ -92,7 +92,7 @@ pub async fn run(
 /// in flight, older than the grace). A hash with a size mismatch is never
 /// also reported dangling.
 fn classify_rows(
-    db_rows: &[(String, String, i64, i64)],
+    db_rows: &[db::ObjectBrief],
     blobs: &[(String, Duration, i64)],
     in_flight: &InFlight,
     grace: Duration,
@@ -106,25 +106,26 @@ fn classify_rows(
 
     let mut dangling = Vec::new();
     let mut size_mismatches = Vec::new();
-    for (hash, name, created_at, file_size) in db_rows {
+    for row in db_rows {
+        let hash = &row.store_path_hash;
         // Both findings get both guards: a row in flight or younger than the
         // grace may be an upload overwriting an orphan blob of another size
         // since the S3 listing, not drift.
-        if in_flight.contains(hash) || now - created_at < grace.as_secs() as i64 {
+        if in_flight.contains(hash) || now - row.created_at < grace.as_secs() as i64 {
             continue;
         }
         match s3_sizes.get(hash.as_str()) {
             None => {
                 dangling.push(FsckRow {
                     store_path_hash: hash.clone(),
-                    name: name.clone(),
+                    name: row.name.clone(),
                 });
             }
-            Some(&s3_size) if verify_sizes && s3_size != *file_size => {
+            Some(&s3_size) if verify_sizes && s3_size != row.file_size => {
                 size_mismatches.push(FsckSizeMismatch {
                     store_path_hash: hash.clone(),
-                    name: name.clone(),
-                    db_size: *file_size,
+                    name: row.name.clone(),
+                    db_size: row.file_size,
                     s3_size,
                 });
             }
@@ -143,13 +144,13 @@ fn classify_rows(
 /// deleted.
 fn apply_repair(
     conn: &Arc<Mutex<Connection>>,
-    listed: &[(String, String, i64, i64)],
+    listed: &[db::ObjectBrief],
     dangling: &[FsckRow],
     size_mismatches: &[FsckSizeMismatch],
 ) -> Result<usize> {
     let listed: HashMap<&str, i64> = listed
         .iter()
-        .map(|(hash, _, created_at, _)| (hash.as_str(), *created_at))
+        .map(|row| (row.store_path_hash.as_str(), row.created_at))
         .collect();
     let listed = &listed;
     let dangling = repair_rows(
@@ -216,8 +217,13 @@ impl Drop for ClearOnDrop<'_> {
 mod tests {
     use super::*;
 
-    fn row(hash: &str, name: &str, created_at: i64, file_size: i64) -> (String, String, i64, i64) {
-        (hash.to_string(), name.to_string(), created_at, file_size)
+    fn row(hash: &str, name: &str, created_at: i64, file_size: i64) -> db::ObjectBrief {
+        db::ObjectBrief {
+            store_path_hash: hash.to_string(),
+            name: name.to_string(),
+            created_at,
+            file_size,
+        }
     }
 
     fn blob(hash: &str, age_secs: u64, size: i64) -> (String, Duration, i64) {

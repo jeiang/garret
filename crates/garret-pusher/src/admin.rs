@@ -219,9 +219,12 @@ async fn delete_pushed_by(
         pushed_by(&conn, subject, since)?
     };
     let bytes_freed = if dry_run {
-        matched.iter().map(|(_, _, size)| size).sum()
+        matched.iter().map(|row| row.file_size).sum()
     } else {
-        let hashes: Vec<String> = matched.iter().map(|(hash, _, _)| hash.clone()).collect();
+        let hashes: Vec<String> = matched
+            .iter()
+            .map(|row| row.store_path_hash.clone())
+            .collect();
         let Response::Delete {
             bytes_freed,
             missing,
@@ -232,7 +235,7 @@ async fn delete_pushed_by(
         };
         // Gone between the listing and the delete (GC got there first): not
         // deleted by this command, so not reported as such.
-        matched.retain(|(hash, _, _)| !missing.contains(hash));
+        matched.retain(|row| !missing.contains(&row.store_path_hash));
         tracing::info!(
             subject,
             since,
@@ -245,28 +248,29 @@ async fn delete_pushed_by(
     Ok(Response::DeletePushedBy {
         objects: matched
             .into_iter()
-            .map(|(hash, name, _)| format!("{hash}-{name}"))
+            .map(|row| format!("{}-{}", row.store_path_hash, row.name))
             .collect(),
         bytes_freed,
     })
 }
 
-/// `(hash, name, file_size)` of every object first pushed by `subject`, at or
-/// after `since` when given. Exact match: a subject is `<issuer>#<sub>`, and
-/// a prefix of one GitHub ref's subject can be another's.
+/// Every object first pushed by `subject`, at or after `since` when given.
+/// Exact match: a subject is `<issuer>#<sub>`, and a prefix of one GitHub
+/// ref's subject can be another's.
 fn pushed_by(
     conn: &rusqlite::Connection,
     subject: &str,
     since: Option<i64>,
-) -> Result<Vec<(String, String, i64)>> {
+) -> Result<Vec<db::ObjectBrief>> {
     let mut stmt = conn.prepare(
-        "SELECT store_path_hash, name, file_size FROM objects
+        "SELECT store_path_hash, name, created_at, file_size FROM objects
          WHERE pushed_by = ?1 AND created_at >= ?2
          ORDER BY created_at, store_path_hash",
     )?;
-    let rows = stmt.query_map(rusqlite::params![subject, since.unwrap_or(i64::MIN)], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![subject, since.unwrap_or(i64::MIN)],
+        db::ObjectBrief::from_row,
+    )?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -280,18 +284,21 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
         if dry_run {
             Ok((doomed, Vec::new()))
         } else {
-            let hashes: Vec<&str> = doomed.iter().map(|(hash, _, _)| hash.as_str()).collect();
+            let hashes: Vec<&str> = doomed
+                .iter()
+                .map(|row| row.store_path_hash.as_str())
+                .collect();
             let claims = claim_deletions(&in_flight, &hashes)?;
             db::delete_pruned(conn, &doomed)?;
             Ok((doomed, claims))
         }
     })
     .await?;
-    let bytes_freed = pruned.iter().map(|(_, _, size)| size).sum();
+    let bytes_freed = pruned.iter().map(|row| row.file_size).sum();
     if !dry_run {
         let keys: Vec<String> = pruned
             .iter()
-            .map(|(hash, _, _)| garret_server::storage::key_for(hash))
+            .map(|row| garret_server::storage::key_for(&row.store_path_hash))
             .collect();
         state.storage.delete_objects(&keys).await?;
         drop(claims);
@@ -305,7 +312,7 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
     Ok(Response::Prune {
         pruned: pruned
             .into_iter()
-            .map(|(hash, name, _)| format!("{hash}-{name}"))
+            .map(|row| format!("{}-{}", row.store_path_hash, row.name))
             .collect(),
         bytes_freed,
     })
@@ -495,9 +502,9 @@ mod tests {
             pushed_by(&conn, leaked, since)
                 .unwrap()
                 .into_iter()
-                .map(|(hash, name, size)| {
-                    assert_eq!((name.as_str(), size), ("thing", 5));
-                    hash
+                .map(|row| {
+                    assert_eq!((row.name.as_str(), row.file_size), ("thing", 5));
+                    row.store_path_hash
                 })
                 .collect()
         };
