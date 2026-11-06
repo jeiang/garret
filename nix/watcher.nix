@@ -78,7 +78,7 @@ in
     pollIntervalSeconds = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Seconds between polls of the nix database."; };
     jobs = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Concurrent uploads."; };
     zstdLevel = mkOption { type = types.nullOr types.int; default = null; description = "Client-side zstd level."; };
-    maxRetries = mkOption { type = types.nullOr types.int; default = null; description = "Upload attempts per path beyond the first, for 5xx answers and dropped connections."; };
+    maxRetries = mkOption { type = types.nullOr types.ints.unsigned; default = null; description = "Upload attempts per path beyond the first, for 5xx answers and dropped connections."; };
     maxAttempts = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Push attempts per path in one watcher process before it leaves the path on the failed list for a restart or drain."; };
 
     socketPath = mkOption {

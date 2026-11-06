@@ -134,7 +134,8 @@ struct PullArgs {
 }
 
 /// Where the numbers came from. `label` is the comparison key: the diff
-/// script refuses to silently compare across labels.
+/// script refuses to silently compare across labels, and refuses outright
+/// across corpus versions.
 #[derive(Debug, Serialize)]
 struct Meta {
     os: &'static str,
@@ -142,17 +143,15 @@ struct Meta {
     cpus: usize,
     label: String,
     seed: u64,
+    corpus_version: u32,
     version: &'static str,
     timestamp_unix: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 struct Output {
-    #[serde(skip_serializing_if = "Option::is_none")]
     push: Option<PushResults>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<Vec<StreamResult>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pull: Option<Vec<PullResults>>,
 }
 
@@ -252,6 +251,7 @@ async fn main() -> Result<()> {
             .clone()
             .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)),
         seed: cli.seed,
+        corpus_version: corpus::VERSION,
         version: env!("CARGO_PKG_VERSION"),
         timestamp_unix: timestamp,
     };
@@ -352,7 +352,9 @@ async fn run_push(
         cli.seed
     );
 
-    let counters = Arc::new(Counters::default());
+    // Retries are counted per phase: the baseline's must not show up in the
+    // loaded results.
+    let baseline_counters = Counters::default();
 
     // Baseline first, one at a time, over the same corpus under different
     // keys: same sizes and compressibility, so the medians are comparable and
@@ -367,7 +369,7 @@ async fn run_push(
             token,
             entry,
             args.zstd_level,
-            &counters,
+            &baseline_counters,
         )
         .await?;
         // Floored at 1 ms: the ratio below divides by this.
@@ -381,7 +383,7 @@ async fn run_push(
         baseline.len()
     );
 
-    counters.wire.store(0, Ordering::Relaxed);
+    let counters = Arc::new(Counters::default());
     let started = Instant::now();
 
     let latencies: Vec<(usize, Option<Duration>)> = stream::iter(entries.into_iter().enumerate())
@@ -735,6 +737,14 @@ async fn put_with_retry(
 /// Largest zstd block, and the window the frame header declares.
 const RAW_BLOCK: usize = 128 * 1024;
 
+/// The frame header's window descriptor for a window of exactly
+/// [`RAW_BLOCK`] bytes: exponent above 2^10 in the top five bits, no
+/// mantissa (RFC 8878 section 3.1.1.1.2).
+const WINDOW_DESCRIPTOR: u8 = {
+    assert!(RAW_BLOCK.is_power_of_two());
+    ((RAW_BLOCK.trailing_zeros() - 10) << 3) as u8
+};
+
 /// Wraps NAR chunks, each at most [`RAW_BLOCK`], in one zstd frame of raw
 /// (stored) blocks. The Pusher decompresses and verifies it like any other
 /// frame, but building it costs this client none of the CPU that
@@ -746,9 +756,8 @@ fn raw_zstd_frame(chunks: impl Iterator<Item = Vec<u8>>) -> impl Iterator<Item =
     fn block(len: usize, last: bool) -> Vec<u8> {
         (((len as u32) << 3) | u32::from(last)).to_le_bytes()[..3].to_vec()
     }
-    // Magic, a descriptor with no content size or checksum, and a window
-    // descriptor of 2^17 bytes (one block).
-    let header = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38];
+    // Magic, a descriptor with no content size or checksum, and the window.
+    let header = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, WINDOW_DESCRIPTOR];
     std::iter::once(header)
         .chain(chunks.flat_map(|c| [block(c.len(), false), c]))
         .chain(std::iter::once(block(0, true)))
@@ -787,4 +796,19 @@ fn upload_url(endpoint: &str, entry: &corpus::Entry) -> String {
         "{endpoint}{}",
         wire::with_hash(wire::NAR_UPLOAD, &entry.hash)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_zstd_frame_decodes_to_its_chunks() {
+        let entry = corpus::stream_entry(1, 3 * RAW_BLOCK + 17, 0, 0);
+        let chunks: Vec<Vec<u8>> = entry.chunks(RAW_BLOCK).collect();
+        let frame: Vec<u8> = raw_zstd_frame(chunks.clone().into_iter())
+            .flatten()
+            .collect();
+        assert_eq!(zstd::decode_all(&frame[..]).unwrap(), chunks.concat());
+    }
 }

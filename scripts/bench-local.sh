@@ -18,22 +18,18 @@ start_garage 20G
 make_signing_key
 mint_dev_tokens
 
-# Default limits (part size, parts in flight, 256 MiB in-flight cap) are what the
-# RSS criterion is measured against (spec 09 scenario 1: peak RSS < 2x
-# max_in_flight_bytes). The one override: the default max_concurrent_uploads
-# (16) is below the 20 pushers, which would shed uploads with 429 and measure
-# the retry path, so it is raised. GARRET_IN_FLIGHT_CAP overrides the in-flight
-# cap so a memory-limited sandbox can size the Pusher to its box, exactly as a
-# real deployment would. No [gc]: eviction mid-benchmark would measure the
-# sweep, not the push path.
-in_flight_cap=${GARRET_IN_FLIGHT_CAP:-268435456} # 256 MiB, the default
-limits="[limits]
-max_concurrent_uploads = 32"
-if [ -n "${GARRET_IN_FLIGHT_CAP:-}" ]; then
-  limits="$limits
+# The RSS criterion (spec 09 scenario 1: peak RSS < 2x max_in_flight_bytes) is
+# measured against the in-flight cap this script writes, so the budget and the
+# Pusher always agree. GARRET_IN_FLIGHT_CAP sets it so a memory-limited sandbox
+# can size the Pusher to its box, exactly as a real deployment would.
+# max_concurrent_uploads is raised above the 20 pushers: shedding with 429
+# would measure the retry path. Part size and parts in flight keep the Pusher's
+# defaults. No [gc]: eviction mid-benchmark would measure the sweep, not the
+# push path.
+in_flight_cap=${GARRET_IN_FLIGHT_CAP:-268435456} # 256 MiB
+write_configs "[limits]
+max_concurrent_uploads = 32
 max_in_flight_bytes = $in_flight_cap"
-fi
-write_configs "$limits"
 build_binaries release garret-pusher garret-puller garret-bench
 start_services
 
