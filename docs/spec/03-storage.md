@@ -130,7 +130,9 @@ The Puller **does not proxy NAR bytes**. `GET /nar/<hash>.nar.zst`
 answers `307 Temporary Redirect` with a presigned S4 URL (TTL configurable, default 1 h);
 the client fetches bytes directly from S4, which serves Range requests
 itself. Narinfo is still served by the Puller — it holds the signatures
-— so the substituter surface is unchanged from a client's view.
+— so the substituter surface is unchanged from a client's view. A file
+name that is not a store hash's (32 nix-base32 characters, then
+`.narinfo` or `.nar.zst`) answers 404 without a database read.
 
 Rationale: with a remote store, proxying crosses the host's uplink twice
 per byte served. Redirecting removes the Puller from the byte path
