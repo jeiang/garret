@@ -15,12 +15,12 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
-use garret_common::{is_store_hash, wire};
+use garret_common::{is_store_hash, unix_now, wire};
 use garret_server::{
     auth::{self, Authenticator, Rejection},
     browse,
     config::{IssuerConfig, PullerConfig},
-    db, metrics as garret_metrics, narinfo, now,
+    db, metrics as garret_metrics, narinfo,
     storage::{self, Storage},
 };
 use parking_lot::Mutex;
@@ -112,7 +112,7 @@ async fn flush_bumps(state: Arc<AppState>, conn: Conn) {
         tick.tick().await;
         let state = state.clone();
         let flushed = on_conn(conn.clone(), "bump", move |conn| {
-            state.bumps.flush(conn, now(), state.bump_debounce)
+            state.bumps.flush(conn, unix_now(), state.bump_debounce)
         })
         .await;
         let Err(e) = flushed else { continue };
@@ -384,7 +384,7 @@ async fn narinfo(state: &AppState, file: &str) -> Outcome {
         Ok(Some((obj, last_accessed_at))) => {
             state
                 .bumps
-                .hit(hash, last_accessed_at, now(), state.bump_debounce);
+                .hit(hash, last_accessed_at, unix_now(), state.bump_debounce);
             Outcome::Hit(
                 (
                     [(header::CONTENT_TYPE, "text/x-nix-narinfo")],
@@ -716,7 +716,7 @@ mod tests {
         let mut conn = state.db().unwrap().pull.lock().await;
         state
             .bumps
-            .flush(&mut conn, now(), state.bump_debounce)
+            .flush(&mut conn, unix_now(), state.bump_debounce)
             .unwrap()
     }
 
@@ -731,7 +731,7 @@ mod tests {
         let mut pusher = db::open(path, true).unwrap();
         db::migrate(&pusher).unwrap();
         let hash = "a".repeat(32);
-        db::insert_object(&mut pusher, &object(&hash), now()).unwrap();
+        db::insert_object(&mut pusher, &object(&hash), unix_now()).unwrap();
         let puller = db::open(path, false).unwrap();
         puller.busy_timeout(Duration::from_millis(10)).unwrap();
         let state = state_with_db(puller).await;

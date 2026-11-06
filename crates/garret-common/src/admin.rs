@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Where `garret-admin` looks for the Pusher's admin socket by default.
+pub const DEFAULT_ADMIN_SOCKET: &str = "/run/garret/admin.sock";
+
 /// A command sent by `garret-admin` to the Pusher's admin socket.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -56,7 +59,8 @@ pub enum Request {
     /// newer push or a live pin still needs (spec 05).
     Prune {
         /// Unix time; objects last pushed before it are candidates. Must be
-        /// at least a day ago, so a push in progress keeps its closure.
+        /// at least [`crate::PUSH_GRACE`] ago, so a push in progress keeps its
+        /// closure.
         before: i64,
         /// Report what would go without deleting anything.
         dry_run: bool,
@@ -150,24 +154,7 @@ pub enum Response {
         removed: bool,
     },
     /// Audit findings and repairs.
-    Fsck {
-        /// Rows with no matching blob, past the in-flight and age guards.
-        dangling: Vec<FsckRow>,
-        /// Rows whose blob exists but disagrees on size (`--verify-sizes`
-        /// only) — a third category, not double-reported as dangling.
-        size_mismatches: Vec<FsckSizeMismatch>,
-        /// Blob keys with no matching row, past the same guards. Informational
-        /// only: the existing orphan sweep owns deleting these, on its own
-        /// schedule.
-        orphans: Vec<String>,
-        /// Rows actually deleted this run (dangling + size-mismatch
-        /// combined). Zero unless the request asked for a repair.
-        repaired: usize,
-        /// `None` unless the request was [`Repair::Quiesced`]; then whether
-        /// in-flight uploads reached zero within the timeout. `Some(false)`
-        /// means the drain timed out and no repair happened.
-        quiesce_drained: Option<bool>,
-    },
+    Fsck(FsckReport),
     /// What was, or on a dry run would be, pruned.
     Prune {
         /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
@@ -192,6 +179,38 @@ pub enum Response {
         /// Human-readable description of what went wrong.
         message: String,
     },
+}
+
+/// What [`Request::Fsck`] found and repaired.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
+pub struct FsckReport {
+    /// Rows with no matching blob, past the in-flight and age guards.
+    pub dangling: Vec<FsckRow>,
+    /// Rows whose blob exists but disagrees on size (`--verify-sizes`
+    /// only) — a third category, not double-reported as dangling.
+    pub size_mismatches: Vec<FsckSizeMismatch>,
+    /// Blob keys with no matching row, past the same guards. Informational
+    /// only: the existing orphan sweep owns deleting these, on its own
+    /// schedule.
+    pub orphans: Vec<String>,
+    /// Rows actually deleted this run (dangling + size-mismatch
+    /// combined). Zero unless the request asked for a repair.
+    pub repaired: usize,
+    /// `None` unless the request was [`Repair::Quiesced`]; then whether
+    /// in-flight uploads reached zero within the timeout. `Some(false)`
+    /// means the drain timed out and no repair happened.
+    pub quiesce_drained: Option<bool>,
+}
+
+impl FsckReport {
+    /// Whether `garret-admin fsck` exits zero (spec 10): no dangling or
+    /// size-mismatched rows and no timed-out quiesce. Orphans alone stay
+    /// informational: the orphan sweep owns them on its own schedule.
+    pub fn ok(&self) -> bool {
+        self.dangling.is_empty()
+            && self.size_mismatches.is_empty()
+            && self.quiesce_drained != Some(false)
+    }
 }
 
 /// A dangling row: a store path with no matching blob (spec 02).
@@ -367,7 +386,7 @@ mod tests {
                 r#"{"unpin":{"removed":false}}"#.to_owned(),
             ),
             (
-                Response::Fsck {
+                Response::Fsck(FsckReport {
                     dangling: vec![FsckRow {
                         store_path_hash: hash.clone(),
                         name: "x".into(),
@@ -381,30 +400,30 @@ mod tests {
                     orphans: vec!["nar/k.nar.zst".into()],
                     repaired: 2,
                     quiesce_drained: Some(true),
-                },
+                }),
                 format!(
                     r#"{{"fsck":{{"dangling":[{{"store_path_hash":"{hash}","name":"x"}}],"size_mismatches":[{{"store_path_hash":"{hash}","name":"y","db_size":5,"s3_size":6}}],"orphans":["nar/k.nar.zst"],"repaired":2,"quiesce_drained":true}}}}"#
                 ),
             ),
             (
-                Response::Fsck {
+                Response::Fsck(FsckReport {
                     dangling: vec![],
                     size_mismatches: vec![],
                     orphans: vec![],
                     repaired: 0,
                     quiesce_drained: Some(false),
-                },
+                }),
                 r#"{"fsck":{"dangling":[],"size_mismatches":[],"orphans":[],"repaired":0,"quiesce_drained":false}}"#
                     .to_owned(),
             ),
             (
-                Response::Fsck {
+                Response::Fsck(FsckReport {
                     dangling: vec![],
                     size_mismatches: vec![],
                     orphans: vec![],
                     repaired: 0,
                     quiesce_drained: None,
-                },
+                }),
                 r#"{"fsck":{"dangling":[],"size_mismatches":[],"orphans":[],"repaired":0,"quiesce_drained":null}}"#
                     .to_owned(),
             ),
@@ -435,6 +454,43 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&response).unwrap(), wire);
             assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), response);
+        }
+    }
+
+    #[test]
+    fn fsck_fails_on_dangling_size_mismatch_or_timed_out_quiesce_but_not_orphans() {
+        let clean = FsckReport {
+            dangling: vec![],
+            size_mismatches: vec![],
+            orphans: vec!["nar/k.nar.zst".into()],
+            repaired: 0,
+            quiesce_drained: Some(true),
+        };
+        assert!(clean.ok(), "orphans alone must not fail fsck");
+        let row = || FsckRow {
+            store_path_hash: "a".repeat(32),
+            name: "x".into(),
+        };
+        for bad in [
+            FsckReport {
+                dangling: vec![row()],
+                ..clean.clone()
+            },
+            FsckReport {
+                size_mismatches: vec![FsckSizeMismatch {
+                    store_path_hash: "a".repeat(32),
+                    name: "x".into(),
+                    db_size: 1,
+                    s3_size: 2,
+                }],
+                ..clean.clone()
+            },
+            FsckReport {
+                quiesce_drained: Some(false),
+                ..clean.clone()
+            },
+        ] {
+            assert!(!bad.ok(), "{bad:?}");
         }
     }
 }

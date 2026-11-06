@@ -146,6 +146,17 @@ pub fn human_bytes(bytes: i64) -> String {
     }
 }
 
+/// Seconds a Negotiation protects the paths it reported present: neither GC
+/// nor prune removes an object pushed more recently (spec 05).
+pub const PUSH_GRACE: i64 = 86400;
+
+/// Current unix time in seconds; 0 if the clock reads before the epoch.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

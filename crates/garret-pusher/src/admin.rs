@@ -108,7 +108,7 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             expires_at,
         } => {
             crate::db_run(&state.conn, move |conn| {
-                db::pin(conn, &name, &hash, expires_at, garret_server::now())
+                db::pin(conn, &name, &hash, expires_at, garret_common::unix_now())
                     .map(|()| Response::Pin)
             })
             .await
@@ -318,7 +318,7 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
     let in_flight = state.in_flight.clone();
     // One closure, so listing and deleting stay atomic under the lock.
     let (pruned, deletion) = crate::db_run(&state.conn, move |conn| {
-        let doomed = db::prunable(conn, before, garret_server::now())?;
+        let doomed = db::prunable(conn, before, garret_common::unix_now())?;
         if dry_run {
             return Ok((doomed, None));
         }
@@ -573,7 +573,7 @@ mod tests {
         db::insert_object(&mut conn, &object(&a), 100).unwrap();
         let state = test_state(conn).await;
         let _gc = state.in_flight.claim_delete(&a).unwrap();
-        let before = garret_server::now() - 2 * db::PUSH_GRACE;
+        let before = garret_common::unix_now() - 2 * db::PUSH_GRACE;
 
         let Response::Prune { pruned, .. } = prune(&state, before, true).await.unwrap() else {
             panic!("not a prune response");

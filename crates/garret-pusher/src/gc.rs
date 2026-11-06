@@ -8,11 +8,11 @@ use std::{
 };
 
 use anyhow::Result;
+use garret_common::unix_now;
 use garret_server::{
     config::GcConfig,
     db,
     inflight::InFlight,
-    now,
     storage::{self, Storage},
 };
 use parking_lot::Mutex;
@@ -108,7 +108,7 @@ impl Gc {
         metrics::gauge!("garret_gc_low_watermark_bytes").set(self.cfg.low() as f64);
 
         if usage < self.cfg.high() {
-            metrics::gauge!("garret_gc_last_success_timestamp").set(now() as f64);
+            metrics::gauge!("garret_gc_last_success_timestamp").set(unix_now() as f64);
             return Ok(());
         }
         self.run().await.map(drop)
@@ -131,7 +131,7 @@ impl Gc {
         let mut usage = crate::db_run(&self.conn, |conn| db::reconcile_total_bytes(conn)).await?;
 
         while usage > low {
-            let at = now();
+            let at = unix_now();
             let candidates =
                 crate::db_run(&self.conn, move |conn| db::evictable(conn, BATCH, at)).await?;
             if candidates.is_empty() {
@@ -183,7 +183,7 @@ impl Gc {
         metrics::counter!("garret_gc_evicted_objects_total").increment(result.evicted as u64);
         metrics::counter!("garret_gc_evicted_bytes_total").increment(result.bytes_freed as u64);
         metrics::histogram!("garret_gc_pass_duration_seconds").record(started.elapsed());
-        metrics::gauge!("garret_gc_last_success_timestamp").set(now() as f64);
+        metrics::gauge!("garret_gc_last_success_timestamp").set(unix_now() as f64);
         metrics::gauge!("garret_gc_usage_bytes").set(usage as f64);
         tracing::info!(
             evicted = result.evicted,
@@ -235,7 +235,7 @@ impl Gc {
 
         metrics::counter!("garret_gc_orphans_deleted_total").increment(count as u64);
         metrics::counter!("garret_gc_stale_multiparts_aborted_total").increment(aborted as u64);
-        metrics::gauge!("garret_gc_last_sweep_timestamp_seconds").set(now() as f64);
+        metrics::gauge!("garret_gc_last_sweep_timestamp_seconds").set(unix_now() as f64);
         if count > 0 || aborted > 0 {
             tracing::info!(
                 orphans = count,
@@ -381,7 +381,7 @@ mod tests {
         let mut conn = crate::tests::open_db();
         let d = "d".repeat(32);
         db::insert_object(&mut conn, &object(&d).sized(100), 0).unwrap();
-        let reported = db::missing(&mut conn, std::slice::from_ref(&d), now()).unwrap();
+        let reported = db::missing(&mut conn, std::slice::from_ref(&d), unix_now()).unwrap();
         assert!(reported.is_empty(), "d should be reported present");
         let gc = Gc::new(
             Arc::new(Mutex::new(conn)),

@@ -353,10 +353,7 @@ async fn main() -> Result<()> {
             }
             let pins: Vec<wire::Pin> =
                 serde_json::from_value(raw).context("parsing the pin list")?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
+            let now = garret_common::unix_now();
             for pin in &pins {
                 let expiry = match pin.expires_at {
                     None => "permanent".to_owned(),
@@ -509,7 +506,7 @@ async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> 
 
     let issuer = cfg.oidc.issuer.as_deref();
     let expires_at = claims.exp.map(|exp| {
-        let remaining = exp - now();
+        let remaining = exp - garret_common::unix_now();
         format!("{exp} ({})", human_duration(remaining))
     });
 
@@ -600,13 +597,6 @@ async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(
         .context("set `puller_endpoint` in the config: list/tree query the Puller")?;
     let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
     Ok((puller, token))
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Relative time for a token expiry; the JSON output keeps the raw epoch.

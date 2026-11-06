@@ -9,8 +9,11 @@ use std::{
 };
 
 use anyhow::Result;
-use garret_common::admin::{FsckRow, FsckSizeMismatch, Repair, Response};
-use garret_server::{db, inflight::InFlight, now, storage};
+use garret_common::{
+    admin::{FsckReport, FsckRow, FsckSizeMismatch, Repair, Response},
+    unix_now,
+};
+use garret_server::{db, inflight::InFlight, storage};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
@@ -55,7 +58,7 @@ pub async fn run(
         &blobs,
         &state.in_flight,
         grace,
-        now(),
+        unix_now(),
         verify_sizes,
     );
     let (dangling, size_mismatches) = to_wire(&findings);
@@ -78,13 +81,13 @@ pub async fn run(
         0
     };
 
-    Ok(Response::Fsck {
+    Ok(Response::Fsck(FsckReport {
         dangling,
         size_mismatches,
         orphans,
         repaired,
         quiesce_drained,
-    })
+    }))
 }
 
 /// A row fsck would repair, carrying the `created_at` it was listed with so
@@ -381,17 +384,17 @@ mod tests {
     async fn a_quiesce_that_cannot_drain_repairs_nothing() {
         let mut conn = crate::tests::open_db();
         let hash = "a".repeat(32);
-        db::insert_object(&mut conn, &object(&hash), now() - 2 * 86400).unwrap();
+        db::insert_object(&mut conn, &object(&hash), unix_now() - 2 * 86400).unwrap();
         let state = crate::tests::test_state_with_storage(conn, empty_bucket().await).await;
         let fsck = |repair| run(&state, GRACE, Duration::from_millis(50), false, repair);
 
         let upload = state.in_flight.claim(&"b".repeat(32)).unwrap();
-        let Response::Fsck {
+        let Response::Fsck(FsckReport {
             dangling,
             repaired,
             quiesce_drained,
             ..
-        } = fsck(Repair::Quiesced).await.unwrap()
+        }) = fsck(Repair::Quiesced).await.unwrap()
         else {
             panic!("not an fsck response");
         };
@@ -400,11 +403,11 @@ mod tests {
         assert!(db::exists(&state.conn.lock(), &hash).unwrap());
         drop(upload);
 
-        let Response::Fsck {
+        let Response::Fsck(FsckReport {
             repaired,
             quiesce_drained,
             ..
-        } = fsck(Repair::Live).await.unwrap()
+        }) = fsck(Repair::Live).await.unwrap()
         else {
             panic!("not an fsck response");
         };

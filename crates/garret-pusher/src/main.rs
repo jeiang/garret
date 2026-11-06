@@ -23,7 +23,7 @@ use axum::{
 };
 use futures::StreamExt;
 use garret_common::{
-    Preamble, is_store_hash, sha256_nix32, store_basename,
+    Preamble, is_store_hash, sha256_nix32, store_basename, unix_now,
     wire::{self, Discovery, Oidc, UploadAck},
 };
 use garret_server::{
@@ -33,7 +33,6 @@ use garret_server::{
     inflight::{self, InFlight},
     metrics as garret_metrics,
     narinfo::{self, SigningKeyFile},
-    now,
     storage::{self, Storage, UploadLimits},
 };
 use serde_json::json;
@@ -415,7 +414,7 @@ async fn missing_paths(
 ) -> Result<Json<Vec<String>>, Error> {
     let batch = hashes.len();
     let missing = db_run(&state.conn, move |conn| {
-        db::missing(conn, &hashes, garret_server::now())
+        db::missing(conn, &hashes, unix_now())
     })
     .await?;
     tracing::debug!(subject = %subject.0, batch, missing = missing.len(), "negotiation");
@@ -592,7 +591,7 @@ async fn store_upload(
     object.file_hash = sha256_nix32(&digest);
     object.file_size = file_size;
     object.sigs = narinfo::sign(&object, &state.store_dir, &state.keys)?;
-    let at = now();
+    let at = unix_now();
     // The claim moves into the blocking closure: a dropped handler future
     // (client gone) must not release the path while the insert can still
     // commit, or a delete could race the row it is about to remove.

@@ -803,7 +803,7 @@ wait_for pusher "$pusher_url/api/v1/missing-paths"
 # evicts. Backdated, it is ordinary LRU fodder again.
 admin gc run | tee "$root/gcrun-fresh.out"
 grep -q "evicted 0 object" "$root/gcrun-fresh.out"
-grep -q "pushed in the last day" "$root/gcrun-fresh.out"
+grep -q "pushed in the last 24 hours" "$root/gcrun-fresh.out"
 echo "  nothing inside the push grace was evicted"
 backdate "SELECT store_path_hash FROM objects"
 

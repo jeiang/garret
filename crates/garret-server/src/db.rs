@@ -171,7 +171,7 @@ const PUSHED_AT_DEBOUNCE: i64 = 3600;
 /// behind that Negotiation. Neither GC ([`evictable`]) nor prune ([`prunable`]) removes
 /// an object pushed more recently than this, which leaves a push up to 23
 /// hours long room to finish against a complete closure.
-pub const PUSH_GRACE: i64 = 86400;
+pub use garret_common::PUSH_GRACE;
 
 /// Applies the schema (idempotent `IF NOT EXISTS`). Pusher-only, like every
 /// other write.

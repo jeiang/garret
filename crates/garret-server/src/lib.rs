@@ -15,14 +15,6 @@ pub mod testing;
 
 use anyhow::Result;
 
-/// Current unix time in seconds, as stored in `created_at`/`last_accessed_at`.
-pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Reads and parses every configured signing key file, failing on the first
 /// unreadable or malformed one — a partial key set would sign with fewer keys
 /// than the rotation plan expects. A key readable by group or other is
