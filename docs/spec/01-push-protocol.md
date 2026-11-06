@@ -108,6 +108,8 @@ normal operation:
   upload now would lose its blob to the pending delete; by the retry the
   path is simply missing.
 - Completed → `201 {"status":"created"}`.
+- Any other `status` is a protocol error: the client fails that attempt
+  rather than counting the path as pushed.
 
 ## Parallelism and transport
 

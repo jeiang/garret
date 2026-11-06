@@ -148,7 +148,11 @@ pub fn render(obj: &Object) -> String {
     );
     // Writing to a String cannot fail.
     let _ = writeln!(out, "StorePath: {}", obj.store_path);
-    let _ = writeln!(out, "URL: nar/{}.nar.zst", obj.store_path_hash);
+    let _ = writeln!(
+        out,
+        "URL: {}",
+        garret_common::wire::nar_url(&obj.store_path_hash)
+    );
     out.push_str("Compression: zstd\n");
     let _ = writeln!(out, "FileHash: {}", obj.file_hash);
     let _ = writeln!(out, "FileSize: {}", obj.file_size);

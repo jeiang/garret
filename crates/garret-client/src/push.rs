@@ -14,7 +14,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use async_compression::{Level, tokio::bufread::ZstdEncoder, zstd::CParameter};
 use futures::{StreamExt, stream};
-use garret_common::{Preamble, hash_of_store_path};
+use garret_common::{
+    Preamble, hash_of_store_path,
+    wire::{self, UploadAck},
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressBarIter, ProgressStyle};
 use reqwest::{Body, StatusCode};
 use serde::Deserialize;
@@ -248,23 +251,6 @@ impl Outcome {
     }
 }
 
-/// What a successful upload attempt achieved: the server stored the path, or
-/// already held it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stored {
-    Pushed,
-    Deduped,
-}
-
-impl From<Stored> for Outcome {
-    fn from(stored: Stored) -> Self {
-        match stored {
-            Stored::Pushed => Self::Pushed,
-            Stored::Deduped => Self::Deduped,
-        }
-    }
-}
-
 /// Folds per-path outcomes into the run's [`Summary`] and the failed paths.
 fn tally(outcomes: Vec<(String, Outcome)>, nar_bytes: u64) -> (Summary, Vec<String>) {
     let mut summary = Summary {
@@ -471,7 +457,7 @@ impl Pusher {
     pub async fn negotiate(&self, hashes: &[&str]) -> Result<HashSet<String>> {
         let send = |token: &str| {
             self.http
-                .post(format!("{}/api/v1/missing-paths", self.endpoint))
+                .post(format!("{}{}", self.endpoint, wire::MISSING_PATHS))
                 .bearer_auth(token)
                 .json(&hashes)
                 // Small and quick when healthy; without a cap a stalled
@@ -532,7 +518,7 @@ impl Pusher {
         let outcomes = stream::iter(references_first(paths))
             .map(|info| async move {
                 let outcome = match self.push_one(&info, report).await {
-                    Ok(stored) => Outcome::from(stored),
+                    Ok(outcome) => outcome,
                     Err(e) => Outcome::Failed(format!("{e:#}")),
                 };
                 report.path(&info, &outcome);
@@ -544,14 +530,20 @@ impl Pusher {
         tally(outcomes, nar_bytes)
     }
 
-    async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<Stored> {
+    async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<Outcome> {
         let mut backoff = Backoff::new(self.max_retries);
         let mut renewed = false;
         loop {
             let token = self.tokens.get().await?;
             let error = match self.attempt(info, report, &token).await {
-                Ok(Attempt::Stored(stored)) => return Ok(stored),
-                Ok(Attempt::InProgress) => match backoff.in_progress() {
+                // "deduped", not "skipped": the bytes were uploaded and only
+                // then found redundant, so the bandwidth was spent either way.
+                Ok(UploadAck::Exists) => return Ok(Outcome::Deduped),
+                Ok(UploadAck::Created) => return Ok(Outcome::Pushed),
+                // Not success yet: the other upload may still fail, and then
+                // nobody would have pushed it. Wait until the server answers
+                // `exists`, or lets this one through.
+                Ok(UploadAck::InProgress) => match backoff.in_progress() {
                     Some(wait) => {
                         tokio::time::sleep(wait).await;
                         continue;
@@ -581,7 +573,7 @@ impl Pusher {
         }
     }
 
-    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<Attempt> {
+    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<UploadAck> {
         let preamble = Preamble {
             store_path: info.path.clone(),
             nar_hash: info.nar_hash.clone(),
@@ -603,9 +595,9 @@ impl Pusher {
         let request = self
             .http
             .put(format!(
-                "{}/api/v1/nar/{}",
+                "{}{}",
                 self.endpoint,
-                hash_of_store_path(&info.path)
+                wire::with_hash(wire::NAR_UPLOAD, hash_of_store_path(&info.path))
             ))
             .bearer_auth(token);
         let response = send_watched(request, body, self.upload_idle)
@@ -629,21 +621,14 @@ impl Pusher {
             .into());
         }
 
-        #[derive(Deserialize)]
-        struct Ack {
-            status: String,
-        }
-        let ack: Ack = response.json().await.context("parsing upload response")?;
-        match ack.status.as_str() {
-            // "deduped", not "skipped": the bytes were uploaded and only then
-            // found redundant, so the bandwidth was spent either way.
-            "exists" => Ok(Attempt::Stored(Stored::Deduped)),
-            // Not success yet: the other upload may still fail. Wait until
-            // the server answers `exists`, or lets this one through.
-            "in-progress" => Ok(Attempt::InProgress),
-            _ => Ok(Attempt::Stored(Stored::Pushed)),
-        }
+        parse_ack(&response.bytes().await.context("reading upload response")?)
     }
+}
+
+/// The Pusher's upload ack. An unknown status is an error: counting it as
+/// pushed would report a path stored that the server never confirmed.
+fn parse_ack(body: &[u8]) -> Result<UploadAck> {
+    serde_json::from_slice(body).context("parsing upload response")
 }
 
 /// Orders `paths` so each comes after the paths in the batch it references.
@@ -850,14 +835,6 @@ impl std::fmt::Display for Shed {
 }
 
 impl std::error::Error for Shed {}
-
-/// What one upload attempt got back: the path stored, or another pusher
-/// uploading it right now. The latter is waited out rather than counted as
-/// pushed: that upload may yet fail, and then nobody would have pushed it.
-enum Attempt {
-    Stored(Stored),
-    InProgress,
-}
 
 /// How long one path keeps waiting out 429s and other pushers' uploads before
 /// it fails: long enough to queue behind several multi-minute uploads, short
@@ -1088,6 +1065,18 @@ mod tests {
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"
         );
         assert_eq!(infos[0].nar_size, 12);
+    }
+
+    #[test]
+    fn upload_acks_parse_and_an_unknown_one_is_an_error() {
+        for (body, ack) in [
+            (r#"{"status":"created"}"#, UploadAck::Created),
+            (r#"{"status":"exists"}"#, UploadAck::Exists),
+            (r#"{"status":"in-progress"}"#, UploadAck::InProgress),
+        ] {
+            assert_eq!(parse_ack(body.as_bytes()).unwrap(), ack, "{body}");
+        }
+        assert!(parse_ack(br#"{"status":"stored"}"#).is_err());
     }
 
     #[test]
@@ -1408,7 +1397,10 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let endless = stream::repeat_with(|| Ok(bytes::Bytes::from_static(&CHUNK)));
-        let request = reqwest::Client::new().put(format!("http://{addr}/api/v1/nar/x"));
+        let request = reqwest::Client::new().put(format!(
+            "http://{addr}{}",
+            wire::with_hash(wire::NAR_UPLOAD, "x")
+        ));
         let watched = send_watched(request, endless, Duration::from_millis(500));
         let error = tokio::time::timeout(Duration::from_secs(30), watched)
             .await

@@ -4,7 +4,10 @@
 //! and naming the broken layer instead of letting a push fail three layers
 //! deeper with a message about the wrong one.
 
-use garret_common::parse_store_hash;
+use garret_common::{
+    parse_store_hash,
+    wire::{self, Discovery},
+};
 
 use crate::{auth, config, discovery};
 
@@ -210,7 +213,7 @@ async fn pull_check(
         );
     };
 
-    let url = format!("{puller}/nix-cache-info");
+    let url = format!("{puller}{}", wire::NIX_CACHE_INFO);
     let body = match http.get(&url).send().await {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
         Ok(r) => return Check::fail("pull", format!("{url} answered {}", r.status())),
@@ -224,7 +227,8 @@ async fn pull_check(
     }
 
     let probe = path.and_then(parse_store_hash).unwrap_or(ABSENT_HASH);
-    let narinfo_url = format!("{puller}/{probe}.narinfo");
+    let narinfo_file = wire::narinfo_file(probe);
+    let narinfo_url = format!("{puller}/{narinfo_file}");
     match http.get(&narinfo_url).send().await {
         Ok(r)
             if r.status() == reqwest::StatusCode::OK
@@ -233,7 +237,7 @@ async fn pull_check(
             Check::pass(
                 "pull",
                 format!(
-                    "the Puller serves nix-cache-info; {probe}.narinfo answered {}",
+                    "the Puller serves nix-cache-info; {narinfo_file} answered {}",
                     r.status().as_u16()
                 ),
             )
@@ -260,7 +264,7 @@ async fn path_check(
     };
 
     let response = match http
-        .post(format!("{}/api/v1/missing-paths", cfg.endpoint))
+        .post(format!("{}{}", cfg.endpoint, wire::MISSING_PATHS))
         .bearer_auth(token)
         .json(&vec![hash])
         .send()
@@ -304,7 +308,7 @@ async fn path_check(
 /// signing-key match is its own check. The `oidc` fields are compared only
 /// for device-flow configs, the ones `garret login` writes; a machine
 /// config's issuer, audience and client id are its operator's to set.
-fn drift(cfg: &config::Config, d: &discovery::Discovery, device_flow: bool) -> Vec<String> {
+fn drift(cfg: &config::Config, d: &Discovery, device_flow: bool) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(advertised) = &d.puller_endpoint
         && cfg.puller_endpoint.as_deref() != Some(advertised.as_str())
@@ -417,7 +421,7 @@ fn fix_hint(device_flow: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{Discovery, Oidc};
+    use garret_common::wire::Oidc;
 
     fn cfg() -> config::Config {
         config::Config {

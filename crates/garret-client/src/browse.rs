@@ -2,51 +2,13 @@
 //! (spec 07). Rendering only; every query is the server's to answer.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use garret_common::wire::{self, TreeNode};
 
 use crate::auth::ensure_success;
 
-/// One Object in a `garret list` page, as the browse API summarizes it.
-#[derive(Debug, Deserialize)]
-pub struct Summary {
-    /// The store path hash — the Object's key in the cache.
-    pub hash: String,
-    /// The store path's name part (everything after `<hash>-`).
-    pub name: String,
-    /// Uncompressed NAR size in bytes.
-    pub nar_size: i64,
-    /// Size of the stored Blob — the compressed NAR — in bytes.
-    pub file_size: i64,
-}
-
-/// One page of `garret list` results.
-#[derive(Debug, Deserialize)]
-pub struct Page {
-    /// The Objects on this page.
-    pub objects: Vec<Summary>,
-    /// Opaque cursor for the next page; `None` on the last one.
-    pub next_cursor: Option<String>,
-}
-
-/// One node of a `garret tree` dependency tree.
-#[derive(Debug, Deserialize)]
-pub struct TreeNode {
-    /// The store path's name part.
-    pub name: String,
-    /// The cache does not hold this dependency (referenced but never pushed,
-    /// or evicted).
-    pub missing: bool,
-    /// The server pruned this subtree because the node already appeared
-    /// elsewhere in the tree; [`render`] marks it `(…)`.
-    pub truncated: bool,
-    /// Direct dependencies; empty when missing or truncated.
-    pub children: Vec<TreeNode>,
-}
-
-/// Both queries return the server's JSON verbatim rather than a re-shaped
-/// struct. `--json` then passes it straight through — the browse API already
-/// has a schema (spec 07), and mirroring it client-side would create a second
-/// one to keep in sync. Human rendering deserializes it into the types below.
+/// Each query returns the server's JSON verbatim, so `--json` passes it
+/// straight through; human rendering deserializes it into the
+/// [`garret_common::wire`] types the server serialises.
 pub async fn list(
     http: &reqwest::Client,
     puller: &str,
@@ -55,7 +17,7 @@ pub async fn list(
     limit: usize,
 ) -> Result<serde_json::Value> {
     let mut request = http
-        .get(format!("{puller}/api/v1/objects"))
+        .get(format!("{puller}{}", wire::OBJECTS))
         .bearer_auth(token)
         .query(&[("limit", limit.to_string())]);
     if let Some(q) = query {
@@ -77,7 +39,10 @@ pub async fn tree(
     hash: &str,
 ) -> Result<serde_json::Value> {
     let response = http
-        .get(format!("{puller}/api/v1/objects/{hash}/tree"))
+        .get(format!(
+            "{puller}{}",
+            wire::with_hash(wire::OBJECT_TREE, hash)
+        ))
         .bearer_auth(token)
         .send()
         .await?;
@@ -88,23 +53,10 @@ pub async fn tree(
         .context("parsing the dependency tree")
 }
 
-/// One pin in a `garret pins` listing (ticket 22).
-#[derive(Debug, Deserialize)]
-pub struct Pin {
-    /// Operator-chosen pin name.
-    pub name: String,
-    /// Store path hash of the pinned root.
-    pub store_path_hash: String,
-    /// The store path's name part is not sent separately; render from the path.
-    pub store_path: String,
-    /// Unix time the pin stops protecting; `None` = permanent.
-    pub expires_at: Option<i64>,
-}
-
 /// Fetches the pin listing, verbatim — see [`list`] for why.
 pub async fn pins(http: &reqwest::Client, puller: &str, token: &str) -> Result<serde_json::Value> {
     let response = http
-        .get(format!("{puller}/api/v1/pins"))
+        .get(format!("{puller}{}", wire::PINS))
         .bearer_auth(token)
         .send()
         .await?;
@@ -135,6 +87,7 @@ mod tests {
 
     fn node(name: &str, missing: bool, truncated: bool, children: Vec<TreeNode>) -> TreeNode {
         TreeNode {
+            hash: String::new(),
             name: name.into(),
             missing,
             truncated,

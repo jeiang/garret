@@ -1,8 +1,9 @@
-//! Wire types shared by the client and the server.
+//! Wire types and store-path helpers shared by the client and the server.
 
 #![warn(missing_docs)]
 
 pub mod admin;
+pub mod wire;
 
 use serde::{Deserialize, Serialize};
 

@@ -22,7 +22,10 @@ use axum::{
     routing::{get, post, put},
 };
 use futures::StreamExt;
-use garret_common::{Preamble, is_store_hash};
+use garret_common::{
+    Preamble, is_store_hash,
+    wire::{self, Discovery, Oidc, UploadAck},
+};
 use garret_server::{
     auth::{self, Authenticator, Subject},
     config::PusherConfig,
@@ -189,15 +192,15 @@ async fn main() -> Result<()> {
                  `garret use`, `list` and `tree` stay unconfigured"
             );
         }
-        serde_json::to_string(&json!({
-            "puller_endpoint": cfg.puller_endpoint,
-            "public_keys": state.keys.iter().map(|k| k.public_key()).collect::<Vec<_>>(),
-            "oidc": device.map(|i| json!({
-                "issuer": i.issuer,
-                "audience": i.audience,
-                "client_id": i.client_id,
-            })),
-        }))?
+        serde_json::to_string(&Discovery {
+            oidc: device.map(|i| Oidc {
+                audience: i.audience.clone(),
+                client_id: i.client_id.clone(),
+                issuer: i.issuer.clone(),
+            }),
+            public_keys: state.keys.iter().map(|k| k.public_key()).collect(),
+            puller_endpoint: cfg.puller_endpoint.clone(),
+        })?
     };
 
     // Kept for shutdown: `state` itself moves into the router.
@@ -213,14 +216,14 @@ async fn main() -> Result<()> {
 /// The Pusher's routes: OIDC on the push endpoints, anonymous discovery.
 fn router(state: Arc<AppState>, discovery: String) -> Router {
     Router::new()
-        .route("/api/v1/missing-paths", post(missing_paths))
-        .route("/api/v1/nar/{hash}", put(upload))
+        .route(wire::MISSING_PATHS, post(missing_paths))
+        .route(wire::NAR_UPLOAD, put(upload))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_oidc))
         // `route_layer` wraps only the routes above it, so unmatched paths get
         // a plain 404, not a 401. Discovery stays anonymous because it is
         // registered after the layer; do not reorder it upwards.
         .route(
-            "/api/v1/discovery",
+            wire::DISCOVERY,
             get(move || {
                 let body = discovery.clone();
                 async move { ([(header::CONTENT_TYPE, "application/json")], body) }
@@ -412,10 +415,6 @@ async fn already_stored(state: &AppState, hash: &str) -> Result<bool, Error> {
     Ok(stored)
 }
 
-fn exists_response() -> Response {
-    (StatusCode::OK, Json(json!({"status": "exists"}))).into_response()
-}
-
 /// Holds an upload slot's accounting for as long as it lives: counts in
 /// `garret_uploads_in_flight` and, on drop, adds the slot's hold time to
 /// `garret_upload_slot_milliseconds_total`. A handler future dropped mid-upload
@@ -538,7 +537,7 @@ async fn upload(
     // Idempotency: answered before the body is read, so `Expect: 100-continue`
     // clients skip the transfer entirely (spec 01).
     if already_stored(&state, &hash).await? {
-        return Ok(exists_response());
+        return Ok((StatusCode::OK, Json(UploadAck::Exists)).into_response());
     }
 
     // Shed before reading a byte: the queue belongs in the clients, and past
@@ -559,7 +558,7 @@ async fn upload(
         Err(inflight::Refused::Uploading) => {
             metrics::counter!("garret_upload_skipped_total", "reason" => "in-progress")
                 .increment(1);
-            return Ok((StatusCode::OK, Json(json!({"status": "in-progress"}))).into_response());
+            return Ok((StatusCode::OK, Json(UploadAck::InProgress)).into_response());
         }
         // GC, `delete` or prune has removed the row and not yet the blob: a
         // blob uploaded now would go with it (spec 05). By the retry the path
@@ -582,7 +581,7 @@ async fn upload(
     // upload that finished just before this one released its claim. The
     // blob is already stored; do not overwrite it (spec 01).
     if already_stored(&state, &hash).await? {
-        return Ok(exists_response());
+        return Ok((StatusCode::OK, Json(UploadAck::Exists)).into_response());
     }
 
     let started = std::time::Instant::now();
@@ -599,7 +598,7 @@ async fn upload(
     metrics::histogram!("garret_upload_duration_seconds", "outcome" => outcome)
         .record(started.elapsed());
     result?;
-    Ok((StatusCode::CREATED, Json(json!({"status": "created"}))).into_response())
+    Ok((StatusCode::CREATED, Json(UploadAck::Created)).into_response())
 }
 
 /// Reads the preamble, then streams the rest straight to S3. Returns the
@@ -1238,7 +1237,7 @@ mod tests {
         };
         let res = send(Request::get("/a/b").header(header::AUTHORIZATION, "Bearer x")).await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        let res = send(Request::post("/api/v1/missing-paths")).await;
+        let res = send(Request::post(wire::MISSING_PATHS)).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1269,7 +1268,7 @@ mod tests {
         let send = |token: String| {
             let app = app.clone();
             async move {
-                let req = Request::post("/api/v1/missing-paths")
+                let req = Request::post(wire::MISSING_PATHS)
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap();

@@ -221,7 +221,7 @@ pub async fn ensure_success(response: reqwest::Response, what: &str) -> Result<r
 /// `push` uses, so success proves the Pusher accepts `token`.
 pub async fn probe_pusher(http: &reqwest::Client, endpoint: &str, token: &str) -> Result<()> {
     let response = http
-        .post(format!("{endpoint}/api/v1/missing-paths"))
+        .post(format!("{endpoint}{}", garret_common::wire::MISSING_PATHS))
         .bearer_auth(token)
         .json(&Vec::<String>::new())
         .send()

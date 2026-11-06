@@ -15,6 +15,7 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
+use garret_common::wire;
 use garret_server::{
     auth::Authenticator,
     browse,
@@ -232,11 +233,11 @@ fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>>
     };
     let auth = Arc::new(Authenticator::new(vec![issuer.clone()])?);
     Ok(Router::new()
-        .route("/api/v1/objects", get(list_objects))
-        .route("/api/v1/objects/{hash}", get(object_detail))
-        .route("/api/v1/objects/{hash}/tree", get(object_tree))
-        .route("/api/v1/objects/{hash}/referrers", get(object_referrers))
-        .route("/api/v1/pins", get(list_pins))
+        .route(wire::OBJECTS, get(list_objects))
+        .route(wire::OBJECT, get(object_detail))
+        .route(wire::OBJECT_TREE, get(object_tree))
+        .route(wire::OBJECT_REFERRERS, get(object_referrers))
+        .route(wire::PINS, get(list_pins))
         .route_layer(axum::middleware::from_fn_with_state(
             auth,
             require_browse_oidc,
@@ -319,7 +320,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route(
-            "/nix-cache-info",
+            wire::NIX_CACHE_INFO,
             get(move || {
                 let body = format!("StoreDir: {store_dir}\nWantMassQuery: 1\nPriority: 40\n");
                 async move { body }
@@ -337,7 +338,7 @@ async fn main() -> Result<()> {
         .route("/ready/deep", get(ready_deep))
         // axum 0.8 wants whole-segment params, so the suffix is split here.
         .route("/{file}", get(narinfo_route))
-        .route("/nar/{file}", get(nar_route))
+        .route(wire::NAR_FILE, get(nar_route))
         .merge(browse_routes)
         .layer(axum::middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
@@ -365,7 +366,7 @@ async fn narinfo_route(state: State<Arc<AppState>>, file: Path<String>) -> Respo
 }
 
 async fn narinfo(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
-    let Some(hash) = file.strip_suffix(".narinfo").map(str::to_owned) else {
+    let Some(hash) = wire::narinfo_hash(&file).map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(conn) = state.conn_handle() else {
@@ -531,7 +532,7 @@ async fn nar_route(state: State<Arc<AppState>>, file: Path<String>) -> Response 
 }
 
 async fn nar_redirect(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
-    let Some(hash) = file.strip_suffix(".nar.zst") else {
+    let Some(hash) = wire::nar_file_hash(&file) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     // Only redirect to blobs we have a row for — row exists ⇒ blob exists.
@@ -1005,7 +1006,7 @@ mod tests {
             assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
             assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
         }
-        let res = get_status("/api/v1/objects").await;
+        let res = get_status(wire::OBJECTS).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -1036,7 +1037,7 @@ mod tests {
         let send = |token: String| {
             let app = app.clone();
             async move {
-                let req = axum::http::Request::get("/api/v1/objects")
+                let req = axum::http::Request::get(wire::OBJECTS)
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(axum::body::Body::empty())
                     .unwrap();
