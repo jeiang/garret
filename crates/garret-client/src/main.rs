@@ -231,41 +231,12 @@ async fn main() -> Result<()> {
                 anyhow::ensure!(jobs >= 1, "--jobs must be at least 1");
                 pusher.jobs = jobs;
             }
-            let closure = push::closure(&paths).await?;
-            let closure_len = closure.len();
-            let (own, upstream) = match no_upstream_filter {
-                true => (closure, Vec::new()),
-                false => push::partition_upstream(closure, &cfg.upstream_keys),
+            let upstream_keys: &[String] = match no_upstream_filter {
+                true => &[],
+                false => &cfg.upstream_keys,
             };
-            let missing = pusher.missing(&own).await?;
-
-            if dry_run {
-                push::Report::dry_run(cli.json, &progress, closure_len, &upstream, &missing);
-                return Ok(());
-            }
-
-            let report = push::Report::start(cli.json, &progress, closure_len, &upstream, &missing);
-            let pushed_any = !missing.is_empty();
-            let mut summary = pusher.push_all(missing, &report).await;
-            // A closure is only substitutable whole, and a path the Negotiation
-            // found present can be gone by the end of the run (evicted, deleted,
-            // or another pusher's upload that never finished). One more
-            // Negotiation after a clean run catches it, and pushes it.
-            let mut recheck = Ok(());
-            if pushed_any && summary.failed == 0 {
-                match pusher.missing(&own).await {
-                    Ok(gone) if gone.is_empty() => {}
-                    Ok(gone) => {
-                        report.rechecked(&gone);
-                        summary += pusher.push_all(gone, &report).await;
-                    }
-                    Err(e) => recheck = Err(e.context("re-checking the closure after pushing")),
-                }
-            }
-            report.finish(&summary);
-            // Reported first, so a --json consumer always sees `done`, then the
-            // exit code carries the failure.
-            recheck?;
+            let summary =
+                push::run(&pusher, &paths, upstream_keys, dry_run, cli.json, &progress).await?;
             if summary.failed > 0 {
                 anyhow::bail!("{} path(s) failed to push", summary.failed);
             }
