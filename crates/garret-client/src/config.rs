@@ -226,6 +226,54 @@ impl Config {
         );
         Ok(())
     }
+
+    /// How this machine authenticates, `GARRET_TOKEN` aside: that variable
+    /// overrides the token but never changes what kind of config this is.
+    pub fn credential_kind(&self, github: Option<GithubActions>) -> CredentialKind<'_> {
+        match (&self.oidc.client_secret_file, github) {
+            (Some(path), _) => CredentialKind::ClientSecret(path),
+            (None, Some(github)) => CredentialKind::GithubActions(github),
+            (None, None) => CredentialKind::DeviceFlow,
+        }
+    }
+}
+
+/// Which credential a config uses, first match wins (spec 06).
+#[derive(Debug)]
+pub enum CredentialKind<'a> {
+    /// `oidc.client_secret_file`: the client_credentials grant.
+    ClientSecret(&'a std::path::Path),
+    /// A GitHub Actions runner's OIDC token.
+    GithubActions(GithubActions),
+    /// The refresh token `garret login` stored.
+    DeviceFlow,
+}
+
+/// A GitHub Actions runner's request for an OIDC token.
+#[derive(Debug)]
+pub struct GithubActions {
+    /// `ACTIONS_ID_TOKEN_REQUEST_URL`.
+    pub url: String,
+    /// `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, the bearer for that URL.
+    pub request_token: String,
+}
+
+impl GithubActions {
+    /// The runner's OIDC request variables, or `None` off a runner.
+    pub fn from_env() -> Option<Self> {
+        Self::from_vars(
+            std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").ok(),
+            std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").ok(),
+        )
+    }
+
+    /// Both variables or nothing: a token cannot be requested with only one.
+    pub fn from_vars(url: Option<String>, request_token: Option<String>) -> Option<Self> {
+        Some(Self {
+            url: url?,
+            request_token: request_token?,
+        })
+    }
 }
 
 /// TOML-quotes a string. Base64 signing keys carry `+/=` and issuer URLs carry

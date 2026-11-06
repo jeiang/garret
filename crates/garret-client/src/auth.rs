@@ -570,14 +570,12 @@ impl TokenSource {
     /// a GitHub Actions runner; the refresh token `garret login` stored (which
     /// fails on first use with "run `garret login`" when there is none).
     pub fn for_config(http: &reqwest::Client, cfg: &crate::config::Config) -> Result<Self> {
-        let github = match (
-            std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL"),
-            std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN"),
-        ) {
-            (Ok(url), Ok(request_token)) => Some((url, request_token)),
-            _ => None,
-        };
-        Self::select(http, cfg, std::env::var("GARRET_TOKEN").ok(), github)
+        Self::select(
+            http,
+            cfg,
+            std::env::var("GARRET_TOKEN").ok(),
+            cfg.credential_kind(crate::config::GithubActions::from_env()),
+        )
     }
 
     /// [`for_config`](Self::for_config) with the environment passed in, so the
@@ -586,13 +584,13 @@ impl TokenSource {
         http: &reqwest::Client,
         cfg: &crate::config::Config,
         given: Option<String>,
-        github: Option<(String, String)>,
+        kind: crate::config::CredentialKind<'_>,
     ) -> Result<Self> {
+        use crate::config::CredentialKind;
         let oidc = &cfg.oidc;
-        let mint = if let Some(token) = given {
-            Mint::Given(token)
-        } else if let Some(path) = &oidc.client_secret_file {
-            Mint::ClientCredentials {
+        let mint = match (given, kind) {
+            (Some(token), _) => Mint::Given(token),
+            (None, CredentialKind::ClientSecret(path)) => Mint::ClientCredentials {
                 issuer: oidc.issuer.clone().context(
                     "`oidc.issuer` is required to use client credentials (`oidc.client_secret_file`)",
                 )?,
@@ -601,17 +599,15 @@ impl TokenSource {
                 )?,
                 client_secret: read_client_secret(path)?,
                 resource: oidc.resource.clone(),
-            }
-        } else if let Some((url, request_token)) = github {
-            Mint::Github {
-                url,
-                request_token,
+            },
+            (None, CredentialKind::GithubActions(github)) => Mint::Github {
+                url: github.url,
+                request_token: github.request_token,
                 audience: oidc.audience.clone(),
-            }
-        } else {
-            Mint::Stored {
+            },
+            (None, CredentialKind::DeviceFlow) => Mint::Stored {
                 resource: oidc.resource.clone(),
-            }
+            },
         };
         Ok(Self::new(http, mint))
     }
@@ -810,12 +806,36 @@ mod tests {
         given: Option<&str>,
         github: bool,
     ) -> Result<TokenSource> {
+        let github = github.then(|| crate::config::GithubActions {
+            url: "https://actions.example".into(),
+            request_token: "rt".into(),
+        });
         TokenSource::select(
             &reqwest::Client::new(),
             cfg,
             given.map(str::to_owned),
-            github.then(|| ("https://actions.example".to_owned(), "rt".to_owned())),
+            cfg.credential_kind(github),
         )
+    }
+
+    /// A runner that exposes only the request URL cannot mint a GitHub token,
+    /// so it is a device-flow config, as `doctor` also classifies it.
+    #[test]
+    fn a_request_url_without_its_token_is_not_github_actions() {
+        let plain = cfg("issuer = \"https://id.example\"\nclient_id = \"cli\"\n");
+        let github =
+            crate::config::GithubActions::from_vars(Some("https://actions.example".into()), None);
+        assert!(matches!(
+            TokenSource::select(
+                &reqwest::Client::new(),
+                &plain,
+                None,
+                plain.credential_kind(github)
+            )
+            .unwrap()
+            .mint,
+            Mint::Stored { .. }
+        ));
     }
 
     /// `GARRET_TOKEN` > `client_secret_file` > GitHub Actions > stored login.
