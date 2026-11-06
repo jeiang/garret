@@ -775,7 +775,7 @@ impl Storage {
                 let (Some(key), Some(upload_id)) = (upload.key(), upload.upload_id()) else {
                     continue;
                 };
-                let hash = hash_for(key).unwrap_or_default();
+                let Some(hash) = hash_for(key) else { continue };
                 if in_flight.contains(hash) || age(upload.initiated()) < grace {
                     continue;
                 }
