@@ -119,6 +119,19 @@ pub fn tree(conn: &Connection, hash: &str, depth_limit: usize) -> Result<Option<
     }))
 }
 
+/// A node's child edges with whether each child is cached: one PK range on
+/// `object_refs` (already in `reference` order) and one `objects` PK lookup
+/// per edge. The hash is the generated `reference_hash` that referrers and
+/// GC join on; a malformed reference just matches no object. Self-edges are
+/// stored because the signature covers them, but a path is not its own
+/// dependency: showing it would add a truncated self-child to nearly every
+/// node, since most compiled packages refer to themselves.
+const CHILDREN: &str = "SELECT r.reference, r.reference_hash, o.store_path_hash IS NULL
+     FROM object_refs r
+     LEFT JOIN objects o ON o.store_path_hash = r.reference_hash
+     WHERE r.referrer = ?1 AND r.reference_hash != ?1
+     ORDER BY r.reference";
+
 fn children_of(
     conn: &Connection,
     hash: &str,
@@ -128,26 +141,20 @@ fn children_of(
     if depth == 0 {
         return Ok(Vec::new());
     }
-    let mut stmt =
-        conn.prepare("SELECT reference FROM object_refs WHERE referrer = ?1 ORDER BY reference")?;
-    let references: Vec<String> = stmt
-        .query_map(params![hash], |row| row.get(0))?
+    // Collected before recursing, so the cached statement is back in the
+    // cache for the children's queries.
+    let edges: Vec<(String, String, bool)> = conn
+        .prepare_cached(CHILDREN)?
+        .query_map(params![hash], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
 
-    let mut out = Vec::new();
-    for reference in references {
-        // Stored because the signature covers them, but a path is not its
-        // own dependency: showing it would add a truncated self-child to
-        // nearly every node, since most compiled packages refer to themselves.
-        let child_hash = garret_common::hash_of_store_path(&reference);
-        if child_hash == hash {
-            continue;
-        }
-        let child_hash = child_hash.to_owned();
+    let mut out = Vec::with_capacity(edges.len());
+    for (reference, child_hash, missing) in edges {
         // A cycle through two paths would still loop forever without the
         // seen set.
         let truncated = !seen.insert(child_hash.clone());
-        let missing = name_of(conn, &child_hash)?.is_none();
         out.push(TreeNode {
             name: reference,
             children: if truncated || missing {
@@ -407,6 +414,54 @@ mod tests {
         assert_eq!(hashes, vec![dep.as_str()]);
         assert!(!tree.children[0].truncated);
         assert!(tree.children[0].children.is_empty());
+    }
+
+    /// A tree query runs once per expanded node on the single browse
+    /// connection, so each must be index lookups: no scan of either table,
+    /// and no sort (the primary key already orders edges by reference).
+    #[test]
+    fn tree_children_are_index_lookups() {
+        let conn = db();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {CHILDREN}"))
+            .unwrap()
+            .query_map(params![h('a')], |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(plan.len(), 2, "{plan:?}");
+        assert!(
+            plan[0].starts_with("SEARCH r USING PRIMARY KEY (referrer=?)"),
+            "{plan:?}"
+        );
+        assert!(
+            plan[1].starts_with("SEARCH o USING")
+                && plan[1].contains("INDEX sqlite_autoindex_objects_1 (store_path_hash=?)"),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn tree_truncates_a_cycle_instead_of_looping() {
+        let mut conn = db();
+        let (a, b) = (h('a'), h('b'));
+        let (a_ref, b_ref) = (format!("{a}-a"), format!("{b}-b"));
+        db::insert_object(&mut conn, &object(&a, "a", &[&b_ref]), 100).unwrap();
+        db::insert_object(&mut conn, &object(&b, "b", &[&a_ref]), 100).unwrap();
+
+        let tree = tree(&conn, &a, 10).unwrap().unwrap();
+        let b_node = &tree.children[..];
+        assert_eq!(b_node.len(), 1);
+        assert_eq!(
+            (b_node[0].hash.as_str(), b_node[0].truncated),
+            (b.as_str(), false)
+        );
+        let a_again = &b_node[0].children[..];
+        assert_eq!(a_again.len(), 1);
+        assert_eq!(a_again[0].hash, a);
+        assert_eq!(a_again[0].name, a_ref);
+        assert!(a_again[0].truncated && !a_again[0].missing);
+        assert!(a_again[0].children.is_empty());
     }
 
     fn tree_of_unknown_hash(conn: &Connection) -> bool {
