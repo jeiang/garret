@@ -8,17 +8,7 @@ let
   pusher = config.services.garret.pusher;
   inherit (lib) mkEnableOption mkOption mkIf types;
 
-  # `pkgs.formats.toml` has no representation for null, and every nullable
-  # value here (the Pusher's `s3.region` and `s3.endpointUrl`, `browseOidc.jwks_url`) reaches
-  # this attrset as `null` when unset -- which fails the build with
-  # "unsupported unit type" rather than being omitted. Serde already defaults
-  # every one of these on the Rust side, so dropping the key is exactly right.
-  stripNulls = value:
-    if lib.isAttrs value
-    then lib.mapAttrs (_: stripNulls) (lib.filterAttrs (_: v: v != null) value)
-    else if lib.isList value
-    then map stripNulls value
-    else value;
+  common = import ./common.nix { inherit lib pkgs; };
 
   settings = {
     listen = cfg.listen;
@@ -34,11 +24,10 @@ let
       inherit (pusher.s3) bucket region;
       endpoint_url = pusher.s3.endpointUrl;
       path_style = pusher.s3.pathStyle;
-      operation_timeout_secs = cfg.s3.operationTimeoutSeconds;
     };
   } // lib.optionalAttrs (cfg.browseOidc != null) { browse_oidc = cfg.browseOidc; };
 
-  configFile = (pkgs.formats.toml { }).generate "garret-puller.toml" (lib.recursiveUpdate (stripNulls settings) cfg.extraSettings);
+  configFile = common.configFile "garret-puller.toml" settings cfg.extraSettings;
 in
 {
   # The Pusher's option declarations, so this module evaluates on its own;
@@ -54,51 +43,45 @@ in
       description = "The garret-puller package to run.";
     };
 
-    extraSettings = mkOption {
-      type = (pkgs.formats.toml { }).type;
-      default = { };
-      description = ''
-        Raw TOML settings merged over the generated config (recursively), for
-        keys that have no typed option here.
-      '';
-    };
+    extraSettings = common.extraSettings;
 
-    listen = mkOption { type = types.str; default = "127.0.0.1:8081"; description = "Public substituter listener. Front it with TLS."; };
-    metricsListen = mkOption { type = types.str; default = "127.0.0.1:9092"; description = "Internal metrics listener. Never expose this publicly."; };
+    # Null options below are left out of the config file, so garret-puller
+    # applies its own default (spec 10-packaging).
+    listen = mkOption { type = types.nullOr types.str; default = null; description = "Public substituter listener. Front it with TLS. Null: loopback."; };
+    metricsListen = mkOption { type = types.nullOr types.str; default = null; description = "Internal metrics listener. Never expose this publicly. Null: loopback."; };
 
     presignTtlSeconds = mkOption {
-      type = types.ints.between 1 604800;
-      default = 3600;
+      type = types.nullOr (types.ints.between 1 604800);
+      default = null;
       description = "Lifetime of the presigned URLs NAR requests redirect to.";
     };
 
     bumpDebounceSeconds = mkOption {
-      type = types.ints.unsigned;
-      default = 86400;
+      type = types.nullOr types.ints.unsigned;
+      default = null;
       description = "Skip a last-accessed write if the stored value is newer than this.";
     };
 
     dbWaitTimeoutSeconds = mkOption {
-      type = types.ints.positive;
-      default = 300;
+      type = types.nullOr types.ints.positive;
+      default = null;
       description = "How long to wait for the Pusher to create the database before exiting.";
     };
 
     dbReadBudgetMs = mkOption {
-      type = types.ints.positive;
-      default = 250;
+      type = types.nullOr types.ints.positive;
+      default = null;
       description = "Pull-path database read budget before the request degrades to a 404 miss.";
     };
 
     presignBudgetMs = mkOption {
-      type = types.ints.positive;
-      default = 250;
+      type = types.nullOr types.ints.positive;
+      default = null;
       description = "Presign budget before a NAR request degrades to a 404 miss.";
     };
 
     s3 = {
       # Bucket, endpoint, region and addressing come from the Pusher.
-      operationTimeoutSeconds = mkOption { type = types.int; default = 60; description = "Has no effect on the Puller (presigning is local, no S3 request is made). Kept for compatibility."; };
       credentialsFile = mkOption {
         type = types.path;
         description = ''
@@ -128,7 +111,7 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
+  config = mkIf cfg.enable (lib.mkMerge [ (common.serviceUser "garret-puller") {
     assertions = [{
       assertion = pusher.enable;
       message = "services.garret.puller needs services.garret.pusher on the same host: the Puller serves the Pusher's database and bucket, and takes dbPath, storeDir and s3 from it.";
@@ -142,18 +125,9 @@ in
       after = [ "network-online.target" "garret-pusher.service" ];
       wants = [ "network-online.target" ];
 
-      serviceConfig = import ./sandbox.nix // {
+      serviceConfig = common.daemonServiceConfig // {
         ExecStart = "${cfg.package}/bin/garret-puller ${configFile}";
         EnvironmentFile = cfg.s3.credentialsFile;
-        Restart = "on-failure";
-        # Server daemons only (the watcher shares the rest of the sandbox):
-        # hide other processes and SysV IPC.
-        ProtectProc = "invisible";
-        ProcSubset = "pid";
-        PrivateIPC = true;
-        RemoveIPC = true;
-        # The binary signals READY=1 once every listener is bound.
-        Type = "notify";
         # Its own user, in group `garret` only to share the database
         # (ADR-0009): the signing keys and the admin socket are owner-only, so
         # the public-facing process can reach neither. No StateDirectory: the
@@ -163,11 +137,5 @@ in
         ReadWritePaths = [ (builtins.dirOf pusher.dbPath) ];
       };
     };
-
-    users.users.garret-puller = {
-      isSystemUser = true;
-      group = "garret";
-    };
-    users.groups.garret = { };
-  };
+  } ]);
 }

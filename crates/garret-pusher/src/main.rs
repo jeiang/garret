@@ -98,8 +98,8 @@ async fn main() -> Result<()> {
             cfg.limits.part_size,
             cfg.limits.max_parts_in_flight,
             cfg.limits.max_in_flight_bytes,
-        )
-        .with_body_idle(Duration::from_secs(cfg.limits.body_idle_timeout_secs)),
+            Duration::from_secs(cfg.limits.body_idle_timeout_secs),
+        ),
         uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
         in_flight: InFlight::new(),
     });
@@ -842,7 +842,7 @@ mod tests {
                 allowed_groups: vec![],
             }])
             .unwrap(),
-            limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024),
+            limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024, Duration::from_secs(60)),
             uploads: Arc::new(Semaphore::new(1)),
             in_flight: InFlight::new(),
         })

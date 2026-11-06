@@ -59,23 +59,22 @@ impl UploadLimits {
     /// `max_in_flight_bytes` becomes a whole number of units, never fewer
     /// than one part's worth so a cap below one part cannot deadlock every
     /// upload.
-    pub fn new(part_size: usize, max_parts_in_flight: usize, max_in_flight_bytes: u64) -> Self {
+    pub fn new(
+        part_size: usize,
+        max_parts_in_flight: usize,
+        max_in_flight_bytes: u64,
+        body_idle: Duration,
+    ) -> Self {
         let (unit, part_units, total_units) = budget(part_size, max_in_flight_bytes);
         Self {
             part_size,
             max_parts_in_flight,
-            body_idle: BODY_IDLE_TIMEOUT,
+            body_idle,
             part_slots: Arc::new(Semaphore::new(total_units)),
             unit,
             part_units,
             total_units,
         }
-    }
-
-    /// Replaces the default [`BODY_IDLE_TIMEOUT`].
-    pub fn with_body_idle(mut self, idle: Duration) -> Self {
-        self.body_idle = idle;
-        self
     }
 
     /// How many part-sized buffers fit in the budget at once, process-wide.
@@ -173,12 +172,6 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .and_then(|k| k.strip_suffix(".nar.zst"))
         .filter(|h| !h.is_empty())
 }
-
-/// Default for `limits.body_idle_timeout_secs`: how long an upload body may
-/// send nothing before the upload is abandoned (spec 01). A stalled body holds an upload slot, its in-flight claim and,
-/// mid-NAR, a part slot, so without a bound a few quiet senders starve every
-/// other push. Idle, not total: a slow sender that keeps moving is fine.
-pub const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The client's request body stalled or broke mid-upload: a failure on the
 /// sender's side, not the server's. Handlers downcast to it to log such
@@ -785,6 +778,8 @@ impl Storage {
 mod tests {
     use super::*;
 
+    const IDLE: Duration = Duration::from_secs(60);
+
     #[test]
     fn s3_error_kinds_come_from_the_sdk_variant() {
         let timeout = SdkError::<()>::timeout_error("slow");
@@ -817,7 +812,7 @@ mod tests {
         chunks: Vec<&'static [u8]>,
     ) -> BodyReader<impl Stream<Item = Result<Bytes, std::io::Error>> + Unpin> {
         let body = futures::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))));
-        BodyReader::new(body, BODY_IDLE_TIMEOUT)
+        BodyReader::new(body, IDLE)
     }
 
     /// Feeds `chunks` through part fills and returns the part sizes produced.
@@ -883,11 +878,11 @@ mod tests {
 
     #[test]
     fn byte_caps_become_whole_part_slots() {
-        let limits = UploadLimits::new(64 * 1024 * 1024, 4, 1024 * 1024 * 1024);
+        let limits = UploadLimits::new(64 * 1024 * 1024, 4, 1024 * 1024 * 1024, IDLE);
         assert_eq!(limits.total_slots(), 16);
         // A cap smaller than one part still leaves a usable slot rather than
         // deadlocking every upload.
-        let tiny = UploadLimits::new(64 * 1024 * 1024, 4, 1024);
+        let tiny = UploadLimits::new(64 * 1024 * 1024, 4, 1024, IDLE);
         assert_eq!(tiny.total_slots(), 1);
     }
 
@@ -895,7 +890,7 @@ mod tests {
     /// reservation never exceeds a part or falls to zero.
     #[test]
     fn a_small_reservation_costs_a_fraction_of_a_part() {
-        let limits = UploadLimits::new(16 * 1024 * 1024, 4, 256 * 1024 * 1024);
+        let limits = UploadLimits::new(16 * 1024 * 1024, 4, 256 * 1024 * 1024, IDLE);
         assert_eq!(limits.total_slots(), 16);
         let whole = limits.part_slots.available_permits();
         assert_eq!(limits.units(16 * 1024 * 1024), limits.part_units);
@@ -913,8 +908,8 @@ mod tests {
     async fn a_stalled_body_fails_the_read() {
         let body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
             .chain(futures::stream::pending());
-        let mut reader = BodyReader::new(body, BODY_IDLE_TIMEOUT);
-        let read = tokio::time::timeout(BODY_IDLE_TIMEOUT * 2, read_part(&mut reader, 1024)).await;
+        let mut reader = BodyReader::new(body, IDLE);
+        let read = tokio::time::timeout(IDLE * 2, read_part(&mut reader, 1024)).await;
         assert!(read.expect("a stalled body hung the read").is_err());
     }
 
@@ -941,10 +936,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_slow_body_that_keeps_moving_is_not_cut_off() {
         let body = Box::pin(futures::stream::iter(0..4).then(|_| async {
-            tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
+            tokio::time::sleep(IDLE / 2).await;
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
-        let mut reader = BodyReader::new(body, BODY_IDLE_TIMEOUT);
+        let mut reader = BodyReader::new(body, IDLE);
         assert_eq!(read_part(&mut reader, 1024).await.unwrap().len(), 8);
     }
     /// Just enough S3 on a loopback port. Every call succeeds, except that
@@ -1023,7 +1018,7 @@ mod tests {
     /// hung forever — so the timeout turns a regression into a failure.
     #[tokio::test]
     async fn in_flight_bytes_rises_on_acquire_and_returns_to_zero() {
-        let limits = UploadLimits::new(1024, 2, 4096);
+        let limits = UploadLimits::new(1024, 2, 4096, IDLE);
         assert_eq!(limits.in_flight_bytes(), 0);
         let permit = limits.acquire(1024).await.unwrap();
         assert_eq!(limits.in_flight_bytes(), 1024);
@@ -1036,7 +1031,7 @@ mod tests {
         let storage = fake_s3().await;
         // Two slots, two parts in flight per upload, three 5-part uploads:
         // one upload alone already wants every slot.
-        let limits = UploadLimits::new(1024, 2, 2048);
+        let limits = UploadLimits::new(1024, 2, 2048, IDLE);
         let body: Vec<u8> = (0..4 * 1024 + 100).map(|i| i as u8).collect();
         let keys: Vec<String> = (0..3).map(|i| key_for(&i.to_string())).collect();
         let uploads = keys.iter().map(|key| {
@@ -1067,7 +1062,7 @@ mod tests {
     #[tokio::test]
     async fn a_small_upload_does_not_need_a_whole_part_slot() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024 * 1024, 4, 1024 * 1024);
+        let limits = UploadLimits::new(1024 * 1024, 4, 1024 * 1024, IDLE);
         // Another upload holds all but two units of the one-part budget.
         let held = limits.acquire_units(limits.total_units - 2).await.unwrap();
         let body = vec![7u8; 1000];
@@ -1093,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_past_its_hint_is_refused() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024, 2, 4096);
+        let limits = UploadLimits::new(1024, 2, 4096, IDLE);
         let body: Vec<u8> = (0..500).map(|i| i as u8).collect();
         let chunks: Vec<_> = body
             .chunks(300)
@@ -1117,7 +1112,7 @@ mod tests {
     #[tokio::test]
     async fn hash_and_length_cover_the_stored_bytes_across_boundaries() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024, 2, 8192);
+        let limits = UploadLimits::new(1024, 2, 8192, IDLE);
         let body: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
         let chunked = |body: &[u8], sizes: &[usize]| {
             let mut at = 0;
@@ -1158,7 +1153,7 @@ mod tests {
     #[tokio::test]
     async fn a_stall_probing_past_the_hint_reports_the_bytes_received() {
         let storage = fake_s3().await;
-        let limits = UploadLimits::new(1024, 2, 4096).with_body_idle(Duration::from_millis(50));
+        let limits = UploadLimits::new(1024, 2, 4096, Duration::from_millis(50));
         let body = futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from(vec![1u8; 60])),
             Ok(Bytes::from(vec![2u8; 40])),
@@ -1206,7 +1201,9 @@ mod proofs {
 
     /// S3's part-size range, which `PusherConfig::validate` enforces.
     fn any_part_size() -> usize {
-        kani::any_where(|p: &usize| (5 << 20..=5 << 30).contains(p))
+        kani::any_where(|p: &usize| {
+            (crate::config::MIN_PART_SIZE..=crate::config::MAX_PART_SIZE).contains(p)
+        })
     }
 
     /// A buffer of up to one part is always fully paid for by its permits,
