@@ -445,14 +445,10 @@ async fn login(
     Ok(())
 }
 
-/// Proves the token is not merely present but accepted, with the same empty
-/// Negotiation `doctor` sends: it crosses exactly the authentication path
-/// `push` uses.
+/// Proves the token is not merely present but accepted, with the same
+/// [`push::Pusher::authenticate`] `doctor` runs.
 async fn whoami(cfg: &config::Config, http: &reqwest::Client, as_json: bool) -> Result<()> {
-    let pusher = push::Pusher::from_config(cfg, http)?;
-    pusher.negotiate(&[]).await?;
-    // After the Negotiation, which may have replaced a rejected token.
-    let claims = auth::peek_claims(&pusher.tokens.get().await?).unwrap_or_default();
+    let claims = push::Pusher::from_config(cfg, http)?.authenticate().await?;
 
     let issuer = cfg.oidc.issuer.as_deref();
     let expires_at = claims.exp.map(|exp| {

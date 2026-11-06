@@ -628,6 +628,18 @@ impl Pusher {
         Ok(missing)
     }
 
+    /// Proves the Pusher accepts this machine's token with an empty
+    /// Negotiation, which crosses exactly the authentication path `push` uses
+    /// (a 401 renews the token once). Returns the accepted token's claims,
+    /// unverified ([`peek_claims`](crate::auth::peek_claims)); empty when
+    /// they cannot be read.
+    pub async fn authenticate(&self) -> Result<crate::auth::Claims> {
+        self.tokens.get().await.context("no token")?;
+        self.negotiate(&[]).await?;
+        // After the Negotiation, which may have replaced a rejected token.
+        Ok(crate::auth::peek_claims(&self.tokens.get().await?).unwrap_or_default())
+    }
+
     /// Uploads every path with at most `jobs` in flight, references first.
     ///
     /// A failure does not abort the run: every path is attempted and reported,
