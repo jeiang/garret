@@ -42,6 +42,9 @@ use verify::VerifiedNar;
 
 pub(crate) struct AppState {
     pub conn: Arc<Mutex<rusqlite::Connection>>,
+    /// The database file, for `garret-admin backup` to copy on a connection
+    /// of its own.
+    pub db_path: String,
     pub storage: Storage,
     pub keys: Vec<SigningKeyFile>,
     pub store_dir: String,
@@ -49,6 +52,8 @@ pub(crate) struct AppState {
     pub limits: UploadLimits,
     pub uploads: Arc<Semaphore>,
     pub in_flight: InFlight,
+    /// `None` without a `[gc]` section.
+    pub gc: Option<Arc<gc::Gc>>,
 }
 
 #[tokio::main]
@@ -70,9 +75,22 @@ async fn main() -> Result<()> {
         tracing::warn!("startup WAL checkpoint failed: {e}");
     }
 
+    let conn = Arc::new(Mutex::new(conn));
+    let storage = Storage::new(&cfg.s3).await?;
+    let in_flight = InFlight::new();
+    let gc = cfg.gc.clone().map(|gc_cfg| {
+        Arc::new(gc::Gc::new(
+            conn.clone(),
+            storage.clone(),
+            in_flight.clone(),
+            gc_cfg,
+        ))
+    });
+
     let state = Arc::new(AppState {
-        conn: Arc::new(Mutex::new(conn)),
-        storage: Storage::new(&cfg.s3).await?,
+        conn,
+        db_path: cfg.db_path,
+        storage,
         keys: garret_server::load_signing_keys(&cfg.signing_key_files)?,
         store_dir: cfg.store_dir,
         auth,
@@ -83,7 +101,8 @@ async fn main() -> Result<()> {
             Duration::from_secs(cfg.limits.body_idle_timeout_secs),
         ),
         uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
-        in_flight: InFlight::new(),
+        in_flight,
+        gc,
     });
 
     // Saturation must be visible before it hurts, so the caps are exported
@@ -97,27 +116,18 @@ async fn main() -> Result<()> {
         metrics::gauge!("garret_in_flight_bytes").set(scrape_state.limits.in_flight_bytes() as f64);
     });
 
-    let collector = cfg.gc.clone().map(|gc_cfg| {
-        Arc::new(gc::Gc::new(
-            state.conn.clone(),
-            state.storage.clone(),
-            state.in_flight.clone(),
-            gc_cfg,
-        ))
-    });
-
     if let Some(admin_listener) = admin_listener {
-        let (state, collector) = (state.clone(), collector.clone());
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = admin::serve(admin_listener, state, collector).await {
+            if let Err(e) = admin::serve(admin_listener, state).await {
                 tracing::error!("admin socket failed: {e:#}");
             }
         });
     }
 
-    match &collector {
-        Some(collector) => {
-            tokio::spawn(collector.clone().run_forever());
+    match &state.gc {
+        Some(gc) => {
+            tokio::spawn(gc.clone().run_forever());
         }
         None => tracing::warn!("no [gc] section: the cache is unbounded and will never evict"),
     }
@@ -706,6 +716,7 @@ mod tests {
     ) -> Arc<AppState> {
         Arc::new(AppState {
             conn: Arc::new(Mutex::new(conn)),
+            db_path: ":memory:".into(),
             storage,
             keys: vec![],
             store_dir: "/nix/store".into(),
@@ -713,6 +724,7 @@ mod tests {
             limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024, Duration::from_secs(60)),
             uploads: Arc::new(Semaphore::new(1)),
             in_flight: InFlight::new(),
+            gc: None,
         })
     }
 

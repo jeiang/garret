@@ -42,16 +42,12 @@ pub fn bind(path: &str) -> Result<UnixListener> {
     Ok(listener)
 }
 
-pub async fn serve(
-    listener: UnixListener,
-    state: Arc<AppState>,
-    gc: Option<Arc<Gc>>,
-) -> Result<()> {
+pub async fn serve(listener: UnixListener, state: Arc<AppState>) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
-        let (state, gc) = (state.clone(), gc.clone());
+        let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, state, gc).await {
+            if let Err(e) = handle(stream, state).await {
                 tracing::warn!("admin connection failed: {e:#}");
             }
         });
@@ -64,12 +60,12 @@ fn restrict(path: &str) -> Result<()> {
     Ok(())
 }
 
-async fn handle(stream: UnixStream, state: Arc<AppState>, gc: Option<Arc<Gc>>) -> Result<()> {
+async fn handle(stream: UnixStream, state: Arc<AppState>) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => dispatch(request, &state, gc.as_deref()).await,
+            Ok(request) => dispatch(request, &state).await,
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
@@ -81,7 +77,8 @@ async fn handle(stream: UnixStream, state: Arc<AppState>, gc: Option<Arc<Gc>>) -
     Ok(())
 }
 
-async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Response {
+async fn dispatch(request: Request, state: &AppState) -> Response {
+    let gc = state.gc.as_deref();
     let result = match request {
         Request::Status => status(state, gc).await,
         Request::GcRun => match gc {
@@ -404,18 +401,10 @@ async fn resign(state: &AppState) -> Result<Response> {
 }
 
 /// The online backup: a consistent copy of the whole database, taken while
-/// both services keep running (spec 10-packaging). Takes the source path from
-/// the shared connection and copies on a connection of its own, so pushes
-/// wait on nothing longer than that lookup.
+/// both services keep running (spec 10-packaging). Copies on a connection of
+/// its own, so pushes never wait on it.
 async fn backup(state: &AppState, dest: String) -> Result<Response> {
-    let source = state
-        .conn
-        .lock()
-        .path()
-        // rusqlite reports an in-memory database as an empty path.
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .context("the database is in memory; there is no file to back up")?;
+    let source = state.db_path.clone();
     let bytes = tokio::task::spawn_blocking(move || backup_to(&source, Path::new(&dest))).await??;
     Ok(Response::Backup { bytes })
 }

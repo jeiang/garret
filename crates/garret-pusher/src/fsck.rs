@@ -5,6 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
 
@@ -45,10 +46,7 @@ pub async fn run(
     };
 
     let blobs = state.storage.list_blobs().await?;
-    let db_rows = {
-        let conn = state.conn.lock();
-        db::all_objects_brief(&conn)?
-    };
+    let db_rows = crate::db_run(&state.conn, |conn| db::all_objects_brief(conn)).await?;
 
     let findings = classify_rows(
         &db_rows,
@@ -73,7 +71,7 @@ pub async fn run(
     // A timed-out drain means the live signal was never trustworthy enough
     // to delete rows on — report the findings, but repair nothing.
     let repaired = if repair != Repair::No && quiesce_drained != Some(false) {
-        apply_repair(&state.conn, &findings)?
+        apply_repair(&state.conn, &findings).await?
     } else {
         0
     };
@@ -177,13 +175,16 @@ fn to_wire(findings: &[Finding<'_>]) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
 /// blob is back) is skipped, not counted. A re-push rewrites `created_at`,
 /// so an unchanged `created_at` is the listed row (found by the TLA+ model,
 /// `verification/tla`). Returns the count actually deleted.
-fn apply_repair(conn: &Mutex<Connection>, findings: &[Finding<'_>]) -> Result<usize> {
+async fn apply_repair(conn: &Arc<Mutex<Connection>>, findings: &[Finding<'_>]) -> Result<usize> {
     let (mut dangling, mut mismatched) = (0, 0);
     for f in findings {
-        let mut conn = conn.lock();
-        if db::created_at(&conn, f.hash)? == Some(f.listed_at)
-            && db::delete_object(&mut conn, f.hash)?.is_some()
-        {
+        let (hash, listed_at) = (f.hash.to_owned(), f.listed_at);
+        let deleted = crate::db_run(conn, move |conn| {
+            Ok(db::created_at(conn, &hash)? == Some(listed_at)
+                && db::delete_object(conn, &hash)?.is_some())
+        })
+        .await?;
+        if deleted {
             match f.drift {
                 Drift::Dangling => dangling += 1,
                 Drift::SizeMismatch { .. } => mismatched += 1,
@@ -322,8 +323,8 @@ mod tests {
         assert!(mismatches.is_empty());
     }
 
-    #[test]
-    fn a_row_gone_before_the_repair_is_skipped_and_the_rest_repaired() {
+    #[tokio::test]
+    async fn a_row_gone_before_the_repair_is_skipped_and_the_rest_repaired() {
         // GC evicts `a` between fsck's listing and its repair.
         let mut conn = crate::tests::open_db();
         let [a, b, c] = ["a", "b", "c"].map(|h| h.repeat(32));
@@ -337,9 +338,9 @@ mod tests {
         let (dangling, mismatches) = to_wire(&findings);
         assert_eq!((dangling.len(), mismatches.len()), (2, 1));
         db::delete_object(&mut conn, &a).unwrap();
-        let conn = Mutex::new(conn);
+        let conn = Arc::new(Mutex::new(conn));
 
-        let repaired = apply_repair(&conn, &findings).unwrap();
+        let repaired = apply_repair(&conn, &findings).await.unwrap();
         assert_eq!(repaired, 2, "the vanished row counted as repaired");
         let conn = conn.lock();
         assert!(!db::exists(&conn, &b).unwrap());
@@ -349,8 +350,8 @@ mod tests {
     /// The TLA+ model's counterexample (`verification/tla/fsck_race.cfg`):
     /// a dangling row is deleted and pushed again, blob and all, between
     /// fsck's listing and its repair. The healthy new row must survive.
-    #[test]
-    fn a_row_pushed_again_since_the_listing_is_not_repaired() {
+    #[tokio::test]
+    async fn a_row_pushed_again_since_the_listing_is_not_repaired() {
         let mut conn = crate::tests::open_db();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
@@ -359,9 +360,9 @@ mod tests {
         assert_eq!(findings.len(), 1);
         db::delete_object(&mut conn, &hash).unwrap();
         db::insert_object(&mut conn, &object(&hash), NOW).unwrap();
-        let conn = Mutex::new(conn);
+        let conn = Arc::new(Mutex::new(conn));
 
-        let repaired = apply_repair(&conn, &findings).unwrap();
+        let repaired = apply_repair(&conn, &findings).await.unwrap();
         assert_eq!(repaired, 0);
         assert!(db::exists(&conn.lock(), &hash).unwrap());
     }

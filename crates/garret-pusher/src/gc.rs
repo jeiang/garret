@@ -150,7 +150,7 @@ impl Gc {
             let mut deletion = Deletion::default();
             let mut settled = false;
             for (hash, _) in &candidates {
-                let Some(claim) = Deletion::claim_available(&self.in_flight, hash) else {
+                let Ok(claim) = self.in_flight.claim_delete(hash) else {
                     continue;
                 };
                 settled = true;
@@ -218,7 +218,7 @@ impl Gc {
             crate::db_run(&self.conn, move |conn| {
                 let mut deletion = Deletion::default();
                 for hash in orphan_hashes(&blobs, &known, &in_flight, grace) {
-                    let Some(claim) = Deletion::claim_available(&in_flight, hash) else {
+                    let Ok(claim) = in_flight.claim_delete(hash) else {
                         continue;
                     };
                     if db::exists(conn, hash)? {
