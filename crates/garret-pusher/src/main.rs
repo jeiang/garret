@@ -586,12 +586,19 @@ async fn store_upload(
             verify::max_compressed_len(object.nar_size),
         )
         .await;
+    // Only an `Accepted` verdict may be signed (ADR-0010). No verdict means
+    // the stream never reached its end: the store failed, and its error is
+    // the cause. A store that succeeded without one is a server bug.
     match nar.into_outcome() {
+        Some(verify::Outcome::Accepted) => {}
         Some(verify::Outcome::Failed(reason)) => return Err(anyhow::anyhow!(reason).into()),
         Some(verify::Outcome::Refused(reason)) => {
             return Err(Error::refused(reason));
         }
-        Some(verify::Outcome::Accepted) | None => {}
+        None => {
+            stored?;
+            return Err(anyhow::anyhow!("stored a NAR the check never accepted").into());
+        }
     }
     let (digest, file_size) = stored?;
 
