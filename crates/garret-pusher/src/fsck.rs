@@ -19,29 +19,20 @@ use crate::{AppState, gc};
 /// Ceiling on how long `--quiesce` waits for in-flight uploads to drain.
 /// ponytail: fixed timeout, add a CLI/config knob if an operator ever needs
 /// to wait longer than 5 minutes for uploads to drain.
-const QUIESCE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const QUIESCE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Runs one fsck pass: lists S3 keys, then DB rows (in that order — a push
 /// landing in the gap between the two listings looks exactly like the
 /// dangling-row race the in-flight/age guards exist to close), classifies
-/// the difference, and repairs if asked.
+/// the difference, and repairs if asked. Rows and blobs younger than `grace`
+/// (the GC orphan grace) may be mid-push and are never findings; a quiesced
+/// repair waits at most `quiesce_timeout` for uploads to drain.
 pub async fn run(
     state: &AppState,
-    gc: &gc::Gc,
-    verify_sizes: bool,
-    repair: Repair,
-) -> Result<Response> {
-    run_within(state, gc, verify_sizes, repair, QUIESCE_TIMEOUT).await
-}
-
-/// [`run`] with the drain timeout as a parameter, so a test need not wait
-/// out the real one.
-async fn run_within(
-    state: &AppState,
-    gc: &gc::Gc,
-    verify_sizes: bool,
-    repair: Repair,
+    grace: Duration,
     quiesce_timeout: Duration,
+    verify_sizes: bool,
+    repair: Repair,
 ) -> Result<Response> {
     metrics::counter!("garret_fsck_runs_total").increment(1);
 
@@ -53,7 +44,6 @@ async fn run_within(
         None => None,
     };
 
-    let grace = Duration::from_secs(gc.cfg.orphan_grace_secs);
     let blobs = state.storage.list_blobs().await?;
     let db_rows = {
         let conn = state.conn.lock();
@@ -445,19 +435,7 @@ mod tests {
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), now() - 2 * 86400).unwrap();
         let state = crate::tests::test_state_with_storage(conn, empty_bucket().await).await;
-        let gc = gc::Gc::new(
-            state.conn.clone(),
-            state.storage.clone(),
-            state.in_flight.clone(),
-            garret_server::config::GcConfig {
-                quota_bytes: 1 << 30,
-                high_watermark: 0.95,
-                low_watermark: 0.85,
-                interval_secs: 300,
-                orphan_grace_secs: 86400,
-            },
-        );
-        let fsck = |repair| run_within(&state, &gc, false, repair, Duration::from_millis(50));
+        let fsck = |repair| run(&state, GRACE, Duration::from_millis(50), false, repair);
 
         let upload = state
             .in_flight

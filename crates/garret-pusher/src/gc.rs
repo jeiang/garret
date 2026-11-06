@@ -24,11 +24,14 @@ use crate::deletion::Deletion;
 /// dependencies, which the next query then surfaces.
 const BATCH: usize = 500;
 
+/// How often the orphan sweep runs after the startup one (spec 05: weekly).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 pub struct Gc {
-    pub conn: Arc<Mutex<Connection>>,
-    pub storage: Storage,
-    pub in_flight: InFlight,
-    pub cfg: GcConfig,
+    conn: Arc<Mutex<Connection>>,
+    storage: Storage,
+    in_flight: InFlight,
+    cfg: GcConfig,
     /// Held for a whole eviction pass. The timer and `garret-admin gc run`
     /// share this `Gc`, and a pass counts down from its own reconciled usage,
     /// so two passes at once would each evict to the low watermark as if the
@@ -62,10 +65,39 @@ impl Gc {
         }
     }
 
+    /// The configured quota, for `garret-admin status`.
+    pub fn quota_bytes(&self) -> u64 {
+        self.cfg.quota_bytes
+    }
+
+    /// How old a rowless blob must be before it counts as an orphan.
+    pub fn orphan_grace(&self) -> Duration {
+        Duration::from_secs(self.cfg.orphan_grace_secs)
+    }
+
+    /// The GC schedule (spec 05): an orphan sweep at startup and then every
+    /// [`SWEEP_INTERVAL`], and a tick every `interval_secs`.
+    pub async fn run_forever(self: Arc<Self>) {
+        let mut ticker = tokio::time::interval(Duration::from_secs(self.cfg.interval_secs));
+        let mut last_sweep: Option<Instant> = None;
+        loop {
+            if last_sweep.is_none_or(|at| at.elapsed() >= SWEEP_INTERVAL) {
+                last_sweep = Some(Instant::now());
+                if let Err(e) = self.sweep_orphans().await {
+                    tracing::error!("orphan sweep failed: {e:#}");
+                }
+            }
+            ticker.tick().await;
+            if let Err(e) = self.tick().await {
+                tracing::error!("GC pass failed: {e:#}");
+            }
+        }
+    }
+
     /// Every tick is a cheap counter check; eviction only happens past the
     /// high watermark (spec 05). A check that finds nothing to evict is a
     /// successful run too: the timestamp says GC is alive, not that it evicted.
-    pub async fn tick(&self) -> Result<Option<PassResult>> {
+    async fn tick(&self) -> Result<()> {
         let usage = counted(
             "pass",
             crate::db_run(&self.conn, |conn| db::total_bytes(conn)).await,
@@ -77,9 +109,9 @@ impl Gc {
 
         if usage < self.cfg.high() {
             metrics::gauge!("garret_gc_last_success_timestamp").set(now() as f64);
-            return Ok(None);
+            return Ok(());
         }
-        Ok(Some(self.run().await?))
+        self.run().await.map(drop)
     }
 
     /// One eviction pass: loops until usage reaches the low watermark or no
@@ -165,12 +197,12 @@ impl Gc {
     /// Deletes blobs with no row and aborts stale multiparts (spec 05). Both
     /// are only touched past `orphan_grace`, so an upload in progress — whose
     /// row is written only after the blob completes — is never swept away.
-    pub async fn sweep_orphans(&self) -> Result<usize> {
+    async fn sweep_orphans(&self) -> Result<usize> {
         counted("sweep", self.sweep().await)
     }
 
     async fn sweep(&self) -> Result<usize> {
-        let grace = Duration::from_secs(self.cfg.orphan_grace_secs);
+        let grace = self.orphan_grace();
         let known = crate::db_run(&self.conn, |conn| db::all_hashes(conn)).await?;
         let blobs = self.storage.list_blobs().await?;
         // Before the orphans are claimed: the abort skips in-flight paths.

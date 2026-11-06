@@ -115,32 +115,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    if let Some(collector) = collector.clone() {
-        let gc_cfg = collector.cfg.clone();
-        tokio::spawn(async move {
-            // Startup sweep first, then a tick loop. Each tick is a counter
-            // check; eviction only happens past the high watermark (spec 05).
-            if let Err(e) = collector.sweep_orphans().await {
-                tracing::error!("startup orphan sweep failed: {e:#}");
-            }
-            let mut ticker = tokio::time::interval(Duration::from_secs(gc_cfg.interval_secs));
-            let mut since_sweep = Duration::ZERO;
-            loop {
-                ticker.tick().await;
-                if let Err(e) = collector.tick().await {
-                    tracing::error!("GC pass failed: {e:#}");
-                }
-                since_sweep += Duration::from_secs(gc_cfg.interval_secs);
-                if since_sweep >= Duration::from_secs(7 * 24 * 60 * 60) {
-                    since_sweep = Duration::ZERO;
-                    if let Err(e) = collector.sweep_orphans().await {
-                        tracing::error!("weekly orphan sweep failed: {e:#}");
-                    }
-                }
-            }
-        });
-    } else {
-        tracing::warn!("no [gc] section: the cache is unbounded and will never evict");
+    match &collector {
+        Some(collector) => {
+            tokio::spawn(collector.clone().run_forever());
+        }
+        None => tracing::warn!("no [gc] section: the cache is unbounded and will never evict"),
     }
 
     // Everything `garret login` needs to write a whole client config from one

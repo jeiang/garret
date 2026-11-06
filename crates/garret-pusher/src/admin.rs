@@ -92,9 +92,7 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
                 bytes_freed: pass.bytes_freed,
                 candidates_exhausted: pass.candidates_exhausted,
             }),
-            None => Ok(Response::Error {
-                message: "no [gc] section is configured".into(),
-            }),
+            None => Ok(no_gc()),
         },
         Request::Resign => resign(state).await,
         Request::Delete { hashes, dry_run } => {
@@ -127,10 +125,17 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             verify_sizes,
             repair,
         } => match gc {
-            Some(gc) => fsck::run(state, gc, verify_sizes, repair).await,
-            None => Ok(Response::Error {
-                message: "no [gc] section is configured".into(),
-            }),
+            Some(gc) => {
+                fsck::run(
+                    state,
+                    gc.orphan_grace(),
+                    fsck::QUIESCE_TIMEOUT,
+                    verify_sizes,
+                    repair,
+                )
+                .await
+            }
+            None => Ok(no_gc()),
         },
         Request::Prune { before, dry_run } => prune(state, before, dry_run).await,
         Request::DeletePushedBy {
@@ -145,9 +150,16 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
     })
 }
 
+/// The reply to a command that needs the `[gc]` section: `gc run`, and
+/// `fsck`, whose guards use the orphan grace.
+fn no_gc() -> Response {
+    Response::Error {
+        message: "no [gc] section is configured".into(),
+    }
+}
+
 async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
-    let (quota_bytes, uploads_in_flight) =
-        (gc.map(|gc| gc.cfg.quota_bytes), state.in_flight.uploads());
+    let (quota_bytes, uploads_in_flight) = (gc.map(Gc::quota_bytes), state.in_flight.uploads());
     crate::db_run(&state.conn, move |conn| {
         Ok(Response::Status {
             objects: conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?,
