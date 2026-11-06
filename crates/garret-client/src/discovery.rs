@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use garret_common::wire::{self, Discovery};
 use reqwest::StatusCode;
 
-/// Fetches `GET /api/v1/discovery` from the Pusher, anonymously, and refuses a
-/// document that [`check`] rejects.
+/// Fetches `GET /api/v1/discovery` from the Pusher at `endpoint` (no trailing
+/// `/`), anonymously, and refuses a document that [`check`] rejects.
 ///
 /// Distinguishes one failure precisely: a 404 *or* 401 means a server that
 /// predates the discovery endpoint (discovery needs no token, so a 401 can
@@ -18,7 +18,7 @@ use reqwest::StatusCode;
 /// letting it read as a typo'd URL or bad credentials.
 pub async fn fetch(http: &reqwest::Client, endpoint: &str) -> Result<Discovery> {
     check_url("the Pusher URL", endpoint)?;
-    let url = format!("{}{}", endpoint.trim_end_matches('/'), wire::DISCOVERY);
+    let url = format!("{endpoint}{}", wire::DISCOVERY);
     let response = http
         .get(&url)
         .send()
@@ -191,16 +191,7 @@ mod tests {
 
     #[test]
     fn a_document_with_one_bad_value_is_refused() {
-        use garret_common::wire::Oidc;
-        let good = || Discovery {
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA".into()],
-            oidc: Some(Oidc {
-                issuer: "https://id.example".into(),
-                audience: "garret".into(),
-                client_id: Some("garret-cli".into()),
-            }),
-        };
+        let good = crate::testing::discovery;
         check(&good()).unwrap();
 
         let mut d = good();

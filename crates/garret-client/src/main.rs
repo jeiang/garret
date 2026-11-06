@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
-use garret_client::{auth, browse, config, discovery, doctor, nixconf, push, watcher};
-use garret_common::{human_bytes, wire};
+use garret_client::{auth, browse, config, discovery, doctor, http, nixconf, push, watcher};
+use garret_common::wire;
 use indicatif::MultiProgress;
 use serde_json::json;
 
@@ -141,8 +141,7 @@ async fn main() -> Result<()> {
     // A server that never accepts becomes an error instead of a hang. A
     // connection that stalls once open is `push`'s to catch: reqwest's read
     // timeout cannot tell a slow upload from a stuck one.
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
+    let http = http::client_builder()
         .connect_timeout(Duration::from_secs(30))
         // The servers close connections idle for 30 s; retire pooled ones
         // first so an upload is never sent on a connection mid-close.
@@ -168,8 +167,7 @@ async fn main() -> Result<()> {
             // A diagnostic that hangs is a diagnostic that failed: every probe
             // gets a hard timeout, unlike the push path, which gives up only
             // on a stalled connection, never on a slow one.
-            let timed = reqwest::Client::builder()
-                .user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
+            let timed = http::client_builder()
                 .timeout(Duration::from_secs(15))
                 .build()?;
             let checks = doctor::run(&cfg, &timed, path.as_deref()).await;
@@ -312,17 +310,7 @@ async fn main() -> Result<()> {
             }
             let page: wire::Page =
                 serde_json::from_value(raw).context("parsing the object list")?;
-            for object in &page.objects {
-                println!(
-                    "{}  {:<40} {:>12} on disk",
-                    object.hash,
-                    object.name,
-                    human_bytes(object.file_size),
-                );
-            }
-            if page.next_cursor.is_some() {
-                println!("… more results; narrow the query or raise --limit");
-            }
+            print!("{}", browse::render_page(&page));
         }
 
         Command::Tree { hash } => {
@@ -353,22 +341,7 @@ async fn main() -> Result<()> {
             }
             let pins: Vec<wire::Pin> =
                 serde_json::from_value(raw).context("parsing the pin list")?;
-            let now = garret_common::unix_now();
-            for pin in &pins {
-                let expiry = match pin.expires_at {
-                    None => "permanent".to_owned(),
-                    Some(t) if t <= now => "expired".to_owned(),
-                    // Unix seconds, not a formatted date: no date dependency
-                    // for one column, and --json is the machine surface.
-                    Some(t) => format!("expires at {t}"),
-                };
-                println!(
-                    "{:<20} {}  {} ({expiry})",
-                    pin.name,
-                    &pin.store_path_hash[..8.min(pin.store_path_hash.len())],
-                    pin.store_path,
-                );
-            }
+            print!("{}", browse::render_pins(&pins, garret_common::unix_now()));
             if pins.is_empty() {
                 eprintln!("no pins");
             }
@@ -422,25 +395,17 @@ async fn login(
     url: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let path = match explicit {
-        Some(p) => std::path::PathBuf::from(p),
-        None => config::path()?,
-    };
-    let exists = path.exists();
-
-    let cfg = match (&url, exists) {
-        // Nothing to go on: no config to re-authenticate against, no URL to
-        // bootstrap from.
-        (None, false) => anyhow::bail!(
-            "no config at {} — run `garret login <pusher-url>` to create one",
-            path.display()
-        ),
+    let cfg = match url {
         // Pure re-authentication. The config is not touched, so a token that
-        // has expired or been revoked costs nothing to replace.
-        (None, true) => config::load(explicit)?,
-        (Some(url), _) => {
+        // has expired or been revoked costs nothing to replace. Without a
+        // config there is nothing to re-authenticate against, and `load`
+        // says to pass a URL.
+        None => config::load(explicit)?,
+        Some(url) => {
+            let path = config::resolve_path(explicit)?;
+            let url = url.trim_end_matches('/');
             let discovered = discovery::fetch(http, url).await?;
-            let rendered = config::render(url.trim_end_matches('/'), &discovered)?;
+            let rendered = config::render(url, &discovered)?;
             let current = garret_client::files::read_optional(&path)?;
             match current {
                 // Re-running against the server that wrote this config: nothing

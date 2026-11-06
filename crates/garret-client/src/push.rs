@@ -170,7 +170,7 @@ impl Report {
 
     /// The daemon's reporter: per-path lines to the journal, no bar (the
     /// journal is not a TTY anyway), no events.
-    pub fn plain() -> Self {
+    pub(crate) fn plain() -> Self {
         Self {
             json: false,
             mp: MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden()),
@@ -363,21 +363,21 @@ impl std::ops::AddAssign for Summary {
 /// [`push_all`]: Pusher::push_all
 pub struct Pusher {
     /// Shared HTTP client, reused across the negotiation and every PUT.
-    pub http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     /// Pusher base URL.
-    pub endpoint: String,
+    pub(crate) endpoint: String,
     /// Bearer tokens, asked for per request: a run can outlive any one token.
     pub tokens: crate::auth::TokenSource,
     /// Maximum concurrent uploads.
     pub jobs: usize,
     /// zstd level for compressing NARs on the way out.
-    pub zstd_level: i32,
+    pub(crate) zstd_level: i32,
     /// Retries per path on 5xx and dropped connections, with exponential
     /// jittered backoff; 429s wait out `Retry-After` instead.
-    pub max_retries: u32,
+    pub(crate) max_retries: u32,
     /// How long an upload may go without progress before it is abandoned as
     /// [`Stalled`] and retried.
-    pub upload_idle: Duration,
+    pub(crate) upload_idle: Duration,
 }
 
 /// The subset of `nix path-info --json` garret needs. Shelling out to nix
@@ -406,14 +406,14 @@ pub struct PathInfo {
 }
 
 /// The key name of a signature or public key: the part before `:`.
-pub fn key_name(key: &str) -> &str {
+pub(crate) fn key_name(key: &str) -> &str {
     key.split_once(':').map_or(key, |(name, _)| name)
 }
 
 /// True when any signature's key name is one of `key_names`. Exact name
 /// equality, not substring: a key merely *containing* `cache.nixos.org-1`
 /// must not match.
-pub fn signed_by<'a>(
+pub(crate) fn signed_by<'a>(
     signatures: &[String],
     key_names: impl Iterator<Item = &'a str> + Clone,
 ) -> bool {
@@ -444,7 +444,7 @@ pub async fn closure(paths: &[String]) -> Result<Vec<PathInfo>> {
 /// `nix path-info --json` over `paths`: with `recursive`, their whole closure;
 /// without, just the paths themselves (their direct references are named in
 /// each entry's `references`).
-pub async fn path_info(paths: &[String], recursive: bool) -> Result<Vec<PathInfo>> {
+pub(crate) async fn path_info(paths: &[String], recursive: bool) -> Result<Vec<PathInfo>> {
     let mut command = Command::new("nix");
     command.args(["path-info", "--json", "--json-format", "1"]);
     if recursive {
@@ -501,7 +501,7 @@ fn parse_path_info(stdout: &[u8]) -> Result<Vec<PathInfo>> {
 
 /// The entries of `infos` whose hash is in `missing`, in order. A set lookup
 /// per entry: Negotiations over thousands of paths must not go quadratic.
-pub fn retain_missing(infos: &[PathInfo], missing: &HashSet<String>) -> Vec<PathInfo> {
+pub(crate) fn retain_missing(infos: &[PathInfo], missing: &HashSet<String>) -> Vec<PathInfo> {
     infos
         .iter()
         .filter(|p| missing.contains(hash_of_store_path(&p.path)))
@@ -584,7 +584,7 @@ impl Pusher {
 
     /// [`push_all`](Self::push_all), also naming the paths that failed — what
     /// the Watcher puts on its failed list.
-    pub async fn push_tracked(
+    pub(crate) async fn push_tracked(
         &self,
         paths: Vec<PathInfo>,
         report: &Report,
@@ -875,9 +875,9 @@ impl std::error::Error for Rejected {}
 /// survives renewal is not this: it can be transient (JWKS outage), so it is
 /// an ordinary failure.
 #[derive(Debug)]
-pub struct Refused(
+pub(crate) struct Refused(
     /// The Pusher's explanation, as sent.
-    pub String,
+    pub(crate) String,
 );
 
 impl std::fmt::Display for Refused {
@@ -1559,70 +1559,13 @@ mod tests {
         );
     }
 
-    /// Serves `status` with `body` to every request, counting them. Each
-    /// request is read whole (headers, then a `Content-Length` body) before
-    /// the reply, so nothing hinges on how the client's writes are split.
-    async fn answering(
-        status: u16,
-        body: &'static str,
-    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = hits.clone();
-        tokio::spawn(async move {
-            loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut socket = BufReader::new(socket);
-                let mut content_length = 0;
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    socket.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        content_length = value.trim().parse().unwrap();
-                    }
-                }
-                let mut request_body = vec![0; content_length];
-                socket.read_exact(&mut request_body).await.unwrap();
-                counter.fetch_add(1, Ordering::SeqCst);
-                let reply = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.get_mut().write_all(reply.as_bytes()).await;
-            }
-        });
-        (endpoint, hits)
-    }
-
-    fn pusher(endpoint: String) -> (Pusher, Arc<std::sync::atomic::AtomicUsize>) {
-        let (tokens, mints) = crate::auth::TokenSource::counting();
-        let pusher = Pusher {
-            http: reqwest::Client::new(),
-            endpoint,
-            tokens,
-            jobs: 1,
-            zstd_level: 3,
-            max_retries: 0,
-            upload_idle: Duration::from_secs(5),
-        };
-        (pusher, mints)
-    }
-
     /// 403 is a permanent refusal: no renewal, one request, typed `Refused`.
     #[tokio::test]
     async fn a_403_negotiation_is_refused_without_renewing_the_token() {
         use std::sync::atomic::Ordering;
-        let (endpoint, requests) = answering(403, r#"{"error":"not authorized"}"#).await;
-        let (pusher, mints) = pusher(endpoint);
+        let (endpoint, requests) =
+            crate::testing::answering(403, r#"{"error":"not authorized"}"#).await;
+        let (pusher, mints) = crate::testing::pusher(endpoint);
         let error = pusher.negotiate(&["h"]).await.unwrap_err();
         let refused = error.downcast_ref::<Refused>().expect("typed Refused");
         assert!(refused.0.contains("not authorized"), "{}", refused.0);
@@ -1635,8 +1578,9 @@ mod tests {
     #[tokio::test]
     async fn a_persistent_401_renews_once_and_is_not_a_refusal() {
         use std::sync::atomic::Ordering;
-        let (endpoint, requests) = answering(401, r#"{"error":"invalid token"}"#).await;
-        let (pusher, mints) = pusher(endpoint);
+        let (endpoint, requests) =
+            crate::testing::answering(401, r#"{"error":"invalid token"}"#).await;
+        let (pusher, mints) = crate::testing::pusher(endpoint);
         let error = pusher.negotiate(&["h"]).await.unwrap_err();
         assert!(!error.is::<Refused>());
         assert!(format!("{error:#}").contains("401"), "{error:#}");

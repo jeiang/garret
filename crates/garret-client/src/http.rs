@@ -1,8 +1,16 @@
-//! Turning a non-2xx answer into an error that says why. Servers and issuers
-//! explain themselves in the body, which `error_for_status` discards.
+//! The client's HTTP conventions: every request names garret in its
+//! `User-Agent`, and a non-2xx answer becomes an error that says why. Servers
+//! and issuers explain themselves in the body, which `error_for_status`
+//! discards.
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
+
+/// A client builder whose requests carry `User-Agent: garret/<version>`
+/// (spec 06).
+pub fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().user_agent(concat!("garret/", env!("CARGO_PKG_VERSION")))
+}
 
 /// Passes a 2xx response through; turns anything else into an error naming
 /// `what`, the status, and the body's [`error_detail`].
