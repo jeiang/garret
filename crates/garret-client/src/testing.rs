@@ -10,7 +10,9 @@ use std::{
     time::Duration,
 };
 
-use crate::push::Pusher;
+use garret_common::wire::{Discovery, Oidc};
+
+use crate::{config::Config, push::Pusher};
 
 /// An empty directory, removed with its contents on drop, so a failing
 /// test leaves nothing behind.
@@ -43,6 +45,25 @@ pub fn scratch_dir() -> ScratchDir {
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).expect("creating scratch dir");
     ScratchDir(path)
+}
+
+/// A server's discovery document with every field advertised.
+pub fn discovery() -> Discovery {
+    Discovery {
+        puller_endpoint: Some("https://cache.example".into()),
+        public_keys: vec!["garret-1:AAAA+bb/cc=".into()],
+        oidc: Some(Oidc {
+            issuer: "https://id.example".into(),
+            audience: "garret".into(),
+            client_id: Some("garret-cli".into()),
+        }),
+    }
+}
+
+/// The config `garret login https://push.example` writes from [`discovery`].
+pub fn config() -> Config {
+    let text = crate::config::render("https://push.example", &discovery()).unwrap();
+    toml::from_str(&text).unwrap()
 }
 
 /// Serves `status` with `body` to every request, counting them. Each

@@ -183,7 +183,8 @@ mod tests {
         assert_eq!(out.lines().count(), 1);
         page.next_cursor = Some("c".into());
         assert!(
-            render_page(&page).ends_with("on disk\n… more results; narrow the query or raise --limit\n")
+            render_page(&page)
+                .ends_with("on disk\n… more results; narrow the query or raise --limit\n")
         );
     }
 
@@ -203,18 +204,10 @@ mod tests {
             pin("later", Some(1001)),
         ];
         let out = render_pins(&pins, 1000);
-        let expiries: Vec<&str> = out
-            .lines()
-            .map(|l| &l[l.rfind('(').unwrap()..])
-            .collect();
+        let expiries: Vec<&str> = out.lines().map(|l| &l[l.rfind('(').unwrap()..]).collect();
         assert_eq!(
             expiries,
-            [
-                "(permanent)",
-                "(expired)",
-                "(expired)",
-                "(expires at 1001)"
-            ]
+            ["(permanent)", "(expired)", "(expired)", "(expires at 1001)"]
         );
         assert!(out.starts_with("forever              abcdefgh  /nix/store/abcdefghijklmnop-x"));
     }

@@ -191,16 +191,7 @@ mod tests {
 
     #[test]
     fn a_document_with_one_bad_value_is_refused() {
-        use garret_common::wire::Oidc;
-        let good = || Discovery {
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA".into()],
-            oidc: Some(Oidc {
-                issuer: "https://id.example".into(),
-                audience: "garret".into(),
-                client_id: Some("garret-cli".into()),
-            }),
-        };
+        let good = crate::testing::discovery;
         check(&good()).unwrap();
 
         let mut d = good();

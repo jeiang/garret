@@ -27,49 +27,49 @@ const BATCH_SIZE: usize = 500;
 /// The daemon's assembled settings; [`run`](Watcher::run) is its whole life.
 pub struct Watcher {
     /// Path to the Nix database (normally `/nix/var/nix/db/db.sqlite`).
-    pub nix_db: String,
+    nix_db: String,
     /// Where the Watcher Cursor persists across restarts.
-    pub cursor_path: PathBuf,
+    cursor_path: PathBuf,
     /// How long to sleep when a poll finds nothing new.
-    pub poll_interval: Duration,
+    poll_interval: Duration,
     /// What not to push.
-    pub filters: Filters,
+    filters: Filters,
     /// Push attempts per path in one process, the first included, before the
     /// watcher leaves it on the failed list for a restart or a drain.
-    pub max_attempts: u32,
+    max_attempts: u32,
     /// Where the wake socket listens; `garret enqueue` pokes it to collapse
     /// push latency from `poll_interval` to "right after the build".
-    pub socket_path: PathBuf,
+    socket_path: PathBuf,
 }
 
 /// Why a newly-valid path might not be worth pushing (spec 06).
 #[derive(Debug, Default, Clone)]
-pub struct Filters {
+struct Filters {
     /// Signed by one of these upstreams already — someone else serves it.
-    pub upstream_keys: Vec<String>,
+    upstream_keys: Vec<String>,
     /// Substring matches, so an operator can exclude a whole family of paths.
-    pub exclude_patterns: Vec<String>,
+    exclude_patterns: Vec<String>,
     /// The cache's own `public_keys` (`name:base64`); a path signed by one of
     /// these names came from the cache, so pushing it back is pointless.
-    pub own_keys: Vec<String>,
+    own_keys: Vec<String>,
 }
 
 /// One newly-valid store path, as the Nix database describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidPath {
+struct ValidPath {
     /// `ValidPaths.id` — AUTOINCREMENT, so also the cursor value.
-    pub id: i64,
+    id: i64,
     /// Full store path.
-    pub path: String,
+    path: String,
     /// Its signatures, `key-name:base64` each, for the upstream filter.
-    pub sigs: Vec<String>,
+    sigs: Vec<String>,
 }
 
 impl Filters {
     /// `.drv` files are build recipes nix fetches from its own sources, and a
     /// path already signed upstream is already served by someone else. Keeps
     /// `-source` and fixed-output paths (spec 06).
-    pub fn should_skip(&self, path: &ValidPath) -> Option<&'static str> {
+    fn should_skip(&self, path: &ValidPath) -> Option<&'static str> {
         if path.path.ends_with(".drv") {
             return Some("drv");
         }
@@ -106,7 +106,7 @@ impl Filters {
 
 /// Opens the Nix database read-only and checks the schema is the one we index
 /// against — a silent schema change would make the cursor meaningless.
-pub fn open_nix_db(path: &str) -> Result<Connection> {
+fn open_nix_db(path: &str) -> Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -128,7 +128,7 @@ pub fn open_nix_db(path: &str) -> Result<Connection> {
 
 /// Paths validated after `cursor`, oldest first. Signatures come along so the
 /// upstream filter needs no second query.
-pub fn paths_after(conn: &Connection, cursor: i64, limit: usize) -> Result<Vec<ValidPath>> {
+fn paths_after(conn: &Connection, cursor: i64, limit: usize) -> Result<Vec<ValidPath>> {
     let mut stmt = conn
         .prepare("SELECT id, path, sigs FROM ValidPaths WHERE id > ?1 ORDER BY id ASC LIMIT ?2")?;
     Ok(stmt
@@ -149,7 +149,7 @@ pub fn paths_after(conn: &Connection, cursor: i64, limit: usize) -> Result<Vec<V
 
 /// The newest `ValidPaths.id`, or 0 in an empty store — where a fresh cursor
 /// bootstraps so only paths validated from now on push.
-pub fn max_id(conn: &Connection) -> Result<i64> {
+fn max_id(conn: &Connection) -> Result<i64> {
     Ok(
         conn.query_row("SELECT COALESCE(MAX(id), 0) FROM ValidPaths", [], |r| {
             r.get(0)
@@ -160,7 +160,7 @@ pub fn max_id(conn: &Connection) -> Result<i64> {
 /// Reads the persisted cursor; `None` (no file) means first run and triggers
 /// the bootstrap in [`Watcher::run`]. A cursor that is there but unreadable is
 /// an error: bootstrapping past it would silently skip the backlog.
-pub fn read_cursor(path: &Path) -> Result<Option<i64>> {
+fn read_cursor(path: &Path) -> Result<Option<i64>> {
     crate::files::read_optional(path)?
         .map(|text| {
             text.trim()
@@ -173,7 +173,7 @@ pub fn read_cursor(path: &Path) -> Result<Option<i64>> {
 /// Persists the cursor, replaced whole: the daemon is stopped by a signal (CI
 /// kills it before draining), and a kill mid-write must not leave an empty
 /// cursor that bootstraps past the backlog.
-pub fn write_cursor(path: &Path, cursor: i64) -> Result<()> {
+fn write_cursor(path: &Path, cursor: i64) -> Result<()> {
     crate::files::write_atomic(path, cursor.to_string().as_bytes(), 0o666)
 }
 
@@ -269,7 +269,7 @@ fn log_failure(path: &str, spent: u32, max: u32) {
 /// Binds the wake socket `garret enqueue` datagrams land on. A stale file from
 /// an unclean shutdown is unlinked first, so the only warning-worthy failure
 /// left is a real one (usually: the directory is not writable by this user).
-pub fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
+fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating socket directory {parent:?}"))?;
@@ -291,7 +291,7 @@ pub fn bind_wake_socket(path: &std::path::Path) -> Result<UnixDatagram> {
 /// Sleeps until `interval` elapses or a wake datagram arrives, whichever comes
 /// first. Bursts coalesce: whatever queued is drained before returning, so a
 /// hook firing fifty times costs one early poll.
-pub async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
+async fn wait_for_wake(socket: Option<&UnixDatagram>, interval: Duration) {
     let Some(socket) = socket else {
         return tokio::time::sleep(interval).await;
     };
@@ -723,8 +723,7 @@ mod tests {
     /// failed list, to push once the policy is fixed.
     #[tokio::test]
     async fn a_refused_negotiation_keeps_the_batch_on_the_failed_list() {
-        let (endpoint, _) =
-            crate::testing::answering(403, r#"{"error":"not authorized"}"#).await;
+        let (endpoint, _) = crate::testing::answering(403, r#"{"error":"not authorized"}"#).await;
         let (pusher, _) = crate::testing::pusher(endpoint);
         let a = format!("/nix/store/{}-a", "a".repeat(32));
         let b = format!("/nix/store/{}-b", "b".repeat(32));
@@ -738,7 +737,12 @@ mod tests {
             list.record_failure(path);
         }
         list.save().unwrap();
-        assert_eq!(FailedList::load(&dir.join("watcher-cursor")).unwrap().due(5), [a, b]);
+        assert_eq!(
+            FailedList::load(&dir.join("watcher-cursor"))
+                .unwrap()
+                .due(5),
+            [a, b]
+        );
     }
 
     #[test]

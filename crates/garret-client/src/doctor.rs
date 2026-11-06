@@ -391,40 +391,8 @@ fn fix_hint(device_flow: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{config as cfg, discovery as advertised};
     use garret_common::wire::Oidc;
-
-    fn cfg() -> config::Config {
-        config::Config {
-            endpoint: "https://push.example".into(),
-            oidc: config::Oidc {
-                issuer: Some("https://id.example".into()),
-                client_id: Some("garret-cli".into()),
-                client_secret_file: None,
-                audience: "garret".into(),
-                resource: None,
-            },
-            jobs: 8,
-            zstd_level: 3,
-            max_retries: 5,
-            upload_idle_secs: 300,
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA=".into()],
-            upstream_keys: vec!["cache.nixos.org-1".into()],
-            watch: Default::default(),
-        }
-    }
-
-    fn advertised() -> Discovery {
-        Discovery {
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA=".into()],
-            oidc: Some(Oidc {
-                issuer: "https://id.example".into(),
-                audience: "garret".into(),
-                client_id: Some("garret-cli".into()),
-            }),
-        }
-    }
 
     #[test]
     fn a_matching_config_has_no_drift() {

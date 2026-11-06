@@ -347,19 +347,8 @@ pub fn create_private_dir(dir: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use garret_common::wire::{Discovery, Oidc};
-
-    fn discovery() -> Discovery {
-        Discovery {
-            puller_endpoint: Some("https://cache.example".into()),
-            public_keys: vec!["garret-1:AAAA+bb/cc=".into()],
-            oidc: Some(Oidc {
-                issuer: "https://id.example".into(),
-                audience: "garret".into(),
-                client_id: Some("garret-cli".into()),
-            }),
-        }
-    }
+    use crate::testing::discovery;
+    use garret_common::wire::Discovery;
 
     #[test]
     fn validate_rejects_zero_values() {
