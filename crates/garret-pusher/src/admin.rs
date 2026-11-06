@@ -117,15 +117,11 @@ async fn dispatch(request: Request, state: &AppState, gc: Option<&Gc>) -> Respon
             .await
         }
         Request::Fsck {
-            repair,
             verify_sizes,
-            quiesce,
-        } => match (quiesce && !repair, gc) {
-            (true, _) => Ok(Response::Error {
-                message: "--quiesce requires --repair".into(),
-            }),
-            (false, Some(gc)) => fsck::run(state, gc, repair, verify_sizes, quiesce).await,
-            (false, None) => Ok(Response::Error {
+            repair,
+        } => match gc {
+            Some(gc) => fsck::run(state, gc, verify_sizes, repair).await,
+            None => Ok(Response::Error {
                 message: "no [gc] section is configured".into(),
             }),
         },

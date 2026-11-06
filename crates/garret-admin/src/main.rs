@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use clap::{Parser, Subcommand};
 use garret_common::{
-    admin::{Request, Response},
+    admin::{Repair, Request, Response},
     human_bytes,
 };
 use serde_json::json;
@@ -318,9 +318,12 @@ async fn main() -> Result<()> {
         } => match request(
             &cli.socket,
             Request::Fsck {
-                repair,
                 verify_sizes,
-                quiesce,
+                repair: match (repair, quiesce) {
+                    (false, _) => Repair::No,
+                    (true, false) => Repair::Live,
+                    (true, true) => Repair::Quiesced,
+                },
             },
         )
         .await?
@@ -330,14 +333,13 @@ async fn main() -> Result<()> {
                 size_mismatches,
                 orphans,
                 repaired,
-                quiesced,
                 quiesce_drained,
             } => {
                 // Orphans alone stay informational: the orphan sweep already
                 // owns them on its own schedule.
                 let ok = dangling.is_empty()
                     && size_mismatches.is_empty()
-                    && !(quiesced && !quiesce_drained);
+                    && quiesce_drained != Some(false);
 
                 if json {
                     println!(
@@ -348,12 +350,12 @@ async fn main() -> Result<()> {
                             "size_mismatches": size_mismatches,
                             "orphans": orphans,
                             "repaired": repaired,
-                            "quiesce_drained": quiesced.then_some(quiesce_drained),
+                            "quiesce_drained": quiesce_drained,
                         })
                     );
                 } else {
                     print_fsck_report(&dangling, &size_mismatches, &orphans, repair, repaired);
-                    if quiesced && !quiesce_drained {
+                    if quiesce_drained == Some(false) {
                         println!(
                             "quiesce timed out waiting for uploads to drain — no repair was performed"
                         );

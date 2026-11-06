@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::Result;
-use garret_common::admin::{FsckRow, FsckSizeMismatch, Response};
+use garret_common::admin::{FsckRow, FsckSizeMismatch, Repair, Response};
 use garret_server::{db, inflight::InFlight, now, storage};
 use parking_lot::Mutex;
 use rusqlite::Connection;
@@ -29,18 +29,29 @@ const QUIESCE_TIMEOUT: Duration = Duration::from_secs(300);
 pub async fn run(
     state: &AppState,
     gc: &gc::Gc,
-    repair: bool,
     verify_sizes: bool,
-    quiesce: bool,
+    repair: Repair,
+) -> Result<Response> {
+    run_within(state, gc, verify_sizes, repair, QUIESCE_TIMEOUT).await
+}
+
+/// [`run`] with the drain timeout as a parameter, so a test need not wait
+/// out the real one.
+async fn run_within(
+    state: &AppState,
+    gc: &gc::Gc,
+    verify_sizes: bool,
+    repair: Repair,
+    quiesce_timeout: Duration,
 ) -> Result<Response> {
     metrics::counter!("garret_fsck_runs_total").increment(1);
 
     // Held to the end of `run`, however it returns: dropping the guard
     // reopens the gate unless another quiesce still holds it.
-    let guard = quiesce.then(|| state.in_flight.quiesce());
+    let guard = (repair == Repair::Quiesced).then(|| state.in_flight.quiesce());
     let quiesce_drained = match &guard {
-        Some(guard) => guard.drain(QUIESCE_TIMEOUT).await,
-        None => true,
+        Some(guard) => Some(guard.drain(quiesce_timeout).await),
+        None => None,
     };
 
     let grace = Duration::from_secs(gc.cfg.orphan_grace_secs);
@@ -68,7 +79,7 @@ pub async fn run(
 
     // A timed-out drain means the live signal was never trustworthy enough
     // to delete rows on — report the findings, but repair nothing.
-    let repaired = if repair && quiesce_drained {
+    let repaired = if repair != Repair::No && quiesce_drained != Some(false) {
         apply_repair(&state.conn, &db_rows, &dangling, &size_mismatches)?
     } else {
         0
@@ -79,7 +90,6 @@ pub async fn run(
         size_mismatches,
         orphans,
         repaired,
-        quiesced: quiesce,
         quiesce_drained,
     })
 }
@@ -386,5 +396,69 @@ mod tests {
             sigs: vec![],
             pushed_by: None,
         }
+    }
+
+    /// An S3 stand-in whose bucket lists no blobs.
+    async fn empty_bucket() -> storage::Storage {
+        let app = axum::Router::new().fallback(|| async {
+            r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><KeyCount>0</KeyCount><IsTruncated>false</IsTruncated></ListBucketResult>"#
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        crate::tests::storage_at(&endpoint).await
+    }
+
+    /// A quiesced repair whose drain times out reports it and deletes
+    /// nothing, though the row is dangling; a live repair deletes it and
+    /// reports no drain at all.
+    #[tokio::test]
+    async fn a_quiesce_that_cannot_drain_repairs_nothing() {
+        let mut conn = crate::tests::open_db();
+        let hash = "a".repeat(32);
+        db::insert_object(&mut conn, &object(&hash), now() - 2 * 86400).unwrap();
+        let state = crate::tests::test_state_with_storage(conn, empty_bucket().await).await;
+        let gc = gc::Gc::new(
+            state.conn.clone(),
+            state.storage.clone(),
+            state.in_flight.clone(),
+            garret_server::config::GcConfig {
+                quota_bytes: 1 << 30,
+                high_watermark: 0.95,
+                low_watermark: 0.85,
+                interval_secs: 300,
+                orphan_grace_secs: 86400,
+            },
+        );
+        let fsck = |repair| run_within(&state, &gc, false, repair, Duration::from_millis(50));
+
+        let upload = state
+            .in_flight
+            .claim(&"b".repeat(32), garret_server::inflight::Kind::Upload)
+            .unwrap();
+        let Response::Fsck {
+            dangling,
+            repaired,
+            quiesce_drained,
+            ..
+        } = fsck(Repair::Quiesced).await.unwrap()
+        else {
+            panic!("not an fsck response");
+        };
+        assert_eq!((dangling.len(), repaired), (1, 0));
+        assert_eq!(quiesce_drained, Some(false));
+        assert!(db::exists(&state.conn.lock(), &hash).unwrap());
+        drop(upload);
+
+        let Response::Fsck {
+            repaired,
+            quiesce_drained,
+            ..
+        } = fsck(Repair::Live).await.unwrap()
+        else {
+            panic!("not an fsck response");
+        };
+        assert_eq!((repaired, quiesce_drained), (1, None));
+        assert!(!db::exists(&state.conn.lock(), &hash).unwrap());
     }
 }

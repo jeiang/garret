@@ -46,16 +46,11 @@ pub enum Request {
     },
     /// Audit row ⇔ blob consistency (spec 02/03), and optionally repair it.
     Fsck {
-        /// Delete dangling rows and size-mismatched rows. Dry-run (report
-        /// only) is the default.
-        repair: bool,
         /// Compare `file_size` against the S3 object's size for hashes with
         /// both a row and a blob; mismatches are a third finding category.
         verify_sizes: bool,
-        /// Reject new pushes and wait for in-flight uploads to drain before
-        /// repairing, for the degraded case where the live in-flight signal
-        /// alone isn't trusted. Only meaningful with `repair: true`.
-        quiesce: bool,
+        /// Whether, and how, to delete the rows found.
+        repair: Repair,
     },
     /// Delete every closure last pushed before a cutoff, keeping anything a
     /// newer push or a live pin still needs (spec 05).
@@ -83,6 +78,21 @@ pub enum Request {
         /// Report what would go without deleting anything.
         dry_run: bool,
     },
+}
+
+/// Whether [`Request::Fsck`] repairs what it finds.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Repair {
+    /// Report only: the default.
+    No,
+    /// Delete dangling and size-mismatched rows, trusting the live
+    /// in-flight signal.
+    Live,
+    /// Reject new pushes and wait for in-flight uploads to drain before
+    /// repairing, for the degraded case where the live in-flight signal
+    /// alone isn't trusted.
+    Quiesced,
 }
 
 /// The Pusher's reply to a [`Request`]; variants mirror the request commands,
@@ -151,14 +161,12 @@ pub enum Response {
         /// schedule.
         orphans: Vec<String>,
         /// Rows actually deleted this run (dangling + size-mismatch
-        /// combined). Zero unless `repair: true`.
+        /// combined). Zero unless the request asked for a repair.
         repaired: usize,
-        /// Whether quiesce mode was engaged at all, mirroring the request.
-        quiesced: bool,
-        /// True if in-flight uploads reached zero within the timeout. False
-        /// means the drain timed out and no repair happened, even if
-        /// `repair` was requested.
-        quiesce_drained: bool,
+        /// `None` unless the request was [`Repair::Quiesced`]; then whether
+        /// in-flight uploads reached zero within the timeout. `Some(false)`
+        /// means the drain timed out and no repair happened.
+        quiesce_drained: Option<bool>,
     },
     /// Reply to [`Request::Prune`].
     Prune {
@@ -223,9 +231,8 @@ mod tests {
                 dry_run: true,
             },
             Request::Fsck {
-                repair: true,
                 verify_sizes: true,
-                quiesce: true,
+                repair: Repair::Quiesced,
             },
             Request::Pin {
                 name: "release".into(),
@@ -260,12 +267,11 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&Request::Fsck {
-                repair: false,
                 verify_sizes: false,
-                quiesce: false,
+                repair: Repair::Live,
             })
             .unwrap(),
-            r#"{"command":"fsck","repair":false,"verify_sizes":false,"quiesce":false}"#
+            r#"{"command":"fsck","verify_sizes":false,"repair":"live"}"#
         );
     }
 
@@ -279,5 +285,26 @@ mod tests {
         };
         let line = serde_json::to_string(&response).unwrap();
         assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), response);
+    }
+
+    #[test]
+    fn fsck_responses_round_trip_every_drain_outcome() {
+        for (quiesce_drained, wire) in
+            [(None, "null"), (Some(true), "true"), (Some(false), "false")]
+        {
+            let response = Response::Fsck {
+                dangling: vec![],
+                size_mismatches: vec![],
+                orphans: vec![],
+                repaired: 0,
+                quiesce_drained,
+            };
+            let line = serde_json::to_string(&response).unwrap();
+            assert!(
+                line.contains(&format!(r#""quiesce_drained":{wire}"#)),
+                "{line}"
+            );
+            assert_eq!(serde_json::from_str::<Response>(&line).unwrap(), response);
+        }
     }
 }
