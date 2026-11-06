@@ -550,7 +550,14 @@ impl Pusher {
         loop {
             let token = self.tokens.get().await?;
             let error = match self.attempt(info, report, &token).await {
-                Ok(stored) => return Ok(stored),
+                Ok(Attempt::Stored(stored)) => return Ok(stored),
+                Ok(Attempt::InProgress) => match backoff.in_progress() {
+                    Some(wait) => {
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    None => bail!("another pusher is still uploading this path"),
+                },
                 Err(e) => e,
             };
             // The token expired or was revoked mid-run: replace it once and go
@@ -574,7 +581,7 @@ impl Pusher {
         }
     }
 
-    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<Stored> {
+    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<Attempt> {
         let preamble = Preamble {
             store_path: info.path.clone(),
             nar_hash: info.nar_hash.clone(),
@@ -630,11 +637,11 @@ impl Pusher {
         match ack.status.as_str() {
             // "deduped", not "skipped": the bytes were uploaded and only then
             // found redundant, so the bandwidth was spent either way.
-            "exists" => Ok(Stored::Deduped),
+            "exists" => Ok(Attempt::Stored(Stored::Deduped)),
             // Not success yet: the other upload may still fail. Wait until
             // the server answers `exists`, or lets this one through.
-            "in-progress" => Err(InProgress.into()),
-            _ => Ok(Stored::Pushed),
+            "in-progress" => Ok(Attempt::InProgress),
+            _ => Ok(Attempt::Stored(Stored::Pushed)),
         }
     }
 }
@@ -844,19 +851,13 @@ impl std::fmt::Display for Shed {
 
 impl std::error::Error for Shed {}
 
-/// Another pusher is uploading the path right now. Typed so [`Backoff`]
-/// waits for it to finish instead of counting the path as pushed: that upload
-/// may yet fail, and then nobody would have pushed it.
-#[derive(Debug)]
-struct InProgress;
-
-impl std::fmt::Display for InProgress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "another pusher is still uploading this path")
-    }
+/// What one upload attempt got back: the path stored, or another pusher
+/// uploading it right now. The latter is waited out rather than counted as
+/// pushed: that upload may yet fail, and then nobody would have pushed it.
+enum Attempt {
+    Stored(Stored),
+    InProgress,
 }
-
-impl std::error::Error for InProgress {}
 
 /// How long one path keeps waiting out 429s and other pushers' uploads before
 /// it fails: long enough to queue behind several multi-minute uploads, short
@@ -897,20 +898,8 @@ impl Backoff {
 
     /// How long to wait before trying again after `error`; `None` to give up.
     fn next(&mut self, error: &anyhow::Error) -> Option<Duration> {
-        let queued = if let Some(Shed(after)) = error.downcast_ref::<Shed>() {
-            Some(*after)
-        } else if error.is::<InProgress>() {
-            let poll = self.poll;
-            self.poll = (poll * 2).min(IN_PROGRESS_MAX_POLL);
-            Some(poll)
-        } else {
-            None
-        };
-        if let Some(base) = queued {
-            self.retries = 0;
-            self.delay = Duration::from_millis(250);
-            let wait = base + Duration::from_millis(fastrand_millis(base));
-            return (self.started.elapsed() + wait <= WAIT_DEADLINE).then_some(wait);
+        if let Some(Shed(after)) = error.downcast_ref::<Shed>() {
+            return self.queued(*after);
         }
         if self.retries >= self.max_retries || !is_retryable(error) {
             return None;
@@ -919,6 +908,23 @@ impl Backoff {
         self.retries += 1;
         self.delay *= 2;
         Some(wait)
+    }
+
+    /// How long to wait before asking again after an `in-progress` ack;
+    /// `None` to give up.
+    fn in_progress(&mut self) -> Option<Duration> {
+        let poll = self.poll;
+        self.poll = (poll * 2).min(IN_PROGRESS_MAX_POLL);
+        self.queued(poll)
+    }
+
+    /// A wait that is not a fault: it resets the error budget and is bounded
+    /// only by [`WAIT_DEADLINE`].
+    fn queued(&mut self, base: Duration) -> Option<Duration> {
+        self.retries = 0;
+        self.delay = Duration::from_millis(250);
+        let wait = base + Duration::from_millis(fastrand_millis(base));
+        (self.started.elapsed() + wait <= WAIT_DEADLINE).then_some(wait)
     }
 }
 
@@ -1279,9 +1285,7 @@ mod tests {
     async fn another_pushers_upload_is_polled_off_the_error_budget_until_the_deadline() {
         let mut backoff = Backoff::new(1);
         for base in [1, 2, 4, 8, 16, 30, 30, 30] {
-            let wait = backoff
-                .next(&InProgress.into())
-                .expect("inside the deadline");
+            let wait = backoff.in_progress().expect("inside the deadline");
             let base = Duration::from_secs(base);
             assert!((base..base * 2).contains(&wait), "{wait:?} for {base:?}");
             tokio::time::advance(wait).await;
@@ -1289,7 +1293,7 @@ mod tests {
         assert!(backoff.next(&rejected(503)).is_some());
         assert!(backoff.next(&rejected(503)).is_none());
         tokio::time::advance(WAIT_DEADLINE).await;
-        assert!(backoff.next(&InProgress.into()).is_none());
+        assert!(backoff.in_progress().is_none());
     }
 
     fn node(name: &str, references: &[&str]) -> PathInfo {
