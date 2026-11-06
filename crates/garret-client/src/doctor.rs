@@ -121,9 +121,6 @@ pub async fn run(cfg: &config::Config, http: &reqwest::Client, path: Option<&str
                     ),
                 ),
             });
-            // A machine config with no `public_keys` is a build host that
-            // pushes and never substitutes through `garret use`; anything
-            // that does carry keys has them checked.
             if keys_checked(cfg, device_flow) {
                 let (status, detail) = keys_verdict(&cfg.public_keys, &d.public_keys);
                 checks.push(Check {

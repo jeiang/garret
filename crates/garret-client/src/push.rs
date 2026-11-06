@@ -561,7 +561,6 @@ impl Pusher {
             response = send(&token).await.context("negotiating missing paths")?;
         }
 
-        // A 403 is typed so the watcher can drop the batch instead of retrying.
         if response.status() == StatusCode::FORBIDDEN {
             return Err(Refused(error_detail(response).await).into());
         }
@@ -872,9 +871,9 @@ impl std::fmt::Display for Rejected {
 impl std::error::Error for Rejected {}
 
 /// The Negotiation got a 403: the Pusher's policy refuses this identity, now
-/// and on every retry. Typed so the watcher logs it once and drops the batch
-/// instead of retrying. A 401 that survives renewal is not this: it can be
-/// transient (JWKS outage), so it is an ordinary failure.
+/// and on every retry. Typed so the watcher can say so loudly. A 401 that
+/// survives renewal is not this: it can be transient (JWKS outage), so it is
+/// an ordinary failure.
 #[derive(Debug)]
 pub struct Refused(
     /// The Pusher's explanation, as sent.

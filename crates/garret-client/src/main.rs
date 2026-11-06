@@ -235,8 +235,6 @@ async fn main() -> Result<()> {
             }
             let closure = push::closure(&paths).await?;
             let closure_len = closure.len();
-            // Paths an upstream cache already signs never enter the
-            // Negotiation; they are reported as `upstream` instead.
             let (own, upstream) = match no_upstream_filter {
                 true => (closure, Vec::new()),
                 false => push::partition_upstream(closure, &cfg.upstream_keys),

@@ -256,7 +256,6 @@ impl Watcher {
                 .into(),
             poll_interval: Duration::from_secs(watch.poll_interval_secs),
             filters: Filters {
-                // `[watch]` may override the client-wide upstream list.
                 upstream_keys: watch
                     .upstream_keys
                     .clone()
@@ -319,7 +318,6 @@ impl Watcher {
                 continue;
             };
 
-            // One Negotiation and one `nix path-info` for the whole poll.
             for path in self.push_batch(pusher, &self.select(&batch)).await {
                 tracing::warn!(path, "on the failed list, retried when idle");
                 attempts.insert(path.clone(), 1);
@@ -351,8 +349,6 @@ impl Watcher {
         if due.is_empty() {
             return Ok(());
         }
-        // In batches the size of a poll, so a long failed list never becomes
-        // one huge argv or an oversized Negotiation body.
         for chunk in due.chunks(BATCH_SIZE) {
             let still: HashSet<String> = self.push_batch(pusher, chunk).await.into_iter().collect();
             for path in chunk {
@@ -417,8 +413,6 @@ impl Watcher {
         }
         tracing::info!(cursor, paths = todo.len(), "draining");
 
-        // Oldest first, in batches the size of a poll: one `nix path-info`
-        // and one Negotiation each, and an argv that stays small.
         for chunk in todo.chunks(BATCH_SIZE) {
             let still_failed = self.push_batch(pusher, chunk).await;
             for path in chunk {
@@ -497,7 +491,6 @@ impl Watcher {
             "negotiated"
         );
         if !to_push.is_empty() {
-            // The daemon reports per path into the journal and draws no bar.
             let (_, pushed_failed) = pusher
                 .push_tracked(to_push, &crate::push::Report::plain())
                 .await;

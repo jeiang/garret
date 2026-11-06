@@ -147,7 +147,6 @@ pub struct Oidc {
 }
 
 fn jobs() -> usize {
-    // Uploads are network-bound, so this is not a core count.
     8
 }
 
