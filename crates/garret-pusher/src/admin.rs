@@ -477,8 +477,7 @@ mod tests {
     /// `since` is inclusive, so the first push after a leak is not missed.
     #[test]
     fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = open_db();
         let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
         let (a, b, c, d) = (
             "a".repeat(32),
@@ -579,7 +578,7 @@ mod tests {
         db::insert_object(&mut conn, &object(&a), 100).unwrap();
         let state = test_state(conn).await;
         let _gc = state.in_flight.claim_delete(&a).unwrap();
-        let before = garret_server::now() - 2 * 86400;
+        let before = garret_server::now() - 2 * db::PUSH_GRACE;
 
         let Response::Prune { pruned, .. } = prune(&state, before, true).await.unwrap() else {
             panic!("not a prune response");
