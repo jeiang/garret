@@ -152,39 +152,47 @@ pub fn config_home() -> Result<std::path::PathBuf> {
         .context("neither XDG_CONFIG_HOME nor HOME is set")
 }
 
-/// The default config location: `$XDG_CONFIG_HOME/garret/config.toml`.
-pub fn path() -> Result<std::path::PathBuf> {
-    Ok(config_home()?.join("garret").join("config.toml"))
+/// The config file `explicit` (the `--config` flag) names, or the default
+/// `$XDG_CONFIG_HOME/garret/config.toml`.
+pub fn resolve_path(explicit: Option<&str>) -> Result<std::path::PathBuf> {
+    match explicit {
+        Some(p) => Ok(p.into()),
+        None => Ok(config_home()?.join("garret").join("config.toml")),
+    }
 }
 
-/// Loads the config from `explicit` (the `--config` flag) or the default
-/// path, then applies the `GARRET_ENDPOINT` override. A missing file is an
-/// error that names `garret login` as the fix.
+/// Loads the config from [`resolve_path`], then applies the
+/// `GARRET_ENDPOINT` override. A missing file is an error that names
+/// `garret login` as the fix.
 pub fn load(explicit: Option<&str>) -> Result<Config> {
-    let path = match explicit {
-        Some(p) => std::path::PathBuf::from(p),
-        None => path()?,
-    };
+    let path = resolve_path(explicit)?;
     // `login` is the only way to create a config, so a missing one has exactly
     // one fix and this says it rather than reporting a bare ENOENT.
-    if !path.exists() {
+    let Some(text) = crate::files::read_optional(&path)? else {
         anyhow::bail!(
             "no config at {} — run `garret login <pusher-url>` to create one",
             path.display()
         );
-    }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading client config {}", path.display()))?;
+    };
     let mut cfg: Config = toml::from_str(&text).context("parsing client config")?;
     cfg.validate()?;
     if let Ok(endpoint) = std::env::var("GARRET_ENDPOINT") {
         cfg.endpoint = endpoint;
+    }
+    // Every request URL is the base followed by a route that starts with `/`.
+    trim_trailing_slashes(&mut cfg.endpoint);
+    if let Some(puller) = &mut cfg.puller_endpoint {
+        trim_trailing_slashes(puller);
     }
     crate::discovery::check_url("endpoint", &cfg.endpoint)?;
     if let Some(issuer) = &cfg.oidc.issuer {
         crate::discovery::check_url("oidc.issuer", issuer)?;
     }
     Ok(cfg)
+}
+
+fn trim_trailing_slashes(url: &mut String) {
+    url.truncate(url.trim_end_matches('/').len());
 }
 
 impl Config {

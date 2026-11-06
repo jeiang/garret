@@ -138,7 +138,8 @@ Every request carries `User-Agent: garret/<version>`. The configured Pusher
 URL (after any `GARRET_ENDPOINT` override), `oidc.issuer` and the OIDC
 `token_endpoint` and `device_authorization_endpoint` must follow the same
 https rule as discovery (plain `http` only to loopback); a config or issuer
-that breaks it is refused before any token is sent.
+that breaks it is refused before any token is sent. Trailing `/`s on
+`endpoint` (after the override) and `puller_endpoint` are dropped on load.
 
 **Retries** run on two schedules. A `429` is the server's queue, not a
 fault: the path waits out `Retry-After` (held between 1 s and 15 minutes,

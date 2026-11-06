@@ -425,25 +425,17 @@ async fn login(
     url: Option<String>,
     force: bool,
 ) -> Result<()> {
-    let path = match explicit {
-        Some(p) => std::path::PathBuf::from(p),
-        None => config::path()?,
-    };
-    let exists = path.exists();
-
-    let cfg = match (&url, exists) {
-        // Nothing to go on: no config to re-authenticate against, no URL to
-        // bootstrap from.
-        (None, false) => anyhow::bail!(
-            "no config at {} — run `garret login <pusher-url>` to create one",
-            path.display()
-        ),
+    let cfg = match url {
         // Pure re-authentication. The config is not touched, so a token that
-        // has expired or been revoked costs nothing to replace.
-        (None, true) => config::load(explicit)?,
-        (Some(url), _) => {
+        // has expired or been revoked costs nothing to replace. Without a
+        // config there is nothing to re-authenticate against, and `load`
+        // says to pass a URL.
+        None => config::load(explicit)?,
+        Some(url) => {
+            let path = config::resolve_path(explicit)?;
+            let url = url.trim_end_matches('/');
             let discovered = discovery::fetch(http, url).await?;
-            let rendered = config::render(url.trim_end_matches('/'), &discovered)?;
+            let rendered = config::render(url, &discovered)?;
             let current = garret_client::files::read_optional(&path)?;
             match current {
                 // Re-running against the server that wrote this config: nothing
