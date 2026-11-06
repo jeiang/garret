@@ -134,13 +134,14 @@ pub async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints>
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let raw: RawEndpoints = http
+    let response = http
         .get(&url)
         .timeout(TOKEN_TIMEOUT)
         .send()
         .await
-        .and_then(|r| r.error_for_status())
-        .with_context(|| format!("OIDC discovery at {url}"))?
+        .with_context(|| format!("OIDC discovery at {url}"))?;
+    let raw: RawEndpoints = ensure_success(response, &format!("OIDC discovery at {url}"))
+        .await?
         .json()
         .await
         .with_context(|| format!("parsing OIDC discovery at {url}"))?;
@@ -228,7 +229,7 @@ pub async fn device_login(
     let mut interval = grant.interval;
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
-        let response: TokenResponse = http
+        let mut response = http
             .post(endpoints.token_endpoint())
             .form(&with_resource(
                 vec![
@@ -240,9 +241,16 @@ pub async fn device_login(
             ))
             .timeout(TOKEN_TIMEOUT)
             .send()
-            .await?
-            .json()
             .await?;
+        // RFC 8628 §3.5: pending, slow_down and refusals are 400s whose OAuth
+        // error body is read below; any other non-2xx is a plain failure.
+        if response.status() != reqwest::StatusCode::BAD_REQUEST {
+            response = ensure_success(response, "polling for device approval").await?;
+        }
+        let response: TokenResponse = response
+            .json()
+            .await
+            .context("parsing the device token response")?;
 
         match response.error.as_deref() {
             Some("authorization_pending") => continue,
@@ -326,15 +334,15 @@ async fn github_token(
     request_token: &str,
     audience: &str,
 ) -> Result<String> {
-    let token: GithubToken = http
+    let response = http
         .get(url)
         .query(&[("audience", audience)])
         .bearer_auth(request_token)
         .timeout(TOKEN_TIMEOUT)
         .send()
+        .await?;
+    let token: GithubToken = ensure_success(response, "requesting a GitHub Actions OIDC token")
         .await?
-        .error_for_status()
-        .context("requesting a GitHub Actions OIDC token")?
         .json()
         .await?;
     Ok(token.value)
