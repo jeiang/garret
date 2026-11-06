@@ -24,10 +24,13 @@ One subcommand per scenario (`push`, `stream`, `pull`) plus `all`,
 writing a single JSON report.
 
 Every report carries a `meta` block: os, arch, cpu count, binary
-version, seed, and a `label` (default `os-arch`, `--label` /
-`GARRET_BENCH_LABEL` to override). The label is the comparison key —
-the diff tool refuses to compare runs across labels, so a laptop
-baseline can never silently masquerade as the cgroup-limited sandbox's.
+version, seed, `corpus_version` (bumped whenever the same seed would
+generate a different corpus; a report without it is version 1), and a
+`label` (default `os-arch`, `--label` / `GARRET_BENCH_LABEL` to
+override). The label is the comparison key — the diff tool refuses to
+compare runs across labels, so a laptop baseline can never silently
+masquerade as the cgroup-limited sandbox's. It also refuses runs of
+different corpus versions, which pushed different bytes.
 A limited environment encodes its caps in the label
 (e.g. `linux-x86_64-2cpu-2g`), and applies them via `GARRET_WRAP` — a
 command prefix (`taskset -c 0`, a systemd-run scope, …) that
@@ -137,7 +140,8 @@ stay honest.
 
 Results emit JSON (`bench-results.json`); `just bench-compare` diffs
 against the checked-in baseline (`benchmarks/baseline.json`, promoted
-via `just bench-baseline`), failing only on failed requests or an
-environment-label mismatch — latency and throughput judgement stays
+via `just bench-baseline`), failing only on failed requests, an
+environment-label mismatch or a corpus-version mismatch — latency and
+throughput judgement stays
 with a human. Rerun before merging performance-relevant changes. No CI
 gating in v1.

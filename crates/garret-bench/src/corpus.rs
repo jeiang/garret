@@ -7,6 +7,11 @@
 
 use garret_common::NIX_BASE32_ALPHABET;
 
+/// Bumped whenever the same seed would generate a different corpus, so
+/// results from different generators are never compared. 2: each body's RNG
+/// is seeded from its full hash (before, most entries shared seed 1).
+pub const VERSION: u32 = 2;
+
 /// xorshift64*: a few lines, no dependency, and identical everywhere. Bench
 /// input needs reproducibility, not statistical quality.
 pub struct Rng(u64);

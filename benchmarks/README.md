@@ -8,6 +8,12 @@ scenario) against a throwaway local Garage. `just bench-compare` diffs a
 fresh run against `baseline.json`; the diff refuses to compare across
 labels, so each environment keeps its own file.
 
+**These results predate corpus v2.** The generator's per-entry seeding was
+fixed after this refresh, so the same seed now pushes different bytes. The
+checked-in JSONs carry no `meta.corpus_version` (read as v1), and
+`just bench-compare` refuses to diff a v2 run against them. Regenerate each
+(`just bench-local`, then `just bench-baseline`) before comparing.
+
 ## Systems
 
 | Host | Hardware | OS | Notes |
