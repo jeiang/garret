@@ -49,72 +49,53 @@ pub struct Config {
     pub watch: Watch,
 }
 
-/// Store watcher settings; only the daemon reads these.
+/// Store watcher settings; only the daemon reads these. Every field has a
+/// default, so an absent `[watch]` table equals an empty one.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Watch {
     /// The Nix database the watcher polls for newly validated paths.
-    #[serde(default = "nix_db")]
     pub nix_db: String,
     /// Where the Watcher Cursor persists across restarts.
-    #[serde(default = "cursor_path")]
     pub cursor_path: String,
     /// Seconds between database polls when the backlog is empty.
-    #[serde(default = "poll_interval")]
     pub poll_interval_secs: u64,
     /// Per-daemon override of the top-level `upstream_keys`; unset means the
     /// watcher shares the client-wide list.
-    #[serde(default)]
     pub upstream_keys: Option<Vec<String>>,
     /// Substring patterns; a matching store path is never pushed.
-    #[serde(default)]
     pub exclude_patterns: Vec<String>,
     /// Push attempts per path in one watcher process, the first included,
     /// before it stops retrying and leaves the path on the failed list for a
     /// restart or a drain.
-    #[serde(default = "max_attempts")]
     pub max_attempts: u32,
     /// Where the wake socket listens; `garret enqueue` (the post-build-hook
     /// stub) pokes it so a fresh build is polled for immediately instead of
     /// after `poll_interval_secs`.
-    #[serde(default = "socket_path")]
     pub socket_path: String,
 }
 
-/// An absent `[watch]` table must equal an empty one, not zeroed fields.
 impl Default for Watch {
     fn default() -> Self {
-        toml::from_str("").expect("every Watch field has a serde default")
+        Self {
+            nix_db: "/nix/var/nix/db/db.sqlite".into(),
+            cursor_path: "/var/lib/garret/watcher-cursor".into(),
+            poll_interval_secs: 30,
+            upstream_keys: None,
+            exclude_patterns: Vec::new(),
+            max_attempts: 5,
+            socket_path: DEFAULT_SOCKET_PATH.into(),
+        }
     }
-}
-
-fn nix_db() -> String {
-    "/nix/var/nix/db/db.sqlite".into()
-}
-
-fn cursor_path() -> String {
-    "/var/lib/garret/watcher-cursor".into()
-}
-
-fn poll_interval() -> u64 {
-    30
 }
 
 fn upstream_keys() -> Vec<String> {
     vec!["cache.nixos.org-1".into()]
 }
 
-fn max_attempts() -> u32 {
-    5
-}
-
 /// The default wake-socket path, shared with `garret enqueue`'s `--socket`
 /// default so both ends agree with zero configuration.
 pub const DEFAULT_SOCKET_PATH: &str = "/run/garret/watch.sock";
-
-fn socket_path() -> String {
-    DEFAULT_SOCKET_PATH.into()
-}
 
 /// Which issuer to get tokens from, and what to ask it for (spec 04-auth).
 #[derive(Debug, Deserialize)]
@@ -195,10 +176,6 @@ pub fn load(explicit: Option<&str>) -> Result<Config> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading client config {}", path.display()))?;
     let mut cfg: Config = toml::from_str(&text).context("parsing client config")?;
-    anyhow::ensure!(
-        cfg.upload_idle_secs > 0,
-        "upload_idle_secs must be at least 1"
-    );
     cfg.validate()?;
     if let Ok(endpoint) = std::env::var("GARRET_ENDPOINT") {
         cfg.endpoint = endpoint;
@@ -215,6 +192,10 @@ impl Config {
     /// watcher, naming the key.
     fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.jobs >= 1, "jobs must be at least 1");
+        anyhow::ensure!(
+            self.upload_idle_secs >= 1,
+            "upload_idle_secs must be at least 1"
+        );
         anyhow::ensure!(
             self.watch.poll_interval_secs >= 1,
             "watch.poll_interval_secs must be at least 1"
@@ -321,10 +302,15 @@ pub fn render(endpoint: &str, discovery: &garret_common::wire::Discovery) -> Res
         q(client_id),
         q(&oidc.audience),
     ));
-    out.push_str(
-        "\n# Optional: jobs = 8, zstd_level = 3, max_retries = 5,\n\
-         # upstream_keys = [\"cache.nixos.org-1\"] (paths these keys sign are not pushed)\n",
-    );
+    let upstream: Vec<String> = upstream_keys().iter().map(|k| q(k)).collect();
+    out.push_str(&format!(
+        "\n# Optional: jobs = {}, zstd_level = {}, max_retries = {},\n\
+         # upstream_keys = [{}] (paths these keys sign are not pushed)\n",
+        jobs(),
+        zstd_level(),
+        max_retries(),
+        upstream.join(", "),
+    ));
     Ok(out)
 }
 
@@ -374,6 +360,7 @@ mod tests {
         ok.validate().unwrap();
         for (edit, key) in [
             ("jobs = 0\n", "jobs"),
+            ("upload_idle_secs = 0\n", "upload_idle_secs"),
             ("[watch]\npoll_interval_secs = 0\n", "poll_interval_secs"),
             ("[watch]\nmax_attempts = 0\n", "max_attempts"),
         ] {
