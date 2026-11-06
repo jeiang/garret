@@ -5,7 +5,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::Duration,
 };
 
@@ -50,7 +49,7 @@ pub async fn run(
         db::all_objects_brief(&conn)?
     };
 
-    let (dangling, size_mismatches) = classify_rows(
+    let findings = classify_rows(
         &db_rows,
         &blobs,
         &state.in_flight,
@@ -58,6 +57,7 @@ pub async fn run(
         now(),
         verify_sizes,
     );
+    let (dangling, size_mismatches) = to_wire(&findings);
     let known: HashSet<String> = db_rows.iter().map(|r| r.store_path_hash.clone()).collect();
     let orphans = gc::orphan_keys(&blobs, &known, &state.in_flight, grace);
 
@@ -69,7 +69,7 @@ pub async fn run(
     // A timed-out drain means the live signal was never trustworthy enough
     // to delete rows on — report the findings, but repair nothing.
     let repaired = if repair && quiesce_drained {
-        apply_repair(&state.conn, &db_rows, &dangling, &size_mismatches)?
+        apply_repair(&state.conn, &findings)?
     } else {
         0
     };
@@ -84,108 +84,115 @@ pub async fn run(
     })
 }
 
-/// Splits DB rows into dangling (no blob) and size-mismatched (blob exists,
+/// A row fsck would repair, carrying the `created_at` it was listed with so
+/// repair can tell that row from one written since.
+struct Finding<'a> {
+    hash: &'a str,
+    name: &'a str,
+    listed_at: i64,
+    drift: Drift,
+}
+
+/// How a row disagrees with S3. One per row, so a size-mismatched row is
+/// never also dangling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drift {
+    /// No blob.
+    Dangling,
+    /// A blob of another size (`verify_sizes` only).
+    SizeMismatch { db: i64, s3: i64 },
+}
+
+/// Finds dangling rows (no blob) and size-mismatched ones (blob exists,
 /// sizes disagree — `verify_sizes` only), each only past both guards (not
-/// in flight, older than the grace). A hash with a size mismatch is never
-/// also reported dangling.
-fn classify_rows(
-    db_rows: &[db::ObjectBrief],
+/// in flight, older than the grace).
+fn classify_rows<'a>(
+    db_rows: &'a [db::ObjectBrief],
     blobs: &[(String, Duration, i64)],
     in_flight: &InFlight,
     grace: Duration,
     now: i64,
     verify_sizes: bool,
-) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
+) -> Vec<Finding<'a>> {
     let s3_sizes: HashMap<&str, i64> = blobs
         .iter()
         .filter_map(|(key, _age, size)| storage::hash_for(key).map(|h| (h, *size)))
         .collect();
 
+    db_rows
+        .iter()
+        .filter_map(|row| {
+            let hash = row.store_path_hash.as_str();
+            // Both findings get both guards: a row in flight or younger than
+            // the grace may be an upload overwriting an orphan blob of another
+            // size since the S3 listing, not drift.
+            if in_flight.contains(hash) || now - row.created_at < grace.as_secs() as i64 {
+                return None;
+            }
+            let drift = match s3_sizes.get(hash) {
+                None => Drift::Dangling,
+                Some(&s3) if verify_sizes && s3 != row.file_size => Drift::SizeMismatch {
+                    db: row.file_size,
+                    s3,
+                },
+                Some(_) => return None,
+            };
+            Some(Finding {
+                hash,
+                name: &row.name,
+                listed_at: row.created_at,
+                drift,
+            })
+        })
+        .collect()
+}
+
+/// The findings as the admin reply reports them, in listing order.
+fn to_wire(findings: &[Finding<'_>]) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
     let mut dangling = Vec::new();
     let mut size_mismatches = Vec::new();
-    for row in db_rows {
-        let hash = &row.store_path_hash;
-        // Both findings get both guards: a row in flight or younger than the
-        // grace may be an upload overwriting an orphan blob of another size
-        // since the S3 listing, not drift.
-        if in_flight.contains(hash) || now - row.created_at < grace.as_secs() as i64 {
-            continue;
-        }
-        match s3_sizes.get(hash.as_str()) {
-            None => {
-                dangling.push(FsckRow {
-                    store_path_hash: hash.clone(),
-                    name: row.name.clone(),
-                });
-            }
-            Some(&s3_size) if verify_sizes && s3_size != row.file_size => {
-                size_mismatches.push(FsckSizeMismatch {
-                    store_path_hash: hash.clone(),
-                    name: row.name.clone(),
-                    db_size: row.file_size,
-                    s3_size,
-                });
-            }
-            Some(_) => {}
+    for f in findings {
+        match f.drift {
+            Drift::Dangling => dangling.push(FsckRow {
+                store_path_hash: f.hash.to_owned(),
+                name: f.name.to_owned(),
+            }),
+            Drift::SizeMismatch { db, s3 } => size_mismatches.push(FsckSizeMismatch {
+                store_path_hash: f.hash.to_owned(),
+                name: f.name.to_owned(),
+                db_size: db,
+                s3_size: s3,
+            }),
         }
     }
     (dangling, size_mismatches)
 }
 
-/// Deletes every dangling and size-mismatched row (`db::delete_object`,
-/// row+refs+stats in one transaction each — never the S3 object, which is
-/// left for the orphan sweep by design). Only the row the listing saw is
-/// deleted: one gone since (GC evicted it, say) or replaced since (deleted
-/// and pushed again, so its blob is back) is skipped, not counted. `listed`
-/// is the row listing the findings came from. Returns the count actually
-/// deleted.
-fn apply_repair(
-    conn: &Arc<Mutex<Connection>>,
-    listed: &[db::ObjectBrief],
-    dangling: &[FsckRow],
-    size_mismatches: &[FsckSizeMismatch],
-) -> Result<usize> {
-    let listed: HashMap<&str, i64> = listed
-        .iter()
-        .map(|row| (row.store_path_hash.as_str(), row.created_at))
-        .collect();
-    let listed = &listed;
-    let dangling = repair_rows(
-        conn,
-        listed,
-        dangling.iter().map(|r| r.store_path_hash.as_str()),
-        "dangling",
-    )?;
-    let mismatched = repair_rows(
-        conn,
-        listed,
-        size_mismatches.iter().map(|r| r.store_path_hash.as_str()),
-        "size_mismatch",
-    )?;
-    Ok(dangling + mismatched)
-}
-
-/// Deletes each row still exactly as listed, counting the deletions under
-/// `reason`. A re-push rewrites `created_at`, so an unchanged `created_at`
-/// is the listed row (found by the TLA+ model, `verification/tla`).
-fn repair_rows<'a>(
-    conn: &Mutex<Connection>,
-    listed: &HashMap<&str, i64>,
-    hashes: impl Iterator<Item = &'a str>,
-    reason: &'static str,
-) -> Result<usize> {
-    let mut repaired = 0;
-    for hash in hashes {
+/// Deletes every finding's row (`db::delete_object`, row+refs+stats in one
+/// transaction each — never the S3 object, which is left for the orphan
+/// sweep by design). Only the row the listing saw is deleted: one gone since
+/// (GC evicted it, say) or replaced since (deleted and pushed again, so its
+/// blob is back) is skipped, not counted. A re-push rewrites `created_at`,
+/// so an unchanged `created_at` is the listed row (found by the TLA+ model,
+/// `verification/tla`). Returns the count actually deleted.
+fn apply_repair(conn: &Mutex<Connection>, findings: &[Finding<'_>]) -> Result<usize> {
+    let (mut dangling, mut mismatched) = (0, 0);
+    for f in findings {
         let mut conn = conn.lock();
-        if db::created_at(&conn, hash)?.is_some_and(|at| listed.get(hash) == Some(&at))
-            && db::delete_object(&mut conn, hash)?.is_some()
+        if db::created_at(&conn, f.hash)? == Some(f.listed_at)
+            && db::delete_object(&mut conn, f.hash)?.is_some()
         {
-            repaired += 1;
+            match f.drift {
+                Drift::Dangling => dangling += 1,
+                Drift::SizeMismatch { .. } => mismatched += 1,
+            }
         }
     }
-    metrics::counter!("garret_fsck_rows_repaired_total", "reason" => reason)
-        .increment(repaired as u64);
-    Ok(repaired)
+    metrics::counter!("garret_fsck_rows_repaired_total", "reason" => "dangling")
+        .increment(dangling as u64);
+    metrics::counter!("garret_fsck_rows_repaired_total", "reason" => "size_mismatch")
+        .increment(mismatched as u64);
+    Ok(dangling + mismatched)
 }
 
 #[cfg(test)]
@@ -205,6 +212,23 @@ mod tests {
         (storage::key_for(hash), Duration::from_secs(age_secs), size)
     }
 
+    /// [`classify_rows`] at `GRACE` and `NOW`, as the reply reports it.
+    fn classified(
+        rows: &[db::ObjectBrief],
+        blobs: &[(String, Duration, i64)],
+        in_flight: &InFlight,
+        verify_sizes: bool,
+    ) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
+        to_wire(&classify_rows(
+            rows,
+            blobs,
+            in_flight,
+            GRACE,
+            NOW,
+            verify_sizes,
+        ))
+    }
+
     const GRACE: Duration = Duration::from_secs(86400);
     const NOW: i64 = 1_000_000;
 
@@ -213,7 +237,7 @@ mod tests {
         let rows = vec![row("a", "thing", NOW - 2 * 86400, 5)];
         let blobs = vec![];
         let in_flight = InFlight::new();
-        let (dangling, mismatches) = classify_rows(&rows, &blobs, &in_flight, GRACE, NOW, false);
+        let (dangling, mismatches) = classified(&rows, &blobs, &in_flight, false);
         assert_eq!(
             dangling,
             vec![FsckRow {
@@ -232,7 +256,7 @@ mod tests {
         let _claim = in_flight
             .claim("a", garret_server::inflight::Kind::Upload)
             .unwrap();
-        let (dangling, _) = classify_rows(&rows, &blobs, &in_flight, GRACE, NOW, false);
+        let (dangling, _) = classified(&rows, &blobs, &in_flight, false);
         assert!(dangling.is_empty(), "in-flight upload reported as dangling");
     }
 
@@ -241,7 +265,7 @@ mod tests {
         let rows = vec![row("a", "thing", NOW - 10, 5)];
         let blobs = vec![];
         let in_flight = InFlight::new();
-        let (dangling, _) = classify_rows(&rows, &blobs, &in_flight, GRACE, NOW, false);
+        let (dangling, _) = classified(&rows, &blobs, &in_flight, false);
         assert!(dangling.is_empty(), "young row reported as dangling");
     }
 
@@ -251,11 +275,11 @@ mod tests {
         let blobs = vec![blob("a", 90000, 9)];
         let in_flight = InFlight::new();
 
-        let (dangling, mismatches) = classify_rows(&rows, &blobs, &in_flight, GRACE, NOW, false);
+        let (dangling, mismatches) = classified(&rows, &blobs, &in_flight, false);
         assert!(dangling.is_empty());
         assert!(mismatches.is_empty(), "no size check without verify_sizes");
 
-        let (dangling, mismatches) = classify_rows(&rows, &blobs, &in_flight, GRACE, NOW, true);
+        let (dangling, mismatches) = classified(&rows, &blobs, &in_flight, true);
         assert!(dangling.is_empty(), "mismatch double-reported as dangling");
         assert_eq!(
             mismatches,
@@ -275,7 +299,7 @@ mod tests {
     fn a_young_or_in_flight_row_is_not_reported_as_a_size_mismatch() {
         let blobs = vec![blob("a", 90000, 9)];
         let young = vec![row("a", "thing", NOW - 10, 5)];
-        let (_, mismatches) = classify_rows(&young, &blobs, &InFlight::new(), GRACE, NOW, true);
+        let (_, mismatches) = classified(&young, &blobs, &InFlight::new(), true);
         assert!(mismatches.is_empty(), "young row reported as a mismatch");
 
         let old = vec![row("a", "thing", NOW - 2 * 86400, 5)];
@@ -283,7 +307,7 @@ mod tests {
         let _claim = in_flight
             .claim("a", garret_server::inflight::Kind::Upload)
             .unwrap();
-        let (_, mismatches) = classify_rows(&old, &blobs, &in_flight, GRACE, NOW, true);
+        let (_, mismatches) = classified(&old, &blobs, &in_flight, true);
         assert!(
             mismatches.is_empty(),
             "in-flight row reported as a mismatch"
@@ -295,7 +319,7 @@ mod tests {
         let rows = vec![row("a", "thing", NOW - 2 * 86400, 5)];
         let blobs = vec![blob("a", 90000, 5)];
         let in_flight = InFlight::new();
-        let (dangling, mismatches) = classify_rows(&rows, &blobs, &in_flight, GRACE, NOW, true);
+        let (dangling, mismatches) = classified(&rows, &blobs, &in_flight, true);
         assert!(dangling.is_empty());
         assert!(mismatches.is_empty());
     }
@@ -309,17 +333,17 @@ mod tests {
         db::migrate(&conn).unwrap();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Mutex::new(conn);
 
         let db_rows = {
             let c = conn.lock();
             db::all_objects_brief(&c).unwrap()
         };
         let in_flight = InFlight::new();
-        let (dangling, mismatches) = classify_rows(&db_rows, &[], &in_flight, GRACE, NOW, false);
-        assert_eq!(dangling.len(), 1);
+        let findings = classify_rows(&db_rows, &[], &in_flight, GRACE, NOW, false);
+        assert_eq!(findings.len(), 1);
 
-        let repaired = apply_repair(&conn, &db_rows, &dangling, &mismatches).unwrap();
+        let repaired = apply_repair(&conn, &findings).unwrap();
         assert_eq!(repaired, 1);
         let c = conn.lock();
         assert!(!db::exists(&c, &hash).unwrap());
@@ -337,13 +361,13 @@ mod tests {
         let rows = db::all_objects_brief(&conn).unwrap();
         // `c`'s blob is the wrong size; `a` and `b` have none.
         let blobs = [blob(&c, 90000, 9)];
-        let (dangling, mismatches) =
-            classify_rows(&rows, &blobs, &InFlight::new(), GRACE, NOW, true);
+        let findings = classify_rows(&rows, &blobs, &InFlight::new(), GRACE, NOW, true);
+        let (dangling, mismatches) = to_wire(&findings);
         assert_eq!((dangling.len(), mismatches.len()), (2, 1));
         db::delete_object(&mut conn, &a).unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Mutex::new(conn);
 
-        let repaired = apply_repair(&conn, &rows, &dangling, &mismatches).unwrap();
+        let repaired = apply_repair(&conn, &findings).unwrap();
         assert_eq!(repaired, 2, "the vanished row counted as repaired");
         let conn = conn.lock();
         assert!(!db::exists(&conn, &b).unwrap());
@@ -360,13 +384,13 @@ mod tests {
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
         let rows = db::all_objects_brief(&conn).unwrap();
-        let (dangling, mismatches) = classify_rows(&rows, &[], &InFlight::new(), GRACE, NOW, false);
-        assert_eq!(dangling.len(), 1);
+        let findings = classify_rows(&rows, &[], &InFlight::new(), GRACE, NOW, false);
+        assert_eq!(findings.len(), 1);
         db::delete_object(&mut conn, &hash).unwrap();
         db::insert_object(&mut conn, &object(&hash), NOW).unwrap();
-        let conn = Arc::new(Mutex::new(conn));
+        let conn = Mutex::new(conn);
 
-        let repaired = apply_repair(&conn, &rows, &dangling, &mismatches).unwrap();
+        let repaired = apply_repair(&conn, &findings).unwrap();
         assert_eq!(repaired, 0);
         assert!(db::exists(&conn.lock(), &hash).unwrap());
     }
