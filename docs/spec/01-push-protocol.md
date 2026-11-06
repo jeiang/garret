@@ -109,6 +109,11 @@ normal operation:
   row but not yet the blob; spec 05) → `503` + `Retry-After: 1`. An
   upload now would lose its blob to the pending delete; by the retry the
   path is simply missing.
+- Quiescing (`garret-admin fsck --repair --quiesce` holds the upload
+  gate; spec 05) → `503` + `Retry-After: 1`, answered before any other
+  check. The client waits it out on its deadline instead of spending
+  retries, so pushes resume once the repair (at most a few minutes)
+  returns.
 - Completed → `201 {"status":"created"}`.
 - Any other `status` is a protocol error: the client fails that attempt
   rather than counting the path as pushed.

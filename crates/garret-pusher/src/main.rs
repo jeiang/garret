@@ -436,15 +436,15 @@ async fn missing_paths(
     Ok(Json(missing))
 }
 
-/// The answer to a push while `fsck --repair --quiesce` holds the gate.
+/// The answer to a push while `fsck --repair --quiesce` holds the gate. With
+/// `Retry-After` the client waits it out on its deadline instead of
+/// spending retries during a drain of up to [`fsck::QUIESCE_TIMEOUT`].
 fn quiescing() -> Error {
     metrics::counter!("garret_upload_skipped_total", "reason" => "quiescing").increment(1);
-    Error {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        message: "cache is quiescing for fsck --repair --quiesce".into(),
-        reason: None,
-        retry_after: false,
-    }
+    Error::retry_after(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "cache is quiescing for fsck --repair --quiesce",
+    )
 }
 
 async fn upload(
@@ -741,21 +741,24 @@ mod tests {
 
     /// The quiescing check sits before the idempotency check, the upload
     /// semaphore and the in-flight claim — this exercises it in isolation,
-    /// with no upload machinery reached.
+    /// with no upload machinery reached. `Retry-After` keeps the client
+    /// waiting rather than spending retries (spec 01).
     #[tokio::test]
     async fn quiescing_rejects_a_push_before_anything_else() {
         let state = test_state(open_db()).await;
         let _quiesce = state.in_flight.quiesce();
 
-        let err = upload(
+        let response = upload(
             State(state),
             Path("a".repeat(32)),
             axum::Extension(Subject("test#user".into())),
             Body::empty(),
         )
         .await
-        .expect_err("quiescing must reject the push");
-        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        .expect_err("quiescing must reject the push")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 
     /// Past the upload cap the push is shed before its body is read, with a
