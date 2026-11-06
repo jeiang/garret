@@ -375,7 +375,13 @@ async fn fetch_keys(
         .iter()
         .filter_map(|jwk| {
             let kid = jwk.common.key_id.clone()?;
-            DecodingKey::from_jwk(jwk).ok().map(|k| (kid, k))
+            match DecodingKey::from_jwk(jwk) {
+                Ok(key) => Some((kid, key)),
+                Err(e) => {
+                    tracing::warn!("skipping unusable JWK {kid} from {url}: {e}");
+                    None
+                }
+            }
         })
         .collect())
 }
