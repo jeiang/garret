@@ -685,7 +685,9 @@ impl Pusher {
             // The token expired or was revoked mid-run: replace it once and go
             // again straight away. A second 401 is a real refusal.
             if !renewed
-                && error.is::<Unauthorized>()
+                && error
+                    .downcast_ref::<Rejected>()
+                    .is_some_and(|r| r.status == StatusCode::UNAUTHORIZED)
                 && self
                     .tokens
                     .renew(&token)
@@ -737,9 +739,6 @@ impl Pusher {
         let status = response.status();
         if let Some(after) = retry_after(status, &response) {
             return Err(Shed(after).into());
-        }
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(Unauthorized(error_detail(response).await).into());
         }
         if !status.is_success() {
             let body = error_detail(response).await;
@@ -891,25 +890,8 @@ async fn unless_stalled<T>(
     }
 }
 
-/// The Pusher refused the token. Typed so [`Pusher::push_one`] can tell it
-/// apart from other rejections and renew the token instead of failing.
-#[derive(Debug)]
-struct Unauthorized(String);
-
-impl std::fmt::Display for Unauthorized {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "upload rejected with {}: {}",
-            StatusCode::UNAUTHORIZED,
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for Unauthorized {}
-
-/// The Pusher refused an upload with a status other than 401 or 429. Typed so
+/// The Pusher refused an upload with a non-2xx status other than a shed.
+/// Typed so [`Pusher::push_one`] renews the token on a 401 and
 /// [`is_retryable`] reads the status instead of searching the message.
 #[derive(Debug)]
 struct Rejected {
@@ -1007,7 +989,7 @@ impl Backoff {
         if self.retries >= self.max_retries || !is_retryable(error) {
             return None;
         }
-        let wait = self.delay + Duration::from_millis(fastrand_millis(self.delay));
+        let wait = self.delay + jitter(self.delay);
         self.retries += 1;
         self.delay *= 2;
         Some(wait)
@@ -1026,7 +1008,7 @@ impl Backoff {
     fn queued(&mut self, base: Duration) -> Option<Duration> {
         self.retries = 0;
         self.delay = Duration::from_millis(250);
-        let wait = base + Duration::from_millis(fastrand_millis(base));
+        let wait = base + jitter(base);
         (self.started.elapsed() + wait <= WAIT_DEADLINE).then_some(wait)
     }
 }
@@ -1170,15 +1152,9 @@ pub fn connection_dropped(error: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
-/// Jitter without a rand dependency: sub-second clock noise, capped at the
-/// delay. Microseconds, not nanoseconds: macOS clocks tick in whole
-/// microseconds, so nanoseconds modulo a whole second would always be 0.
-fn fastrand_millis(delay: Duration) -> u64 {
-    let micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_micros() as u64)
-        .unwrap_or(0);
-    micros % delay.as_millis().max(1) as u64
+/// A random wait below `delay`, in whole milliseconds.
+fn jitter(delay: Duration) -> Duration {
+    Duration::from_millis(fastrand::u64(..delay.as_millis().max(1) as u64))
 }
 
 #[cfg(test)]
