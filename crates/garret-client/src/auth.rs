@@ -13,14 +13,14 @@ use crate::http::{ensure_success, error_detail};
 /// re-running the device flow. Never the access token itself — that is
 /// short-lived by design and re-minted as it ages (see [`TokenSource`]).
 #[derive(Debug, Serialize, Deserialize)]
-pub struct StoredToken {
+struct StoredToken {
     /// The rotating refresh token. Each refresh may replace it, and the
     /// replacement must be persisted or the next run is locked out.
-    pub refresh_token: String,
+    refresh_token: String,
     /// Issuer URL the token came from; refresh goes back to the same one.
-    pub issuer: String,
+    issuer: String,
     /// The public client id the device flow authenticated as.
-    pub client_id: String,
+    client_id: String,
 }
 
 /// `$XDG_CONFIG_HOME/garret/token.json` — where the refresh token lives.
@@ -70,7 +70,7 @@ pub fn peek_claims(token: &str) -> Result<Claims> {
 }
 
 /// Writes the token file, creating `~/.config/garret/` mode 0700 if needed.
-pub fn save_token(token: &StoredToken) -> Result<()> {
+fn save_token(token: &StoredToken) -> Result<()> {
     write_private(&token_path()?, &serde_json::to_vec_pretty(token)?)
 }
 
@@ -87,7 +87,7 @@ fn write_private(path: &std::path::Path, contents: &[u8]) -> Result<()> {
 /// Built only by [`discover`], so every URL here has passed
 /// [`crate::discovery::check_url`] before any credential is posted to it.
 #[derive(Debug)]
-pub struct Endpoints {
+struct Endpoints {
     device_authorization_endpoint: Option<String>,
     token_endpoint: String,
 }
@@ -112,13 +112,13 @@ impl Endpoints {
     }
 
     /// Where every grant type is exchanged for tokens.
-    pub fn token_endpoint(&self) -> &str {
+    fn token_endpoint(&self) -> &str {
         &self.token_endpoint
     }
 
     /// Where the device flow asks for a user code (RFC 8628); an error when
     /// the issuer does not offer the device flow.
-    pub fn device_authorization_endpoint(&self) -> Result<&str> {
+    fn device_authorization_endpoint(&self) -> Result<&str> {
         self.device_authorization_endpoint.as_deref().context(
             "the OIDC issuer advertises no device_authorization_endpoint, so it offers no \
              device flow",
@@ -128,7 +128,7 @@ impl Endpoints {
 
 /// Fetches the issuer's `/.well-known/openid-configuration`. The issuer may
 /// come from token.json rather than the checked config, so it is checked here.
-pub async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints> {
+async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Endpoints> {
     crate::discovery::check_url("the OIDC issuer", issuer)?;
     let url = format!(
         "{}/.well-known/openid-configuration",
@@ -178,18 +178,26 @@ fn missing_token() -> anyhow::Error {
     anyhow!("token response contained no access_token")
 }
 
-/// Appends the RFC 8707 `resource` parameter only when one is configured.
-/// Always sending it breaks issuers that require each resource to be
-/// registered in advance (Pocket ID answers `invalid_target`), and the
-/// parameter is not needed when the issuer already puts the client id in `aud`.
-fn with_resource<'a>(
-    mut form: Vec<(&'a str, &'a str)>,
-    resource: Option<&'a str>,
-) -> Vec<(&'a str, &'a str)> {
+/// POSTs `form` to an issuer endpoint within [`TOKEN_TIMEOUT`], with the
+/// RFC 8707 `resource` parameter only when one is configured. Always sending
+/// it breaks issuers that require each resource to be registered in advance
+/// (Pocket ID answers `invalid_target`), and the parameter is not needed when
+/// the issuer already puts the client id in `aud`.
+async fn post_form(
+    http: &reqwest::Client,
+    endpoint: &str,
+    mut form: Vec<(&str, &str)>,
+    resource: Option<&str>,
+) -> Result<reqwest::Response> {
     if let Some(resource) = resource {
         form.push(("resource", resource));
     }
-    form
+    Ok(http
+        .post(endpoint)
+        .form(&form)
+        .timeout(TOKEN_TIMEOUT)
+        .send()
+        .await?)
 }
 
 /// Device flow: the human approves in a browser (passkey, in Pocket ID's case)
@@ -202,15 +210,13 @@ pub async fn device_login(
     resource: Option<&str>,
 ) -> Result<bool> {
     let endpoints = discover(http, issuer).await?;
-    let response = http
-        .post(endpoints.device_authorization_endpoint()?)
-        .form(&with_resource(
-            vec![("client_id", client_id), ("scope", "openid offline_access")],
-            resource,
-        ))
-        .timeout(TOKEN_TIMEOUT)
-        .send()
-        .await?;
+    let response = post_form(
+        http,
+        endpoints.device_authorization_endpoint()?,
+        vec![("client_id", client_id), ("scope", "openid offline_access")],
+        resource,
+    )
+    .await?;
     let grant: DeviceGrant = ensure_success(response, "requesting a device code")
         .await?
         .json()
@@ -229,19 +235,17 @@ pub async fn device_login(
     let mut interval = grant.interval;
     loop {
         tokio::time::sleep(Duration::from_secs(interval)).await;
-        let mut response = http
-            .post(endpoints.token_endpoint())
-            .form(&with_resource(
-                vec![
-                    ("client_id", client_id),
-                    ("device_code", &grant.device_code),
-                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ],
-                resource,
-            ))
-            .timeout(TOKEN_TIMEOUT)
-            .send()
-            .await?;
+        let mut response = post_form(
+            http,
+            endpoints.token_endpoint(),
+            vec![
+                ("client_id", client_id),
+                ("device_code", &grant.device_code),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ],
+            resource,
+        )
+        .await?;
         // RFC 8628 §3.5: pending, slow_down and refusals are 400s whose OAuth
         // error body is read below; any other non-2xx is a plain failure.
         if response.status() != reqwest::StatusCode::BAD_REQUEST {
@@ -275,19 +279,17 @@ async fn refresh(
     resource: Option<&str>,
 ) -> Result<String> {
     let endpoints = discover(http, &stored.issuer).await?;
-    let response = http
-        .post(endpoints.token_endpoint())
-        .form(&with_resource(
-            vec![
-                ("client_id", &stored.client_id as &str),
-                ("refresh_token", &stored.refresh_token),
-                ("grant_type", "refresh_token"),
-            ],
-            resource,
-        ))
-        .timeout(TOKEN_TIMEOUT)
-        .send()
-        .await?;
+    let response = post_form(
+        http,
+        endpoints.token_endpoint(),
+        vec![
+            ("client_id", stored.client_id.as_str()),
+            ("refresh_token", stored.refresh_token.as_str()),
+            ("grant_type", "refresh_token"),
+        ],
+        resource,
+    )
+    .await?;
     // The issuer answers 400 `invalid_grant` (or 401) for a refresh token that
     // expired, was revoked or was already rotated: only a new login fixes it.
     if matches!(response.status().as_u16(), 400 | 401) {
@@ -350,7 +352,7 @@ async fn github_token(
 
 /// Machine clients: a confidential client whose secret lives in a root-owned
 /// file wired by the NixOS module (spec 04-auth).
-pub async fn client_credentials(
+async fn client_credentials(
     http: &reqwest::Client,
     issuer: &str,
     client_id: &str,
@@ -358,19 +360,17 @@ pub async fn client_credentials(
     resource: Option<&str>,
 ) -> Result<String> {
     let endpoints = discover(http, issuer).await?;
-    let response = http
-        .post(endpoints.token_endpoint())
-        .form(&with_resource(
-            vec![
-                ("client_id", client_id),
-                ("client_secret", client_secret),
-                ("grant_type", "client_credentials"),
-            ],
-            resource,
-        ))
-        .timeout(TOKEN_TIMEOUT)
-        .send()
-        .await?;
+    let response = post_form(
+        http,
+        endpoints.token_endpoint(),
+        vec![
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("grant_type", "client_credentials"),
+        ],
+        resource,
+    )
+    .await?;
     let response: TokenResponse = ensure_success(response, "requesting a client_credentials token")
         .await?
         .json()
