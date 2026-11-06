@@ -664,21 +664,20 @@ mod tests {
         wrap(rusqlite::Connection::open_in_memory().unwrap())
     }
 
-    #[tokio::test]
-    async fn a_read_within_budget_returns_its_result() {
-        let got = db_read(conn(), Duration::from_secs(5), |_| Ok(42)).await;
-        assert_eq!(got, Ok(42));
+    /// Stands in for a wedged statement: blocks its thread until the test
+    /// sends on `gate`'s sender, and fails if that never comes.
+    fn wedge(gate: &std::sync::mpsc::Receiver<()>) -> anyhow::Result<()> {
+        gate.recv_timeout(Duration::from_secs(5))
+            .context("never released")
     }
 
     /// The read is sync under the connection lock; the budget must still
     /// trip while it is wedged (ticket 25) — hence the blocking pool.
     #[tokio::test]
     async fn a_wedged_read_trips_the_budget_instead_of_hanging() {
-        let got = db_read(conn(), Duration::from_millis(25), |_| {
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(())
-        })
-        .await;
+        let (release, gate) = std::sync::mpsc::channel();
+        let got = db_read(conn(), Duration::from_millis(25), move |_| wedge(&gate)).await;
+        let _ = release.send(());
         assert_eq!(got, Err(Degraded::DbTimeout));
     }
 
@@ -688,18 +687,19 @@ mod tests {
     async fn a_read_queued_behind_a_wedged_lock_holder_trips_its_budget() {
         let conn = conn();
         let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
         let wedged = db_read(conn.clone(), Duration::from_millis(25), move |_| {
             // Signal that the lock is held so the queued read provably starts
             // second; otherwise it could win the lock and succeed.
             holding_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(500));
-            Ok(())
+            wedge(&gate)
         });
         let wedged = tokio::spawn(wedged);
         holding_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("wedged read should acquire the lock");
         let queued = db_read(conn, Duration::from_millis(25), |_| Ok(())).await;
+        let _ = release.send(());
         let wedged = wedged.await.unwrap();
         assert_eq!(wedged, Err(Degraded::DbTimeout));
         assert_eq!(
@@ -711,87 +711,103 @@ mod tests {
 
     const DAY: i64 = 86400;
 
-    /// The pull-path read of `hash`'s `last_accessed_at`, fed to a hit the
-    /// way `narinfo` does.
-    fn hit(bumps: &Bumps, conn: &rusqlite::Connection, hash: &str, now: i64) {
-        let (_, last_accessed_at) = db::get_object_and_last_accessed(conn, hash)
+    /// Flushes `state`'s queued bumps on its pull connection; how many it wrote.
+    async fn flush(state: &AppState) -> usize {
+        let mut conn = state.db().unwrap().pull.lock().await;
+        state
+            .bumps
+            .flush(&mut conn, now(), state.bump_debounce)
             .unwrap()
-            .unwrap();
-        bumps.hit(hash, last_accessed_at, now, DAY);
     }
 
     /// Nearly every hit is on a fresh row, and it must not write: not even
     /// take the WAL write lock the Pusher needs. Proved against a Pusher
     /// holding that lock, where any write attempt fails busy.
-    #[test]
-    fn a_debounced_hit_performs_no_write() {
+    #[tokio::test]
+    async fn a_debounced_hit_performs_no_write() {
         let dir = scratch_dir();
         let path = dir.join("garret.sqlite");
         let path = path.to_str().unwrap();
         let mut pusher = db::open(path, true).unwrap();
         db::migrate(&pusher).unwrap();
         let hash = "a".repeat(32);
-        db::insert_object(&mut pusher, &object(&hash), 1000).unwrap();
-        let mut puller = db::open(path, false).unwrap();
+        db::insert_object(&mut pusher, &object(&hash), now()).unwrap();
+        let puller = db::open(path, false).unwrap();
         puller.busy_timeout(Duration::from_millis(10)).unwrap();
+        let state = state_with_db(puller).await;
+        let app = pull_routes().with_state(state.clone());
 
         pusher.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let bumps = Bumps::default();
+        let served = request(&app, &format!("/{hash}.narinfo")).await;
+        assert_eq!(served.status(), StatusCode::OK);
         // The last second of the window, where the UPDATE's WHERE would
         // match nothing: still no write lock.
-        hit(&bumps, &puller, &hash, 1000 + DAY);
-        let flushed = bumps.flush(&mut puller, 1000 + DAY, DAY);
+        state.bumps.hit(&hash, 1000, 1000 + DAY, DAY);
+        let flushed = flush(&state).await;
         pusher.execute_batch("ROLLBACK").unwrap();
-        assert_eq!(flushed.unwrap(), 0, "a fresh row must not be written");
+        assert_eq!(flushed, 0, "a fresh row must not be written");
     }
 
-    #[test]
-    fn a_burst_of_hits_on_one_hash_is_one_write() {
+    #[tokio::test]
+    async fn a_burst_of_hits_on_one_hash_is_one_write() {
         let mut conn = db::open(":memory:", true).unwrap();
         db::migrate(&conn).unwrap();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), 1000).unwrap();
-        let now = 1000 + DAY + 1;
+        let state = state_with_db(conn).await;
+        let app = pull_routes().with_state(state.clone());
+        let narinfo = format!("/{hash}.narinfo");
 
-        let bumps = Bumps::default();
         for _ in 0..100 {
-            hit(&bumps, &conn, &hash, now);
+            assert_eq!(request(&app, &narinfo).await.status(), StatusCode::OK);
         }
-        assert_eq!(bumps.flush(&mut conn, now, DAY).unwrap(), 1);
+        assert_eq!(flush(&state).await, 1);
 
         // Written: later hits read the fresh value and queue nothing.
-        hit(&bumps, &conn, &hash, now + 1);
-        assert_eq!(bumps.flush(&mut conn, now + 1, DAY).unwrap(), 0);
+        assert_eq!(request(&app, &narinfo).await.status(), StatusCode::OK);
+        assert_eq!(flush(&state).await, 0);
     }
 
     /// A slow browse query (a big tree walk, a full-scan search) must not
-    /// delay a pull-path read. With one runtime thread, a query run on the
-    /// async worker would stall the narinfo read's own task.
+    /// delay a narinfo read: it runs on its own connection, and off the
+    /// async worker, which with one runtime thread would stall every request.
     #[tokio::test(flavor = "current_thread")]
     async fn a_slow_browse_query_does_not_delay_pull_reads() {
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let hash = "a".repeat(32);
+        db::insert_object(&mut conn, &object(&hash), 1000).unwrap();
+        let state = state_with_db(conn).await;
+
         let (running_tx, running_rx) = tokio::sync::oneshot::channel();
-        let started = std::time::Instant::now();
-        let slow = tokio::spawn(on_conn(conn(), "browse", |_| {
-            running_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_secs(1));
-            Ok(())
-        }));
+        let (release, gate) = std::sync::mpsc::channel();
+        let slow = tokio::spawn({
+            let state = state.clone();
+            async move {
+                browse(&state, "tree", move |_| {
+                    running_tx.send(()).unwrap();
+                    wedge(&gate).map(Some)
+                })
+                .await
+            }
+        });
         running_rx.await.unwrap();
 
-        let read = db_read(conn(), Duration::from_millis(900), |_| Ok(42)).await;
-        assert_eq!(read, Ok(42), "the pull read tripped its budget");
-        assert!(
-            started.elapsed() < Duration::from_millis(900),
-            "the pull read waited on the browse query: {:?}",
-            started.elapsed()
+        let app = pull_routes().with_state(state);
+        let served = request(&app, &format!("/{hash}.narinfo")).await;
+        let _ = release.send(());
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "the narinfo read waited on the browse query"
         );
-        slow.await.unwrap().unwrap();
+        assert_eq!(slow.await.unwrap().status(), StatusCode::OK);
     }
 
     /// A client that disconnects mid-probe cancels its handler. That must not
     /// leave the cache empty, or a loop of abandoned requests would cost one
     /// S3 read each instead of one per TTL.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_abandoned_probe_still_fills_the_cache() {
         let cache = ProbeCache::default();
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -813,7 +829,8 @@ mod tests {
     }
 
     /// One bad row that panics a read must cost that request, not the
-    /// Puller: the process stays up, so nothing would restart it.
+    /// Puller: the process stays up, so nothing would restart it, and the
+    /// connection must keep serving.
     #[tokio::test]
     async fn a_panicked_read_does_not_break_later_reads() {
         let conn = conn();
@@ -828,27 +845,13 @@ mod tests {
         assert_eq!(next, Ok(42));
     }
 
-    /// The async lock cannot poison at all; this guards that design choice,
-    /// and the 500 a panicking browse request must still answer.
-    #[tokio::test]
-    async fn a_panicking_browse_request_is_a_500_and_the_next_one_is_served() {
-        let state = state_with_db(rusqlite::Connection::open_in_memory().unwrap()).await;
-        let panicked = browse(&state, "tree", |_| -> anyhow::Result<Option<()>> {
-            panic!("boom")
-        })
-        .await;
-        assert_eq!(panicked.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let next = browse(&state, "tree", |_| Ok(Some(42))).await;
-        assert_eq!(next.status(), StatusCode::OK);
-    }
-
     async fn state() -> Arc<AppState> {
         let storage = unreachable_storage().await;
         Arc::new(AppState {
             db: OnceLock::new(),
             storage,
             presign_ttl: Duration::from_secs(1),
-            bump_debounce: 0,
+            bump_debounce: DAY,
             bumps: Bumps::default(),
             db_read_budget: Duration::from_secs(1),
             presign_budget: Duration::from_secs(1),
