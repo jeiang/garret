@@ -273,15 +273,20 @@ async fn main() -> Result<()> {
 
         Command::List { query, limit } => {
             let cfg = load()?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::list(&http, &puller, &token, query.as_deref(), limit).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let page: wire::Page =
-                serde_json::from_value(raw).context("parsing the object list")?;
-            print!("{}", browse::render_page(&page));
+            let limit = limit.to_string();
+            let mut params = vec![("limit", limit.as_str())];
+            params.extend(query.as_deref().map(|q| ("q", q)));
+            let render = |page: wire::Page| print!("{}", browse::render_page(&page));
+            show(
+                &cfg,
+                &http,
+                wire::OBJECTS,
+                &params,
+                cli.json,
+                "the object list",
+                render,
+            )
+            .await?;
         }
 
         Command::Tree { hash } => {
@@ -289,33 +294,42 @@ async fn main() -> Result<()> {
             let hash = garret_common::parse_store_hash(&hash).with_context(|| {
                 format!("`{hash}` is not a 32-character store hash or a store path")
             })?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::tree(&http, &puller, &token, hash).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let tree: wire::TreeNode =
-                serde_json::from_value(raw).context("parsing the dependency tree")?;
-            let mut out = String::new();
-            browse::render(&tree, 0, &mut out);
-            print!("{out}");
+            let route = wire::with_hash(wire::OBJECT_TREE, hash);
+            let render = |tree: wire::TreeNode| {
+                let mut out = String::new();
+                browse::render(&tree, 0, &mut out);
+                print!("{out}");
+            };
+            show(
+                &cfg,
+                &http,
+                &route,
+                &[],
+                cli.json,
+                "the dependency tree",
+                render,
+            )
+            .await?;
         }
 
         Command::Pins => {
             let cfg = load()?;
-            let (puller, token) = browse_target(&cfg, &http).await?;
-            let raw = browse::pins(&http, &puller, &token).await?;
-            if cli.json {
-                println!("{raw}");
-                return Ok(());
-            }
-            let pins: Vec<wire::Pin> =
-                serde_json::from_value(raw).context("parsing the pin list")?;
-            print!("{}", browse::render_pins(&pins, garret_common::unix_now()));
-            if pins.is_empty() {
-                eprintln!("no pins");
-            }
+            let render = |pins: Vec<wire::Pin>| {
+                print!("{}", browse::render_pins(&pins, garret_common::unix_now()));
+                if pins.is_empty() {
+                    eprintln!("no pins");
+                }
+            };
+            show(
+                &cfg,
+                &http,
+                wire::PINS,
+                &[],
+                cli.json,
+                "the pin list",
+                render,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -520,13 +534,34 @@ fn use_cache(cfg: &config::Config, print: bool) -> Result<()> {
     Ok(())
 }
 
-async fn browse_target(cfg: &config::Config, http: &reqwest::Client) -> Result<(String, String)> {
+/// `list`/`tree`/`pins`: one GET of `route` on the Puller. `--json` prints
+/// the answer verbatim; otherwise it is parsed as `T` and rendered.
+async fn show<T: serde::de::DeserializeOwned>(
+    cfg: &config::Config,
+    http: &reqwest::Client,
+    route: &str,
+    params: &[(&str, &str)],
+    as_json: bool,
+    what: &str,
+    render: impl FnOnce(T),
+) -> Result<()> {
     let puller = cfg
         .puller_endpoint
-        .clone()
-        .context("set `puller_endpoint` in the config: list/tree query the Puller")?;
+        .as_deref()
+        .context("set `puller_endpoint` in the config: list/tree/pins query the Puller")?;
     let token = auth::TokenSource::for_config(http, cfg)?.get().await?;
-    Ok((puller, token))
+    let mut url = reqwest::Url::parse(&format!("{puller}{route}"))
+        .with_context(|| format!("building the URL for {what}"))?;
+    if !params.is_empty() {
+        url.query_pairs_mut().extend_pairs(params);
+    }
+    let raw = browse::get(http, url, &token, what).await?;
+    if as_json {
+        println!("{raw}");
+        return Ok(());
+    }
+    render(serde_json::from_value(raw).with_context(|| format!("parsing {what}"))?);
+    Ok(())
 }
 
 /// Relative time for a token expiry; the JSON output keeps the raw epoch.
