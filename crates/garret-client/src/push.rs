@@ -74,7 +74,7 @@ impl Report {
                 "nar_bytes": nar_bytes,
             }));
             for info in upstream {
-                report.path(info, "upstream", None);
+                report.path(info, &Outcome::Upstream);
             }
             return report;
         }
@@ -137,22 +137,13 @@ impl Report {
     /// One path finished, one way or another. A failure is reported here and
     /// the run continues: every path gets an event, and the non-zero exit comes
     /// after `finish`, so a consumer always sees the totals.
-    fn path(&self, info: &PathInfo, status: &str, error: Option<&str>) {
+    fn path(&self, info: &PathInfo, outcome: &Outcome) {
         if self.json {
-            let mut event = json!({
-                "event": "path",
-                "path": info.path,
-                "status": status,
-                "nar_size": info.nar_size,
-            });
-            if let Some(error) = error {
-                event["error"] = error.into();
-            }
-            self.event(event);
-        } else if let Some(error) = error {
+            self.event(path_event(info, outcome));
+        } else if let Outcome::Failed(error) = outcome {
             self.out(&format!("  failed   {}: {error}", info.path));
         } else {
-            self.out(&format!("  {status:<8} {}", info.path));
+            self.out(&format!("  {:<8} {}", outcome.as_str(), info.path));
         }
     }
 
@@ -218,6 +209,81 @@ impl Report {
             None => ProgressBar::hidden().wrap_async_read(reader),
         }
     }
+}
+
+/// The `--json` event for one finished path; `error` appears only on failure.
+fn path_event(info: &PathInfo, outcome: &Outcome) -> serde_json::Value {
+    let mut event = json!({
+        "event": "path",
+        "path": info.path,
+        "status": outcome.as_str(),
+        "nar_size": info.nar_size,
+    });
+    if let Outcome::Failed(error) = outcome {
+        event["error"] = error.as_str().into();
+    }
+    event
+}
+
+/// How one path ended up. The status strings are the NDJSON `path` event
+/// contract (spec 06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Outcome {
+    Pushed,
+    Deduped,
+    /// Failed even after retries; carries the `{e:#}` error text.
+    Failed(String),
+    /// Signed by an upstream key, so never negotiated or uploaded.
+    Upstream,
+}
+
+impl Outcome {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pushed => "pushed",
+            Self::Deduped => "deduped",
+            Self::Failed(_) => "failed",
+            Self::Upstream => "upstream",
+        }
+    }
+}
+
+/// What a successful upload attempt achieved: the server stored the path, or
+/// already held it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stored {
+    Pushed,
+    Deduped,
+}
+
+impl From<Stored> for Outcome {
+    fn from(stored: Stored) -> Self {
+        match stored {
+            Stored::Pushed => Self::Pushed,
+            Stored::Deduped => Self::Deduped,
+        }
+    }
+}
+
+/// Folds per-path outcomes into the run's [`Summary`] and the failed paths.
+fn tally(outcomes: Vec<(String, Outcome)>, nar_bytes: u64) -> (Summary, Vec<String>) {
+    let mut summary = Summary {
+        nar_bytes,
+        ..Summary::default()
+    };
+    let mut failed = Vec::new();
+    for (path, outcome) in outcomes {
+        match outcome {
+            Outcome::Pushed => summary.pushed += 1,
+            Outcome::Deduped => summary.deduped += 1,
+            Outcome::Failed(_) => {
+                summary.failed += 1;
+                failed.push(path);
+            }
+            Outcome::Upstream => {}
+        }
+    }
+    (summary, failed)
 }
 
 /// What a push run did. `deduped` means the bytes were uploaded and *then*
@@ -465,43 +531,26 @@ impl Pusher {
         let nar_bytes: u64 = paths.iter().map(|p| p.nar_size.max(0) as u64).sum();
         let outcomes = stream::iter(references_first(paths))
             .map(|info| async move {
-                match self.push_one(&info, report).await {
-                    Ok(status) => {
-                        report.path(&info, status, None);
-                        (info.path, status)
-                    }
-                    Err(e) => {
-                        report.path(&info, "failed", Some(&format!("{e:#}")));
-                        (info.path, "failed")
-                    }
-                }
+                let outcome = match self.push_one(&info, report).await {
+                    Ok(stored) => Outcome::from(stored),
+                    Err(e) => Outcome::Failed(format!("{e:#}")),
+                };
+                report.path(&info, &outcome);
+                (info.path, outcome)
             })
             .buffer_unordered(self.jobs)
             .collect::<Vec<_>>()
             .await;
-
-        let count = |wanted: &str| outcomes.iter().filter(|(_, s)| *s == wanted).count();
-        let summary = Summary {
-            pushed: count("pushed"),
-            deduped: count("deduped"),
-            failed: count("failed"),
-            nar_bytes,
-        };
-        let failed = outcomes
-            .into_iter()
-            .filter(|(_, s)| *s == "failed")
-            .map(|(path, _)| path)
-            .collect();
-        (summary, failed)
+        tally(outcomes, nar_bytes)
     }
 
-    async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<&'static str> {
+    async fn push_one(&self, info: &PathInfo, report: &Report) -> Result<Stored> {
         let mut backoff = Backoff::new(self.max_retries);
         let mut renewed = false;
         loop {
             let token = self.tokens.get().await?;
             let error = match self.attempt(info, report, &token).await {
-                Ok(status) => return Ok(status),
+                Ok(stored) => return Ok(stored),
                 Err(e) => e,
             };
             // The token expired or was revoked mid-run: replace it once and go
@@ -525,7 +574,7 @@ impl Pusher {
         }
     }
 
-    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<&'static str> {
+    async fn attempt(&self, info: &PathInfo, report: &Report, token: &str) -> Result<Stored> {
         let preamble = Preamble {
             store_path: info.path.clone(),
             nar_hash: info.nar_hash.clone(),
@@ -581,11 +630,11 @@ impl Pusher {
         match ack.status.as_str() {
             // "deduped", not "skipped": the bytes were uploaded and only then
             // found redundant, so the bandwidth was spent either way.
-            "exists" => Ok("deduped"),
+            "exists" => Ok(Stored::Deduped),
             // Not success yet: the other upload may still fail. Wait until
             // the server answers `exists`, or lets this one through.
             "in-progress" => Err(InProgress.into()),
-            _ => Ok("pushed"),
+            _ => Ok(Stored::Pushed),
         }
     }
 }
@@ -1117,6 +1166,49 @@ mod tests {
             Report::negotiated_line(5, 3, 1),
             "5 path(s) in closure, 3 served upstream, 1 missing"
         );
+    }
+
+    #[test]
+    fn tally_counts_each_outcome_and_names_the_failures() {
+        let outcomes = vec![
+            ("/nix/store/a".to_owned(), Outcome::Pushed),
+            ("/nix/store/b".to_owned(), Outcome::Failed("boom".into())),
+            ("/nix/store/c".to_owned(), Outcome::Deduped),
+            ("/nix/store/d".to_owned(), Outcome::Pushed),
+            ("/nix/store/e".to_owned(), Outcome::Upstream),
+            ("/nix/store/f".to_owned(), Outcome::Failed("bang".into())),
+        ];
+        let (summary, failed) = tally(outcomes, 42);
+        assert_eq!(
+            summary,
+            Summary {
+                pushed: 2,
+                deduped: 1,
+                failed: 2,
+                nar_bytes: 42,
+            }
+        );
+        assert_eq!(failed, ["/nix/store/b", "/nix/store/f"]);
+    }
+
+    #[test]
+    fn path_events_carry_the_status_and_only_a_failure_carries_an_error() {
+        let path = info("/nix/store/aaa-x", &[]);
+        let failed = path_event(&path, &Outcome::Failed("uploading NAR: reset".into()));
+        assert_eq!(failed["event"], "path");
+        assert_eq!(failed["path"], "/nix/store/aaa-x");
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"], "uploading NAR: reset");
+        assert_eq!(failed["nar_size"], 1);
+        for (outcome, status) in [
+            (Outcome::Pushed, "pushed"),
+            (Outcome::Deduped, "deduped"),
+            (Outcome::Upstream, "upstream"),
+        ] {
+            let event = path_event(&path, &outcome);
+            assert_eq!(event["status"], status);
+            assert!(event.get("error").is_none(), "{event}");
+        }
     }
 
     fn shed(secs: u64) -> anyhow::Error {
