@@ -95,12 +95,12 @@ pub enum Repair {
     Quiesced,
 }
 
-/// The Pusher's reply to a [`Request`]; variants mirror the request commands,
-/// plus [`Response::Error`] for any failure.
+/// The Pusher's reply to a [`Request`]: the variant named after the command
+/// ([`Response::Gc`] for [`Request::GcRun`]), or [`Response::Error`].
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Response {
-    /// Reply to [`Request::Status`].
+    /// Cache usage now.
     Status {
         /// Number of objects in the cache.
         objects: i64,
@@ -111,7 +111,7 @@ pub enum Response {
         /// Uploads currently being received.
         uploads_in_flight: usize,
     },
-    /// Reply to [`Request::GcRun`].
+    /// One eviction pass's outcome.
     Gc {
         /// Objects evicted by this pass.
         evicted: usize,
@@ -122,7 +122,7 @@ pub enum Response {
         /// is referenced.
         candidates_exhausted: bool,
     },
-    /// Reply to [`Request::Resign`].
+    /// Re-signing tally.
     Resign {
         /// Objects whose narinfo signatures were rewritten.
         resigned: usize,
@@ -131,7 +131,7 @@ pub enum Response {
         /// would otherwise launder tampered metadata into a valid signature.
         refused: usize,
     },
-    /// Reply to [`Request::Delete`].
+    /// What was, or on a dry run would be, deleted.
     Delete {
         /// Objects removed (or, on a dry run, that would be removed).
         deleted: usize,
@@ -141,15 +141,15 @@ pub enum Response {
         /// silently reporting success would hide a typo.
         missing: Vec<String>,
     },
-    /// Reply to [`Request::Pin`].
+    /// The pin is stored.
     Pin,
-    /// Reply to [`Request::Unpin`].
+    /// Whether the named pin existed.
     Unpin {
         /// False when no pin had that name — reported, not swallowed, so a
         /// typo does not look like a successful unpin.
         removed: bool,
     },
-    /// Reply to [`Request::Fsck`].
+    /// Audit findings and repairs.
     Fsck {
         /// Rows with no matching blob, past the in-flight and age guards.
         dangling: Vec<FsckRow>,
@@ -168,19 +168,19 @@ pub enum Response {
         /// means the drain timed out and no repair happened.
         quiesce_drained: Option<bool>,
     },
-    /// Reply to [`Request::Prune`].
+    /// What was, or on a dry run would be, pruned.
     Prune {
         /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
         pruned: Vec<String>,
         /// Compressed bytes reclaimed (or reclaimable, on a dry run).
         bytes_freed: i64,
     },
-    /// Reply to [`Request::Backup`].
+    /// The copy is written.
     Backup {
         /// Size of the copy written, in bytes.
         bytes: u64,
     },
-    /// Reply to [`Request::DeletePushedBy`].
+    /// What was, or on a dry run would be, deleted.
     DeletePushedBy {
         /// Basenames (`<hash>-<name>`) removed, or that a dry run would remove.
         objects: Vec<String>,

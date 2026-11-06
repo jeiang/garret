@@ -266,8 +266,6 @@ async fn main() -> Result<()> {
                 } => {
                     let verb = if dry_run { "would delete" } else { "deleted" };
                     println!("{verb} {deleted} object(s), {}", human_bytes(bytes_freed));
-                    // Reported, not swallowed: a mistyped hash would otherwise
-                    // look exactly like a successful delete.
                     if !missing.is_empty() {
                         println!("not in the cache: {}", missing.join(", "));
                     }
@@ -302,8 +300,6 @@ async fn main() -> Result<()> {
 
         Command::Unpin { name } => match request(&cli.socket, Request::Unpin { name }).await? {
             Response::Unpin { removed: true } => println!("unpinned"),
-            // Reported, not swallowed: a mistyped name would otherwise look
-            // exactly like a successful unpin.
             Response::Unpin { removed: false } => {
                 bail!("no pin has that name");
             }
@@ -481,8 +477,6 @@ fn print_unexpected(response: Response) {
         Response::Error { message } => eprintln!("error: {message}"),
         other => eprintln!("unexpected response: {other:?}"),
     }
-    // A failed command must fail the process: scripts branch on the exit
-    // code, and a printed error with status 0 reads as success.
     std::process::exit(1);
 }
 
@@ -519,8 +513,7 @@ fn parse_store_hash(text: &str) -> Result<String> {
     }
 }
 
-/// `<number><s|m|h|d>` → seconds. ponytail: four suffixes cover release
-/// retention; reach for a duration crate only if operators ask for more.
+/// `<number><s|m|h|d>` → seconds.
 fn parse_duration(text: &str) -> Result<i64> {
     let (digits, suffix) = text.split_at(text.len().saturating_sub(1));
     let scale = match suffix {

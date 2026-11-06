@@ -53,8 +53,6 @@ pub fn preamble_end(buf: &[u8], max: usize) -> Result<Option<usize>, usize> {
 /// `<hash>-<name>` → hash, the object key everything else is keyed by.
 pub fn hash_of_store_path(path: &str) -> &str {
     let base = path.rsplit('/').next().unwrap_or(path);
-    // `get` rather than slicing: a multibyte character straddling byte 32
-    // would make `&base[..32]` panic.
     base.get(..32).unwrap_or(base)
 }
 
@@ -62,7 +60,7 @@ pub fn hash_of_store_path(path: &str) -> &str {
 /// hashes and narinfo hashes.
 pub const NIX_BASE32_ALPHABET: &[u8; 32] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
-/// Whether every byte of `s` is in [`NIX_BASE32_ALPHABET`].
+/// Whether `s` is spelled in Nix's base32.
 pub fn is_nix_base32(s: &str) -> bool {
     s.bytes().all(|b| NIX_BASE32_ALPHABET.contains(&b))
 }
