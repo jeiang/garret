@@ -70,7 +70,10 @@ async fn run_within(
     );
     let (dangling, size_mismatches) = to_wire(&findings);
     let known: HashSet<String> = db_rows.iter().map(|r| r.store_path_hash.clone()).collect();
-    let orphans = gc::orphan_keys(&blobs, &known, &state.in_flight, grace);
+    let orphans: Vec<String> = gc::orphan_hashes(&blobs, &known, &state.in_flight, grace)
+        .into_iter()
+        .map(storage::key_for)
+        .collect();
 
     metrics::gauge!("garret_fsck_findings", "kind" => "dangling").set(dangling.len() as f64);
     metrics::gauge!("garret_fsck_findings", "kind" => "orphan").set(orphans.len() as f64);

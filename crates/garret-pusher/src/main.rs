@@ -6,6 +6,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 
 mod admin;
+mod deletion;
 mod fsck;
 mod gc;
 mod verify;

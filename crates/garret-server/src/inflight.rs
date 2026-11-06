@@ -34,6 +34,25 @@ pub enum Refused {
     Quiescing,
 }
 
+/// Why [`InFlight::claim_delete`] turned a delete claim away: only another
+/// claim on the path can, never the quiesce gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Busy {
+    /// The path is already claimed by an upload.
+    Uploading,
+    /// The path is already claimed by a delete.
+    Deleting,
+}
+
+impl From<Busy> for Refused {
+    fn from(busy: Busy) -> Self {
+        match busy {
+            Busy::Uploading => Refused::Uploading,
+            Busy::Deleting => Refused::Deleting,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     claims: HashMap<String, Kind>,
@@ -77,23 +96,28 @@ impl InFlight {
     /// so no upload is admitted that a drain cannot see.
     pub fn claim(&self, hash: &str, kind: Kind) -> Result<Claim, Refused> {
         let mut state = self.0.state.lock();
-        let State {
-            claims,
-            uploads,
-            quiescers,
-        } = &mut *state;
-        if kind == Kind::Upload && *quiescers > 0 {
+        if kind == Kind::Upload && state.quiescers > 0 {
             return Err(Refused::Quiescing);
         }
-        match claims.entry(hash.to_owned()) {
+        Ok(self.take(&mut state, hash, kind)?)
+    }
+
+    /// A [`Kind::Delete`] claim: first claimer wins, and the quiesce gate
+    /// does not apply.
+    pub fn claim_delete(&self, hash: &str) -> Result<Claim, Busy> {
+        self.take(&mut self.0.state.lock(), hash, Kind::Delete)
+    }
+
+    fn take(&self, state: &mut State, hash: &str, kind: Kind) -> Result<Claim, Busy> {
+        match state.claims.entry(hash.to_owned()) {
             Entry::Occupied(held) => Err(match held.get() {
-                Kind::Upload => Refused::Uploading,
-                Kind::Delete => Refused::Deleting,
+                Kind::Upload => Busy::Uploading,
+                Kind::Delete => Busy::Deleting,
             }),
             Entry::Vacant(slot) => {
                 slot.insert(kind);
                 if kind == Kind::Upload {
-                    *uploads += 1;
+                    state.uploads += 1;
                 }
                 Ok(Claim {
                     set: self.clone(),
@@ -154,6 +178,13 @@ impl QuiesceGuard {
 impl Drop for QuiesceGuard {
     fn drop(&mut self) {
         self.0.0.state.lock().quiescers -= 1;
+    }
+}
+
+impl Claim {
+    /// The claimed store path hash.
+    pub fn hash(&self) -> &str {
+        &self.hash
     }
 }
 
@@ -228,7 +259,7 @@ mod tests {
             Some(Refused::Quiescing)
         );
         assert_eq!(set.uploads(), 0);
-        assert!(set.claim("abc", Kind::Delete).is_ok());
+        assert!(set.claim_delete("abc").is_ok());
 
         drop(guard);
         assert!(!set.is_quiescing());

@@ -11,12 +11,14 @@ use anyhow::Result;
 use garret_server::{
     config::GcConfig,
     db,
-    inflight::{self, InFlight},
+    inflight::InFlight,
     now,
     storage::{self, Storage},
 };
 use parking_lot::Mutex;
 use rusqlite::Connection;
+
+use crate::deletion::Deletion;
 
 /// Candidates are re-queried after each batch: deleting a root frees its
 /// dependencies, which the next query then surfaces.
@@ -113,22 +115,16 @@ impl Gc {
                 break;
             }
 
-            let mut keys = Vec::with_capacity(candidates.len());
-            // Held from each row delete until the blob delete returns: an
-            // upload of the path in between would write a blob that delete
-            // then removes, under the row the upload inserts (spec 05).
-            let mut claims = Vec::with_capacity(candidates.len());
+            let mut deletion = Deletion::default();
             let mut settled = false;
             for (hash, _) in &candidates {
                 // Being uploaded or deleted elsewhere: not ours to touch.
-                let Ok(claim) = self.in_flight.claim(hash, inflight::Kind::Delete) else {
+                let Some(claim) = Deletion::claim_available(&self.in_flight, hash) else {
                     continue;
                 };
                 settled = true;
-                // Row first, blob second: a failed blob delete leaves an orphan
-                // for the sweep, never a row without a blob (spec 05). A
-                // candidate negotiated or referenced since the snapshot stays;
-                // the next query no longer returns it.
+                // A candidate negotiated or referenced since the snapshot
+                // stays; the next query no longer returns it.
                 let owned = hash.clone();
                 let Some(freed) =
                     crate::db_run(&self.conn, move |conn| db::evict_object(conn, &owned, at))
@@ -139,14 +135,12 @@ impl Gc {
                 usage -= freed;
                 result.evicted += 1;
                 result.bytes_freed += freed;
-                keys.push(storage::key_for(hash));
-                claims.push(claim);
+                deletion.hold(claim);
                 if usage <= low {
                     break;
                 }
             }
-            self.storage.delete_objects(&keys).await?;
-            drop(claims);
+            deletion.finish(&self.storage).await?;
             if !settled {
                 // Every candidate is claimed by an upload or deletion; the
                 // query would return them all again. The next tick retries.
@@ -186,33 +180,27 @@ impl Gc {
             .await?;
 
         // Each orphan is claimed from a final row check until its blob delete
-        // returns: an upload re-pushing the path in between would otherwise
-        // land a row whose blob the pending delete then removes (spec 05).
-        // A path claimed elsewhere is skipped, and one whose row landed since
-        // `known` was read is no orphan.
-        let (orphans, claims) = {
+        // returns (spec 05). A path claimed elsewhere is skipped, and one
+        // whose row landed since `known` was read is no orphan.
+        let deletion = {
             let in_flight = self.in_flight.clone();
             crate::db_run(&self.conn, move |conn| {
-                let mut orphans = Vec::new();
-                let mut claims = Vec::new();
-                for key in orphan_keys(&blobs, &known, &in_flight, grace) {
-                    let hash = storage::hash_for(&key).unwrap_or_default();
-                    let Ok(claim) = in_flight.claim(hash, inflight::Kind::Delete) else {
+                let mut deletion = Deletion::default();
+                for hash in orphan_hashes(&blobs, &known, &in_flight, grace) {
+                    let Some(claim) = Deletion::claim_available(&in_flight, hash) else {
                         continue;
                     };
                     if db::exists(conn, hash)? {
                         continue;
                     }
-                    orphans.push(key);
-                    claims.push(claim);
+                    deletion.hold(claim);
                 }
-                Ok((orphans, claims))
+                Ok(deletion)
             })
             .await?
         };
-        let count = orphans.len();
-        self.storage.delete_objects(&orphans).await?;
-        drop(claims);
+        let count = deletion.len();
+        deletion.finish(&self.storage).await?;
 
         metrics::counter!("garret_gc_orphans_deleted_total").increment(count as u64);
         metrics::counter!("garret_gc_stale_multiparts_aborted_total").increment(aborted as u64);
@@ -237,16 +225,16 @@ fn counted<T>(phase: &'static str, result: Result<T>) -> Result<T> {
     result
 }
 
-/// Blob keys with no DB row, past both guards: an upload in the in-flight
-/// set, or younger than `grace` — a row lands only after its blob
-/// completes, so a rowless blob might just be mid-push. Shared with
+/// Store path hashes of blobs with no DB row, past both guards: an upload in
+/// the in-flight set, or younger than `grace` — a row lands only after its
+/// blob completes, so a rowless blob might just be mid-push. Shared with
 /// `garret-admin fsck`'s read-only mirror-image check.
-pub(crate) fn orphan_keys(
-    blobs: &[(String, Duration, i64)],
+pub(crate) fn orphan_hashes<'a>(
+    blobs: &'a [(String, Duration, i64)],
     known: &std::collections::HashSet<String>,
     in_flight: &InFlight,
     grace: Duration,
-) -> Vec<String> {
+) -> Vec<&'a str> {
     blobs
         .iter()
         .filter_map(|(key, age, _size)| {
@@ -254,7 +242,7 @@ pub(crate) fn orphan_keys(
             if known.contains(hash) || in_flight.contains(hash) || *age < grace {
                 return None;
             }
-            Some(key.clone())
+            Some(hash)
         })
         .collect()
 }
@@ -262,9 +250,10 @@ pub(crate) fn orphan_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use garret_server::inflight;
 
     #[test]
-    fn orphan_keys_excludes_known_in_flight_and_young_blobs() {
+    fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
         let grace = Duration::from_secs(86400);
         let blobs = vec![
             (
@@ -291,8 +280,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            orphan_keys(&blobs, &known, &in_flight, grace),
-            vec!["nar/stale.nar.zst".to_string()],
+            orphan_hashes(&blobs, &known, &in_flight, grace),
+            vec!["stale"]
         );
     }
 
