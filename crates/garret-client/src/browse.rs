@@ -154,7 +154,8 @@ mod tests {
                 .ends_with("on disk\n… more results; narrow the query or raise --limit\n")
         );
         assert!(
-            render_page(&page, wire::MAX_LIMIT).ends_with("on disk\n… more results; narrow the query\n")
+            render_page(&page, wire::MAX_LIMIT)
+                .ends_with("on disk\n… more results; narrow the query\n")
         );
     }
 
