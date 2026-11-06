@@ -8,17 +8,13 @@ use std::{collections::HashSet, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use garret_common::admin::{Request, Response};
-use garret_server::{
-    db,
-    inflight::{Claim, InFlight, Kind, Refused},
-    narinfo,
-};
+use garret_server::{db, narinfo};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
 };
 
-use crate::{AppState, fsck, gc::Gc};
+use crate::{AppState, deletion::Deletion, fsck, gc::Gc};
 
 /// Binds the admin socket (0600), replacing a stale one, so a bind failure
 /// fails startup instead of a background task.
@@ -177,41 +173,43 @@ async fn delete(state: &AppState, hashes: &[String], dry_run: bool) -> Result<De
         .collect();
     // A dry run deletes nothing, so it claims nothing and cannot collide with
     // an upload or a GC pass.
-    let _claims = if dry_run {
-        Vec::new()
+    let mut deletion = if dry_run {
+        None
     } else {
-        claim_deletions(&state.in_flight, &hashes)?
+        Some(Deletion::claim_all(&state.in_flight, &hashes)?)
     };
     let mut done = Deleted {
         deleted: 0,
         bytes_freed: 0,
         missing: Vec::new(),
     };
-    let mut keys = Vec::new();
 
     for hash in hashes {
         // One lock hold per path: whether the row exists is decided by the
         // delete itself, so a row fsck repair removed meanwhile is missing,
         // not a zero-byte delete.
-        let freed = {
-            let mut conn = state.conn.lock();
+        let owned = hash.to_owned();
+        let freed = crate::db_run(&state.conn, move |conn| {
             if dry_run {
-                db::file_size(&conn, hash)?
+                db::file_size(conn, &owned)
             } else {
-                db::delete_object(&mut conn, hash)?
+                db::delete_object(conn, &owned)
             }
-        };
+        })
+        .await?;
         let Some(freed) = freed else {
             done.missing.push(hash.to_owned());
             continue;
         };
         done.deleted += 1;
         done.bytes_freed += freed;
-        keys.push(garret_server::storage::key_for(hash));
+        if let Some(deletion) = &mut deletion {
+            deletion.queue_blob(hash);
+        }
     }
 
-    if !dry_run && !keys.is_empty() {
-        state.storage.delete_objects(&keys).await?;
+    if let Some(deletion) = deletion {
+        deletion.finish(&state.storage).await?;
     }
     Ok(done)
 }
@@ -226,8 +224,8 @@ async fn delete_pushed_by(
     dry_run: bool,
 ) -> Result<Response> {
     let matched = {
-        let conn = state.conn.lock();
-        pushed_by(&conn, subject, since)?
+        let subject = subject.to_owned();
+        crate::db_run(&state.conn, move |conn| pushed_by(conn, &subject, since)).await?
     };
     let (matched, bytes_freed) = delete_listed(state, matched, dry_run).await?;
     if !dry_run {
@@ -240,12 +238,16 @@ async fn delete_pushed_by(
         );
     }
     Ok(Response::DeletePushedBy {
-        objects: matched
-            .into_iter()
-            .map(|row| format!("{}-{}", row.store_path_hash, row.name))
-            .collect(),
+        objects: basenames(matched),
         bytes_freed,
     })
+}
+
+/// `<hash>-<name>`, the store path basename each listed object is reported as.
+fn basenames(rows: Vec<db::ObjectBrief>) -> Vec<String> {
+    rows.into_iter()
+        .map(|row| format!("{}-{}", row.store_path_hash, row.name))
+        .collect()
 }
 
 /// Deletes the listed objects through [`delete`]; returns those it actually
@@ -296,29 +298,26 @@ fn pushed_by(
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
     let in_flight = state.in_flight.clone();
     // One closure, so listing and deleting stay atomic under the lock.
-    let (pruned, claims) = crate::db_run(&state.conn, move |conn| {
+    let (pruned, deletion) = crate::db_run(&state.conn, move |conn| {
         let doomed = db::prunable(conn, before, garret_server::now())?;
         if dry_run {
-            Ok((doomed, Vec::new()))
-        } else {
-            let hashes: Vec<&str> = doomed
-                .iter()
-                .map(|row| row.store_path_hash.as_str())
-                .collect();
-            let claims = claim_deletions(&in_flight, &hashes)?;
-            db::delete_pruned(conn, &doomed)?;
-            Ok((doomed, claims))
+            return Ok((doomed, None));
         }
+        let hashes: Vec<&str> = doomed
+            .iter()
+            .map(|row| row.store_path_hash.as_str())
+            .collect();
+        let mut deletion = Deletion::claim_all(&in_flight, &hashes)?;
+        db::delete_pruned(conn, &doomed)?;
+        for hash in hashes {
+            deletion.queue_blob(hash);
+        }
+        Ok((doomed, Some(deletion)))
     })
     .await?;
     let bytes_freed = pruned.iter().map(|row| row.file_size).sum();
-    if !dry_run {
-        let keys: Vec<String> = pruned
-            .iter()
-            .map(|row| garret_server::storage::key_for(&row.store_path_hash))
-            .collect();
-        state.storage.delete_objects(&keys).await?;
-        drop(claims);
+    if let Some(deletion) = deletion {
+        deletion.finish(&state.storage).await?;
         tracing::info!(
             before,
             objects = pruned.len(),
@@ -327,32 +326,9 @@ async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response>
         );
     }
     Ok(Response::Prune {
-        pruned: pruned
-            .into_iter()
-            .map(|row| format!("{}-{}", row.store_path_hash, row.name))
-            .collect(),
+        pruned: basenames(pruned),
         bytes_freed,
     })
-}
-
-/// Claims every path before the first row goes, for the caller to hold until
-/// the blob delete returns (spec 05): an upload of one in between would write
-/// a blob that delete then removes. A path already being uploaded or deleted
-/// fails the whole command before anything is deleted.
-fn claim_deletions(in_flight: &InFlight, hashes: &[&str]) -> Result<Vec<Claim>> {
-    hashes
-        .iter()
-        .map(|hash| {
-            in_flight.claim(hash, Kind::Delete).map_err(|refused| {
-                let doing = match refused {
-                    Refused::Uploading => "uploaded",
-                    Refused::Deleting => "deleted",
-                    Refused::Quiescing => unreachable!("quiescing refuses only uploads"),
-                };
-                anyhow::anyhow!("{hash} is being {doing}; nothing was deleted, retry")
-            })
-        })
-        .collect()
 }
 
 /// Backfills signatures after a key is added, so both the old and new key
@@ -588,14 +564,19 @@ mod tests {
             db::insert_object(&mut conn, &object(h), 100).unwrap();
         }
         let state = test_state(conn).await;
-        let _gc = state.in_flight.claim(&b, Kind::Delete).unwrap();
+        let _gc = state.in_flight.claim_delete(&b).unwrap();
 
         let err = delete(&state, &[a.clone(), a.clone(), b.clone()], false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains(&b), "{err:#}");
         assert!(db::exists(&state.conn.lock(), &a).unwrap());
-        assert!(state.in_flight.claim(&a, Kind::Upload).is_ok());
+        assert!(
+            state
+                .in_flight
+                .claim(&a, garret_server::inflight::Kind::Upload)
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -604,7 +585,7 @@ mod tests {
         let mut conn = open_db();
         db::insert_object(&mut conn, &object(&a), 100).unwrap();
         let state = test_state(conn).await;
-        let _gc = state.in_flight.claim(&a, Kind::Delete).unwrap();
+        let _gc = state.in_flight.claim_delete(&a).unwrap();
         let before = garret_server::now() - 2 * 86400;
 
         let Response::Prune { pruned, .. } = prune(&state, before, true).await.unwrap() else {
