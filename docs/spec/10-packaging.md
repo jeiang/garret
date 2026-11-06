@@ -8,8 +8,8 @@ Source: resolved at spec assembly
 ```
 Cargo.toml            # workspace
 crates/
-  garret-common/      # protocol types, narinfo/signing, NAR framing, config
-  garret-server/      # shared server internals: DB, storage, metrics, auth
+  garret-common/      # wire contract (push/API JSON types), store-path grammar, admin socket types
+  garret-server/      # shared server internals: config, DB, storage, narinfo/signing, metrics, auth
   garret-pusher/      # bin: push API + GC
   garret-puller/      # bin: substituter + browse
   garret-client/      # lib (push/watch logic) + bin `garret`
@@ -151,7 +151,9 @@ specs and in `config.rs`); the modules restate no Rust default.
   Pusher's database and bucket on the same host (ADR-0001, ADR-0009), so its
   config takes them from `services.garret.pusher`. Enabling the puller
   without the pusher fails evaluation with an assertion. The puller module
-  imports the pusher module's options, so importing it alone evaluates.
+  imports the pusher module's options, so importing it alone evaluates. The
+  removed `puller.s3.operationTimeoutSeconds` fails evaluation with a pointer
+  to the Pusher's option: the Puller makes no S3 requests.
 - Every module also has `extraSettings` (`{}`): raw TOML merged recursively
   over the generated config, for keys without a typed option (for example
   `browse_oidc.extra_audiences` and `browse_oidc.client_id` on the Puller).
@@ -176,14 +178,19 @@ specs and in `config.rs`); the modules restate no Rust default.
   and no per-object request (`--verify-sizes` reuses the listed sizes),
   plus one read of every Object row. Repair stays a manual step. The option
   needs `adminSocketPath`; an assertion rejects `calendar` without it.
+- `watermarks.{high, low}`, `gcIntervalSeconds` and `orphanGraceSeconds`
+  configure GC, which runs only with a quota: an assertion rejects any of
+  them set while `quotaBytes` is null, rather than dropping the `[gc]`
+  section silently.
 - Option types reject the values the binaries reject, at evaluation time:
-  the Pusher quota, `gcIntervalSeconds` and `limits.*` are positive
-  integers, `orphanGraceSeconds` is not negative, watermarks lie in 0 to 1,
-  `presignTtlSeconds` is 1 to 604800 (the SigV4 maximum), the Puller
-  budgets and `dbWaitTimeoutSeconds` are positive, `bumpDebounceSeconds` is
-  not negative, and the watcher `jobs`, `pollIntervalSeconds` and
-  `maxAttempts` are positive. The binaries check the same ranges at startup
-  for hand-written configs (`quota_bytes = 0` would evict the whole cache).
+  the Pusher quota, `gcIntervalSeconds`, `s3.operationTimeoutSeconds` and
+  `limits.*` are positive integers, `orphanGraceSeconds` is not negative,
+  watermarks lie in 0 to 1, `presignTtlSeconds` is 1 to 604800 (the SigV4
+  maximum), the Puller budgets and `dbWaitTimeoutSeconds` are positive,
+  `bumpDebounceSeconds` is not negative, the watcher `jobs`,
+  `pollIntervalSeconds` and `maxAttempts` are positive, and `maxRetries` is
+  not negative. The binaries check the same ranges at startup for
+  hand-written configs (`quota_bytes = 0` would evict the whole cache).
 - **watcher** (client machines): `enable`, `package`, `endpoint`,
   `oidc.{issuer, clientId, audience, clientSecretFile}`, `nixDb` (*null*),
   `cursorPath`, `pollIntervalSeconds`, `jobs`, `zstdLevel`, `maxRetries`,

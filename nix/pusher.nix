@@ -113,7 +113,7 @@ in
       };
       region = mkOption { type = types.nullOr types.str; default = null; description = "S3 region."; };
       pathStyle = mkOption { type = types.nullOr types.bool; default = null; description = "Path-style addressing. Null: on."; };
-      operationTimeoutSeconds = mkOption { type = types.nullOr types.int; default = null; description = "Per-operation S3 timeout."; };
+      operationTimeoutSeconds = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Per-operation S3 timeout."; };
       operationAttemptTimeoutSeconds = mkOption {
         type = types.nullOr types.ints.positive;
         default = null;
@@ -267,6 +267,11 @@ in
     {
       assertion = cfg.fsck.calendar == null || cfg.quotaBytes != null;
       message = "services.garret.pusher.fsck.calendar needs quotaBytes: fsck reads the orphan grace from the [gc] section and refuses without it.";
+    }
+    {
+      assertion = cfg.quotaBytes != null
+        || lib.all (v: v == null) [ cfg.watermarks.high cfg.watermarks.low cfg.gcIntervalSeconds cfg.orphanGraceSeconds ];
+      message = "services.garret.pusher: watermarks, gcIntervalSeconds and orphanGraceSeconds need quotaBytes: GC runs only with a quota.";
     }];
 
     systemd.services.garret-pusher = {

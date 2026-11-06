@@ -32,7 +32,11 @@ in
 {
   # The Pusher's option declarations, so this module evaluates on its own;
   # its config stays off unless services.garret.pusher.enable is set.
-  imports = [ (import ./pusher.nix self) ];
+  imports = [
+    (import ./pusher.nix self)
+    (lib.mkRemovedOptionModule [ "services" "garret" "puller" "s3" "operationTimeoutSeconds" ]
+      "The Puller makes no S3 requests (presigning is local); the timeout is services.garret.pusher.s3.operationTimeoutSeconds.")
+  ];
 
   options.services.garret.puller = {
     enable = mkEnableOption "the garret Puller";
