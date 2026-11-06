@@ -71,9 +71,8 @@ in
       };
     };
 
-    # Null options are left out of the config file, so the client applies its
-    # own default (spec 10-packaging). cursorPath and socketPath stay set here:
-    # the unit's StateDirectory and RuntimeDirectory hold them.
+    # cursorPath and socketPath are not nullable: their defaults must sit in
+    # the unit's StateDirectory and RuntimeDirectory.
     nixDb = mkOption { type = types.nullOr types.str; default = null; description = "The local nix database. Null: the system database."; };
     cursorPath = mkOption { type = types.str; default = "/var/lib/garret/watcher-cursor"; description = "Persisted ValidPaths.id cursor."; };
     pollIntervalSeconds = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Seconds between polls of the nix database."; };
@@ -143,7 +142,6 @@ in
         Restart = "always";
         RestartSec = 10;
         StateDirectory = "garret";
-        # /run/garret, where the wake socket lives.
         RuntimeDirectory = "garret";
         # Root: the client secret file is root's. Reading the nix database needs
         # only read access (spec 06-client), which the CI user has too.

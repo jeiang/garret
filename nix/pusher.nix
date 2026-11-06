@@ -75,8 +75,6 @@ in
 
     extraSettings = common.extraSettings;
 
-    # Null options below are left out of the config file, so garret-pusher
-    # applies its own default (spec 10-packaging).
     listen = mkOption {
       type = types.nullOr types.str;
       default = null;

@@ -45,8 +45,6 @@ in
 
     extraSettings = common.extraSettings;
 
-    # Null options below are left out of the config file, so garret-puller
-    # applies its own default (spec 10-packaging).
     listen = mkOption { type = types.nullOr types.str; default = null; description = "Public substituter listener. Front it with TLS. Null: loopback."; };
     metricsListen = mkOption { type = types.nullOr types.str; default = null; description = "Internal metrics listener. Never expose this publicly. Null: loopback."; };
 

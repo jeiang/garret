@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# M1 gate: push a real store path through the Pusher, then substitute it back
-# out of the Puller with `nix copy` — signature-checked, no --no-check-sigs.
+# End-to-end gate: push a real store path through the Pusher, then substitute
+# it back out of the Puller with `nix copy` — signature-checked, no
+# --no-check-sigs.
 # Provisions a throwaway Garage; leaves nothing behind.
 set -euo pipefail
 
@@ -16,7 +17,7 @@ make_signing_key
 mint_dev_tokens
 
 write_configs '[limits]
-# 5 MiB is the S4 minimum part size; small here so the multipart path is
+# 5 MiB is the S3 minimum part size; small here so the multipart path is
 # actually exercised without moving 64 MiB.
 part_size = 5242880
 max_parts_in_flight = 2
@@ -657,7 +658,6 @@ s.sendall(f"PUT /api/v1/nar/{h} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
 time.sleep(300)
 PY
 hold_pid=$!
-# Integer value of a Pusher metric; 0 before it is first recorded.
 count() { local v; v=$(metric "$pusher_metrics_port" "$1"); v=${v%%.*}; echo "${v:-0}"; }
 wait_until() {
   local i
@@ -697,8 +697,7 @@ print('  pushed', r['pushed'], 'failed', r['failed'],
       'shed-retries', r['shed_retries'], 'dropped-retries', r['dropped_retries'])
 assert r['zero_failures'], r
 assert r['pushed'] == r['corpus_entries'], r
-assert r['uncontended_median_ms'] > 0, 'baseline must actually be measured'
-assert r['p99_slowdown'] > 0, 'slowdown must be measured even though it is not a gate'
+assert r['p99_slowdown'] > 0, 'no slowdown measured: the baseline did not pair with the load run'
 assert r['nar_mib_per_sec'] > 0 and r['wire_bytes'] > 0, r
 "
 "$bin"/garret-bench stream --endpoint "$pusher_url" \
@@ -719,7 +718,6 @@ assert r['zero_failures'], r
 assert r['requests'] == 24, r
 print('  pull narinfo p50:', r['narinfo_p50_ms'], 'ms, redirect p50:', r['redirect_p50_ms'], 'ms')
 "
-# The same seed must produce the same corpus on any machine.
 "$bin"/garret-bench push --endpoint "$pusher_url" \
   --concurrency 2 --count 12 --json "$root/bench2.json" >/dev/null
 python3 -c "
