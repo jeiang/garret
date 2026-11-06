@@ -1,5 +1,5 @@
-//! Client library: token acquisition and the push path. `garret-bench` (M5)
-//! reuses this so benchmarks exercise the real protocol.
+//! Client library behind the `garret` CLI: token acquisition, the push path,
+//! the store watcher and the browse and diagnosis commands.
 
 #![warn(missing_docs)]
 

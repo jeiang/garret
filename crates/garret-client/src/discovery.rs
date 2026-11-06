@@ -25,14 +25,6 @@ pub async fn fetch(http: &reqwest::Client, endpoint: &str) -> Result<Discovery> 
         .await
         .with_context(|| format!("fetching {url}"))?;
 
-    // The one failure worth naming precisely: a client newer than its server.
-    // Without this it surfaces as a bare 404 and looks like a typo'd URL.
-    //
-    // 401 lands here too. Discovery is anonymous by design, so a server that
-    // demands a token on it is one whose auth layer still wraps the whole
-    // router — the shape the Pusher had before this endpoint existed. Left to
-    // the generic arm below it reads as "your credentials are wrong", which
-    // sends you off chasing an OIDC problem that isn't there.
     let status = response.status();
     if status == StatusCode::NOT_FOUND || status == StatusCode::UNAUTHORIZED {
         bail!(

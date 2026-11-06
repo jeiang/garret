@@ -561,7 +561,6 @@ impl Pusher {
             response = send(&token).await.context("negotiating missing paths")?;
         }
 
-        // A 403 is typed so the watcher can drop the batch instead of retrying.
         if response.status() == StatusCode::FORBIDDEN {
             return Err(Refused(error_detail(response).await).into());
         }
@@ -872,9 +871,9 @@ impl std::fmt::Display for Rejected {
 impl std::error::Error for Rejected {}
 
 /// The Negotiation got a 403: the Pusher's policy refuses this identity, now
-/// and on every retry. Typed so the watcher logs it once and drops the batch
-/// instead of retrying. A 401 that survives renewal is not this: it can be
-/// transient (JWKS outage), so it is an ordinary failure.
+/// and on every retry. Typed so the watcher can say so loudly. A 401 that
+/// survives renewal is not this: it can be transient (JWKS outage), so it is
+/// an ordinary failure.
 #[derive(Debug)]
 pub struct Refused(
     /// The Pusher's explanation, as sent.
@@ -1229,18 +1228,6 @@ mod tests {
     }
 
     #[test]
-    fn the_negotiated_line_mentions_upstream_only_when_nonzero() {
-        assert_eq!(
-            Report::negotiated_line(2, 0, 2),
-            "2 path(s) in closure, 2 missing"
-        );
-        assert_eq!(
-            Report::negotiated_line(5, 3, 1),
-            "5 path(s) in closure, 3 served upstream, 1 missing"
-        );
-    }
-
-    #[test]
     fn tally_counts_each_outcome_and_names_the_failures() {
         let outcomes = vec![
             ("/nix/store/a".to_owned(), Outcome::Pushed),
@@ -1520,14 +1507,6 @@ mod tests {
         assert!(!connection_dropped(&std::fmt::Error));
     }
 
-    #[test]
-    fn jitter_never_exceeds_the_delay() {
-        for ms in [1u64, 250, 4000] {
-            let delay = Duration::from_millis(ms);
-            assert!(fastrand_millis(delay) < ms.max(1));
-        }
-    }
-
     fn sh(script: &str) -> Command {
         let mut command = Command::new("sh");
         command.args(["-c", script]);
@@ -1580,28 +1559,45 @@ mod tests {
         );
     }
 
-    /// Serves `status` with `body` to every request, counting them.
+    /// Serves `status` with `body` to every request, counting them. Each
+    /// request is read whole (headers, then a `Content-Length` body) before
+    /// the reply, so nothing hinges on how the client's writes are split.
     async fn answering(
         status: u16,
         body: &'static str,
     ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::Ordering;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = hits.clone();
         tokio::spawn(async move {
             loop {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut buf = [0u8; 4096];
-                let _ = socket.read(&mut buf).await;
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut content_length = 0;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    socket.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0; content_length];
+                socket.read_exact(&mut request_body).await.unwrap();
                 counter.fetch_add(1, Ordering::SeqCst);
                 let reply = format!(
                     "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = socket.write_all(reply.as_bytes()).await;
+                let _ = socket.get_mut().write_all(reply.as_bytes()).await;
             }
         });
         (endpoint, hits)

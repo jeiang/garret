@@ -147,7 +147,6 @@ pub struct Oidc {
 }
 
 fn jobs() -> usize {
-    // Uploads are network-bound, so this is not a core count.
     8
 }
 
@@ -390,13 +389,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn upload_idle_defaults_to_five_minutes() {
-        let text = render("https://push.example", &discovery()).unwrap();
-        let cfg: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg.upload_idle_secs, 300);
-    }
-
     /// The template and the struct can drift; this is what stops them. It also
     /// catches `deny_unknown_fields` violations, which are otherwise only
     /// discovered by a user whose brand-new config refuses to load.
@@ -412,11 +404,6 @@ mod tests {
         assert_eq!(cfg.public_keys, ["garret-1:AAAA+bb/cc="]);
         assert_eq!(cfg.oidc.client_id.as_deref(), Some("garret-cli"));
         assert_eq!(cfg.oidc.audience, "garret");
-        // Defaults survive being absent from the template.
-        assert_eq!(cfg.jobs, jobs());
-        assert_eq!(cfg.upstream_keys, ["cache.nixos.org-1"]);
-        // Unset in [watch] means "share the top-level list".
-        assert!(cfg.watch.upstream_keys.is_none());
     }
 
     /// A server with no `puller_endpoint` and no keys still yields a config

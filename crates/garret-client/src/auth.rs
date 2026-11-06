@@ -163,10 +163,7 @@ fn default_interval() -> u64 {
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    /// Optional because the device-flow poll returns `authorization_pending`
-    /// with no token at all. A required field made the first poll fail to
-    /// deserialize and abort the login, so `garret login` only ever worked if
-    /// the human approved within the poll interval.
+    /// Absent while the device-flow poll is still `authorization_pending`.
     access_token: Option<String>,
     refresh_token: Option<String>,
     #[serde(default)]
@@ -258,8 +255,6 @@ pub async fn device_login(
                 Some(why) => bail!("device authorization failed: {other}: {why}"),
                 None => bail!("device authorization failed: {other}"),
             },
-            // No error and no token is not success -- keep polling rather than
-            // reporting a login that did not happen.
             None if response.access_token.is_none() => continue,
             None => return store_refresh_token(response.refresh_token, issuer, client_id),
         }
