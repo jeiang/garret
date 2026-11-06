@@ -24,6 +24,11 @@ pub const NIX_CACHE_INFO: &str = "/nix-cache-info";
 /// Puller: a NAR named by [`nar_url`], parsed back by [`nar_file_hash`].
 pub const NAR_FILE: &str = "/nar/{file}";
 
+/// Page size when a listing names none (spec 07).
+pub const DEFAULT_LIMIT: usize = 50;
+/// Largest page a listing returns; larger requests are clamped to it (spec 07).
+pub const MAX_LIMIT: usize = 500;
+
 /// A parameterised route with `hash` filled in.
 pub fn with_hash(route: &str, hash: &str) -> String {
     route.replace("{hash}", hash)

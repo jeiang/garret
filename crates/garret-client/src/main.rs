@@ -100,7 +100,7 @@ enum Command {
         /// Substring to match against store path names; omit to list everything
         query: Option<String>,
         /// Maximum number of Objects to print
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = wire::DEFAULT_LIMIT)]
         limit: usize,
     },
     /// Print an object's dependency tree
@@ -273,10 +273,10 @@ async fn main() -> Result<()> {
 
         Command::List { query, limit } => {
             let cfg = load()?;
-            let limit = limit.to_string();
-            let mut params = vec![("limit", limit.as_str())];
+            let limit_param = limit.to_string();
+            let mut params = vec![("limit", limit_param.as_str())];
             params.extend(query.as_deref().map(|q| ("q", q)));
-            let render = |page: wire::Page| print!("{}", browse::render_page(&page));
+            let render = |page: wire::Page| print!("{}", browse::render_page(&page, limit));
             show(
                 &cfg,
                 &http,

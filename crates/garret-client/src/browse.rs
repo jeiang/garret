@@ -47,8 +47,9 @@ pub fn render(node: &TreeNode, depth: usize, out: &mut String) {
     }
 }
 
-/// Renders a listing page, one Object per line, noting when more remain.
-pub fn render_page(page: &wire::Page) -> String {
+/// Renders a listing page fetched with `limit`, one Object per line, noting
+/// when more remain.
+pub fn render_page(page: &wire::Page, limit: usize) -> String {
     let mut out = String::new();
     for object in &page.objects {
         out.push_str(&format!(
@@ -59,7 +60,11 @@ pub fn render_page(page: &wire::Page) -> String {
         ));
     }
     if page.next_cursor.is_some() {
-        out.push_str("… more results; narrow the query or raise --limit\n");
+        out.push_str(if limit < wire::MAX_LIMIT {
+            "… more results; narrow the query or raise --limit\n"
+        } else {
+            "… more results; narrow the query\n"
+        });
     }
     out
 }
@@ -139,14 +144,17 @@ mod tests {
             objects: vec![object],
             next_cursor: None,
         };
-        let out = render_page(&page);
+        let out = render_page(&page, wire::DEFAULT_LIMIT);
         assert!(out.starts_with("aaaa  hello-1.0 "), "{out:?}");
         assert!(out.ends_with(" 2.0 KiB on disk\n"), "{out:?}");
         assert_eq!(out.lines().count(), 1);
         page.next_cursor = Some("c".into());
         assert!(
-            render_page(&page)
+            render_page(&page, wire::DEFAULT_LIMIT)
                 .ends_with("on disk\n… more results; narrow the query or raise --limit\n")
+        );
+        assert!(
+            render_page(&page, wire::MAX_LIMIT).ends_with("on disk\n… more results; narrow the query\n")
         );
     }
 

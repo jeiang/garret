@@ -5,15 +5,11 @@
 use std::{fmt, str::FromStr};
 
 use anyhow::{Context, Result};
-use garret_common::wire::{ObjectDetail, Page, Pin, Summary, TreeNode};
+use garret_common::wire::{MAX_LIMIT, ObjectDetail, Page, Pin, Summary, TreeNode};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::db;
 
-/// Page size when a listing names none (spec 07).
-pub const DEFAULT_LIMIT: usize = 50;
-/// Largest page a listing returns; [`list`] clamps to it (spec 07).
-pub const MAX_LIMIT: usize = 500;
 /// Levels below the root the Puller's tree expands (spec 07).
 pub const TREE_DEPTH: usize = 64;
 

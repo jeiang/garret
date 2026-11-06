@@ -594,7 +594,7 @@ struct ListQuery {
 }
 
 fn default_limit() -> usize {
-    browse::DEFAULT_LIMIT
+    wire::DEFAULT_LIMIT
 }
 
 async fn run_browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response

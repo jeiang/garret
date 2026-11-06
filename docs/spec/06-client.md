@@ -16,7 +16,7 @@ Sources: [ticket 13](../../.scratch/spec/issues/13-client-cli.md),
 | `garret push <paths…\|installable> [--dry-run] [--no-upstream-filter]` | Full closure via one missing-paths query, minus upstream-signed paths; parallel workers. With no paths and a non-terminal stdin, reads whitespace-separated paths from stdin until EOF (`nix build --print-out-paths \| garret push`). A path not valid in the local store fails the push with an error naming it |
 | `garret watch-store [--full-sync] [--drain] [--cursor <path>] [--socket <path>]` | Watcher daemon (below); `--drain` pushes what it has not yet and exits, for CI; `--cursor`/`--socket` override `[watch] cursor_path`/`socket_path` |
 | `garret enqueue [paths…] [--socket]` | Wake a running `watch-store` to poll now; paths default to `$OUT_PATHS`, for use as nix's `post-build-hook`. Exits 0 unconditionally |
-| `garret list [query] [--limit N]` | Search/filter cache contents (browse API); prints full 32-character hashes |
+| `garret list [query] [--limit N]` | Search/filter cache contents (browse API); prints full 32-character hashes. `--limit` defaults to the API's 50; when more results remain the output says so, suggesting a larger `--limit` only while N is below the API's cap of 500 |
 | `garret tree <hash\|path>` | Dependency tree (browse API); accepts a 32-character store hash or a store path |
 | `garret pins` | List GC-exempt pins (browse API; set with `garret-admin pin`) |
 | `garret completions <shell>` | bash/zsh/fish completion script |
