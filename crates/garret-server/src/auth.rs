@@ -163,15 +163,15 @@ impl Authenticator {
     pub async fn authenticate(&self, token: &str) -> Result<Subject> {
         let (issuer, verdict) = self.check(token).await;
         let outcome = match &verdict {
-            Ok(_) => "accepted",
-            Err((outcome, _)) => *outcome,
+            Ok(_) => Outcome::Accepted,
+            Err(refusal) => refusal.outcome,
         };
         metrics::counter!(
             "garret_auth_validations_total",
-            "issuer" => issuer, "outcome" => outcome,
+            "issuer" => issuer, "outcome" => outcome.as_str(),
         )
         .increment(1);
-        verdict.map_err(|(_, e)| e)
+        verdict.map_err(|r| r.error)
     }
 
     /// The verdict and the issuer label: the configured issuer's URL, never
@@ -187,18 +187,19 @@ impl Authenticator {
     /// Unverified read of `iss` picks which issuer to verify against. It
     /// decides routing only; every claim is re-read after verification.
     fn route(&self, token: &str) -> Result<&Arc<Issuer>, Refusal> {
-        let issuer_name = unverified_issuer(token).map_err(|e| ("malformed", e))?;
+        let issuer_name =
+            unverified_issuer(token).map_err(|e| Refusal::new(Outcome::Malformed, e))?;
         self.issuers
             .iter()
             .find(|i| i.cfg.issuer == issuer_name)
-            .ok_or_else(|| ("untrusted_issuer", anyhow!("untrusted issuer")))
+            .ok_or_else(|| Refusal::new(Outcome::UntrustedIssuer, anyhow!("untrusted issuer")))
     }
 
     async fn verify(&self, issuer: &Arc<Issuer>, token: &str) -> Result<Subject, Refusal> {
         let kid = jsonwebtoken::decode_header(token)
             .context("malformed token header")
             .and_then(|h| h.kid.ok_or_else(|| anyhow!("token has no kid")))
-            .map_err(|e| ("malformed", e))?;
+            .map_err(|e| Refusal::new(Outcome::Malformed, e))?;
 
         let (key, expired) = issuer.cached_key(&kid);
         let key = match key {
@@ -217,29 +218,28 @@ impl Authenticator {
                 if let Some(attempt) = issuer.refresh(&self.http) {
                     attempt
                         .await
-                        .map_err(|e| ("jwks_unavailable", anyhow!("{e:#}")))?;
+                        .map_err(|e| Refusal::new(Outcome::JwksUnavailable, anyhow!("{e:#}")))?;
                 }
-                issuer
-                    .cached_key(&kid)
-                    .0
-                    .ok_or_else(|| ("unknown_key", anyhow!("no signing key for kid {kid}")))?
+                issuer.cached_key(&kid).0.ok_or_else(|| {
+                    Refusal::new(Outcome::UnknownKey, anyhow!("no signing key for kid {kid}"))
+                })?
             }
         };
 
         let validation = validation_for(&issuer.cfg);
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
             .context("token failed validation")
-            .map_err(|e| ("invalid", e))?
+            .map_err(|e| Refusal::new(Outcome::Invalid, e))?
             .claims;
 
-        authorize(&issuer.cfg, &claims).map_err(|(claim, e)| {
-            // The claim name is a fixed tag; its value goes in the log only.
+        authorize(&issuer.cfg, &claims).map_err(|(gate, e)| {
+            // The gate name is a fixed tag; the claim value goes in the log only.
             metrics::counter!(
                 "garret_auth_unauthorized_total",
-                "issuer" => issuer.cfg.issuer.clone(), "claim" => claim,
+                "issuer" => issuer.cfg.issuer.clone(), "claim" => gate.as_str(),
             )
             .increment(1);
-            ("unauthorized", e.context(PolicyRefused))
+            Refusal::new(Outcome::Unauthorized(gate), e)
         })?;
         Ok(Subject(format!("{}#{}", claims.iss, claims.sub)))
     }
@@ -258,9 +258,77 @@ impl std::fmt::Display for PolicyRefused {
     }
 }
 
-/// A refused token: the bounded `outcome` label for
-/// `garret_auth_validations_total`, and the reason for the log.
-type Refusal = (&'static str, anyhow::Error);
+/// The `outcome` label of `garret_auth_validations_total` (spec 08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Accepted,
+    Malformed,
+    UntrustedIssuer,
+    UnknownKey,
+    JwksUnavailable,
+    Invalid,
+    /// Verified, but refused by an issuer policy gate.
+    Unauthorized(Gate),
+}
+
+impl Outcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Accepted => "accepted",
+            Outcome::Malformed => "malformed",
+            Outcome::UntrustedIssuer => "untrusted_issuer",
+            Outcome::UnknownKey => "unknown_key",
+            Outcome::JwksUnavailable => "jwks_unavailable",
+            Outcome::Invalid => "invalid",
+            Outcome::Unauthorized(_) => "unauthorized",
+        }
+    }
+}
+
+/// The failed policy gate: the `claim` label of
+/// `garret_auth_unauthorized_total` (spec 08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Owner,
+    Ref,
+    RefProtected,
+    RepositoryId,
+    EventName,
+    JobWorkflowRef,
+    Group,
+}
+
+impl Gate {
+    fn as_str(self) -> &'static str {
+        match self {
+            Gate::Owner => "owner",
+            Gate::Ref => "ref",
+            Gate::RefProtected => "ref_protected",
+            Gate::RepositoryId => "repository_id",
+            Gate::EventName => "event_name",
+            Gate::JobWorkflowRef => "job_workflow_ref",
+            Gate::Group => "group",
+        }
+    }
+}
+
+/// A refused token: its outcome label and the reason for the log.
+struct Refusal {
+    outcome: Outcome,
+    error: anyhow::Error,
+}
+
+impl Refusal {
+    /// The only constructor, so an [`Outcome::Unauthorized`] refusal always
+    /// carries [`PolicyRefused`] and no other outcome does.
+    fn new(outcome: Outcome, error: anyhow::Error) -> Self {
+        let error = match outcome {
+            Outcome::Unauthorized(_) => error.context(PolicyRefused),
+            _ => error,
+        };
+        Self { outcome, error }
+    }
+}
 
 /// Renders an authentication error for the log. The chain can carry
 /// attacker-controlled token text (the kid, header fields echoed by parse
@@ -423,18 +491,17 @@ fn base64_url(s: &str) -> Result<Vec<u8>> {
 /// Authorization, which lives at the issuer wherever possible (ADR-0003):
 /// Pocket ID grants by audience alone unless groups are configured; GitHub
 /// grants by immutable owner id and optional ref, repository, event and
-/// workflow constraints. A refusal carries the failed gate (`owner`, `ref`,
-/// `ref_protected`, `repository_id`, `event_name`, `job_workflow_ref`,
-/// `group`) for `garret_auth_unauthorized_total`.
-fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (&'static str, anyhow::Error)> {
+/// workflow constraints. A refusal carries the failed [`Gate`] for
+/// `garret_auth_unauthorized_total`.
+fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (Gate, anyhow::Error)> {
     if let Some(expected) = &cfg.github_owner_id {
         let owner = claims
             .repository_owner_id
             .as_deref()
-            .ok_or_else(|| ("owner", anyhow!("token has no repository_owner_id")))?;
+            .ok_or_else(|| (Gate::Owner, anyhow!("token has no repository_owner_id")))?;
         if owner != expected {
             return Err((
-                "owner",
+                Gate::Owner,
                 anyhow!("repository owner {owner:?} is not authorized"),
             ));
         }
@@ -442,18 +509,18 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (&'static str, a
     allowlisted(
         &cfg.ref_patterns,
         claims.git_ref.as_deref(),
-        "ref",
+        Gate::Ref,
         ref_matches,
     )?;
     if let Some(expected) = cfg.ref_protected {
         let actual = claims
             .ref_protected
             .as_deref()
-            .ok_or_else(|| ("ref_protected", anyhow!("token has no ref_protected")))?;
+            .ok_or_else(|| (Gate::RefProtected, anyhow!("token has no ref_protected")))?;
         let expected = if expected { "true" } else { "false" };
         if actual != expected {
             return Err((
-                "ref_protected",
+                Gate::RefProtected,
                 anyhow!("ref protection status {actual:?} is not authorized"),
             ));
         }
@@ -461,19 +528,19 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (&'static str, a
     allowlisted(
         &cfg.repository_ids,
         claims.repository_id.as_deref(),
-        "repository_id",
+        Gate::RepositoryId,
         |a, c| a == c,
     )?;
     allowlisted(
         &cfg.event_names,
         claims.event_name.as_deref(),
-        "event_name",
+        Gate::EventName,
         |a, c| a == c,
     )?;
     allowlisted(
         &cfg.job_workflow_refs,
         claims.job_workflow_ref.as_deref(),
-        "job_workflow_ref",
+        Gate::JobWorkflowRef,
         ref_matches,
     )?;
     // A reusable workflow called from another repository carries the callee's
@@ -483,14 +550,14 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (&'static str, a
         let repository = claims
             .repository
             .as_deref()
-            .ok_or_else(|| ("job_workflow_ref", anyhow!("token has no repository")))?;
+            .ok_or_else(|| (Gate::JobWorkflowRef, anyhow!("token has no repository")))?;
         if jwr
             .strip_prefix(repository)
             .and_then(|rest| rest.strip_prefix('/'))
             .is_none()
         {
             return Err((
-                "job_workflow_ref",
+                Gate::JobWorkflowRef,
                 anyhow!("job_workflow_ref {jwr:?} is not from the token's repository"),
             ));
         }
@@ -498,7 +565,7 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (&'static str, a
     if !cfg.allowed_groups.is_empty()
         && !claims.groups.iter().any(|g| cfg.allowed_groups.contains(g))
     {
-        return Err(("group", anyhow!("subject is not in an allowed group")));
+        return Err((Gate::Group, anyhow!("subject is not in an allowed group")));
     }
     Ok(())
 }
@@ -508,15 +575,16 @@ fn authorize(cfg: &IssuerConfig, claims: &Claims) -> Result<(), (&'static str, a
 fn allowlisted(
     allowed: &[String],
     claim: Option<&str>,
-    name: &'static str,
+    gate: Gate,
     matches: impl Fn(&str, &str) -> bool,
-) -> Result<(), (&'static str, anyhow::Error)> {
+) -> Result<(), (Gate, anyhow::Error)> {
     if allowed.is_empty() {
         return Ok(());
     }
-    let value = claim.ok_or_else(|| (name, anyhow!("token has no {name}")))?;
+    let name = gate.as_str();
+    let value = claim.ok_or_else(|| (gate, anyhow!("token has no {name}")))?;
     if !allowed.iter().any(|a| matches(a, value)) {
-        return Err((name, anyhow!("{name} {value:?} is not authorized")));
+        return Err((gate, anyhow!("{name} {value:?} is not authorized")));
     }
     Ok(())
 }
@@ -631,18 +699,20 @@ mod tests {
         cfg.repository_ids = vec!["42".into()];
         let mut c = claims(Some("1234"), Some("refs/heads/main"), &[]);
         c.repository_id = Some("99".into());
-        let (claim, e) = authorize(&cfg, &c).unwrap_err();
-        assert_eq!(claim, "repository_id");
+        let (gate, e) = authorize(&cfg, &c).unwrap_err();
+        assert_eq!(gate, Gate::RepositoryId);
         assert!(format!("{e:#}").contains("\"99\""));
 
-        let (claim, e) =
-            authorize(&github("1234", &[]), &claims(Some("7"), None, &[])).unwrap_err();
-        assert_eq!((claim, format!("{e:#}").contains("\"7\"")), ("owner", true));
+        let (gate, e) = authorize(&github("1234", &[]), &claims(Some("7"), None, &[])).unwrap_err();
+        assert_eq!(
+            (gate, format!("{e:#}").contains("\"7\"")),
+            (Gate::Owner, true)
+        );
 
         let mut cfg = github("1234", &[]);
         cfg.allowed_groups = vec!["builders".into()];
-        let (claim, _) = authorize(&cfg, &claims(Some("1234"), None, &["others"])).unwrap_err();
-        assert_eq!(claim, "group");
+        let (gate, _) = authorize(&cfg, &claims(Some("1234"), None, &["others"])).unwrap_err();
+        assert_eq!(gate, Gate::Group);
     }
 
     #[test]
@@ -1084,7 +1154,7 @@ mod tests {
         let auth = Authenticator::new(vec![dev_issuer(&url)]).unwrap();
         let outcome = async |token: &str| match auth.check(token).await {
             (_, Ok(_)) => "accepted",
-            (_, Err((outcome, _))) => outcome,
+            (_, Err(refusal)) => refusal.outcome.as_str(),
         };
         let elsewhere = token_from("https://elsewhere.example", "new");
         assert_eq!(outcome("not-a-jwt").await, "malformed");
@@ -1098,7 +1168,37 @@ mod tests {
         let auth = Authenticator::new(vec![dev_issuer(&down)]).unwrap();
         let (issuer, verdict) = auth.check(&token_with_kid("new")).await;
         assert_eq!(issuer, DEV_ISSUER);
-        assert_eq!(verdict.unwrap_err().0, "jwks_unavailable");
+        assert_eq!(verdict.unwrap_err().outcome, Outcome::JwksUnavailable);
+    }
+
+    /// Metric label values are a public contract (spec 08): a renamed one
+    /// breaks every dashboard and alert keyed on it.
+    #[test]
+    fn outcome_and_gate_labels_match_spec_08() {
+        let outcomes = [
+            (Outcome::Accepted, "accepted"),
+            (Outcome::Malformed, "malformed"),
+            (Outcome::UntrustedIssuer, "untrusted_issuer"),
+            (Outcome::UnknownKey, "unknown_key"),
+            (Outcome::JwksUnavailable, "jwks_unavailable"),
+            (Outcome::Invalid, "invalid"),
+            (Outcome::Unauthorized(Gate::Owner), "unauthorized"),
+        ];
+        for (outcome, label) in outcomes {
+            assert_eq!(outcome.as_str(), label);
+        }
+        let gates = [
+            (Gate::Owner, "owner"),
+            (Gate::Ref, "ref"),
+            (Gate::RefProtected, "ref_protected"),
+            (Gate::RepositoryId, "repository_id"),
+            (Gate::EventName, "event_name"),
+            (Gate::JobWorkflowRef, "job_workflow_ref"),
+            (Gate::Group, "group"),
+        ];
+        for (gate, label) in gates {
+            assert_eq!(gate.as_str(), label);
+        }
     }
 
     #[test]
