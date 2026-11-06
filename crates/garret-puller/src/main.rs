@@ -349,7 +349,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
+/// Counts every narinfo request by outcome: a hit is a narinfo served (200),
+/// anything else (bad suffix, unknown hash, database not ready, degraded
+/// read) is a miss — the same rule as [`nar_route`].
+async fn narinfo_route(state: State<Arc<AppState>>, file: Path<String>) -> Response {
+    let response = narinfo(state, file).await;
+    let outcome = if response.status() == StatusCode::OK {
+        "hit"
+    } else {
+        "miss"
+    };
+    metrics::counter!("garret_narinfo_requests_total", "outcome" => outcome).increment(1);
+    response
+}
+
+async fn narinfo(State(state): State<Arc<AppState>>, Path(file): Path<String>) -> Response {
     let Some(hash) = file.strip_suffix(".narinfo").map(str::to_owned) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -363,12 +377,6 @@ async fn narinfo_route(State(state): State<Arc<AppState>>, Path(file): Path<Stri
         })
         .await
     };
-    // A degraded request is served as a miss, so it counts as one here too.
-    metrics::counter!(
-        "garret_narinfo_requests_total",
-        "outcome" => if matches!(object, Some(Ok(Some(_)))) { "hit" } else { "miss" },
-    )
-    .increment(1);
     let Some(object) = object else {
         return degraded_miss("db_timeout");
     };
@@ -507,8 +515,9 @@ async fn probe_read(
     }
 }
 
-/// Counts NAR requests by outcome: a hit is a redirect issued, anything else
-/// (unknown blob, degraded read, presign failure) is a miss.
+/// Counts every NAR request by outcome: a hit is a redirect issued, anything
+/// else (bad suffix, unknown blob, database not ready, degraded read, presign
+/// failure) is a miss.
 async fn nar_route(state: State<Arc<AppState>>, file: Path<String>) -> Response {
     let response = nar_redirect(state, file).await;
     let outcome = if response.status() == StatusCode::TEMPORARY_REDIRECT {

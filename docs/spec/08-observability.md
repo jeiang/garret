@@ -131,16 +131,19 @@ Prefix `garret_`; service distinguished by scrape job.
   gauge by `kind` (`dangling`, `orphan`, `size_mismatch`), set to the
   latest run's count per kind; `garret_fsck_rows_repaired_total` counter
   by `reason` (`dangling`, `size_mismatch`).
-- **Puller**: narinfo hit/miss counters; `garret_nar_requests_total` by
-  `outcome` (`hit`: a redirect was issued; `miss`: anything else,
-  degraded requests included, like narinfo — it replaces the former
+- **Puller**: `garret_narinfo_requests_total` and
+  `garret_nar_requests_total` by `outcome`, both counting every request to
+  their route and judged by the final response: `hit` is a narinfo served
+  (200) or a NAR redirect issued; `miss` is anything else — a bad suffix,
+  an unknown hash, a 503 before the database exists, or a degraded request
+  (`garret_nar_requests_total` replaces the former
   `garret_nar_redirects_total`); presign duration histogram;
   `garret_degraded_total` by
   `reason` (`db_timeout`, `db_error`, `presign_timeout`,
   `presign_error`) — pull-path requests degraded to a 404 miss when a
   budget tripped or a read failed (spec
-  [03-storage](03-storage.md#bounded-budgets-degrade-to-a-miss); a
-  degraded narinfo request also counts as a miss); last-accessed bumps
+  [03-storage](03-storage.md#bounded-budgets-degrade-to-a-miss); each is
+  also a miss on its route's counter); last-accessed bumps
   (spec [02](02-database.md#concurrency-discipline)):
   `garret_bump_queue_depth` gauge, `garret_bump_debounced_total`
   (hits on a fresh row, no write) and `garret_bump_failures_total`
