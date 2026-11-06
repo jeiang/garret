@@ -128,7 +128,6 @@ impl Gc {
         let mut result = PassResult::default();
         let low = self.cfg.low();
 
-        // Correct any drift before deciding how much to delete.
         let mut usage = crate::db_run(&self.conn, |conn| db::reconcile_total_bytes(conn)).await?;
 
         while usage > low {
@@ -142,7 +141,8 @@ impl Gc {
                     usage,
                     low,
                     "GC cannot reach the low watermark: everything left is referenced, \
-                     pinned, or pushed within the last day"
+                     pinned, or pushed within the last {} hours",
+                    db::PUSH_GRACE / 3600
                 );
                 break;
             }
@@ -150,7 +150,6 @@ impl Gc {
             let mut deletion = Deletion::default();
             let mut settled = false;
             for (hash, _) in &candidates {
-                // Being uploaded or deleted elsewhere: not ours to touch.
                 let Some(claim) = Deletion::claim_available(&self.in_flight, hash) else {
                     continue;
                 };
@@ -359,10 +358,8 @@ mod tests {
 
     #[tokio::test]
     async fn failed_passes_and_sweeps_are_counted() {
-        // Failures used to be logged only, which no alert can watch.
         let (passes, sweeps) = (gc_failures("pass"), gc_failures("sweep"));
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = crate::tests::open_db();
         db::insert_object(&mut conn, &object(&"a".repeat(32)).sized(100), 0).unwrap();
         let gc = Gc::new(
             Arc::new(Mutex::new(conn)),
@@ -383,8 +380,7 @@ mod tests {
         // Over quota with one candidate, d. A push negotiates d, is told it
         // is present, and will upload d's referrers next: evicting d now
         // would leave them with a hole. The pass must stop and alarm instead.
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = crate::tests::open_db();
         let d = "d".repeat(32);
         db::insert_object(&mut conn, &object(&d).sized(100), 0).unwrap();
         let reported = db::missing(&mut conn, std::slice::from_ref(&d), now()).unwrap();
@@ -407,8 +403,7 @@ mod tests {
         // Between the row delete and the blob delete, an upload of the same
         // path would write a blob the pending delete then removes, under the
         // row that upload inserts.
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = crate::tests::open_db();
         let r = "r".repeat(32);
         db::insert_object(&mut conn, &object(&r).sized(100), 0).unwrap();
         let (storage, held, release) = gated_s3().await;
@@ -484,8 +479,7 @@ mod tests {
         // Between the orphan check and the blob delete, an upload re-pushing
         // the path would land a row whose blob the pending delete removes.
         let o = "o".repeat(32);
-        let conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let conn = crate::tests::open_db();
         let (storage, held, release) = orphan_s3(&o, || {}).await;
         let in_flight = InFlight::new();
         let gc = Arc::new(Gc::new(
@@ -516,8 +510,7 @@ mod tests {
         // An upload of the path completes, row and all, after the sweep read
         // the rows but before it claims the path: its blob is no orphan.
         let o = "o".repeat(32);
-        let conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let conn = crate::tests::open_db();
         let conn = Arc::new(Mutex::new(conn));
         let (storage, mut held, _release) = orphan_s3(&o, {
             let (conn, o) = (conn.clone(), o.clone());
@@ -537,8 +530,7 @@ mod tests {
         // `garret-admin delete` holds the only candidate. The candidate query
         // keeps returning it until that delete commits, so a pass that only
         // skipped it would spin.
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = crate::tests::open_db();
         let r = "r".repeat(32);
         db::insert_object(&mut conn, &object(&r).sized(100), 0).unwrap();
         let in_flight = InFlight::new();
@@ -567,8 +559,7 @@ mod tests {
         // Quota 100, low watermark 85. A pinned 70-byte filler plus the chain
         // r → d → y of 10-byte objects: one pass evicts r, then (next batch)
         // d, and stops at 80 with y kept.
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = crate::tests::open_db();
         let [filler, r, d, y] = ["f", "r", "d", "y"].map(|c| c.repeat(32));
         db::insert_object(&mut conn, &object(&filler).sized(70), 0).unwrap();
         db::pin(&conn, "filler", &filler, None, 0).unwrap();
@@ -585,16 +576,20 @@ mod tests {
             InFlight::new(),
             gc_config(100),
         ));
-        let run = |gc: Arc<Gc>| tokio::spawn(async move { gc.run().await.unwrap() });
 
         // The timer's pass has deleted r's row and waits on its blob delete
-        // when `garret-admin gc run` asks for another.
-        let first = run(gc.clone());
+        // when `garret-admin gc run` asks for another. Polling the second
+        // request once queues it on the pass lock before the first resumes.
+        let first = tokio::spawn({
+            let gc = gc.clone();
+            async move { gc.run().await.unwrap() }
+        });
         held.await.unwrap();
-        let second = run(gc.clone());
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut second = std::pin::pin!(gc.run());
+        assert!(futures::poll!(second.as_mut()).is_pending());
         release.send(()).unwrap();
-        let evicted = first.await.unwrap().evicted + second.await.unwrap().evicted;
+        let (first, second) = tokio::join!(first, second);
+        let evicted = first.unwrap().evicted + second.unwrap().evicted;
 
         let conn = gc.conn.lock();
         assert!(

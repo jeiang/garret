@@ -42,7 +42,6 @@ pub fn bind(path: &str) -> Result<UnixListener> {
     Ok(listener)
 }
 
-/// Accept loop over a socket from [`bind`].
 pub async fn serve(
     listener: UnixListener,
     state: Arc<AppState>,
@@ -59,7 +58,6 @@ pub async fn serve(
     }
 }
 
-/// 0600: the file mode *is* the authorization for this socket.
 fn restrict(path: &str) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -171,7 +169,6 @@ async fn status(state: &AppState, gc: Option<&Gc>) -> Result<Response> {
     .await
 }
 
-/// What [`delete`] removed (or, on a dry run, would remove).
 #[derive(Debug)]
 struct Deleted {
     deleted: usize,
@@ -266,7 +263,6 @@ async fn delete_pushed_by(
     })
 }
 
-/// `<hash>-<name>`, the store path basename each listed object is reported as.
 fn basenames(rows: Vec<db::ObjectBrief>) -> Vec<String> {
     rows.into_iter()
         .map(|row| format!("{}-{}", row.store_path_hash, row.name))
@@ -317,7 +313,7 @@ fn pushed_by(
 }
 
 /// Deletes old closures (spec 05). Unlike GC this ignores quota: the operator
-/// chose the cutoff. Row first, blob second, as everywhere else.
+/// chose the cutoff.
 async fn prune(state: &AppState, before: i64, dry_run: bool) -> Result<Response> {
     let in_flight = state.in_flight.clone();
     // One closure, so listing and deleting stay atomic under the lock.
@@ -379,7 +375,6 @@ async fn resign(state: &AppState) -> Result<Response> {
                 .collect::<Result<Vec<_>>>()
         })
         .await?;
-        // Verify and sign without the lock.
         let mut updates = Vec::new();
         for object in objects {
             if !narinfo::verify(&object, &state.store_dir, &state.keys) {
@@ -482,8 +477,7 @@ mod tests {
     /// `since` is inclusive, so the first push after a leak is not missed.
     #[test]
     fn pushed_by_matches_the_exact_subject_since_the_cutoff() {
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = open_db();
         let leaked = "https://issuer#repo:o/r:ref:refs/heads/main";
         let (a, b, c, d) = (
             "a".repeat(32),
@@ -584,7 +578,7 @@ mod tests {
         db::insert_object(&mut conn, &object(&a), 100).unwrap();
         let state = test_state(conn).await;
         let _gc = state.in_flight.claim_delete(&a).unwrap();
-        let before = garret_server::now() - 2 * 86400;
+        let before = garret_server::now() - 2 * db::PUSH_GRACE;
 
         let Response::Prune { pruned, .. } = prune(&state, before, true).await.unwrap() else {
             panic!("not a prune response");

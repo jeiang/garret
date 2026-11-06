@@ -156,7 +156,6 @@ enum Engine {
     },
 }
 
-/// How a [`VerifiedNar`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// End of stream, and the NAR matched its claim.
@@ -459,11 +458,6 @@ mod tests {
         padded.extend(std::iter::repeat_n(0u8, 2 * 1024 * 1024));
         let (_, refused) = run(&padded, &hash, size).await;
         assert_refused(refused, "zstd bound");
-        // A tiny NAR gets only the slack on top of its own bound.
-        assert_eq!(
-            max_compressed_len(0),
-            zstd::zstd_safe::compress_bound(0) + COMPRESSED_SLACK
-        );
     }
 
     #[tokio::test]

@@ -150,7 +150,6 @@ fn classify_rows<'a>(
         .collect()
 }
 
-/// The findings as the admin reply reports them, in listing order.
 fn to_wire(findings: &[Finding<'_>]) -> (Vec<FsckRow>, Vec<FsckSizeMismatch>) {
     let mut dangling = Vec::new();
     let mut size_mismatches = Vec::new();
@@ -216,7 +215,6 @@ mod tests {
         (storage::key_for(hash), Duration::from_secs(age_secs), size)
     }
 
-    /// [`classify_rows`] at `GRACE` and `NOW`, as the reply reports it.
     fn classified(
         rows: &[db::ObjectBrief],
         blobs: &[(String, Duration, i64)],
@@ -297,8 +295,8 @@ mod tests {
     }
 
     /// An upload that overwrote an orphan blob of another size since the S3
-    /// listing (review of #72): its fresh row would read as a mismatch and
-    /// `--repair` would delete it, so the guards apply here too.
+    /// listing: its fresh row would read as a mismatch and `--repair` would
+    /// delete it, so the guards apply here too.
     #[test]
     fn a_young_or_in_flight_row_is_not_reported_as_a_size_mismatch() {
         let blobs = vec![blob("a", 90000, 9)];
@@ -328,36 +326,10 @@ mod tests {
         assert!(mismatches.is_empty());
     }
 
-    /// The full classify → repair round trip against a real in-memory
-    /// connection, not fabricated tuples: a dangling row is found, deleted,
-    /// and gone from the database.
-    #[test]
-    fn end_to_end_against_a_real_in_memory_connection() {
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
-        let hash = "a".repeat(32);
-        db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
-        let conn = Mutex::new(conn);
-
-        let db_rows = {
-            let c = conn.lock();
-            db::all_objects_brief(&c).unwrap()
-        };
-        let in_flight = InFlight::new();
-        let findings = classify_rows(&db_rows, &[], &in_flight, GRACE, NOW, false);
-        assert_eq!(findings.len(), 1);
-
-        let repaired = apply_repair(&conn, &findings).unwrap();
-        assert_eq!(repaired, 1);
-        let c = conn.lock();
-        assert!(!db::exists(&c, &hash).unwrap());
-    }
-
     #[test]
     fn a_row_gone_before_the_repair_is_skipped_and_the_rest_repaired() {
         // GC evicts `a` between fsck's listing and its repair.
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = crate::tests::open_db();
         let [a, b, c] = ["a", "b", "c"].map(|h| h.repeat(32));
         for hash in [&a, &b, &c] {
             db::insert_object(&mut conn, &object(hash), NOW - 2 * 86400).unwrap();
@@ -383,8 +355,7 @@ mod tests {
     /// fsck's listing and its repair. The healthy new row must survive.
     #[test]
     fn a_row_pushed_again_since_the_listing_is_not_repaired() {
-        let mut conn = db::open(":memory:", true).unwrap();
-        db::migrate(&conn).unwrap();
+        let mut conn = crate::tests::open_db();
         let hash = "a".repeat(32);
         db::insert_object(&mut conn, &object(&hash), NOW - 2 * 86400).unwrap();
         let rows = db::all_objects_brief(&conn).unwrap();

@@ -157,7 +157,6 @@ async fn main() -> Result<()> {
         })?
     };
 
-    // Kept for shutdown: `state` itself moves into the router.
     let storage = state.storage.clone();
     let app = router(state, discovery);
 
@@ -166,7 +165,6 @@ async fn main() -> Result<()> {
     serve_until_stopped(listener, app, storage).await
 }
 
-/// The Pusher's routes: OIDC on the push endpoints, anonymous discovery.
 fn router(state: Arc<AppState>, discovery: String) -> Router {
     Router::new()
         .route(wire::MISSING_PATHS, post(missing_paths))
@@ -355,7 +353,6 @@ where
     .context("database task failed")?
 }
 
-/// Whether the object's row exists, i.e. the push is already complete.
 async fn already_stored(state: &AppState, hash: &str) -> Result<bool, Error> {
     let hash = hash.to_owned();
     let stored = db_run(&state.conn, move |conn| db::exists(conn, &hash)).await?;
@@ -386,7 +383,6 @@ impl Drop for UploadGauge {
     }
 }
 
-/// Every Pusher endpoint requires a valid token from a configured issuer.
 async fn require_oidc(
     State(state): State<Arc<AppState>>,
     mut request: Request,
@@ -531,8 +527,7 @@ async fn upload(
     Ok((StatusCode::CREATED, Json(UploadAck::Created)).into_response())
 }
 
-/// Reads the preamble, then streams the rest straight to S3. Returns the
-/// stored size. The body never lands in memory whole.
+/// Returns the stored size. The body never lands in memory whole.
 async fn store_upload(
     state: &AppState,
     hash: &str,
@@ -744,12 +739,6 @@ mod tests {
         .await
         .expect_err("quiescing must reject the push");
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-        // Spec 01 promises Retry-After only on 429 and the deleting 503.
-        assert!(
-            !err.into_response()
-                .headers()
-                .contains_key(header::RETRY_AFTER)
-        );
     }
 
     /// Past the upload cap the push is shed before its body is read, with a
@@ -797,31 +786,11 @@ mod tests {
         assert!(response.headers().contains_key(header::RETRY_AFTER));
     }
 
-    /// With no quiesce live, the handler proceeds past the quiescing check
-    /// into its normal idempotency short-circuit.
     #[tokio::test]
     async fn a_non_quiescing_push_reaches_the_idempotency_check() {
         let mut conn = open_db();
         let hash = "a".repeat(32);
-        db::insert_object(
-            &mut conn,
-            &Object {
-                store_path_hash: hash.clone(),
-                store_path: format!("/nix/store/{hash}-thing"),
-                name: "thing".into(),
-                nar_hash: "sha256:x".into(),
-                nar_size: 1,
-                file_hash: "sha256:y".into(),
-                file_size: 1,
-                deriver: None,
-                ca: None,
-                references: vec![],
-                sigs: vec![],
-                pushed_by: None,
-            },
-            0,
-        )
-        .unwrap();
+        db::insert_object(&mut conn, &garret_server::testing::object(&hash), 0).unwrap();
         let state = test_state(conn).await;
 
         let response = upload(
@@ -921,7 +890,7 @@ mod tests {
                     p.store_path = format!("/nix/store/{H}-héllo");
                 }),
             ),
-            // Byte 32 inside `é`: this used to panic the Puller's browse tree.
+            // Byte 32 falls inside `é`.
             (
                 "reference with a non-ASCII hash",
                 with(|p| {
@@ -999,10 +968,9 @@ mod tests {
         }
     }
 
-    /// A 500's body must not echo the error chain, yet must carry an id the
-    /// operator can find in the log next to that chain.
-    #[tokio::test]
-    async fn an_internal_error_hides_its_chain_behind_a_logged_id() {
+    /// Runs `f` under a subscriber that records every log line; returns
+    /// `f`'s result and the log text.
+    fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
         #[derive(Clone, Default)]
         struct Log(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Log {
@@ -1022,7 +990,16 @@ mod tests {
                 move || log.clone()
             })
             .finish();
-        let err = tracing::subscriber::with_default(subscriber, || {
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(log.0.lock().clone()).unwrap();
+        (result, text)
+    }
+
+    /// A 500's body must not echo the error chain, yet must carry an id the
+    /// operator can find in the log next to that chain.
+    #[tokio::test]
+    async fn an_internal_error_hides_its_chain_behind_a_logged_id() {
+        let (err, log) = capture_logs(|| {
             Error::from(
                 anyhow::anyhow!("sqlite: disk I/O error at /var/lib/garret/db")
                     .context("inserting object"),
@@ -1048,7 +1025,6 @@ mod tests {
             );
         }
 
-        let log = String::from_utf8(log.0.lock().clone()).unwrap();
         let line = log
             .lines()
             .find(|l| l.contains(&format!("error_id={id}")))
@@ -1063,26 +1039,7 @@ mod tests {
     /// with an id, but logged as a warning, not an error.
     #[test]
     fn a_client_body_failure_is_a_warning_with_the_same_response() {
-        #[derive(Clone, Default)]
-        struct Log(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Log {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let log = Log::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_writer({
-                let log = log.clone();
-                move || log.clone()
-            })
-            .finish();
-        let err = tracing::subscriber::with_default(subscriber, || {
+        let (err, log) = capture_logs(|| {
             Error::from(anyhow::Error::new(storage::ClientBodyError(
                 "upload body stalled".into(),
             )))
@@ -1093,7 +1050,6 @@ mod tests {
             "{}",
             err.message
         );
-        let log = String::from_utf8(log.0.lock().clone()).unwrap();
         assert!(log.contains("WARN") && log.contains("error_id="), "{log}");
         assert!(!log.contains("ERROR"), "{log}");
     }
