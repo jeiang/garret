@@ -145,7 +145,7 @@ struct Meta {
     seed: u64,
     corpus_version: u32,
     version: &'static str,
-    timestamp_unix: u64,
+    timestamp_unix: i64,
 }
 
 #[derive(Debug, Default)]
@@ -238,10 +238,7 @@ struct Counters {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let timestamp = garret_common::unix_now();
     let meta = Meta {
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
@@ -281,7 +278,7 @@ async fn main() -> Result<()> {
         output.push = Some(run_push(&cli, args, &http, &token).await?);
     }
     if let Some(args) = stream_args {
-        output.stream = Some(run_stream(&cli, args, &http, &token, timestamp).await?);
+        output.stream = Some(run_stream(&cli, args, &http, &token, timestamp as u64).await?);
     }
     if let Some(args) = pull_args {
         output.pull = Some(run_pull(&cli, args).await?);
