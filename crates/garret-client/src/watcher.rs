@@ -597,6 +597,8 @@ mod tests {
         );
     }
 
+    /// Real time: under a paused clock tokio auto-advances past the 30 s sleep
+    /// before the IO driver reports the queued datagram.
     #[tokio::test]
     async fn a_wake_datagram_cuts_the_sleep_short() {
         let dir = crate::testing::scratch_dir();

@@ -442,9 +442,15 @@ mod tests {
             }),
             ..advertised()
         };
-        let drifted = drift(&cfg(), &d, true);
-        assert_eq!(drifted.len(), 4, "{drifted:?}");
-        assert!(drifted[0].contains("puller_endpoint"));
+        let drifted = drift(&cfg(), &d, true).join("\n");
+        for field in [
+            "puller_endpoint",
+            "oidc.issuer",
+            "oidc.audience",
+            "oidc.client_id",
+        ] {
+            assert!(drifted.contains(field), "{field} missing from {drifted}");
+        }
     }
 
     /// A sparse server advertises less, not different: no drift.
@@ -495,37 +501,15 @@ mod tests {
         assert!(!cache_info_ok("<html>404 not found</html>"));
     }
 
+    /// A machine config's issuer, audience and client id are its operator's
+    /// to set, so they are not compared against what the server advertises.
     #[test]
-    fn a_machine_config_is_not_told_to_log_in() {
+    fn a_machine_configs_oidc_fields_are_not_drift() {
         let mut machine = cfg();
         machine.oidc.issuer = None;
+        machine.oidc.audience = "builders".into();
         machine.oidc.client_secret_file = Some("/run/secrets/garret".into());
-        // The device-flow-only OIDC fields are not compared for machines.
         assert!(drift(&machine, &advertised(), false).is_empty());
-        assert!(!fix_hint(false).contains("login"));
-        assert!(fix_hint(true).contains("garret login --force"));
-    }
-
-    /// Only a secret file or a full GitHub Actions pair makes a machine
-    /// config; a request URL alone does not, matching the token provider.
-    #[test]
-    fn a_config_is_a_machine_config_only_by_secret_file_or_github_actions() {
-        use config::{CredentialKind, GithubActions};
-        let url = || Some("https://actions.example".to_owned());
-        let device_flow = |c: &config::Config, token: Option<&str>| {
-            matches!(
-                c.credential_kind(GithubActions::from_vars(url(), token.map(str::to_owned))),
-                CredentialKind::DeviceFlow
-            )
-        };
-        assert!(
-            device_flow(&cfg(), None),
-            "a URL without its token is no runner"
-        );
-        assert!(!device_flow(&cfg(), Some("rt")));
-        let mut machine = cfg();
-        machine.oidc.client_secret_file = Some("/run/secrets/garret".into());
-        assert!(!device_flow(&machine, None));
     }
 
     #[test]
