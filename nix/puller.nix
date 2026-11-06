@@ -168,5 +168,6 @@ in
       isSystemUser = true;
       group = "garret";
     };
+    users.groups.garret = { };
   };
 }
