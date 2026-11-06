@@ -142,7 +142,7 @@ impl Gc {
                     low,
                     "GC cannot reach the low watermark: everything left is referenced, \
                      pinned, or pushed within the last {} hours",
-                    db::PUSH_GRACE / 3600
+                    garret_common::PUSH_GRACE_HOURS
                 );
                 break;
             }

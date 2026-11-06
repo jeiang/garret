@@ -510,7 +510,7 @@ mod tests {
         db::insert_object(&mut conn, &object(&a), 100).unwrap();
         let state = test_state(conn).await;
         let _gc = state.in_flight.claim_delete(&a).unwrap();
-        let before = garret_common::unix_now() - 2 * db::PUSH_GRACE;
+        let before = garret_common::unix_now() - 2 * garret_common::PUSH_GRACE;
 
         let Response::Prune { pruned, .. } = prune(&state, before, true).await.unwrap() else {
             panic!("not a prune response");
