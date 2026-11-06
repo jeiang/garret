@@ -242,7 +242,10 @@ async fn delete_pushed_by(
 ) -> Result<Response> {
     let matched = {
         let subject = subject.to_owned();
-        crate::db_run(&state.conn, move |conn| db::pushed_by(conn, &subject, since)).await?
+        crate::db_run(&state.conn, move |conn| {
+            db::pushed_by(conn, &subject, since)
+        })
+        .await?
     };
     let (matched, bytes_freed) = delete_listed(state, matched, dry_run).await?;
     if !dry_run {
