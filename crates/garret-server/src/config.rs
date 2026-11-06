@@ -44,6 +44,18 @@ pub struct S3Config {
     pub sign_payload: bool,
 }
 
+impl S3Config {
+    /// Rejects a half-set credential pair. The S3 client uses explicit
+    /// credentials only when both are present and otherwise falls back to
+    /// the AWS default chain, so one alone would be silently ignored.
+    pub fn validate_credentials(&self) -> Result<()> {
+        if self.access_key_id.is_some() != self.secret_access_key.is_some() {
+            bail!("s3.access_key_id and s3.secret_access_key must be set together or both omitted");
+        }
+        Ok(())
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -288,6 +300,7 @@ impl PusherConfig {
         if l.max_parts_in_flight == 0 {
             bail!("limits.max_parts_in_flight must be at least 1");
         }
+        self.s3.validate_credentials()?;
         if self.s3.operation_timeout_secs == 0 {
             bail!("s3.operation_timeout_secs must be at least 1");
         }
@@ -382,6 +395,7 @@ impl PullerConfig {
     /// lifetime, a zero budget that degrades every request to a miss) naming
     /// the key, at startup.
     pub fn validate(&self) -> Result<()> {
+        self.s3.validate_credentials()?;
         // 7 days is the SigV4 presigned-URL maximum.
         if !(1..=604_800).contains(&self.presign_ttl_secs) {
             bail!(
@@ -576,6 +590,22 @@ mod validate_tests {
         c.gc = None;
         c.validate().unwrap();
     }
+
+    #[test]
+    fn s3_credentials_are_all_or_nothing() {
+        rejects(
+            |c| c.s3.access_key_id = Some("id".into()),
+            "s3.access_key_id and s3.secret_access_key",
+        );
+        rejects(
+            |c| c.s3.secret_access_key = Some("secret".into()),
+            "s3.access_key_id and s3.secret_access_key",
+        );
+        let mut c = cfg();
+        c.s3.access_key_id = Some("id".into());
+        c.s3.secret_access_key = Some("secret".into());
+        c.validate().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -643,5 +673,21 @@ mod puller_validate_tests {
         rejects(|c| c.presign_budget_ms = 0, "presign_budget_ms");
         rejects(|c| c.bump_debounce_secs = -1, "bump_debounce_secs");
         rejects(|c| c.db_wait_timeout_secs = 0, "db_wait_timeout_secs");
+    }
+
+    #[test]
+    fn s3_credentials_are_all_or_nothing() {
+        rejects(
+            |c| c.s3.access_key_id = Some("id".into()),
+            "s3.access_key_id and s3.secret_access_key",
+        );
+        rejects(
+            |c| c.s3.secret_access_key = Some("secret".into()),
+            "s3.access_key_id and s3.secret_access_key",
+        );
+        let mut c = cfg();
+        c.s3.access_key_id = Some("id".into());
+        c.s3.secret_access_key = Some("secret".into());
+        c.validate().unwrap();
     }
 }
