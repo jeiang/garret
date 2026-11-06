@@ -236,72 +236,101 @@ pub async fn next_chunk<S: Stream + Unpin>(
     })
 }
 
-/// Appends body bytes to `part` until it holds `cap` bytes or the body ends,
-/// keeping any overshoot in `carry` for the next part. Each byte is hashed
-/// as it is appended, while still cache-hot. `part` must have been allocated
-/// with room for `cap` against a permit: a part slot accounts for the
-/// part's only buffer.
-async fn fill_part<S, E>(
-    part: &mut BytesMut,
-    body: &mut S,
-    carry: &mut Option<Bytes>,
-    cap: usize,
-    hasher: &mut Sha256,
+/// The upload body as consumed so far. It owns the read cursor (an overshoot
+/// `carry` left by a split chunk), the running hash and the byte count, so
+/// FileHash and FileSize (spec 03) always describe the same bytes: exactly
+/// those appended to a part.
+struct BodyReader<S> {
+    body: S,
+    carry: Option<Bytes>,
+    hasher: Sha256,
+    /// Bytes appended to parts so far.
+    received: u64,
+    started: Instant,
     idle: Duration,
-    at: Stall,
-) -> Result<()>
-where
-    S: Stream<Item = Result<Bytes, E>> + Unpin,
-    E: std::fmt::Display,
-{
-    while part.len() < cap {
-        let chunk = match carry.take() {
-            Some(left) => left,
-            None => {
-                let here = Stall {
-                    received: at.received + part.len() as u64,
-                    ..at
-                };
-                let Some(chunk) = next_chunk(body, idle, here).await? else {
-                    break;
-                };
-                chunk.map_err(|e| {
-                    anyhow::Error::new(ClientBodyError(format!("reading request body: {e}")))
-                })?
-            }
-        };
-        // A chunk can span several parts, so it is split: a part over
-        // part_size would abort the upload.
-        let room = cap - part.len();
-        if chunk.len() > room {
-            hasher.update(&chunk[..room]);
-            part.extend_from_slice(&chunk[..room]);
-            *carry = Some(chunk.slice(room..));
-            break;
-        }
-        hasher.update(&chunk);
-        part.extend_from_slice(&chunk);
-    }
-    Ok(())
 }
 
-/// Pulls exactly `part_size` bytes (fewer only at end of stream) into one
-/// buffer, hashing them on the way.
-async fn read_part<S, E>(
-    body: &mut S,
-    carry: &mut Option<Bytes>,
-    part_size: usize,
-    hasher: &mut Sha256,
-    idle: Duration,
-    at: Stall,
-) -> Result<Bytes>
+impl<S, E> BodyReader<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
-    let mut part = BytesMut::with_capacity(part_size);
-    fill_part(&mut part, body, carry, part_size, hasher, idle, at).await?;
-    Ok(part.freeze())
+    fn new(body: S, idle: Duration) -> Self {
+        Self {
+            body,
+            carry: None,
+            hasher: Sha256::new(),
+            received: 0,
+            started: Instant::now(),
+            idle,
+        }
+    }
+
+    /// The next chunk not yet appended: the carry first, so leftover bytes
+    /// are never skipped, then the body. Neither hashed nor counted here.
+    async fn next(&mut self, phase: &'static str) -> Result<Option<Bytes>> {
+        if let Some(left) = self.carry.take() {
+            return Ok(Some(left));
+        }
+        let at = Stall {
+            received: self.received,
+            started: self.started,
+            phase,
+        };
+        match next_chunk(&mut self.body, self.idle, at).await? {
+            None => Ok(None),
+            Some(chunk) => chunk.map(Some).map_err(|e| {
+                anyhow::Error::new(ClientBodyError(format!("reading request body: {e}")))
+            }),
+        }
+    }
+
+    /// Hashes and counts `bytes` as they go into `part`, while still
+    /// cache-hot.
+    fn append(&mut self, part: &mut BytesMut, bytes: &[u8]) {
+        self.hasher.update(bytes);
+        part.extend_from_slice(bytes);
+        self.received += bytes.len() as u64;
+    }
+
+    /// Appends body bytes to `part` until it holds `cap` bytes or the body
+    /// ends, keeping any overshoot as the carry. `part` must have been
+    /// allocated with room for `cap` against a permit: a part slot accounts
+    /// for the part's only buffer.
+    async fn fill(&mut self, part: &mut BytesMut, cap: usize, phase: &'static str) -> Result<()> {
+        while part.len() < cap {
+            let Some(chunk) = self.next(phase).await? else {
+                break;
+            };
+            // A chunk can span several parts, so it is split: a part over
+            // part_size would abort the upload.
+            let room = cap - part.len();
+            if chunk.len() > room {
+                self.append(part, &chunk[..room]);
+                self.carry = Some(chunk.slice(room..));
+                break;
+            }
+            self.append(part, &chunk);
+        }
+        Ok(())
+    }
+
+    /// Whether the body holds another byte, without consuming it: a
+    /// non-empty chunk read here becomes the carry. Empty chunks are skipped.
+    async fn has_more(&mut self, phase: &'static str) -> Result<bool> {
+        while let Some(chunk) = self.next(phase).await? {
+            if !chunk.is_empty() {
+                self.carry = Some(chunk);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The sha256 and length of every byte appended.
+    fn finish(self) -> (Vec<u8>, i64) {
+        (self.hasher.finalize().to_vec(), self.received as i64)
+    }
 }
 
 async fn collect(in_flight: &mut JoinSet<Result<CompletedPart>>) -> Result<CompletedPart> {
@@ -395,7 +424,7 @@ impl Storage {
     pub async fn put_streaming<S, E>(
         &self,
         key: &str,
-        mut body: S,
+        body: S,
         limits: &UploadLimits,
         first_part_hint: usize,
     ) -> Result<(Vec<u8>, i64)>
@@ -403,67 +432,29 @@ impl Storage {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        let mut hasher = Sha256::new();
-        let mut total: i64 = 0;
-        let mut carry: Option<Bytes> = None;
-        let started = Instant::now();
-        let idle = limits.body_idle;
+        let mut reader = BodyReader::new(body, limits.body_idle);
 
         // First part decides the shape: if the whole body fits, one PutObject.
         let reserve = first_part_hint.clamp(1, limits.part_size);
         let permit = limits.acquire(reserve).await?;
         let mut first = BytesMut::with_capacity(reserve);
-        let at = Stall {
-            received: 0,
-            started,
-            phase: "first_part",
-        };
-        fill_part(
-            &mut first,
-            &mut body,
-            &mut carry,
-            reserve,
-            &mut hasher,
-            idle,
-            at,
-        )
-        .await?;
-        if first.len() == reserve && reserve < limits.part_size {
-            // The hint is a hard cap for a body that is not a whole part: more
-            // data means the body exceeds what the caller will accept, so fail
-            // rather than wait for more memory while holding a partial permit.
-            let more = match carry.as_ref() {
-                Some(left) => !left.is_empty(),
-                None => loop {
-                    let at = Stall {
-                        received: first.len() as u64,
-                        started,
-                        phase: "first_part",
-                    };
-                    match next_chunk(&mut body, idle, at).await? {
-                        None => break false,
-                        Some(Ok(chunk)) if chunk.is_empty() => continue,
-                        Some(Ok(_)) => break true,
-                        Some(Err(e)) => {
-                            return Err(anyhow::Error::new(ClientBodyError(format!(
-                                "reading the upload body: {e}"
-                            ))));
-                        }
-                    }
-                },
-            };
-            if more {
-                return Err(anyhow::Error::new(BodyOverLimit(format!(
-                    "upload body exceeds the {reserve}-byte limit for its size"
-                ))));
-            }
+        reader.fill(&mut first, reserve, "first_part").await?;
+        // The hint is a hard cap for a body that is not a whole part: more
+        // data means the body exceeds what the caller will accept, so fail
+        // rather than wait for more memory while holding a partial permit.
+        if first.len() == reserve
+            && reserve < limits.part_size
+            && reader.has_more("first_part").await?
+        {
+            return Err(anyhow::Error::new(BodyOverLimit(format!(
+                "upload body exceeds the {reserve}-byte limit for its size"
+            ))));
         }
         let first = first.freeze();
-        total += first.len() as i64;
         if first.len() < limits.part_size {
             self.put(key, first).await?;
             drop(permit);
-            return Ok((hasher.finalize().to_vec(), total));
+            return Ok(reader.finish());
         }
 
         let upload_id = timed(
@@ -484,20 +475,10 @@ impl Storage {
         let mut parts = JoinSet::new();
         parts.spawn(self.upload_part(key, &upload_id, 1, first, permit));
         match self
-            .multipart_body(
-                key,
-                &upload_id,
-                &mut parts,
-                &mut body,
-                &mut carry,
-                limits,
-                &mut hasher,
-                &mut total,
-                started,
-            )
+            .multipart_body(key, &upload_id, &mut parts, &mut reader, limits)
             .await
         {
-            Ok(()) => Ok((hasher.finalize().to_vec(), total)),
+            Ok(()) => Ok(reader.finish()),
             Err(e) => {
                 // Stop the parts still uploading first: one landing after the
                 // abort would re-create what the abort freed.
@@ -527,18 +508,13 @@ impl Storage {
     /// permit, whether or not this loop is waiting. A permit is only ever
     /// held by a part being read or uploaded, never by a waiter, so uploads
     /// sharing the budget cannot wedge each other — whatever the slot count.
-    #[allow(clippy::too_many_arguments)]
     async fn multipart_body<S, E>(
         &self,
         key: &str,
         upload_id: &str,
         in_flight: &mut JoinSet<Result<CompletedPart>>,
-        body: &mut S,
-        carry: &mut Option<Bytes>,
+        reader: &mut BodyReader<S>,
         limits: &UploadLimits,
-        hasher: &mut Sha256,
-        total: &mut i64,
-        started: Instant,
     ) -> Result<()>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -554,18 +530,15 @@ impl Storage {
                 completed.push(collect(in_flight).await?);
             }
             let permit = limits.acquire(limits.part_size).await?;
-            let at = Stall {
-                received: *total as u64,
-                started,
-                phase: "multipart",
-            };
-            let part =
-                read_part(body, carry, limits.part_size, hasher, limits.body_idle, at).await?;
+            let mut part = BytesMut::with_capacity(limits.part_size);
+            reader
+                .fill(&mut part, limits.part_size, "multipart")
+                .await?;
             if part.is_empty() {
                 drop(permit);
                 break;
             }
-            *total += part.len() as i64;
+            let part = part.freeze();
             let is_final = part.len() < limits.part_size;
 
             part_number += 1;
@@ -829,10 +802,28 @@ mod tests {
         assert_eq!(hash_for("nar/abc.zst"), None);
     }
 
-    /// Feeds `chunks` through `read_part` and returns the part sizes produced.
+    /// One `fill` of a fresh `cap`-sized part, as `multipart_body` does it.
+    async fn read_part<S, E>(reader: &mut BodyReader<S>, cap: usize) -> Result<BytesMut>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let mut part = BytesMut::with_capacity(cap);
+        reader.fill(&mut part, cap, "multipart").await?;
+        Ok(part)
+    }
+
+    fn reader_of(
+        chunks: Vec<&'static [u8]>,
+    ) -> BodyReader<impl Stream<Item = Result<Bytes, std::io::Error>> + Unpin> {
+        let body = futures::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))));
+        BodyReader::new(body, BODY_IDLE_TIMEOUT)
+    }
+
+    /// Feeds `chunks` through part fills and returns the part sizes produced.
     /// S4 requires parts 1..N-1 to be identical in size, so this is the check
     /// that matters most: only the final part may be short.
-    /// Also checks that the hasher saw every byte exactly once.
+    /// Also checks that the hash and length cover every byte exactly once.
     fn parts_of(chunks: Vec<&'static [u8]>, part_size: usize) -> Vec<usize> {
         let whole: Vec<u8> = chunks.concat();
         // Tokio, not a bare executor: reads carry the body idle timeout.
@@ -841,25 +832,10 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let mut body = futures::stream::iter(
-                chunks
-                    .into_iter()
-                    .map(|c| Ok::<_, std::io::Error>(Bytes::from_static(c))),
-            );
-            let mut carry = None;
+            let mut reader = reader_of(chunks);
             let mut sizes = Vec::new();
-            let mut hasher = Sha256::new();
             loop {
-                let part = read_part(
-                    &mut body,
-                    &mut carry,
-                    part_size,
-                    &mut hasher,
-                    BODY_IDLE_TIMEOUT,
-                    test_stall(),
-                )
-                .await
-                .unwrap();
+                let part = read_part(&mut reader, part_size).await.unwrap();
                 if part.is_empty() {
                     break;
                 }
@@ -870,8 +846,8 @@ mod tests {
                 }
             }
             assert_eq!(
-                hasher.finalize().as_slice(),
-                Sha256::digest(&whole).as_slice()
+                reader.finish(),
+                (Sha256::digest(&whole).to_vec(), whole.len() as i64)
             );
             sizes
         })
@@ -935,46 +911,26 @@ mod tests {
     /// read that ignores it trips the outer bound instead of hanging.
     #[tokio::test(start_paused = true)]
     async fn a_stalled_body_fails_the_read() {
-        let mut body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
+        let body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
             .chain(futures::stream::pending());
-        let read = tokio::time::timeout(
-            BODY_IDLE_TIMEOUT * 2,
-            read_part(
-                &mut body,
-                &mut None,
-                1024,
-                &mut Sha256::new(),
-                BODY_IDLE_TIMEOUT,
-                test_stall(),
-            ),
-        )
-        .await;
+        let mut reader = BodyReader::new(body, BODY_IDLE_TIMEOUT);
+        let read = tokio::time::timeout(BODY_IDLE_TIMEOUT * 2, read_part(&mut reader, 1024)).await;
         assert!(read.expect("a stalled body hung the read").is_err());
     }
 
-    fn test_stall() -> Stall {
-        Stall {
-            received: 0,
-            started: Instant::now(),
-            phase: "multipart",
-        }
-    }
-
     /// The stall error names how much arrived, so an operator can tell a
-    /// sender that never started from one that died mid-NAR.
+    /// sender that never started from one that died mid-NAR. The count spans
+    /// parts: here 10 bytes filled an earlier part.
     #[tokio::test(start_paused = true)]
     async fn the_stall_error_carries_the_byte_count() {
-        let mut body = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abc"))])
-            .chain(futures::stream::pending());
-        let at = Stall {
-            received: 10,
-            started: Instant::now(),
-            phase: "multipart",
-        };
-        let idle = Duration::from_millis(10);
-        let err = read_part(&mut body, &mut None, 1024, &mut Sha256::new(), idle, at)
-            .await
-            .unwrap_err();
+        let body = futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"0123456789ab")),
+            Ok(Bytes::from_static(b"c")),
+        ])
+        .chain(futures::stream::pending());
+        let mut reader = BodyReader::new(body, Duration::from_millis(10));
+        assert_eq!(read_part(&mut reader, 10).await.unwrap().len(), 10);
+        let err = read_part(&mut reader, 1024).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("after 13 bytes"), "{msg}");
         assert!(msg.contains("(multipart)"), "{msg}");
@@ -984,21 +940,12 @@ mod tests {
     /// trickling bytes is never cut off, however long the part takes.
     #[tokio::test(start_paused = true)]
     async fn a_slow_body_that_keeps_moving_is_not_cut_off() {
-        let mut body = Box::pin(futures::stream::iter(0..4).then(|_| async {
+        let body = Box::pin(futures::stream::iter(0..4).then(|_| async {
             tokio::time::sleep(BODY_IDLE_TIMEOUT / 2).await;
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
-        let part = read_part(
-            &mut body,
-            &mut None,
-            1024,
-            &mut Sha256::new(),
-            BODY_IDLE_TIMEOUT,
-            test_stall(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(part.len(), 8);
+        let mut reader = BodyReader::new(body, BODY_IDLE_TIMEOUT);
+        assert_eq!(read_part(&mut reader, 1024).await.unwrap().len(), 8);
     }
     /// Just enough S3 on a loopback port. Every call succeeds, except that
     /// `DeleteObjects` answers inside a 200 the way S3 and Garage do: keys
@@ -1161,6 +1108,70 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
+        assert_eq!(limits.part_slots.available_permits(), limits.total_units);
+    }
+
+    /// FileHash and FileSize (spec 03) describe exactly the stored bytes when
+    /// chunks straddle the first part, later part boundaries and the hint,
+    /// and when one chunk spans several parts.
+    #[tokio::test]
+    async fn hash_and_length_cover_the_stored_bytes_across_boundaries() {
+        let storage = fake_s3().await;
+        let limits = UploadLimits::new(1024, 2, 8192);
+        let body: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
+        let chunked = |body: &[u8], sizes: &[usize]| {
+            let mut at = 0;
+            let chunks: Vec<_> = sizes
+                .iter()
+                .map(|&s| {
+                    let chunk = Bytes::copy_from_slice(&body[at..at + s]);
+                    at += s;
+                    Ok::<_, std::io::Error>(chunk)
+                })
+                .collect();
+            futures::stream::iter(chunks)
+        };
+        for sizes in [&[700, 700, 3600][..], &[1000, 2500, 1500]] {
+            let stored = storage
+                .put_streaming(&key_for("straddle"), chunked(&body, sizes), &limits, 1024)
+                .await
+                .unwrap();
+            assert_eq!(stored, (Sha256::digest(&body).to_vec(), 5000));
+        }
+        // A body ending exactly at its hint, then an empty chunk: the probe
+        // past the hint skips it and the body is accepted whole.
+        let small = &body[..500];
+        let stored = storage
+            .put_streaming(
+                &key_for("at-hint"),
+                chunked(small, &[300, 200, 0]),
+                &limits,
+                500,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored, (Sha256::digest(small).to_vec(), 500));
+    }
+
+    /// A body that fills its hint and then goes quiet stalls in the probe
+    /// for more; the error counts every byte received before it.
+    #[tokio::test]
+    async fn a_stall_probing_past_the_hint_reports_the_bytes_received() {
+        let storage = fake_s3().await;
+        let limits = UploadLimits::new(1024, 2, 4096).with_body_idle(Duration::from_millis(50));
+        let body = futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![1u8; 60])),
+            Ok(Bytes::from(vec![2u8; 40])),
+        ])
+        .chain(futures::stream::pending());
+        let err = storage
+            .put_streaming(&key_for("probe"), body, &limits, 100)
+            .await
+            .unwrap_err();
+        assert!(err.is::<ClientBodyError>(), "{err:#}");
+        let msg = err.to_string();
+        assert!(msg.contains("after 100 bytes"), "{msg}");
+        assert!(msg.contains("(first_part)"), "{msg}");
         assert_eq!(limits.part_slots.available_permits(), limits.total_units);
     }
 
