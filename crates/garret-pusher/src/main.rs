@@ -1,9 +1,6 @@
 //! Pusher: accepts NARs over the garret push protocol (spec 01-push-protocol).
 
-use std::{
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -48,10 +45,6 @@ pub(crate) struct AppState {
     pub limits: UploadLimits,
     pub uploads: Arc<Semaphore>,
     pub in_flight: InFlight,
-    /// Set for the duration of `fsck --repair --quiesce`'s drain wait and
-    /// repair: while true, new pushes are rejected rather than admitted
-    /// (spec 05-gc).
-    pub quiescing: Arc<AtomicBool>,
 }
 
 #[tokio::main]
@@ -103,7 +96,6 @@ async fn main() -> Result<()> {
         .with_body_idle(Duration::from_secs(cfg.limits.body_idle_timeout_secs)),
         uploads: Arc::new(Semaphore::new(cfg.limits.max_concurrent_uploads)),
         in_flight: InFlight::new(),
-        quiescing: Arc::new(AtomicBool::new(false)),
     });
 
     // Saturation must be visible before it hurts, so the caps are exported
@@ -507,6 +499,15 @@ async fn missing_paths(
     Ok(Json(missing))
 }
 
+/// The answer to a push while `fsck --repair --quiesce` holds the gate.
+fn quiescing() -> Error {
+    metrics::counter!("garret_upload_skipped_total", "reason" => "quiescing").increment(1);
+    Error::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "cache is quiescing for fsck --repair --quiesce".into(),
+    )
+}
+
 async fn upload(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -515,12 +516,9 @@ async fn upload(
 ) -> Result<Response, Error> {
     // Checked before anything else: `fsck --repair --quiesce` needs new
     // pushes rejected outright while it drains and repairs (spec 05-gc).
-    if state.quiescing.load(std::sync::atomic::Ordering::SeqCst) {
-        metrics::counter!("garret_upload_skipped_total", "reason" => "quiescing").increment(1);
-        return Err(Error::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "cache is quiescing for fsck --repair --quiesce".into(),
-        ));
+    // Only a fast path; the claim below is the gate a drain relies on.
+    if state.in_flight.is_quiescing() {
+        return Err(quiescing());
     }
 
     // The hash becomes the DB key and the S3 key, so it is checked before
@@ -553,7 +551,7 @@ async fn upload(
         // Second pusher for the same path: first writer wins. The loser is
         // told `in-progress` and asks again later (spec 01) — this upload may
         // yet fail — rather than racing to overwrite an identical blob.
-        Err(inflight::Kind::Upload) => {
+        Err(inflight::Refused::Uploading) => {
             metrics::counter!("garret_upload_skipped_total", "reason" => "in-progress")
                 .increment(1);
             return Ok((StatusCode::OK, Json(json!({"status": "in-progress"}))).into_response());
@@ -561,7 +559,7 @@ async fn upload(
         // GC, `delete` or prune has removed the row and not yet the blob: a
         // blob uploaded now would go with it (spec 05). By the retry the path
         // is simply missing.
-        Err(inflight::Kind::Delete) => {
+        Err(inflight::Refused::Deleting) => {
             metrics::counter!("garret_upload_skipped_total", "reason" => "deleting").increment(1);
             return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -570,6 +568,9 @@ async fn upload(
             )
                 .into_response());
         }
+        // Quiesce began after the early check: refused here, under the same
+        // lock the drain counts uploads by.
+        Err(inflight::Refused::Quiescing) => return Err(quiescing()),
     };
 
     // The row may have landed between the first check and the claim: an
@@ -827,7 +828,6 @@ mod tests {
             limits: UploadLimits::new(1024 * 1024, 4, 4 * 1024 * 1024),
             uploads: Arc::new(Semaphore::new(1)),
             in_flight: InFlight::new(),
-            quiescing: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -843,9 +843,7 @@ mod tests {
     #[tokio::test]
     async fn quiescing_rejects_a_push_before_anything_else() {
         let state = test_state(open_db()).await;
-        state
-            .quiescing
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _quiesce = state.in_flight.quiesce();
 
         let err = upload(
             State(state),
@@ -882,7 +880,7 @@ mod tests {
         assert!(response.headers().contains_key(header::RETRY_AFTER));
     }
 
-    /// With the flag clear, the handler proceeds past the quiescing check
+    /// With no quiesce live, the handler proceeds past the quiescing check
     /// into its normal idempotency short-circuit.
     #[tokio::test]
     async fn a_non_quiescing_push_reaches_the_idempotency_check() {
