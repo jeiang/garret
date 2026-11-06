@@ -200,6 +200,17 @@ impl std::fmt::Display for BodyOverLimit {
 
 impl std::error::Error for BodyOverLimit {}
 
+/// An S3 request on the upload path failed. Attached as context over the
+/// SDK error, whose type is generic and cannot itself be downcast.
+#[derive(Debug)]
+pub struct S3Failure(pub String);
+
+impl std::fmt::Display for S3Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Where an upload body stood when it went quiet, for the stall error.
 #[derive(Clone, Copy)]
 pub struct Stall {
@@ -395,7 +406,7 @@ impl Storage {
         timed("put", put.send())
             .await
             .inspect_err(|_| metrics::counter!("garret_s3_put_failures_total").increment(1))
-            .with_context(|| format!("uploading {key}"))?;
+            .with_context(|| S3Failure(format!("uploading {key}")))?;
         metrics::counter!("garret_s3_puts_total").increment(1);
         metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
         Ok(())
@@ -459,9 +470,9 @@ impl Storage {
                 .send(),
         )
         .await
-        .with_context(|| format!("starting multipart upload for {key}"))?
+        .with_context(|| S3Failure(format!("starting multipart upload for {key}")))?
         .upload_id
-        .context("S3 returned no upload id")?;
+        .context(S3Failure("S3 returned no upload id".into()))?;
         metrics::counter!("garret_s3_multipart_started_total").increment(1);
 
         // Any failure past this point must abort, or the parts linger and bill.
@@ -562,7 +573,7 @@ impl Storage {
                 .send(),
         )
         .await
-        .with_context(|| format!("completing multipart upload for {key}"))?;
+        .with_context(|| S3Failure(format!("completing multipart upload for {key}")))?;
         metrics::counter!("garret_s3_multipart_completed_total").increment(1);
         Ok(())
     }
@@ -606,7 +617,7 @@ impl Storage {
             };
             let output = timed("upload_part", part.send())
                 .await
-                .with_context(|| format!("uploading part {part_number} of {key}"))?;
+                .with_context(|| S3Failure(format!("uploading part {part_number} of {key}")))?;
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);

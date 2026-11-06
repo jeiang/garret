@@ -823,14 +823,15 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// The server shed the upload (429) and said when to come back. Typed so
-/// [`Backoff`] waits out `Retry-After` instead of parsing the message.
+/// The server turned the upload away (429, or a 503 with `Retry-After`) and
+/// said when to come back. Typed so [`Backoff`] waits out `Retry-After`
+/// instead of parsing the message.
 #[derive(Debug)]
 struct Shed(Duration);
 
 impl std::fmt::Display for Shed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "server is shedding load (429), retry after {:?}", self.0)
+        write!(f, "server asked to retry after {:?}", self.0)
     }
 }
 
@@ -974,18 +975,22 @@ fn compressed_nar(
     Ok(ReaderStream::with_capacity(encoder, 256 * 1024).chain(exit))
 }
 
+/// How long the server asked us to wait: a 429 shed, or a 503 that carries
+/// `Retry-After` (a path being deleted, spec 01). A 503 without one is an
+/// ordinary server error.
 fn retry_after(status: StatusCode, response: &reqwest::Response) -> Option<Duration> {
-    (status == StatusCode::TOO_MANY_REQUESTS).then(|| {
-        shed_for(
-            response
-                .headers()
-                .get(reqwest::header::RETRY_AFTER)
-                .and_then(|v| v.to_str().ok()),
-        )
-    })
+    let header = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok());
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => Some(shed_for(header)),
+        StatusCode::SERVICE_UNAVAILABLE => header.map(|v| shed_for(Some(v))),
+        _ => None,
+    }
 }
 
-/// A 429's `Retry-After`, in seconds; absent or unparseable (an HTTP date)
+/// A `Retry-After`, in seconds; absent or unparseable (an HTTP date)
 /// means 1 s. Clamped to at least 1 s, so a `0` cannot spin, and at most
 /// [`WAIT_DEADLINE`], so an absurd value cannot overflow the wait arithmetic.
 fn shed_for(retry_after: Option<&str>) -> Duration {
@@ -997,7 +1002,8 @@ fn shed_for(retry_after: Option<&str>) -> Duration {
 }
 
 /// 5xx and dropped, timed-out or stalled connections are retryable; 4xx are
-/// the client's fault (spec 01). 429 never reaches here: it is a [`Shed`].
+/// the client's fault (spec 01). 429, and a 503 with `Retry-After`, never
+/// reach here: they are a [`Shed`].
 fn is_retryable(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<Rejected>()
