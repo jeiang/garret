@@ -91,7 +91,7 @@ impl UploadLimits {
         (self.total_units - self.part_slots.available_permits()) as u64 * self.unit as u64
     }
 
-    async fn acquire_units(&self, units: usize) -> Result<OwnedSemaphorePermit> {
+    async fn acquire_units(&self, units: usize) -> Result<Reservation> {
         let started = std::time::Instant::now();
         let permit = self
             .part_slots
@@ -100,11 +100,29 @@ impl UploadLimits {
             .await
             .map_err(|_| anyhow!("upload capacity semaphore closed"))?;
         metrics::histogram!("garret_upload_buffer_wait_seconds").record(started.elapsed());
-        Ok(permit)
+        let bytes = (units * self.unit) as f64;
+        metrics::gauge!("garret_in_flight_bytes").increment(bytes);
+        Ok(Reservation {
+            _permit: permit,
+            bytes,
+        })
     }
 
-    async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
+    async fn acquire(&self, bytes: usize) -> Result<Reservation> {
         self.acquire_units(self.units(bytes)).await
+    }
+}
+
+/// Buffer capacity taken from [`UploadLimits`], counted in
+/// `garret_in_flight_bytes` until it is dropped.
+struct Reservation {
+    _permit: OwnedSemaphorePermit,
+    bytes: f64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        metrics::gauge!("garret_in_flight_bytes").decrement(self.bytes);
     }
 }
 
@@ -598,7 +616,7 @@ impl Storage {
         upload_id: &str,
         part_number: i32,
         body: Bytes,
-        permit: OwnedSemaphorePermit,
+        permit: Reservation,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
         let (client, bucket, key, upload_id, sign_payload) = (
             self.client.clone(),

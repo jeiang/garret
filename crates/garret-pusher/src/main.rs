@@ -110,11 +110,9 @@ async fn main() -> Result<()> {
     metrics::gauge!("garret_uploads_limit").set(cfg.limits.max_concurrent_uploads as f64);
     metrics::gauge!("garret_in_flight_bytes_limit").set(cfg.limits.max_in_flight_bytes as f64);
     metrics::gauge!("garret_part_slots_limit").set(state.limits.total_slots() as f64);
-
-    let scrape_state = state.clone();
-    garret_metrics::on_scrape(move || {
-        metrics::gauge!("garret_in_flight_bytes").set(scrape_state.limits.in_flight_bytes() as f64);
-    });
+    // Moved by the upload budget from here on; exported before the first
+    // upload so the series exists.
+    metrics::gauge!("garret_in_flight_bytes").set(0.0);
 
     if let Some(admin_listener) = admin_listener {
         let state = state.clone();

@@ -70,7 +70,7 @@ Prefix `garret_`; service distinguished by scrape job.
   commit the binary was built from, `unknown` outside the Nix build).
 - **Pusher — uploads**: in-flight uploads and `garret_in_flight_bytes` gauges
   *versus their configured caps* (saturation visible before it hurts;
-  `garret_in_flight_bytes` is read from the upload budget on each scrape);
+  `garret_in_flight_bytes` moves as upload buffers are reserved and released);
   `garret_upload_buffer_wait_seconds`, the time an upload waited for buffer
   room in that budget;
   upload size histogram; `garret_upload_duration_seconds` by `outcome`
