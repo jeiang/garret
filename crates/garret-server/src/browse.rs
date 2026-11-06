@@ -2,7 +2,7 @@
 //! Served entirely by indices: name, creation order, PK, and the reverse-ref
 //! index.
 
-use std::{fmt, str::FromStr};
+use std::{fmt, str::FromStr, sync::LazyLock};
 
 use anyhow::{Context, Result};
 use garret_common::wire::{ObjectDetail, Page, Pin, Summary, TreeNode};
@@ -17,14 +17,23 @@ pub const MAX_LIMIT: usize = 500;
 /// Levels below the root the Puller's tree expands (spec 07).
 pub const TREE_DEPTH: usize = 64;
 
+/// The columns every [`Summary`] query selects, from `objects o`, in
+/// [`summary_from_row`]'s order.
+const SUMMARY_COLUMNS: &str =
+    "o.store_path_hash, o.name, o.store_path, o.nar_size, o.file_size, o.created_at";
+
 /// The listing query. Its order is exactly the `objects_created` index, so a
 /// page walks the index and stops, instead of sorting every row per request.
-const LIST: &str = "SELECT store_path_hash, name, store_path, nar_size, file_size, created_at
-     FROM objects
-     WHERE (?1 IS NULL OR name LIKE ?1 ESCAPE '\\')
-       AND (created_at < ?2 OR (created_at = ?2 AND store_path_hash > ?3))
-     ORDER BY created_at DESC, store_path_hash ASC
-     LIMIT ?4";
+static LIST: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {SUMMARY_COLUMNS}
+         FROM objects o
+         WHERE (?1 IS NULL OR o.name LIKE ?1 ESCAPE '\\')
+           AND (o.created_at < ?2 OR (o.created_at = ?2 AND o.store_path_hash > ?3))
+         ORDER BY o.created_at DESC, o.store_path_hash ASC
+         LIMIT ?4"
+    )
+});
 
 /// Where the next listing page starts: the last row's `created_at:hash`,
 /// a pair strictly ordered even when timestamps collide. Parsing rejects
@@ -80,7 +89,7 @@ pub fn list(
     };
     let pattern = query.map(|q| format!("%{}%", escape_like(q)));
 
-    let mut stmt = conn.prepare(LIST)?;
+    let mut stmt = conn.prepare(&LIST)?;
     let mut objects: Vec<Summary> = stmt
         .query_map(
             params![pattern, after_time, after_hash, limit as i64 + 1],
@@ -116,8 +125,7 @@ fn escape_like(q: &str) -> String {
     escaped
 }
 
-/// A [`Summary`] from `hash, name, store_path, nar_size, file_size,
-/// created_at`, the column order every Summary query selects.
+/// A [`Summary`] from a row selecting [`SUMMARY_COLUMNS`].
 fn summary_from_row(row: &Row) -> rusqlite::Result<Summary> {
     Ok(Summary {
         hash: row.get(0)?,
@@ -235,13 +243,13 @@ fn children_of(
 
 /// Reverse dependencies, via the reverse-ref index.
 pub fn referrers(conn: &Connection, hash: &str) -> Result<Vec<Summary>> {
-    let mut stmt = conn.prepare(
-        "SELECT o.store_path_hash, o.name, o.store_path, o.nar_size, o.file_size, o.created_at
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SUMMARY_COLUMNS}
          FROM object_refs r
          JOIN objects o ON o.store_path_hash = r.referrer
          WHERE r.reference_hash = ?1 AND r.referrer != ?1
-         ORDER BY o.name",
-    )?;
+         ORDER BY o.name"
+    ))?;
     Ok(stmt
         .query_map(params![hash], summary_from_row)?
         .collect::<rusqlite::Result<_>>()?)
@@ -328,7 +336,7 @@ mod tests {
     fn the_unfiltered_listing_walks_an_index_instead_of_sorting() {
         let conn = db();
         let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {LIST}"))
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", *LIST))
             .unwrap()
             .query_map(params![None::<String>, i64::MAX, "", 51], |row| row.get(3))
             .unwrap()

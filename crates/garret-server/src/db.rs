@@ -584,8 +584,11 @@ pub struct ObjectBrief {
     pub file_size: i64,
 }
 
+/// The columns [`ObjectBrief::from_row`] reads, from `objects`.
+const OBJECT_BRIEF_COLUMNS: &str = "store_path_hash, name, created_at, file_size";
+
 impl ObjectBrief {
-    /// Reads a row selecting at least these four columns, by name.
+    /// Reads a row selecting [`OBJECT_BRIEF_COLUMNS`], by name.
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             store_path_hash: row.get("store_path_hash")?,
@@ -599,8 +602,7 @@ impl ObjectBrief {
 /// Every object row — exactly what `garret-admin fsck` needs to classify
 /// rows, without an N+1 fetch through [`get_object`] per hash.
 pub fn all_objects_brief(conn: &Connection) -> Result<Vec<ObjectBrief>> {
-    let mut stmt =
-        conn.prepare("SELECT store_path_hash, name, created_at, file_size FROM objects")?;
+    let mut stmt = conn.prepare(&format!("SELECT {OBJECT_BRIEF_COLUMNS} FROM objects"))?;
     Ok(stmt
         .query_map([], ObjectBrief::from_row)?
         .collect::<rusqlite::Result<_>>()?)
@@ -610,11 +612,11 @@ pub fn all_objects_brief(conn: &Connection) -> Result<Vec<ObjectBrief>> {
 /// oldest first. Exact match: a subject is `<issuer>#<sub>`, and a prefix of
 /// one GitHub ref's subject can be another's.
 pub fn pushed_by(conn: &Connection, subject: &str, since: Option<i64>) -> Result<Vec<ObjectBrief>> {
-    let mut stmt = conn.prepare(
-        "SELECT store_path_hash, name, created_at, file_size FROM objects
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {OBJECT_BRIEF_COLUMNS} FROM objects
          WHERE pushed_by = ?1 AND created_at >= ?2
-         ORDER BY created_at, store_path_hash",
-    )?;
+         ORDER BY created_at, store_path_hash"
+    ))?;
     Ok(stmt
         .query_map(
             params![subject, since.unwrap_or(i64::MIN)],
@@ -730,7 +732,7 @@ pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<ObjectBr
         PUSH_GRACE_HOURS
     );
     Ok(conn
-        .prepare(
+        .prepare(&format!(
             "WITH RECURSIVE keep(hash) AS (
                  SELECT store_path_hash FROM objects WHERE pushed_at >= ?1
                  UNION
@@ -738,10 +740,10 @@ pub fn prunable(conn: &Connection, before: i64, now: i64) -> Result<Vec<ObjectBr
                  UNION
                  SELECT r.reference_hash FROM object_refs r JOIN keep ON r.referrer = keep.hash
              )
-             SELECT store_path_hash, name, created_at, file_size FROM objects
+             SELECT {OBJECT_BRIEF_COLUMNS} FROM objects
              WHERE store_path_hash NOT IN (SELECT hash FROM keep)
-             ORDER BY name, store_path_hash",
-        )?
+             ORDER BY name, store_path_hash"
+        ))?
         .query_map(params![before, now], ObjectBrief::from_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
