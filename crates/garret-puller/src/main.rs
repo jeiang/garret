@@ -379,8 +379,25 @@ fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>>
         )))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Blocking threads. Pull reads serialize on one SQLite connection, so the
+/// pool only needs room for the one read that holds it, a few queued behind it,
+/// and one browse query: hundreds of threads waiting on the same mutex add
+/// futex wakeups without adding concurrency.
+const MAX_BLOCKING_THREADS: usize = 8;
+
+fn main() -> Result<()> {
+    // Explicit, rather than #[tokio::main], for the blocking-pool bound. The
+    // worker count keeps the default (one per core). A read that finds no free
+    // blocking thread waits in the pool's queue, and its budget still trips:
+    // db_read's timeout wraps the join handle, not the read itself.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let garret_server::runtime::Started {
         config: cfg,
         listener,
@@ -815,6 +832,51 @@ mod tests {
             Err(Degraded::DbTimeout),
             "queued read should degrade, not wait"
         );
+    }
+
+    /// A saturated blocking pool must degrade a read, not hang it: the budget
+    /// wraps the join handle, so a read that never gets a thread still trips.
+    #[test]
+    fn a_read_that_finds_no_blocking_thread_still_trips_its_budget() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let conn = conn();
+            let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+            let (release, gate) = std::sync::mpsc::channel();
+            let wedged = tokio::task::spawn_blocking({
+                let conn = conn.clone();
+                move || {
+                    let _held = conn.blocking_lock();
+                    holding_tx.send(()).unwrap();
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                }
+            });
+            holding_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the wedged task should take the only blocking thread");
+
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let got = db_read(conn, Duration::from_millis(25), {
+                let ran = ran.clone();
+                move |_| {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await;
+            assert_eq!(got, Err(Degraded::DbTimeout));
+            assert!(
+                !ran.load(std::sync::atomic::Ordering::SeqCst),
+                "the read ran despite there being no blocking thread"
+            );
+            let _ = release.send(());
+            wedged.await.unwrap();
+        });
     }
 
     const DAY: i64 = 86400;
