@@ -26,8 +26,9 @@ use garret_server::{
 use parking_lot::Mutex;
 use serde::Deserialize;
 
-/// A database connection. Sync rusqlite behind an async lock, so requests
-/// queued on it hold no threads; see [`on_conn`].
+/// A database connection: sync rusqlite behind a tokio Mutex. Bump flushes and
+/// browse queries wait for it asynchronously ([`on_conn`]); pull reads take it
+/// on their blocking thread ([`db_read`]).
 type Conn = Arc<tokio::sync::Mutex<rusqlite::Connection>>;
 
 /// The Puller's database connections, opened together once the Pusher has
@@ -196,14 +197,34 @@ where
         .unwrap_or_else(|e| Err(anyhow::anyhow!("{which} database task failed: {e}")))
 }
 
-/// A pull-path database read under the configured budget (ticket 25),
-/// queueing for the connection included.
+/// A pull-path database read under the configured budget (ticket 25, ADR
+/// 0007), queueing for the connection included. The lock is taken on the
+/// blocking thread, not awaited before it: holding the connection across the
+/// hand-off to the blocking pool serializes that hand-off and costs about 15%
+/// of pull throughput at 20 concurrent clients. A read queued behind a wedged
+/// holder keeps its thread, and checks the deadline under the lock so it never
+/// runs once its request has been answered.
 async fn db_read<T, F>(conn: Conn, budget: Duration, read: F) -> Result<T, Degraded>
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::time::timeout(budget, on_conn(conn, "pull", move |conn| read(conn))).await {
+    let deadline = Instant::now() + budget;
+    let task = tokio::task::spawn_blocking(move || {
+        let waited = Instant::now();
+        let conn = conn.blocking_lock();
+        metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => "pull")
+            .record(waited.elapsed());
+        if Instant::now() > deadline {
+            anyhow::bail!("pull read abandoned: budget elapsed while queued");
+        }
+        read(&conn)
+    });
+    let task = async {
+        task.await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("pull database task failed: {e}")))
+    };
+    match tokio::time::timeout(budget, task).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
             tracing::error!("{e:#}");
