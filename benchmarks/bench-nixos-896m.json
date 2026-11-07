@@ -3,10 +3,11 @@
     "arch": "x86_64",
     "corpus_version": 2,
     "cpus": 8,
+    "harness_version": 2,
     "label": "nixos-x86_64-896m",
     "os": "linux",
     "seed": 20250806,
-    "timestamp_unix": 1794015492,
+    "timestamp_unix": 1794083076,
     "version": "0.1.0"
   },
   "pull": [
@@ -14,14 +15,14 @@
       "concurrency": 20,
       "failed": 0,
       "keepalive": true,
-      "narinfo_p50_ms": 0.323,
-      "narinfo_p99_ms": 1.131,
+      "narinfo_p50_ms": 0.202,
+      "narinfo_p99_ms": 1.061,
       "passes": 3,
-      "redirect_p50_ms": 0.37,
-      "redirect_p99_ms": 1.33,
+      "redirect_p50_ms": 0.21,
+      "redirect_p99_ms": 1.16,
       "requests": 1200,
-      "requests_per_sec": 46874.59900245385,
-      "wall_seconds": 0.025600219,
+      "requests_per_sec": 71958.92153005535,
+      "wall_seconds": 0.016676181,
       "zero_failures": true
     }
   ],
@@ -31,25 +32,25 @@
     "corpus_entries": 200,
     "dropped_retries": 0,
     "failed": 0,
-    "max_ms": 213,
-    "median_ms": 48,
-    "nar_mib_per_sec": 743.1135787687607,
-    "p99_ms": 187,
-    "p99_slowdown": 127.0,
+    "max_ms": 101,
+    "median_ms": 8,
+    "nar_mib_per_sec": 3728.0307929839646,
+    "p99_ms": 95,
+    "p99_slowdown": 21.0,
     "pushed": 200,
     "shed_retries": 0,
-    "uncontended_median_ms": 2,
-    "wall_seconds": 0.858283809,
+    "uncontended_median_ms": 1,
+    "wall_seconds": 0.171082909,
     "wire_bytes": 155238785,
-    "wire_mib_per_sec": 172.49217637823554,
+    "wire_mib_per_sec": 865.3537809823646,
     "zero_failures": true
   },
   "stream": [
     {
       "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.004667613,
-      "mib_per_sec": 214.24226901416205,
+      "median_seconds": 0.003781421,
+      "mib_per_sec": 264.4508506193836,
       "reps": 3,
       "shed_retries": 0,
       "size_bytes": 1048576
@@ -57,8 +58,8 @@
     {
       "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.116401476,
-      "mib_per_sec": 859.0956355226973,
+      "median_seconds": 0.149648904,
+      "mib_per_sec": 668.23075429941,
       "reps": 3,
       "shed_retries": 0,
       "size_bytes": 104857600
@@ -66,15 +67,15 @@
     {
       "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 2.001917778,
-      "mib_per_sec": 1023.019038297386,
+      "median_seconds": 2.16665241,
+      "mib_per_sec": 945.236988890156,
       "reps": 1,
       "shed_retries": 0,
       "size_bytes": 2147483648
     }
   ],
   "pusher_rss": {
-    "peak_kib": 392188,
-    "final_kib": 392188
+    "peak_kib": 253680,
+    "final_kib": 194980
   }
 }

@@ -15,12 +15,6 @@ the object store. The numbers describe the cache, not the bucket.
 The corpus is generated from a seed, so a run is reproducible without holding
 real store contents.
 
-The checked-in baselines below predate the prepared-body change: their push
-numbers include the client's preparation, which ran 20-way concurrent on the
-same machine as the server. `just bench-compare` refuses to diff them against a
-current run (harness v1 against v2); re-record with `just bench-baseline` on
-each host before comparing.
-
 The harness holds the prepared bodies for the load corpus and its baseline twin,
 so it uses roughly 300 MiB of its own memory, or about 2.3 GiB with
 `--with-giant`.
@@ -40,17 +34,23 @@ unconstrained.
 
 ## Results
 
-The table below was measured with Garage as the local stand-in. `just
-bench-local` now provisions versitygw instead, and these numbers have not been
-re-measured against it.
+The table below was measured against versitygw, with the prepared-body harness
+(v2). Each row is one run. The push phase moves 638 MiB in well under a second
+on the unpinned configurations, so treat that column as indicative, like the
+unpinned pull column (see [Run-to-run variance](#run-to-run-variance)).
 
 | Label | Environment | Push NAR MiB/s | Push median/p99/max ms | Stream 1M/100M/2G MiB/s | Pull req/s | narinfo p50/p99 ms | Peak pusher RSS | Zero failures |
 |---|---|---|---|---|---|---|---|---|
-| `macos-aarch64` | MacBook Pro | 734 | 46 / 170 / 209 | 240 / 852 / 870 | 45.7k | 0.35 / 1.52 | 154 MiB | yes |
-| `nixos-x86_64` | Ryzen server, no limits | 731 | 49 / 171 / 221 | 220 / 896 / 1025 | 44.7k | 0.32 / 1.69 | 377 MiB | yes |
-| `nixos-x86_64-896m` | Ryzen server, 896 MiB memory cap | 743 | 48 / 187 / 213 | 214 / 859 / 1023 | 46.9k | 0.32 / 1.13 | 382 MiB | yes |
-| `nixos-x86_64-1cpu` | Ryzen server, pinned to 1 CPU | 699 | 52 / 258 / 282 | 220 / 595 / 677 | 16.6k | 1.17 / 2.07 | 175 MiB | yes |
-| `nixos-x86_64-1cpu-896m` | Ryzen server, 1 CPU + 896 MiB | 715 | 49 / 219 / 313 | 221 / 598 / 699 | 16.7k | 1.16 / 2.01 | 145 MiB | yes |
+| `macos-aarch64` | MacBook Pro | 2934 | 10 / 116 / 142 | 237 / 583 / 697 | 57.2k | 0.29 / 1.76 | 182 MiB | yes |
+| `nixos-x86_64` | Ryzen server, no limits | 3404 | 9 / 104 / 107 | 246 / 665 / 946 | 69.2k | 0.20 / 0.87 | 248 MiB | yes |
+| `nixos-x86_64-896m` | Ryzen server, 896 MiB memory cap | 3728 | 8 / 95 / 101 | 264 / 668 / 945 | 72.0k | 0.20 / 1.06 | 247 MiB | yes |
+| `nixos-x86_64-1cpu` | Ryzen server, pinned to 1 CPU | 1031 | 46 / 301 / 357 | 257 / 464 / 548 | 25.7k | 0.65 / 1.99 | 157 MiB | yes |
+| `nixos-x86_64-1cpu-896m` | Ryzen server, 1 CPU + 896 MiB | 1013 | 46 / 288 / 386 | 249 / 461 / 544 | 25.4k | 0.65 / 1.78 | 153 MiB | yes |
+
+`just bench-local` runs the Pusher with glibc's default malloc settings. The
+NixOS module sets `MALLOC_ARENA_MAX=2` for the Pusher unit (see
+[Deployment](deployment.md#process-behaviour)), which lowered peak RSS by about a third in
+separate runs on the Ryzen server.
 
 The Pusher runs the default limits — a 256 MiB in-flight cap, 16 MiB parts, 4
 parts in flight — except `max_concurrent_uploads`, raised from the default 16 to
@@ -74,7 +74,14 @@ comparison and is not gated.
 
 ## Run-to-run variance
 
-A second pass on the Mac agreed within 2% on push, the 1 MiB and 100 MiB
+With versitygw and harness v2, repeated runs on the Ryzen server with a longer
+workload (`--count 1000 --passes 50`, unpinned) agreed within 0.3% on pull
+(63.5k–63.7k req/s over four sets of three runs). Push-only runs on that corpus
+varied more: set medians spanned 4579–4965 NAR MiB/s, and single runs
+4051–5091, so compare push throughput over several runs.
+
+The figures below are from the Garage-era harness. A second pass on the Mac
+agreed within 2% on push, the 1 MiB and 100 MiB
 streams, pull and RSS; the 2 GiB stream came in 5% higher and push p99 8%
 higher. On the Ryzen server, a second pass of the matrix agreed within 9% on push,
 streams and RSS, but not on pull: the 1200-request scenario lasts about 30 ms on
