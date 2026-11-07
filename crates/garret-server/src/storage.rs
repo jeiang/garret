@@ -529,9 +529,12 @@ impl Storage {
         {
             Ok(()) => Ok(reader.finish()),
             Err(e) => {
-                // Stop the parts still uploading first: one landing after the
-                // abort would re-create what the abort freed.
-                parts.shutdown().await;
+                // Let the parts already sent finish first: one landing after
+                // the abort would re-create what the abort freed. Cancelling
+                // the task is not enough, because S3 keeps processing a request
+                // whose body it has. Each part is bounded by the operation
+                // timeout, so this wait is too.
+                while parts.join_next().await.is_some() {}
                 metrics::counter!("garret_s3_multipart_aborted_total").increment(1);
                 if let Err(abort) = timed(
                     "abort_mpu",
@@ -1077,6 +1080,58 @@ mod tests {
         assert_eq!(limits.in_flight_bytes(), 200);
         drop(upload);
         assert_eq!(limits.in_flight_bytes(), 0);
+    }
+
+    /// A failed upload aborts its multipart only after the parts already
+    /// sent have finished: S3 completes a part request it is processing, and
+    /// one that lands after the abort re-creates the upload.
+    #[tokio::test]
+    async fn a_failed_multipart_aborts_after_its_parts_land() {
+        use axum::{
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = events.clone();
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let log = log.clone();
+            async move {
+                let query = req.uri().query().unwrap_or_default().to_owned();
+                let method = req.method().clone();
+                let _ = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+                match method {
+                    Method::POST if query.contains("uploads") => (
+                        [("content-type", "application/xml")],
+                        "<InitiateMultipartUploadResult><UploadId>u</UploadId>\
+                         </InitiateMultipartUploadResult>",
+                    )
+                        .into_response(),
+                    Method::PUT => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        log.lock().unwrap().push("part".into());
+                        [("etag", "\"e\"")].into_response()
+                    }
+                    Method::DELETE => {
+                        log.lock().unwrap().push("abort".into());
+                        StatusCode::NO_CONTENT.into_response()
+                    }
+                    _ => StatusCode::NO_CONTENT.into_response(),
+                }
+            }
+        });
+        let storage = crate::testing::fake_s3(app).await;
+        let limits = UploadLimits::new(1024, 4, 8192, IDLE);
+        // Two full parts, then the client body fails.
+        let body = futures::stream::iter([
+            Ok(Bytes::from(vec![1u8; 2048])),
+            Err(std::io::Error::other("client went away")),
+        ]);
+        let stored = storage
+            .put_streaming(&key_for("torn"), body, &limits, 4096)
+            .await;
+        assert!(stored.is_err());
+        assert_eq!(*events.lock().unwrap(), ["part", "part", "abort"]);
     }
 
     /// Uploads that together want more part slots than exist must still all
