@@ -382,10 +382,16 @@ where
     }
 }
 
-async fn collect(in_flight: &mut JoinSet<Result<CompletedPart>>) -> Result<CompletedPart> {
-    in_flight
-        .join_next()
-        .await
+/// Takes the next finished part, adding the wait for it to `waited`: S3 part
+/// backpressure and the final drain both show up here.
+async fn collect(
+    in_flight: &mut JoinSet<Result<CompletedPart>>,
+    waited: &mut Duration,
+) -> Result<CompletedPart> {
+    let started = Instant::now();
+    let joined = in_flight.join_next().await;
+    *waited += started.elapsed();
+    joined
         .context("no part upload was in flight")?
         .context("part upload task failed")?
 }
@@ -481,6 +487,31 @@ impl Storage {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
+        let mut part_wait = Duration::ZERO;
+        let stored = self
+            .put_streaming_inner(key, body, limits, first_part_hint, &mut part_wait)
+            .await;
+        // Once per upload, failed ones included: the wait is what tells a
+        // slow store apart from a slow client. Milliseconds, not seconds:
+        // the metrics crate's counters take integers only, and a sub-second
+        // upload would otherwise record nothing.
+        metrics::counter!("garret_upload_s3_part_wait_milliseconds_total")
+            .increment(part_wait.as_millis() as u64);
+        stored
+    }
+
+    async fn put_streaming_inner<S, E>(
+        &self,
+        key: &str,
+        body: S,
+        limits: &UploadLimits,
+        first_part_hint: usize,
+        part_wait: &mut Duration,
+    ) -> Result<(Vec<u8>, i64)>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
         let mut reader = BodyReader::new(body, limits.body_idle);
 
         // First part decides the shape: if the whole body fits, one PutObject.
@@ -524,7 +555,7 @@ impl Storage {
         let mut parts = JoinSet::new();
         parts.spawn(self.upload_part(key, &upload_id, 1, first, permit));
         match self
-            .multipart_body(key, &upload_id, &mut parts, &mut reader, limits)
+            .multipart_body(key, &upload_id, &mut parts, &mut reader, limits, part_wait)
             .await
         {
             Ok(()) => Ok(reader.finish()),
@@ -564,6 +595,7 @@ impl Storage {
         in_flight: &mut JoinSet<Result<CompletedPart>>,
         reader: &mut BodyReader<S>,
         limits: &UploadLimits,
+        part_wait: &mut Duration,
     ) -> Result<()>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -576,7 +608,7 @@ impl Storage {
             // Room, then permit, then read: a part is never buffered before it
             // can be sent, so one NAR holds at most max_parts_in_flight slots.
             while in_flight.len() >= limits.max_parts_in_flight {
-                completed.push(collect(in_flight).await?);
+                completed.push(collect(in_flight, part_wait).await?);
             }
             let permit = limits.acquire(limits.part_size).await?;
             let mut part = BytesMut::with_capacity(limits.part_size);
@@ -598,7 +630,7 @@ impl Storage {
         }
 
         while !in_flight.is_empty() {
-            completed.push(collect(in_flight).await?);
+            completed.push(collect(in_flight, part_wait).await?);
         }
 
         completed.sort_by_key(|p| p.part_number());
