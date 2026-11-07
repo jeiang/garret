@@ -4,6 +4,7 @@
 //! preamble is refused before anything is stored or signed.
 
 use std::{
+    collections::VecDeque,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
@@ -45,10 +46,17 @@ const SCRATCH: usize = 128 * 1024;
 /// handoff saves.
 const OFFLOAD_MIN: i64 = 4 * 1024 * 1024;
 
-/// Chunks queued for an offloaded check: enough to keep its thread busy
-/// while the request task reads, bounded so a slow check pushes back on
-/// the body instead of buffering it.
-const OFFLOAD_DEPTH: usize = 8;
+/// Compressed bytes handed to an offloaded check in one message. A wake and
+/// a park per body chunk cost more than the check itself for small chunks,
+/// so chunks are batched; the batch is also the read-ahead the request task
+/// holds before passing bytes on.
+const BATCH_BYTES: usize = 1024 * 1024;
+
+/// Batches queued for an offloaded check: enough to keep its thread busy
+/// while the request task reads, bounded so a slow check pushes back on the
+/// body instead of buffering it. At most `OFFLOAD_BATCHES * BATCH_BYTES` is
+/// queued, plus the one batch being filled and the one being drained.
+const OFFLOAD_BATCHES: usize = 4;
 
 /// The NarHash/NarSize check over a compressed NAR, fed chunk by chunk.
 struct Checker {
@@ -152,7 +160,7 @@ enum Engine {
     Inline(Box<Checker>),
     Offload {
         /// Closed at end of stream, which tells the thread to finish.
-        tx: Option<PollSender<Bytes>>,
+        tx: Option<PollSender<Vec<Bytes>>>,
         verdict: oneshot::Receiver<Result<(), String>>,
     },
 }
@@ -190,8 +198,16 @@ enum Wait {
 pub struct VerifiedNar<S> {
     inner: S,
     engine: Engine,
-    /// A chunk read from `inner`, waiting for room in the offload queue.
+    /// A chunk read from `inner`, waiting to join the batch.
     pending: Option<Bytes>,
+    /// Chunks read from `inner` but not yet handed to the check.
+    batch: Vec<Bytes>,
+    /// Bytes in `batch`.
+    batch_bytes: usize,
+    /// Chunks the check has seen, waiting to be passed on.
+    ready: VecDeque<Bytes>,
+    /// `inner` has ended: its last batch is flushed, then the verdict.
+    eof: bool,
     /// How the stream ended, once it has: never poll again. `None` while
     /// streaming, and after a body error from `inner`.
     outcome: Option<Outcome>,
@@ -222,15 +238,17 @@ impl<S> VerifiedNar<S> {
     ) -> std::io::Result<Self> {
         let checker = Box::new(Checker::new(claimed_hash, claimed_size)?);
         let engine = if offload {
-            let (tx, mut rx) = mpsc::channel::<Bytes>(OFFLOAD_DEPTH);
+            let (tx, mut rx) = mpsc::channel::<Vec<Bytes>>(OFFLOAD_BATCHES);
             let (verdict_tx, verdict) = oneshot::channel();
             tokio::task::spawn_blocking(move || {
                 let mut checker = checker;
                 let mut verdict = Ok(());
-                while let Some(chunk) = rx.blocking_recv() {
-                    if let Err(reason) = checker.feed(&chunk) {
-                        verdict = Err(reason);
-                        break;
+                'batches: while let Some(batch) = rx.blocking_recv() {
+                    for chunk in batch {
+                        if let Err(reason) = checker.feed(&chunk) {
+                            verdict = Err(reason);
+                            break 'batches;
+                        }
                     }
                 }
                 // Dropping `rx` here closes the queue: the request task
@@ -250,6 +268,10 @@ impl<S> VerifiedNar<S> {
             inner,
             engine,
             pending: None,
+            batch: Vec::new(),
+            batch_bytes: 0,
+            ready: VecDeque::new(),
+            eof: false,
             outcome: None,
             waiting: None,
             client_wait: Duration::ZERO,
@@ -303,6 +325,158 @@ impl<S> VerifiedNar<S> {
     }
 }
 
+impl<S, E> VerifiedNar<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: Into<anyhow::Error>,
+{
+    /// The inline path: one chunk in, one chunk out, no queue.
+    fn poll_inline(&mut self, cx: &mut Context<'_>) -> Poll<Option<anyhow::Result<Bytes>>> {
+        let next = match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(next) => next,
+            Poll::Pending => {
+                self.waiting = Some((Wait::Client, Instant::now()));
+                return Poll::Pending;
+            }
+        };
+        match next {
+            Some(Ok(chunk)) => {
+                let fed = match &mut self.engine {
+                    Engine::Inline(checker) => checker.feed(&chunk),
+                    Engine::Offload { .. } => unreachable!("inline poll on an offloaded check"),
+                };
+                match fed {
+                    Ok(()) => Poll::Ready(Some(Ok(chunk))),
+                    Err(reason) => self.refuse(reason),
+                }
+            }
+            Some(Err(e)) => Poll::Ready(Some(Err(e.into()))),
+            None => {
+                let finished = match &mut self.engine {
+                    Engine::Inline(checker) => checker.finish(),
+                    Engine::Offload { .. } => unreachable!("inline poll on an offloaded check"),
+                };
+                match finished {
+                    Ok(()) => {
+                        self.outcome = Some(Outcome::Accepted);
+                        Poll::Ready(None)
+                    }
+                    Err(reason) => self.refuse(reason),
+                }
+            }
+        }
+    }
+
+    /// The offloaded path: chunks are batched for the check, so its thread
+    /// wakes once per batch rather than once per body chunk. Bytes are
+    /// passed on only after the batch holding them is queued, so the check
+    /// sees every byte before it is stored; a refusal therefore always
+    /// surfaces before the bytes it covers reach the caller.
+    fn poll_offloaded(&mut self, cx: &mut Context<'_>) -> Poll<Option<anyhow::Result<Bytes>>> {
+        loop {
+            if self.eof {
+                // The last batch goes to the check before its verdict is
+                // awaited, and its bytes are passed on before EOF.
+                if let Some(chunk) = self.ready.pop_front() {
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                if !self.batch.is_empty() {
+                    match self.send_batch(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(false) => return self.poll_verdict(cx),
+                        Poll::Ready(true) => continue,
+                    }
+                }
+                return self.poll_verdict(cx);
+            }
+            if matches!(&self.engine, Engine::Offload { tx: None, .. }) {
+                // The check has finished: its refusal is the answer, and the
+                // bytes still held are not stored.
+                return self.poll_verdict(cx);
+            }
+            if let Some(chunk) = self.ready.pop_front() {
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+            if let Some(chunk) = self.pending.take() {
+                // A full batch goes first, so the queue holds at most one
+                // chunk more than BATCH_BYTES.
+                if self.batch_bytes > 0 && self.batch_bytes + chunk.len() > BATCH_BYTES {
+                    match self.send_batch(cx) {
+                        Poll::Pending => {
+                            self.pending = Some(chunk);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(false) => return self.poll_verdict(cx),
+                        Poll::Ready(true) => {}
+                    }
+                    self.pending = Some(chunk);
+                    continue;
+                }
+                self.batch_bytes += chunk.len();
+                self.batch.push(chunk);
+                if self.batch_bytes >= BATCH_BYTES {
+                    match self.send_batch(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(false) => return self.poll_verdict(cx),
+                        Poll::Ready(true) => {}
+                    }
+                }
+                continue;
+            }
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => self.pending = Some(chunk),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(None) => self.eof = true,
+                Poll::Pending => {
+                    // Nothing is held back from the check while the client
+                    // is quiet: the batch goes now.
+                    if !self.batch.is_empty() {
+                        match self.send_batch(cx) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(false) => return self.poll_verdict(cx),
+                            Poll::Ready(true) => {}
+                        }
+                        if let Some(chunk) = self.ready.pop_front() {
+                            return Poll::Ready(Some(Ok(chunk)));
+                        }
+                    }
+                    self.waiting = Some((Wait::Client, Instant::now()));
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+
+    /// Hands the held batch to the check. `false` means the queue is closed:
+    /// the check has finished, refused or died, and its verdict is ready.
+    fn send_batch(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        let Engine::Offload { tx, .. } = &mut self.engine else {
+            unreachable!("only an offloaded check has a batch to send");
+        };
+        let Some(tx) = tx else {
+            return Poll::Ready(false);
+        };
+        match tx.poll_reserve(cx) {
+            Poll::Pending => {
+                self.waiting = Some((Wait::Verify, Instant::now()));
+                Poll::Pending
+            }
+            Poll::Ready(Ok(())) => {
+                let batch = std::mem::take(&mut self.batch);
+                self.batch_bytes = 0;
+                match tx.send_item(batch.clone()) {
+                    Ok(()) => {
+                        self.ready.extend(batch);
+                        Poll::Ready(true)
+                    }
+                    Err(_) => Poll::Ready(false),
+                }
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(false),
+        }
+    }
+}
+
 impl<S, E> Stream for VerifiedNar<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -324,56 +498,10 @@ where
         if this.outcome.is_some() {
             return Poll::Ready(None);
         }
-        if let Engine::Offload { tx: Some(tx), .. } = &mut this.engine
-            && let Some(chunk) = this.pending.take()
-        {
-            // Queued before it is passed on, so the check sees every byte
-            // that is stored. A closed queue means the check has already
-            // refused the NAR.
-            match tx.poll_reserve(cx) {
-                Poll::Pending => {
-                    this.pending = Some(chunk);
-                    this.waiting = Some((Wait::Verify, Instant::now()));
-                    return Poll::Pending;
-                }
-                Poll::Ready(Ok(())) if tx.send_item(chunk.clone()).is_ok() => {
-                    return Poll::Ready(Some(Ok(chunk)));
-                }
-                Poll::Ready(_) => return this.poll_verdict(cx),
-            }
-        }
-        if let Engine::Offload { tx: None, .. } = this.engine {
-            return this.poll_verdict(cx);
-        }
-        let next = match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(next) => next,
-            Poll::Pending => {
-                this.waiting = Some((Wait::Client, Instant::now()));
-                return Poll::Pending;
-            }
-        };
-        match next {
-            Some(Ok(chunk)) => match &mut this.engine {
-                Engine::Inline(checker) => match checker.feed(&chunk) {
-                    Ok(()) => Poll::Ready(Some(Ok(chunk))),
-                    Err(reason) => this.refuse(reason),
-                },
-                Engine::Offload { .. } => {
-                    this.pending = Some(chunk);
-                    Pin::new(this).poll_next(cx)
-                }
-            },
-            Some(Err(e)) => Poll::Ready(Some(Err(e.into()))),
-            None => match &mut this.engine {
-                Engine::Inline(checker) => match checker.finish() {
-                    Ok(()) => {
-                        this.outcome = Some(Outcome::Accepted);
-                        Poll::Ready(None)
-                    }
-                    Err(reason) => this.refuse(reason),
-                },
-                Engine::Offload { .. } => this.poll_verdict(cx),
-            },
+        if matches!(this.engine, Engine::Inline(_)) {
+            this.poll_inline(cx)
+        } else {
+            this.poll_offloaded(cx)
         }
     }
 }
@@ -461,6 +589,68 @@ mod tests {
         assert_eq!(passed, compressed);
     }
 
+    /// A NAR large enough to span several batches of tiny chunks and to fill
+    /// the check's queue, so backpressure is exercised: the check still sees
+    /// every byte, and a corrupted one is still refused.
+    #[tokio::test]
+    async fn a_nar_spanning_several_batches_still_verifies() {
+        // Pseudo-random (splitmix64), so zstd cannot shrink it below a batch.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut nar = Vec::with_capacity(6 * 1024 * 1024);
+        for _ in 0..6 * 1024 * 1024 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            nar.push((z ^ (z >> 31)) as u8);
+        }
+        let compressed = zstd::encode_all(nar.as_slice(), 1).unwrap();
+        assert!(
+            compressed.len() > 2 * BATCH_BYTES,
+            "{} bytes is not several batches",
+            compressed.len()
+        );
+        let hash = garret_common::sha256_nix32(&Sha256::digest(&nar));
+        let chunks = |bytes: &[u8]| -> Vec<Result<Bytes, std::io::Error>> {
+            bytes
+                .chunks(1000)
+                .map(|c| Ok(Bytes::copy_from_slice(c)))
+                .collect()
+        };
+
+        let mut verified = VerifiedNar::with_offload(
+            futures::stream::iter(chunks(&compressed)),
+            &hash,
+            nar.len() as i64,
+            true,
+        )
+        .unwrap();
+        let mut passed = Vec::new();
+        while let Some(item) = verified.next().await {
+            passed.extend_from_slice(&item.unwrap());
+        }
+        assert_eq!(verified.into_outcome(), Some(Outcome::Accepted));
+        assert_eq!(passed, compressed);
+
+        // One flipped byte in the NAR, with the original claim: refused.
+        let mut corrupt = nar.clone();
+        corrupt[nar.len() / 2] ^= 0xff;
+        let corrupt = zstd::encode_all(corrupt.as_slice(), 1).unwrap();
+        let mut verified = VerifiedNar::with_offload(
+            futures::stream::iter(chunks(&corrupt)),
+            &hash,
+            nar.len() as i64,
+            true,
+        )
+        .unwrap();
+        while let Some(item) = verified.next().await {
+            if item.is_err() {
+                break;
+            }
+        }
+        assert_refused(verified.into_outcome(), "NarHash is");
+    }
+
     #[tokio::test]
     async fn a_wrong_nar_hash_is_refused_at_end_of_stream() {
         let (_, compressed, _, size) = nar();
@@ -525,7 +715,7 @@ mod tests {
     /// it treats as final.
     #[tokio::test]
     async fn a_failed_check_thread_is_a_server_fault_not_a_refusal() {
-        let (tx, rx) = mpsc::channel::<Bytes>(1);
+        let (tx, rx) = mpsc::channel::<Vec<Bytes>>(1);
         let (verdict_tx, verdict) = oneshot::channel();
         drop((rx, verdict_tx));
         let chunks = vec![Ok::<_, std::io::Error>(Bytes::from_static(b"nar"))];
@@ -536,6 +726,10 @@ mod tests {
                 verdict,
             },
             pending: None,
+            batch: Vec::new(),
+            batch_bytes: 0,
+            ready: VecDeque::new(),
+            eof: false,
             outcome: None,
             waiting: None,
             client_wait: Duration::ZERO,
@@ -596,8 +790,16 @@ mod tests {
             let mut nar =
                 VerifiedNar::with_offload(futures::stream::iter(chunks), &hash, size, offload)
                     .unwrap();
-            assert!(nar.next().await.unwrap().is_ok());
-            let error = nar.next().await.unwrap().unwrap_err();
+            // Whatever was read before the break may or may not be passed on
+            // (the offloaded path still holds it in a batch); the error is
+            // what the caller must see, and it leaves no verdict.
+            let error = loop {
+                match nar.next().await {
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => break e,
+                    None => panic!("the stream ended without the client error"),
+                }
+            };
             assert!(error.to_string().contains("client went away"), "{error}");
             assert_eq!(nar.into_outcome(), None, "offload: {offload}");
         }
