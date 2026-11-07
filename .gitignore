@@ -4,4 +4,5 @@ result-*
 .direnv/
 /bench-results.json
 /bench-pull-sweep*.json
+/docs/book
 .worktrees/

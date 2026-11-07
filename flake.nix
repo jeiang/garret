@@ -34,6 +34,30 @@
       # Cargo.lock or manifest change rebuilds this; a source edit reuses it.
       garretDeps = pkgs: (craneLib pkgs).buildDepsOnly (commonArgs pkgs);
 
+      # The documentation book. `docs/` is the mdbook source root; the
+      # derivation also validates every relative link and emits llms.txt and
+      # llms-full.txt for agents.
+      docs = pkgs: pkgs.stdenvNoCC.mkDerivation {
+        name = "garret-docs";
+        src = pkgs.lib.fileset.toSource {
+          root = ./docs;
+          fileset = pkgs.lib.fileset.unions [
+            ./docs/book.toml
+            (pkgs.lib.fileset.fileFilter (f: f.hasExt "md") ./docs)
+          ];
+        };
+        nativeBuildInputs = [ pkgs.mdbook pkgs.python3 ];
+        dontConfigure = true;
+        buildPhase = ''
+          runHook preBuild
+          mdbook build . --dest-dir "$out"
+          rm "$out/book.toml"
+          python3 ${./scripts/gen-llms.py} . "$out"
+          runHook postBuild
+        '';
+        dontInstall = true;
+      };
+
       # One derivation builds the workspace; the per-binary outputs are thin
       # wrappers over it, so each unit depends on exactly the binary it runs.
       garret = pkgs: (craneLib pkgs).buildPackage (commonArgs pkgs // {
@@ -86,6 +110,7 @@
         # Build-time only: nothing at run time references it, but pushing it
         # lets a source-only change start from compiled dependencies.
         garret-deps = garretDeps pkgs;
+        docs = docs pkgs;
       });
 
       nixosModules = {
@@ -114,6 +139,8 @@
           jq empty ${./contrib/monitoring/garret-dashboard.json}
           touch $out
         '';
+        # The book builds and every relative link resolves.
+        docs = docs pkgs;
       } // nixpkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
         # The modules on a booted host: service users, file modes, sockets.
         module = pkgs.testers.runNixOSTest (import ./nix/test.nix self);
@@ -135,6 +162,7 @@
             lsof
             openssl
             tlaplus
+            mdbook
             (python3.withPackages (ps: [ ps.pyjwt ps.cryptography ]))
           ];
         };

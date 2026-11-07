@@ -44,8 +44,13 @@ jobs:
 
       # The flake's clippy (-D warnings) and rustfmt checks, the same gates as
       # `just check`, over the dependency build `build` pushes as garret-deps.
+      # The docs check builds the book and fails on a broken relative link.
       - name: Lints and formatting
-        run: nix build -L .#checks.x86_64-linux.clippy .#checks.x86_64-linux.fmt
+        run: |
+          nix build -L \
+            .#checks.x86_64-linux.clippy \
+            .#checks.x86_64-linux.fmt \
+            .#checks.x86_64-linux.docs
 
   # ---------------------------------------------------------------- build ---
   build:

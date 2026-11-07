@@ -4,8 +4,9 @@
 - `garret-dashboard.json`: Grafana dashboard with a `Datasource` and an
   `Instance` variable.
 
-Metric names and labels are in
-[docs/spec/08-observability.md](../../docs/spec/08-observability.md). The rules
+Metric names and labels are the `garret_*` series each service exports at
+`/metrics`; [docs/operations.md](../../docs/operations.md) covers the listeners
+and the readiness probes. The rules
 assume each service is scraped under a job whose name starts with `garret`
 (for example `garret-pusher` on port 9091 and `garret-puller` on port 9092).
 If your jobs use other names, edit the `GarretDown` selector.
