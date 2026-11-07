@@ -289,35 +289,11 @@ where
 /// of pull throughput at 20 concurrent clients. A read queued behind a wedged
 /// holder keeps its thread, and checks the deadline under the lock so it never
 /// runs once its request has been answered.
-///
-/// Uncontended, it runs inline on the calling worker instead: a prepared,
-/// cached WAL lookup is microseconds, and the two cross-thread wakeups of the
-/// blocking-pool round trip cost more than the read. `try_lock` never waits, so
-/// this cannot block a worker on the lock (the bug 6ddb102 fixed). The
-/// trade-off is that an inline read has no budget: the connection mutex
-/// serializes reads, so a wedged disk parks at most the one worker inside the
-/// read, and every other read falls back to the budgeted path.
 async fn db_read<T, F>(conn: Conn, budget: Duration, read: F) -> Result<T, Degraded>
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let waited = Instant::now();
-    if let Ok(conn) = conn.try_lock() {
-        metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => "pull")
-            .record(waited.elapsed());
-        // A panicking read must cost its request, not the worker and the
-        // connection (the test below pins that).
-        let read = std::panic::AssertUnwindSafe(|| read(&conn));
-        return match std::panic::catch_unwind(read) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(e)) => {
-                tracing::error!("{e:#}");
-                Err(Degraded::DbError)
-            }
-            Err(_panic) => Err(Degraded::DbError),
-        };
-    }
     let deadline = Instant::now() + budget;
     let task = tokio::task::spawn_blocking(move || {
         let waited = Instant::now();
@@ -834,17 +810,42 @@ mod tests {
             .context("never released")
     }
 
-    /// A read that finds the connection held queues on the blocking pool,
-    /// where its budget trips: it degrades to a miss rather than waiting for
-    /// the holder. (An uncontended read runs inline instead, so it has no
-    /// budget to trip; see `db_read`.)
+    /// The read is sync under the connection lock; the budget must still
+    /// trip while it is wedged (ticket 25) — hence the blocking pool.
     #[tokio::test]
-    async fn a_read_queued_behind_a_held_lock_trips_its_budget() {
-        let conn = conn();
-        let held = conn.clone().lock_owned().await;
-        let got = db_read(conn.clone(), Duration::from_millis(25), |_| Ok(())).await;
-        drop(held);
+    async fn a_wedged_read_trips_the_budget_instead_of_hanging() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let got = db_read(conn(), Duration::from_millis(25), move |_| wedge(&gate)).await;
+        let _ = release.send(());
         assert_eq!(got, Err(Degraded::DbTimeout));
+    }
+
+    /// Same failure mode, different cause: the wedged reader holds the lock,
+    /// and the next read queues behind it. Its budget must trip too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_queued_behind_a_wedged_lock_holder_trips_its_budget() {
+        let conn = conn();
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let wedged = db_read(conn.clone(), Duration::from_millis(25), move |_| {
+            // Signal that the lock is held so the queued read provably starts
+            // second; otherwise it could win the lock and succeed.
+            holding_tx.send(()).unwrap();
+            wedge(&gate)
+        });
+        let wedged = tokio::spawn(wedged);
+        holding_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wedged read should acquire the lock");
+        let queued = db_read(conn, Duration::from_millis(25), |_| Ok(())).await;
+        let _ = release.send(());
+        let wedged = wedged.await.unwrap();
+        assert_eq!(wedged, Err(Degraded::DbTimeout));
+        assert_eq!(
+            queued,
+            Err(Degraded::DbTimeout),
+            "queued read should degrade, not wait"
+        );
     }
 
     /// A saturated blocking pool must degrade a read, not hang it: the budget
