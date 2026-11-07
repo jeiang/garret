@@ -1,37 +1,39 @@
 # Benchmark results
 
-Human-readable summary of the checked-in result JSONs in this directory,
-last refreshed 2026-09-24 on `c83cd2a`. Produced by `just bench-local` (all spec-09
+Human-readable summary of the checked-in result JSONs in this directory.
+The artemis rows were last refreshed 2026-11-07 on `6ddb102` (main plus the
+pull-lock fix below); the Mac row is from 2026-09-24 on `c83cd2a`. Produced
+by `just bench-local` (all spec-09
 scenarios: 20-way concurrent push of a 200-entry / 638 MiB seeded corpus,
 single-stream pushes of 1 MiB / 100 MiB / 2 GiB, and a 1200-request pull
 scenario) against a throwaway local Garage. `just bench-compare` diffs a
 fresh run against `baseline.json`; the diff refuses to compare across
 labels, so each environment keeps its own file.
 
-**These results predate corpus v2.** The generator's per-entry seeding was
-fixed after this refresh, so the same seed now pushes different bytes. The
-checked-in JSONs carry no `meta.corpus_version` (read as v1), and
-`just bench-compare` refuses to diff a v2 run against them. They also
-predate the current report shape: their `pull` is a flat object, where a
-current run always writes an array of per-step entries. Regenerate each
-(`just bench-local`, then `just bench-baseline`) before comparing.
+**`baseline.json` (the Mac) predates corpus v2.** The generator's per-entry
+seeding was fixed after that run, so the same seed now pushes different
+bytes. It carries no `meta.corpus_version` (read as v1), and
+`just bench-compare` refuses to diff a v2 run against it. Its `pull` is also
+the old flat object, where a current run writes an array of per-step
+entries. Regenerate it on the Mac (`just bench-local`, then
+`just bench-baseline`) before comparing. The artemis JSONs are corpus v2.
 
 ## Systems
 
 | Host | Hardware | OS | Notes |
 |---|---|---|---|
 | MacBook Pro | Apple M3 Pro, 11 cores, 18 GiB RAM | macOS 27.0 | primary dev machine; `benchmarks/baseline.json` |
-| artemis | AMD Ryzen 7 7800X3D, 8 cores, 96 GB RAM | NixOS 26.11 (Zokor), kernel 7.2.0-cachyos-lto, x86_64 | shared home-lab box; limits apply to the **garret services only** (`GARRET_WRAP`: `taskset -c 0` for the CPU pin, per-service systemd user scopes with `MemoryMax=896M MemorySwapMax=0` for the cap). Garage and the bench client stand in for out-of-sandbox components (the upstream S3 service, the pushing machines) and run unconstrained |
+| artemis | AMD Ryzen 7 7800X3D, 8 cores, 96 GB RAM | NixOS 26.11 (Zokor), kernel 7.3.0-cachyos-lto, x86_64 | shared home-lab box; limits apply to the **garret services only** (`GARRET_WRAP`: `taskset -c 0` for the CPU pin, per-service systemd user scopes with `MemoryMax=896M MemorySwapMax=0` for the cap). Garage and the bench client stand in for out-of-sandbox components (the upstream S3 service, the pushing machines) and run unconstrained |
 
 ## Results
 
 | Label | Environment | Push NAR MiB/s | Push median/p99/max ms | Stream 1M/100M/2G MiB/s | Pull req/s | narinfo p50/p99 ms | Peak pusher RSS | Zero failures |
 |---|---|---|---|---|---|---|---|---|
-| `macos-aarch64` | MacBook Pro (dev baseline) | 477 | 72 / 340 / 427 | 78 / 263 / 358 | 36.3k | 0.43 / 1.52 | 217 MiB | yes |
-| `nixos-x86_64` | artemis, no limits | 673 | 50 / 210 / 277 | 101 / 342 / 464 | 37.1k | 0.42 / 1.74 | 399 MiB | yes |
-| `nixos-x86_64-896m` | artemis, 896 MiB memory cap | 672 | 50 / 227 / 299 | 106 / 344 / 461 | 34.2k | 0.48 / 2.10 | 379 MiB | yes |
-| `nixos-x86_64-1cpu` | artemis, pinned to 1 CPU | 615 | 54 / 344 / 411 | 105 / 328 / 453 | 13.4k | 1.48 / 5.89 | 218 MiB | yes |
-| `nixos-x86_64-1cpu-896m` | artemis, 1 CPU + 896 MiB | 609 | 53 / 258 / 419 | 103 / 288 / 346 | 13.3k | 1.46 / 6.29 | 206 MiB | yes |
+| `macos-aarch64` | MacBook Pro (dev baseline, 2026-09-24, corpus v1) | 477 | 72 / 340 / 427 | 78 / 263 / 358 | 36.3k | 0.43 / 1.52 | 217 MiB | yes |
+| `nixos-x86_64` | artemis, no limits | 731 | 49 / 171 / 221 | 220 / 896 / 1025 | 44.7k | 0.32 / 1.69 | 377 MiB | yes |
+| `nixos-x86_64-896m` | artemis, 896 MiB memory cap | 743 | 48 / 187 / 213 | 214 / 859 / 1023 | 46.9k | 0.32 / 1.13 | 382 MiB | yes |
+| `nixos-x86_64-1cpu` | artemis, pinned to 1 CPU | 699 | 52 / 258 / 282 | 220 / 595 / 677 | 16.6k | 1.17 / 2.07 | 175 MiB | yes |
+| `nixos-x86_64-1cpu-896m` | artemis, 1 CPU + 896 MiB | 715 | 49 / 219 / 313 | 221 / 598 / 699 | 16.7k | 1.16 / 2.01 | 145 MiB | yes |
 
 The Pusher runs the default limits (256 MiB in-flight cap, 16 MiB parts, 4 parts
 in flight) except `max_concurrent_uploads`, raised from the default 16 to 32 so
@@ -39,24 +41,33 @@ the 20 pushers are not shed.
 
 The RSS criterion (peak pusher RSS < 2x the 256 MiB in-flight cap, i.e.
 512 MiB) held in every configuration, with zero failed requests and zero
-shed retries throughout. A second pass of the artemis matrix and of the
-Mac run agreed within 5%.
+shed retries throughout. A second pass of the artemis matrix agreed within
+9% on push, streams and RSS. Pull did not: the 1200-request scenario lasts
+about 30 ms on 8 cores, and the two unpinned configs came in 26–29% lower
+on the second pass (the 1-CPU configs agreed within 1%). Treat the
+unpinned pull column as indicative only; for pull comparisons, run
+`GARRET_BENCH_ARGS="--passes 100 --no-giant" just bench-local` (40,000
+requests). Most such runs on artemis agree within about 2%, but about one
+in five came in 4–18% low, so compare the best of three.
 
-**What changed since 2026-08-12.** Concurrent push throughput fell by
-about 28% (Mac 712 → 477, artemis 938 → 673, 1 CPU 892 → 615 MiB/s of
-NAR). The cost is the server-side NarHash check (ADR-0010, #41): the
-Pusher now decompresses every upload and hashes the NAR, about 1.6
-CPU-seconds per GiB. For the 638 MiB corpus that is about 1 CPU-second,
-which matches the 1-CPU wall time. An interleaved A/B on the Mac
-confirms the cause: the commit before #41 (`e8bcdb9`) pushed 656 and
-672 MiB/s, and #41 itself (`34867a9`) pushed 478 and 475. On the Mac,
-nothing merged after #41 changed push throughput. Pull throughput rose
-about 35% (27k → 36–37k req/s) and narinfo p50 fell to about 0.43 ms.
-The likely cause is #34, which moved access-time updates off the request
-path; this was not A/B tested. Peak Pusher RSS rose 50–70 MiB on the Mac
-and in the 1-CPU runs, and is flat in the other artemis runs. All
-values stay well inside the budget. The 100 MiB and 2 GiB streams are
-unchanged within noise.
+**What changed on artemis since 2026-09-24.** Push rose about 9%
+(673 → 731 MiB/s) and the streams roughly doubled (100 MiB 342 → 896,
+2 GiB 464 → 1025 MiB/s). A first-parent bisect over the 2 GiB stream puts
+this on #72 (`9fd5381` 458 MiB/s, `77e7515` 1023): the Pusher's NarHash
+check for NARs of 4 MiB or more now runs on its own blocking thread and
+overlaps the relay instead of serializing with it (spec 01). `c83cd2a`
+rerun on the same day still measures 670 / 467 MiB/s, so the gain is not
+the kernel update. 1-CPU pull rose from 13.4k to 16.6k req/s; this was
+not bisected.
+
+**A pull regression, found and fixed in this refresh.** The untangle
+refactor (#98, its Puller step `690b847`) made pull reads await the
+connection's async lock and then hand off to the blocking pool while
+holding it, serializing the hand-off. In 40,000-request runs with no
+limits, pull fell from 64.2k to 54.7k req/s (narinfo p50 0.234 → 0.31 ms).
+The fix takes the lock on the blocking thread again (ADR 0007): 60.6k to
+61.6k req/s, against 62.8k to 63.4k for the pre-refactor `ffa297d` in the
+same interleaved session.
 
 **Why `max_ms` is reported, and the re-run protocol.** Roughly half of
 1-CPU push runs catch a Garage artifact: a single push held open for

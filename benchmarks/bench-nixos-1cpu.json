@@ -1,71 +1,80 @@
 {
   "meta": {
     "arch": "x86_64",
+    "corpus_version": 2,
     "cpus": 8,
     "label": "nixos-x86_64-1cpu",
     "os": "linux",
     "seed": 20250806,
-    "timestamp_unix": 1790218753,
+    "timestamp_unix": 1794015501,
     "version": "0.1.0"
   },
-  "pull": {
-    "concurrency": 20,
-    "failed": 0,
-    "keepalive": true,
-    "narinfo_p50_ms": 1.478,
-    "narinfo_p99_ms": 5.888,
-    "passes": 3,
-    "redirect_p50_ms": 1.507,
-    "redirect_p99_ms": 6.436,
-    "requests": 1200,
-    "requests_per_sec": 13381.049710566222,
-    "wall_seconds": 0.089679063,
-    "zero_failures": true
-  },
+  "pull": [
+    {
+      "concurrency": 20,
+      "failed": 0,
+      "keepalive": true,
+      "narinfo_p50_ms": 1.174,
+      "narinfo_p99_ms": 2.074,
+      "passes": 3,
+      "redirect_p50_ms": 1.209,
+      "redirect_p99_ms": 2.264,
+      "requests": 1200,
+      "requests_per_sec": 16552.541262692124,
+      "wall_seconds": 0.072496421,
+      "zero_failures": true
+    }
+  ],
   "push": {
     "concurrency": 20,
     "corpus_bytes": 668784240,
     "corpus_entries": 200,
     "dropped_retries": 0,
     "failed": 0,
-    "max_ms": 411,
-    "median_ms": 54,
-    "nar_mib_per_sec": 614.7550229550958,
-    "p99_ms": 344,
-    "p99_slowdown": 146.0,
+    "max_ms": 282,
+    "median_ms": 52,
+    "nar_mib_per_sec": 698.6756641840159,
+    "p99_ms": 258,
+    "p99_slowdown": 144.0,
     "pushed": 200,
     "shed_retries": 0,
     "uncontended_median_ms": 2,
-    "wall_seconds": 1.037490267,
-    "wire_bytes": 155053914,
-    "wire_mib_per_sec": 142.52753991384046,
+    "wall_seconds": 0.912873291,
+    "wire_bytes": 155238785,
+    "wire_mib_per_sec": 162.1772086270972,
     "zero_failures": true
   },
   "stream": [
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.009488144,
-      "mib_per_sec": 105.39469046844145,
+      "median_seconds": 0.004546745,
+      "mib_per_sec": 219.93755972679358,
       "reps": 3,
+      "shed_retries": 0,
       "size_bytes": 1048576
     },
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.305117222,
-      "mib_per_sec": 327.74288958359745,
+      "median_seconds": 0.16799899,
+      "mib_per_sec": 595.2416737743483,
       "reps": 3,
+      "shed_retries": 0,
       "size_bytes": 104857600
     },
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 4.519644488,
-      "mib_per_sec": 453.1329854455579,
+      "median_seconds": 3.023993421,
+      "mib_per_sec": 677.25015067088,
       "reps": 1,
+      "shed_retries": 0,
       "size_bytes": 2147483648
     }
   ],
   "pusher_rss": {
-    "peak_kib": 224044,
-    "final_kib": 224044
+    "peak_kib": 179656,
+    "final_kib": 179656
   }
 }

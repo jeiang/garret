@@ -1,71 +1,80 @@
 {
   "meta": {
     "arch": "x86_64",
+    "corpus_version": 2,
     "cpus": 8,
     "label": "nixos-x86_64-896m",
     "os": "linux",
     "seed": 20250806,
-    "timestamp_unix": 1790218740,
+    "timestamp_unix": 1794015492,
     "version": "0.1.0"
   },
-  "pull": {
-    "concurrency": 20,
-    "failed": 0,
-    "keepalive": true,
-    "narinfo_p50_ms": 0.479,
-    "narinfo_p99_ms": 2.105,
-    "passes": 3,
-    "redirect_p50_ms": 0.552,
-    "redirect_p99_ms": 2.093,
-    "requests": 1200,
-    "requests_per_sec": 34199.777085852955,
-    "wall_seconds": 0.035087948,
-    "zero_failures": true
-  },
+  "pull": [
+    {
+      "concurrency": 20,
+      "failed": 0,
+      "keepalive": true,
+      "narinfo_p50_ms": 0.323,
+      "narinfo_p99_ms": 1.131,
+      "passes": 3,
+      "redirect_p50_ms": 0.37,
+      "redirect_p99_ms": 1.33,
+      "requests": 1200,
+      "requests_per_sec": 46874.59900245385,
+      "wall_seconds": 0.025600219,
+      "zero_failures": true
+    }
+  ],
   "push": {
     "concurrency": 20,
     "corpus_bytes": 668784240,
     "corpus_entries": 200,
     "dropped_retries": 0,
     "failed": 0,
-    "max_ms": 299,
-    "median_ms": 50,
-    "nar_mib_per_sec": 671.9132760933671,
-    "p99_ms": 227,
-    "p99_slowdown": 129.0,
+    "max_ms": 213,
+    "median_ms": 48,
+    "nar_mib_per_sec": 743.1135787687607,
+    "p99_ms": 187,
+    "p99_slowdown": 127.0,
     "pushed": 200,
     "shed_retries": 0,
     "uncontended_median_ms": 2,
-    "wall_seconds": 0.949233146,
-    "wire_bytes": 155053914,
-    "wire_mib_per_sec": 155.77936365073316,
+    "wall_seconds": 0.858283809,
+    "wire_bytes": 155238785,
+    "wire_mib_per_sec": 172.49217637823554,
     "zero_failures": true
   },
   "stream": [
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.009393175,
-      "mib_per_sec": 106.46027567888387,
+      "median_seconds": 0.004667613,
+      "mib_per_sec": 214.24226901416205,
       "reps": 3,
+      "shed_retries": 0,
       "size_bytes": 1048576
     },
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.29106637,
-      "mib_per_sec": 343.56425306022123,
+      "median_seconds": 0.116401476,
+      "mib_per_sec": 859.0956355226973,
       "reps": 3,
+      "shed_retries": 0,
       "size_bytes": 104857600
     },
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 4.444036521,
-      "mib_per_sec": 460.84229738489137,
+      "median_seconds": 2.001917778,
+      "mib_per_sec": 1023.019038297386,
       "reps": 1,
+      "shed_retries": 0,
       "size_bytes": 2147483648
     }
   ],
   "pusher_rss": {
-    "peak_kib": 388436,
-    "final_kib": 388436
+    "peak_kib": 392188,
+    "final_kib": 392188
   }
 }
