@@ -2,7 +2,7 @@
 # End-to-end gate: push a real store path through the Pusher, then substitute
 # it back out of the Puller with `nix copy` — signature-checked, no
 # --no-check-sigs.
-# Provisions a throwaway Garage; leaves nothing behind.
+# Provisions a throwaway versitygw; leaves nothing behind.
 set -euo pipefail
 
 # pwd -P: nix refuses a store whose parent is a symlink, and macOS /tmp is one.
@@ -12,7 +12,7 @@ trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$root"' EXIT
 source "$(dirname "$0")/provision.sh"
 
 require_free_ports
-start_garage 1G
+start_s3
 make_signing_key
 mint_dev_tokens
 
@@ -783,9 +783,14 @@ else
 fi
 curl -sf "$puller_url/$drain_hash.narinfo" >/dev/null \
   || { echo "the drained upload was not committed"; exit 1; }
-garage -c "$root/garage.toml" bucket info garret | tee "$root/bucket-info.out" | grep -i multipart
-grep -qiE "unfinished multipart uploads: +0$" "$root/bucket-info.out" \
-  || { echo "a multipart upload was left open"; exit 1; }
+# ListMultipartUploads: the drain must have completed or aborted every part.
+curl -sf --aws-sigv4 "aws:amz:us-east-1:s3" --user "$key_id:$key_secret" \
+  "http://127.0.0.1:$s3_port/garret?uploads" \
+  | tee "$root/bucket-uploads.out" >/dev/null
+if grep -q "<Upload>" "$root/bucket-uploads.out"; then
+  echo "a multipart upload was left open"
+  exit 1
+fi
 echo "  drained, committed, exited cleanly, and no multipart left open"
 
 # Restart the Pusher (stopped above) under a quota the corpus already

@@ -153,7 +153,7 @@ jobs:
           nix build .#garret-all
 
       - name: End-to-end gate
-        # Provisions a throwaway Garage, pushes real store paths through the
+        # Provisions a throwaway versitygw, pushes real store paths through the
         # real client, and substitutes them back with signature verification.
         # GARRET_BIN keeps it from compiling the workspace all over again.
         env:

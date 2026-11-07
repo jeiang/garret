@@ -1,6 +1,6 @@
 # NixOS VM test for the service modules (spec 10-packaging). `cache` runs the
 # Pusher and the Puller as separate users sharing the database (ADR-0009),
-# over a local Garage; `builder` runs the store watcher. A path goes all the
+# over a local versitygw; `builder` runs the store watcher. A path goes all the
 # way round, under every unit's systemd sandbox: the watcher pushes it through
 # the nix daemon, the Pusher stores it, the Puller serves it back.
 self:
@@ -62,14 +62,14 @@ let
     HTTPServer(("127.0.0.1", 8090), Issuer).serve_forever()
   '';
 
-  # A fixed Garage key, imported rather than created, so the credentials file
-  # can be static.
+  # A fixed key, set in the gateway's environment rather than created, so the
+  # credentials file can be static.
   s3KeyId = "GK0123456789abcdef01234567";
   s3Secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   s3 = {
     bucket = "garret";
     endpointUrl = "http://127.0.0.1:3900";
-    region = "garage";
+    region = "us-east-1";
     credentialsFile = "/etc/garret/s3.env";
   };
 
@@ -99,19 +99,15 @@ in
       '';
     };
 
-    services.garage = {
-      enable = true;
-      package = pkgs.garage;
-      settings = {
-        replication_factor = 1;
-        db_engine = "sqlite";
-        rpc_bind_addr = "127.0.0.1:3901";
-        rpc_public_addr = "127.0.0.1:3901";
-        rpc_secret = "0000000000000000000000000000000000000000000000000000000000000000";
-        s3_api = {
-          s3_region = "garage";
-          api_bind_addr = "127.0.0.1:3900";
-        };
+    systemd.services.versitygw = {
+      wantedBy = [ "multi-user.target" ];
+      environment = {
+        ROOT_ACCESS_KEY = s3KeyId;
+        ROOT_SECRET_KEY = s3Secret;
+      };
+      serviceConfig = {
+        ExecStart = "${pkgs.versitygw}/bin/versitygw --port 127.0.0.1:3900 posix /var/lib/versitygw";
+        StateDirectory = "versitygw";
       };
     };
 
@@ -174,14 +170,11 @@ in
 
     start_all()
 
-    cache.wait_for_unit("garage.service")
-    cache.wait_until_succeeds("garage status")
-    node = cache.succeed("garage node id -q | cut -d@ -f1").strip()
-    cache.succeed(f"garage layout assign -z dc1 -c 1G {node}")
-    cache.succeed("garage layout apply --version 1")
-    cache.succeed("garage bucket create garret")
-    cache.succeed("garage key import --yes -n garret ${s3KeyId} ${s3Secret}")
-    cache.succeed("garage bucket allow --read --write garret --key garret")
+    cache.wait_for_unit("versitygw.service")
+    cache.wait_until_succeeds(
+        "curl -sf -o /dev/null --aws-sigv4 aws:amz:us-east-1:s3"
+        " --user ${s3KeyId}:${s3Secret} -X PUT http://127.0.0.1:3900/garret"
+    )
 
     cache.wait_for_unit("garret-pusher.service")
     # /ready answers once the Puller has opened the database, which it can

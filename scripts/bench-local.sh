@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Self-provisioned benchmark run (spec 09): throwaway Garage + both services
+# Self-provisioned benchmark run (spec 09): throwaway versitygw + both services
 # from the flake, all three garret-bench scenarios in release mode, and the
 # Pusher's RSS sampled throughout — the one criterion the harness cannot see
 # from the outside. Leaves bench-results.json behind for `just bench-compare`.
@@ -13,8 +13,7 @@ out=${GARRET_BENCH_JSON:-bench-results.json}
 source "$(dirname "$0")/provision.sh"
 
 require_free_ports
-# Room for the corpus (~750 MiB), its serial baseline, and the 2 GiB blob.
-start_garage 20G
+start_s3
 make_signing_key
 mint_dev_tokens
 

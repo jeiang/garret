@@ -157,7 +157,7 @@
             rust-analyzer
             sqlite
             just
-            garage
+            versitygw
             zstd
             curl
             lsof

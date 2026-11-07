@@ -1,4 +1,4 @@
-//! S3 blob storage (MEGA S4 in production, Garage locally). Spec 03-storage.
+//! S3 blob storage (MEGA S4 in production, versitygw locally). Spec 03-storage.
 
 use std::{
     sync::Arc,
@@ -412,7 +412,7 @@ impl Storage {
         if let Some(url) = &cfg.endpoint_url {
             builder = builder.endpoint_url(url.clone());
         }
-        // S4 and Garage both accept path-style; it avoids DNS games for dotted buckets.
+        // S4 and versitygw both accept path-style; it avoids DNS games for dotted buckets.
         builder = builder.force_path_style(cfg.path_style);
         // The overall deadline covers the SDK's retries; the optional attempt
         // deadline bounds each try, so a hung attempt leaves time for a retry
@@ -720,8 +720,8 @@ impl Storage {
     /// counted, and once every batch has been tried the call fails: the rows
     /// are already gone, so a blob that stayed must not pass for a deleted
     /// one (spec 05). A key reported as already absent (`NoSuchKey`, which
-    /// Garage lists under `Errors` where S3 lists it as deleted) is not a
-    /// failure — absent is what the caller asked for.
+    /// some S3 implementations list under `Errors` where S3 lists it as
+    /// deleted) is not a failure — absent is what the caller asked for.
     pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
         let (mut failed, mut first_failure) = (0, None);
         for batch in keys.chunks(1000) {
@@ -1009,10 +1009,11 @@ mod tests {
     }
 
     /// Just enough S3 on a loopback port. Every call succeeds, except that
-    /// `DeleteObjects` answers inside a 200 the way S3 and Garage do: keys
-    /// containing `denied` fail, and keys containing `gone` come back as
-    /// Garage reports an already-absent key, a `NoSuchKey` error. For tests
-    /// where the question is our side, not S3 semantics.
+    /// `DeleteObjects` answers inside a 200 the way S3 does: keys containing
+    /// `denied` fail, and keys containing `gone` come back as a `NoSuchKey`
+    /// error — the shape some implementations use for an already-absent key,
+    /// which the caller must tolerate. For tests where the question is our
+    /// side, not S3 semantics.
     async fn fake_s3() -> Storage {
         use axum::{
             extract::Request,
