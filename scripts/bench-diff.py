@@ -3,8 +3,9 @@
 (spec 09). Reports deltas for every numeric metric; judgement stays with the
 human — the only hard failures are failed requests in the new run, an
 environment mismatch, because a laptop number diffed against a sandbox
-number is noise dressed up as a regression, and a corpus-version mismatch,
-because then the two runs pushed different bytes."""
+number is noise dressed up as a regression, and a corpus- or harness-version
+mismatch, because then the two runs pushed different bytes or measured
+different work."""
 
 import json
 import sys
@@ -59,9 +60,24 @@ def main():
             "the runs pushed different data; regenerate the baseline with `just bench-baseline`"
         )
 
+    # Same for the harness: v1 timed the client's own body preparation inside
+    # `push`, v2 prepares bodies before the timed phase.
+    harnesses = tuple(r.get("meta", {}).get("harness_version", 1) for r in (baseline, current))
+    if harnesses[0] != harnesses[1]:
+        sys.exit(
+            f"harness mismatch: baseline is harness v{harnesses[0]}, current is v{harnesses[1]}\n"
+            "the runs measured different work; regenerate the baseline with `just bench-baseline`"
+        )
+
     base = dict(flatten(baseline))
     curr = dict(flatten(current))
-    skip = ("meta.seed", "meta.corpus_version", "meta.timestamp_unix", "meta.cpus")
+    skip = (
+        "meta.seed",
+        "meta.corpus_version",
+        "meta.harness_version",
+        "meta.timestamp_unix",
+        "meta.cpus",
+    )
 
     print(f"{'metric':<52} {'baseline':>14} {'current':>14} {'delta':>9}")
     for key in sorted(set(base) | set(curr)):

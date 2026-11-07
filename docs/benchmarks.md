@@ -6,12 +6,24 @@ the object store. The numbers describe the cache, not the bucket.
 ## What is measured
 
 - **Push**: 20 concurrent pushers over a seeded corpus of 200 entries totalling
-  638 MiB, each entry 4 KiB to 16 MiB.
+  638 MiB, each entry 4 KiB to 16 MiB. Every body is generated, SHA-256'd and
+  zstd-compressed before the timer starts, so the numbers cover the upload and
+  its retries, not the bench client's own CPU.
 - **Stream**: single-stream pushes of 1 MiB, 100 MiB and 2 GiB bodies.
 - **Pull**: 1200 concurrent narinfo and redirect requests.
 
 The corpus is generated from a seed, so a run is reproducible without holding
 real store contents.
+
+The checked-in baselines below predate the prepared-body change: their push
+numbers include the client's preparation, which ran 20-way concurrent on the
+same machine as the server. `just bench-compare` refuses to diff them against a
+current run (harness v1 against v2); re-record with `just bench-baseline` on
+each host before comparing.
+
+The harness holds the prepared bodies for the load corpus and its baseline twin,
+so it uses roughly 300 MiB of its own memory, or about 2.3 GiB with
+`--with-giant`.
 
 ## Systems
 
@@ -90,5 +102,6 @@ so it was a stand-in artifact rather than garret behaviour.
 
 `just bench-local` provisions a throwaway versitygw and runs every scenario
 against it. `just bench-compare` diffs a fresh run against `baseline.json` and
-refuses to compare across labels or corpus versions; each environment keeps its
-own file. The checked-in result JSONs live in `benchmarks/`.
+refuses to compare across labels, corpus versions or harness versions; each
+environment keeps its own file. The checked-in result JSONs live in
+`benchmarks/`.
