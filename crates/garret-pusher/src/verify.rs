@@ -5,7 +5,8 @@
 
 use std::{
     pin::Pin,
-    task::{Context, Poll, ready},
+    task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use anyhow::anyhow;
@@ -167,6 +168,15 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// Which wait a `Pending` belongs to, for the upload wait-time counters.
+#[derive(Clone, Copy)]
+enum Wait {
+    /// The client's body stream had nothing to give.
+    Client,
+    /// The offloaded check was behind (its queue full) or finishing.
+    Verify,
+}
+
 /// Passes the compressed NAR through untouched while decompressing and
 /// hashing it. At end of stream it compares against the claimed NarHash and
 /// NarSize and, on a mismatch, yields an error in place of EOF. Every store
@@ -185,6 +195,12 @@ pub struct VerifiedNar<S> {
     /// How the stream ended, once it has: never poll again. `None` while
     /// streaming, and after a body error from `inner`.
     outcome: Option<Outcome>,
+    /// Where the stream last went `Pending`, and when. The wait is closed on
+    /// the next poll, so it is timed once per wait, not once per chunk.
+    waiting: Option<(Wait, Instant)>,
+    /// Time the body spent waiting on the client, and on the check.
+    client_wait: Duration,
+    verify_wait: Duration,
 }
 
 impl<S> VerifiedNar<S> {
@@ -235,12 +251,22 @@ impl<S> VerifiedNar<S> {
             engine,
             pending: None,
             outcome: None,
+            waiting: None,
+            client_wait: Duration::ZERO,
+            verify_wait: Duration::ZERO,
         })
     }
 
     /// How the stream ended; `None` if it did not reach a verdict.
     pub fn into_outcome(self) -> Option<Outcome> {
         self.outcome
+    }
+
+    /// Time the body spent waiting on the client, and on the check (queue
+    /// backpressure plus the final verdict). Read before `into_outcome`,
+    /// which consumes the stream.
+    pub fn waits(&self) -> (Duration, Duration) {
+        (self.client_wait, self.verify_wait)
     }
 
     fn refuse(&mut self, reason: String) -> Poll<Option<anyhow::Result<Bytes>>> {
@@ -255,7 +281,13 @@ impl<S> VerifiedNar<S> {
             unreachable!("only an offloaded check has a verdict to wait for");
         };
         *tx = None;
-        let verdict = ready!(verdict.poll_unpin(cx));
+        let verdict = match verdict.poll_unpin(cx) {
+            Poll::Ready(verdict) => verdict,
+            Poll::Pending => {
+                self.waiting = Some((Wait::Verify, Instant::now()));
+                return Poll::Pending;
+            }
+        };
         match verdict {
             Ok(Ok(())) => {
                 self.outcome = Some(Outcome::Accepted);
@@ -280,6 +312,15 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        // A wait ends when the wake that brought us back here arrives, so the
+        // time is counted once per wait rather than once per chunk.
+        if let Some((wait, since)) = this.waiting.take() {
+            let waited = since.elapsed();
+            match wait {
+                Wait::Client => this.client_wait += waited,
+                Wait::Verify => this.verify_wait += waited,
+            }
+        }
         if this.outcome.is_some() {
             return Poll::Ready(None);
         }
@@ -292,6 +333,7 @@ where
             match tx.poll_reserve(cx) {
                 Poll::Pending => {
                     this.pending = Some(chunk);
+                    this.waiting = Some((Wait::Verify, Instant::now()));
                     return Poll::Pending;
                 }
                 Poll::Ready(Ok(())) if tx.send_item(chunk.clone()).is_ok() => {
@@ -303,7 +345,14 @@ where
         if let Engine::Offload { tx: None, .. } = this.engine {
             return this.poll_verdict(cx);
         }
-        match ready!(Pin::new(&mut this.inner).poll_next(cx)) {
+        let next = match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(next) => next,
+            Poll::Pending => {
+                this.waiting = Some((Wait::Client, Instant::now()));
+                return Poll::Pending;
+            }
+        };
+        match next {
             Some(Ok(chunk)) => match &mut this.engine {
                 Engine::Inline(checker) => match checker.feed(&chunk) {
                     Ok(()) => Poll::Ready(Some(Ok(chunk))),
@@ -488,6 +537,9 @@ mod tests {
             },
             pending: None,
             outcome: None,
+            waiting: None,
+            client_wait: Duration::ZERO,
+            verify_wait: Duration::ZERO,
         };
         assert!(nar.next().await.unwrap().is_err());
         assert!(
@@ -498,6 +550,37 @@ mod tests {
             matches!(nar.into_outcome(), Some(Outcome::Failed(_))),
             "a server fault, not a refusal"
         );
+    }
+
+    /// A body that goes quiet is the client's wait, not the check's: the
+    /// split is what the upload wait-time counters report.
+    #[tokio::test]
+    async fn a_stalled_body_reports_its_client_wait() {
+        const STALL: Duration = Duration::from_millis(100);
+        let (_, compressed, hash, size) = nar();
+        let half = compressed.len() / 2;
+        let (first, second) = (compressed[..half].to_vec(), compressed[half..].to_vec());
+        let body =
+            futures::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(first)) })
+                .chain(futures::stream::once(async move {
+                    tokio::time::sleep(STALL).await;
+                    Ok(Bytes::from(second))
+                }));
+        let mut nar = VerifiedNar::with_offload(Box::pin(body), &hash, size, false).unwrap();
+        while let Some(item) = nar.next().await {
+            item.unwrap();
+        }
+        let (client_wait, verify_wait) = nar.waits();
+        assert_eq!(nar.into_outcome(), Some(Outcome::Accepted));
+        assert!(
+            client_wait >= STALL / 2,
+            "client wait {client_wait:?} is under half the stall"
+        );
+        assert!(
+            client_wait < STALL * 20,
+            "client wait {client_wait:?} is implausible"
+        );
+        assert_eq!(verify_wait, Duration::ZERO, "an inline check never waits");
     }
 
     /// A body that breaks off with a client error reached no verdict: it is

@@ -1,20 +1,24 @@
 //! S3 blob storage (MEGA S4 in production, versitygw locally). Spec 03-storage.
 
 use std::{
+    convert::Infallible,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use aws_sdk_s3::{
     Client,
     config::Credentials,
     error::SdkError,
     presigning::PresigningConfig,
-    primitives::ByteStream,
+    primitives::{ByteStream, SdkBody},
     types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
 };
-use bytes::{Bytes, BytesMut};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -286,6 +290,91 @@ pub async fn next_chunk<S: Stream + Unpin>(
     })
 }
 
+/// One part's bytes: the body chunks that make it up, in order, and their
+/// exact total. A chunk is a `Bytes` slice of the request body, so a part is
+/// never copied into a contiguous buffer — the SDK streams the chunks as they
+/// are. `len` is what S3's uniform-part-size rule and `Content-Length` need.
+#[derive(Debug, Default)]
+struct Part {
+    chunks: Vec<Bytes>,
+    len: usize,
+}
+
+impl Part {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The part as one buffer. Only the single-`PutObject` path needs this
+    /// (a body below one part), and it is free when hyper delivered the body
+    /// in one chunk.
+    fn into_bytes(mut self) -> Bytes {
+        match self.chunks.len() {
+            0 => Bytes::new(),
+            1 => self.chunks.pop().expect("one chunk"),
+            _ => {
+                let mut buf = Vec::with_capacity(self.len);
+                for chunk in &self.chunks {
+                    buf.extend_from_slice(chunk);
+                }
+                Bytes::from(buf)
+            }
+        }
+    }
+}
+
+/// A part's chunks as an `http_body::Body`, so the SDK reads them straight
+/// out of the request buffers. `remaining` is the exact size hint the SDK
+/// turns into `Content-Length`.
+struct Chunks {
+    chunks: std::vec::IntoIter<Bytes>,
+    remaining: u64,
+}
+
+impl http_body::Body for Chunks {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+        let this = self.get_mut();
+        Poll::Ready(this.chunks.next().map(|chunk| {
+            this.remaining -= chunk.len() as u64;
+            Ok(http_body::Frame::data(chunk))
+        }))
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+}
+
+/// The part as a retryable streaming SDK body. Rebuilding it only clones the
+/// chunk list (refcount bumps), so an SDK retry re-sends the same bytes — the
+/// guarantee `ByteStream::from(Bytes)` gives for the contiguous paths.
+fn part_body(chunks: Vec<Bytes>, len: usize) -> SdkBody {
+    SdkBody::retryable(move || {
+        SdkBody::from_body_1_x(Chunks {
+            chunks: chunks.clone().into_iter(),
+            remaining: len as u64,
+        })
+    })
+}
+
+/// CRC32 of a part, base64-encoded the way S3's `x-amz-checksum-crc32`
+/// header wants it. Computing it here, rather than letting the SDK checksum a
+/// streaming body, keeps the request from switching to aws-chunked encoding
+/// with a trailer.
+fn checksum_crc32(chunks: &[Bytes]) -> String {
+    let mut hasher = crc32fast::Hasher::new();
+    for chunk in chunks {
+        hasher.update(chunk);
+    }
+    B64.encode(hasher.finalize().to_be_bytes())
+}
+
 /// The upload body as consumed so far. It owns the read cursor (an overshoot
 /// `carry` left by a split chunk), the running hash and the byte count, so
 /// FileHash and FileSize (spec 03) always describe the same bytes: exactly
@@ -336,31 +425,39 @@ where
     }
 
     /// Hashes and counts `bytes` as they go into `part`, while still
-    /// cache-hot.
-    fn append(&mut self, part: &mut BytesMut, bytes: &[u8]) {
-        self.hasher.update(bytes);
-        part.extend_from_slice(bytes);
+    /// cache-hot. The chunk is moved, not copied: it is a slice of hyper's
+    /// read buffer and stays one.
+    fn append(&mut self, part: &mut Part, bytes: Bytes) {
+        self.hasher.update(&bytes);
         self.received += bytes.len() as u64;
+        part.len += bytes.len();
+        part.chunks.push(bytes);
     }
 
-    /// Appends body bytes to `part` until it holds `cap` bytes or the body
+    /// Appends body chunks to `part` until it holds `cap` bytes or the body
     /// ends, keeping any overshoot as the carry. `part` must have been
-    /// allocated with room for `cap` against a permit: a part slot accounts
-    /// for the part's only buffer.
-    async fn fill(&mut self, part: &mut BytesMut, cap: usize, phase: &'static str) -> Result<()> {
-        while part.len() < cap {
-            let Some(chunk) = self.next(phase).await? else {
+    /// reserved against a permit: a part slot accounts for the whole part.
+    async fn fill(&mut self, part: &mut Part, cap: usize, phase: &'static str) -> Result<()> {
+        while part.len < cap {
+            let Some(mut chunk) = self.next(phase).await? else {
                 break;
             };
-            // A chunk can span several parts, so it is split: a part over
-            // part_size would abort the upload.
-            let room = cap - part.len();
+            // Empty chunks carry nothing and would only add a frame to the
+            // SDK body; the old buffer copy skipped them implicitly.
+            if chunk.is_empty() {
+                continue;
+            }
+            // A chunk can span several parts, so it is split at the part
+            // boundary: a part over part_size would abort the upload. The
+            // split is a `Bytes` slice, so neither half is copied.
+            let room = cap - part.len;
             if chunk.len() > room {
-                self.append(part, &chunk[..room]);
-                self.carry = Some(chunk.slice(room..));
+                let head = chunk.split_to(room);
+                self.append(part, head);
+                self.carry = Some(chunk);
                 break;
             }
-            self.append(part, &chunk);
+            self.append(part, chunk);
         }
         Ok(())
     }
@@ -382,10 +479,16 @@ where
     }
 }
 
-async fn collect(in_flight: &mut JoinSet<Result<CompletedPart>>) -> Result<CompletedPart> {
-    in_flight
-        .join_next()
-        .await
+/// Takes the next finished part, adding the wait for it to `waited`: S3 part
+/// backpressure and the final drain both show up here.
+async fn collect(
+    in_flight: &mut JoinSet<Result<CompletedPart>>,
+    waited: &mut Duration,
+) -> Result<CompletedPart> {
+    let started = Instant::now();
+    let joined = in_flight.join_next().await;
+    *waited += started.elapsed();
+    joined
         .context("no part upload was in flight")?
         .context("part upload task failed")?
 }
@@ -460,10 +563,11 @@ impl Storage {
     /// Streams a body to S3, hashing the bytes as they pass (spec 03-storage).
     /// Returns the sha256 of exactly what was stored, and its length.
     ///
-    /// One part is buffered at a time and a global permit is taken **before**
-    /// each read, so the reader can never race ahead of S3 and server memory
-    /// stays bounded by configuration rather than by client behaviour. Parts
-    /// upload on their own tasks while the next one is read.
+    /// One part is held at a time — as the request body's own chunks, never a
+    /// copy of them — and a global permit is taken **before** each read, so
+    /// the reader can never race ahead of S3 and server memory stays bounded
+    /// by configuration rather than by client behaviour. Parts upload on their
+    /// own tasks while the next one is read.
     ///
     /// `first_part_hint` is the most bytes the body is expected to hold. The
     /// first buffer reserves only that much (capped at a part), so a small NAR
@@ -481,17 +585,42 @@ impl Storage {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
+        let mut part_wait = Duration::ZERO;
+        let stored = self
+            .put_streaming_inner(key, body, limits, first_part_hint, &mut part_wait)
+            .await;
+        // Once per upload, failed ones included: the wait is what tells a
+        // slow store apart from a slow client. Milliseconds, not seconds:
+        // the metrics crate's counters take integers only, and a sub-second
+        // upload would otherwise record nothing.
+        metrics::counter!("garret_upload_s3_part_wait_milliseconds_total")
+            .increment(part_wait.as_millis() as u64);
+        stored
+    }
+
+    async fn put_streaming_inner<S, E>(
+        &self,
+        key: &str,
+        body: S,
+        limits: &UploadLimits,
+        first_part_hint: usize,
+        part_wait: &mut Duration,
+    ) -> Result<(Vec<u8>, i64)>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
         let mut reader = BodyReader::new(body, limits.body_idle);
 
         // First part decides the shape: if the whole body fits, one PutObject.
         let reserve = first_part_hint.clamp(1, limits.part_size);
         let permit = limits.acquire(reserve).await?;
-        let mut first = BytesMut::with_capacity(reserve);
+        let mut first = Part::default();
         reader.fill(&mut first, reserve, "first_part").await?;
         // The hint is a hard cap for a body that is not a whole part: more
         // data means the body exceeds what the caller will accept, so fail
         // rather than wait for more memory while holding a partial permit.
-        if first.len() == reserve
+        if first.len == reserve
             && reserve < limits.part_size
             && reader.has_more("first_part").await?
         {
@@ -499,9 +628,8 @@ impl Storage {
                 "upload body exceeds the {reserve}-byte limit for its size"
             ))));
         }
-        let first = first.freeze();
-        if first.len() < limits.part_size {
-            self.put(key, first).await?;
+        if first.len < limits.part_size {
+            self.put(key, first.into_bytes()).await?;
             drop(permit);
             return Ok(reader.finish());
         }
@@ -524,7 +652,7 @@ impl Storage {
         let mut parts = JoinSet::new();
         parts.spawn(self.upload_part(key, &upload_id, 1, first, permit));
         match self
-            .multipart_body(key, &upload_id, &mut parts, &mut reader, limits)
+            .multipart_body(key, &upload_id, &mut parts, &mut reader, limits, part_wait)
             .await
         {
             Ok(()) => Ok(reader.finish()),
@@ -564,6 +692,7 @@ impl Storage {
         in_flight: &mut JoinSet<Result<CompletedPart>>,
         reader: &mut BodyReader<S>,
         limits: &UploadLimits,
+        part_wait: &mut Duration,
     ) -> Result<()>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -576,10 +705,10 @@ impl Storage {
             // Room, then permit, then read: a part is never buffered before it
             // can be sent, so one NAR holds at most max_parts_in_flight slots.
             while in_flight.len() >= limits.max_parts_in_flight {
-                completed.push(collect(in_flight).await?);
+                completed.push(collect(in_flight, part_wait).await?);
             }
             let permit = limits.acquire(limits.part_size).await?;
-            let mut part = BytesMut::with_capacity(limits.part_size);
+            let mut part = Part::default();
             reader
                 .fill(&mut part, limits.part_size, "multipart")
                 .await?;
@@ -587,8 +716,7 @@ impl Storage {
                 drop(permit);
                 break;
             }
-            let part = part.freeze();
-            let is_final = part.len() < limits.part_size;
+            let is_final = part.len < limits.part_size;
 
             part_number += 1;
             in_flight.spawn(self.upload_part(key, upload_id, part_number, part, permit));
@@ -598,7 +726,7 @@ impl Storage {
         }
 
         while !in_flight.is_empty() {
-            completed.push(collect(in_flight).await?);
+            completed.push(collect(in_flight, part_wait).await?);
         }
 
         completed.sort_by_key(|p| p.part_number());
@@ -628,7 +756,7 @@ impl Storage {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        body: Bytes,
+        body: Part,
         permit: Reservation,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
         let (client, bucket, key, upload_id, sign_payload) = (
@@ -639,15 +767,29 @@ impl Storage {
             self.sign_payload,
         );
         async move {
-            let bytes = body.len() as u64;
+            let len = body.len;
             let started = Instant::now();
+            // The SDK would otherwise checksum a streaming body in a trailer,
+            // which switches the request to aws-chunked encoding; a checksum
+            // header is what the store expects and what spec 03 promises.
+            let crc32 = checksum_crc32(&body.chunks);
+            // SigV4 payload signing hashes the whole body, so that mode keeps
+            // the contiguous copy; the default path streams the chunks as
+            // they arrived.
+            let payload = if sign_payload {
+                ByteStream::from(body.into_bytes())
+            } else {
+                ByteStream::from(part_body(body.chunks, len))
+            };
             let part = client
                 .upload_part()
                 .bucket(&bucket)
                 .key(&key)
                 .upload_id(&upload_id)
                 .part_number(part_number)
-                .body(ByteStream::from(body))
+                .body(payload)
+                .content_length(len as i64)
+                .checksum_crc32(crc32)
                 .customize()
                 // S4 forbids re-uploading a part, so the SDK must not retry
                 // one: the caller aborts the whole multipart (spec 03-storage).
@@ -665,7 +807,7 @@ impl Storage {
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);
-            metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
+            metrics::counter!("garret_s3_bytes_uploaded_total").increment(len as u64);
             metrics::histogram!("garret_s3_part_duration_seconds").record(started.elapsed());
             Ok(CompletedPart::builder()
                 .part_number(part_number)
@@ -878,12 +1020,12 @@ mod tests {
     }
 
     /// One `fill` of a fresh `cap`-sized part, as `multipart_body` does it.
-    async fn read_part<S, E>(reader: &mut BodyReader<S>, cap: usize) -> Result<BytesMut>
+    async fn read_part<S, E>(reader: &mut BodyReader<S>, cap: usize) -> Result<Part>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        let mut part = BytesMut::with_capacity(cap);
+        let mut part = Part::default();
         reader.fill(&mut part, cap, "multipart").await?;
         Ok(part)
     }
@@ -914,8 +1056,8 @@ mod tests {
                 if part.is_empty() {
                     break;
                 }
-                let short = part.len() < part_size;
-                sizes.push(part.len());
+                let short = part.len < part_size;
+                sizes.push(part.len);
                 if short {
                     break;
                 }
@@ -989,7 +1131,7 @@ mod tests {
         ])
         .chain(futures::stream::pending());
         let mut reader = BodyReader::new(body, Duration::from_millis(10));
-        assert_eq!(read_part(&mut reader, 10).await.unwrap().len(), 10);
+        assert_eq!(read_part(&mut reader, 10).await.unwrap().len, 10);
         let err = read_part(&mut reader, 1024).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("after 13 bytes"), "{msg}");
@@ -1005,7 +1147,7 @@ mod tests {
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
         let mut reader = BodyReader::new(body, IDLE);
-        assert_eq!(read_part(&mut reader, 1024).await.unwrap().len(), 8);
+        assert_eq!(read_part(&mut reader, 1024).await.unwrap().len, 8);
     }
 
     /// Just enough S3 on a loopback port. Every call succeeds, except that
@@ -1060,6 +1202,147 @@ mod tests {
         }
 
         crate::testing::fake_s3(axum::Router::new().fallback(handle)).await
+    }
+
+    /// What the fake S3 saw of one `UploadPart` request.
+    #[derive(Clone, Debug)]
+    struct SeenPart {
+        number: i32,
+        content_length: Option<String>,
+        crc32: Option<String>,
+        /// The request was aws-chunked: a trailer checksum instead of a
+        /// header, and a body wrapped in chunk framing.
+        chunked: bool,
+        body: Vec<u8>,
+    }
+
+    /// A fake S3 that records every `UploadPart`, so a test can check the
+    /// bytes, the length and the checksum that actually went on the wire.
+    async fn recording_s3(seen: Arc<std::sync::Mutex<Vec<SeenPart>>>) -> Storage {
+        use axum::{
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let seen = seen.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let body = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let query = parts.uri.query().unwrap_or_default().to_owned();
+                let param = |name: &str| {
+                    query
+                        .split('&')
+                        .find_map(|p| p.strip_prefix(name)?.strip_prefix('='))
+                        .map(str::to_owned)
+                };
+                let xml = |body: String| ([("content-type", "application/xml")], body);
+                match parts.method {
+                    Method::POST
+                        if query
+                            .split('&')
+                            .any(|p| p.split('=').next() == Some("uploads")) =>
+                    {
+                        xml("<InitiateMultipartUploadResult><UploadId>u</UploadId>\
+                             </InitiateMultipartUploadResult>"
+                            .into())
+                        .into_response()
+                    }
+                    Method::POST => xml("<CompleteMultipartUploadResult/>".into()).into_response(),
+                    Method::PUT => {
+                        if let Some(number) = param("partNumber") {
+                            let header = |name: &str| {
+                                parts
+                                    .headers
+                                    .get(name)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned)
+                            };
+                            seen.lock().expect("seen lock").push(SeenPart {
+                                number: number.parse().expect("part number"),
+                                content_length: header("content-length"),
+                                crc32: header("x-amz-checksum-crc32"),
+                                chunked: header("content-encoding")
+                                    .is_some_and(|v| v.contains("aws-chunked"))
+                                    || header("x-amz-decoded-content-length").is_some(),
+                                body: body.to_vec(),
+                            });
+                        }
+                        [("etag", "\"e\"")].into_response()
+                    }
+                    _ => StatusCode::NO_CONTENT.into_response(),
+                }
+            }
+        });
+        crate::testing::fake_s3(app).await
+    }
+
+    /// A part is sent as the bytes that arrived, not a copy of them: chunk
+    /// boundaries that straddle part boundaries must still produce the exact
+    /// part bytes, the exact `Content-Length`, and a CRC32 header S3 can
+    /// verify over those bytes. A streaming body without that header would
+    /// make the SDK choose aws-chunked encoding with a trailer instead.
+    #[tokio::test]
+    async fn parts_are_sent_whole_with_their_crc32() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let storage = recording_s3(seen.clone()).await;
+        let part_size = 1024;
+        let limits = UploadLimits::new(part_size, 2, 4 * part_size as u64, IDLE);
+        let body: Vec<u8> = (0..2 * part_size + 300).map(|i| (i % 251) as u8).collect();
+        // Chunk boundaries at 700, 800, 1600, 2100: two fall inside a part.
+        let mut at = 0;
+        let chunks: Vec<_> = [700, 100, 800, 500, 248]
+            .iter()
+            .map(|&size| {
+                let chunk = Bytes::copy_from_slice(&body[at..at + size]);
+                at += size;
+                Ok::<_, std::io::Error>(chunk)
+            })
+            .collect();
+        assert_eq!(at, body.len());
+
+        let stored = storage
+            .put_streaming(
+                &key_for("parts"),
+                futures::stream::iter(chunks),
+                &limits,
+                part_size,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored, (Sha256::digest(&body).to_vec(), body.len() as i64));
+
+        let mut parts = seen.lock().expect("seen lock").clone();
+        parts.sort_by_key(|p| p.number);
+        assert_eq!(parts.len(), 3, "two whole parts and the tail");
+        let mut sent = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let start = index * part_size;
+            let end = (start + part_size).min(body.len());
+            assert_eq!(part.body, body[start..end], "part {} bytes", part.number);
+            let expected_len = (end - start).to_string();
+            assert_eq!(
+                part.content_length.as_deref(),
+                Some(expected_len.as_str()),
+                "part {} length",
+                part.number
+            );
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&part.body);
+            let expected_crc = B64.encode(hasher.finalize().to_be_bytes());
+            assert_eq!(
+                part.crc32.as_deref(),
+                Some(expected_crc.as_str()),
+                "part {} checksum",
+                part.number
+            );
+            assert!(!part.chunked, "part {} used aws-chunked", part.number);
+            sent.extend_from_slice(&part.body);
+        }
+        assert_eq!(sent, body, "the parts reassemble the body");
     }
 
     /// An upload is charged its hint (rounded up to a unit) while it waits on
