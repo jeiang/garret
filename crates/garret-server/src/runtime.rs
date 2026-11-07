@@ -102,7 +102,15 @@ where
     loop {
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+                Ok((stream, _)) => {
+                    // Small final responses (a narinfo, a redirect, an upload
+                    // ack) must not wait on Nagle for an ACK that may never
+                    // come. Failure is not fatal: the connection still works.
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::debug!("could not disable Nagle: {e}");
+                    }
+                    stream
+                }
                 // EMFILE and friends: back off instead of spinning.
                 Err(e) => {
                     tracing::warn!("accept failed: {e}");
