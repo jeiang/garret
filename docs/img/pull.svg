@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 300" width="820" height="300" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="14">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6e7681"/>
+    </marker>
+  </defs>
+
+  <g fill="none" stroke="#6e7681" stroke-width="1.5">
+    <rect x="60" y="16" width="140" height="36" rx="6"/>
+    <rect x="340" y="16" width="140" height="36" rx="6"/>
+    <rect x="620" y="16" width="140" height="36" rx="6"/>
+
+    <path d="M130,52 V280" stroke-dasharray="5 5" stroke-width="1"/>
+    <path d="M410,52 V280" stroke-dasharray="5 5" stroke-width="1"/>
+    <path d="M690,52 V280" stroke-dasharray="5 5" stroke-width="1"/>
+
+    <path d="M130,90 H410" marker-end="url(#arrow)"/>
+    <path d="M410,125 H130" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+    <path d="M130,175 H410" marker-end="url(#arrow)"/>
+    <path d="M410,210 H130" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+    <path d="M130,260 H690" marker-end="url(#arrow)"/>
+  </g>
+
+  <g fill="#6e7681" text-anchor="middle">
+    <text x="130" y="39">nix</text>
+    <text x="410" y="39">Puller</text>
+    <text x="690" y="39">S3 bucket</text>
+
+    <text x="270" y="84" font-size="12">narinfo for this store path</text>
+    <text x="270" y="119" font-size="12">signed narinfo</text>
+    <text x="270" y="169" font-size="12">the NAR</text>
+    <text x="270" y="204" font-size="12">redirect to a presigned URL</text>
+    <text x="410" y="254" font-size="12">fetch the NAR bytes</text>
+  </g>
+</svg>

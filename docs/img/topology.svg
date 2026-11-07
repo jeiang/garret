@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 340" width="1000" height="340" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="14">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6e7681"/>
+    </marker>
+  </defs>
+
+  <g fill="none" stroke="#6e7681" stroke-width="1.5">
+    <rect x="10" y="40" width="140" height="44" rx="6"/>
+    <rect x="330" y="40" width="130" height="44" rx="6"/>
+    <rect x="10" y="230" width="140" height="44" rx="6"/>
+    <rect x="330" y="230" width="130" height="44" rx="6"/>
+    <rect x="560" y="120" width="120" height="44" rx="6"/>
+    <rect x="800" y="120" width="120" height="44" rx="6"/>
+
+    <path d="M150,62 H330" marker-end="url(#arrow)"/>
+    <path d="M150,252 H330" marker-end="url(#arrow)"/>
+
+    <path d="M460,62 H500 V132 H560" marker-end="url(#arrow)"/>
+    <path d="M460,252 H520 V152 H560" marker-end="url(#arrow)"/>
+
+    <path d="M395,40 V20 H860 V120" marker-end="url(#arrow)"/>
+    <path d="M395,274 V300 H860 V164" marker-end="url(#arrow)"/>
+  </g>
+
+  <g fill="#6e7681" text-anchor="middle">
+    <text x="80" y="67">build machines</text>
+    <text x="395" y="67">Pusher</text>
+    <text x="80" y="257">any machine</text>
+    <text x="395" y="257">Puller</text>
+    <text x="620" y="147">SQLite</text>
+    <text x="860" y="147">S3 bucket</text>
+
+    <text x="240" y="52" font-size="12">push, signed in</text>
+    <text x="240" y="242" font-size="12">substituter, anonymous</text>
+    <text x="620" y="292" font-size="12">presigned redirect</text>
+  </g>
+</svg>

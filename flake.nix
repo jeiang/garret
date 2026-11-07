@@ -43,6 +43,7 @@
           root = ./docs;
           fileset = pkgs.lib.fileset.unions [
             ./docs/book.toml
+            ./docs/img
             (pkgs.lib.fileset.fileFilter (f: f.hasExt "md") ./docs)
           ];
         };

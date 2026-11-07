@@ -13,21 +13,7 @@ the metadata.
 
 ## Push
 
-```mermaid
-sequenceDiagram
-  participant C as garret client
-  participant P as Pusher
-  participant S as S3 bucket
-  C->>P: which of these store paths do you lack?
-  P-->>C: these N
-  loop each missing path, jobs at a time
-    C->>P: upload one compressed NAR
-    P->>P: check store path and claimed hash
-    P->>S: write the blob
-    P->>P: write the object's row
-    P-->>C: created
-  end
-```
+![Push sequence: the client negotiates, uploads each missing NAR, and the Pusher checks it, writes the blob, then writes the row.](img/push.svg)
 
 The client sends the whole closure once to ask what is missing, then uploads
 only what the cache lacks. Each path is one compressed NAR, streamed rather than
@@ -47,17 +33,7 @@ retrying after a dropped connection, produce the same result.
 
 ## Pull
 
-```mermaid
-sequenceDiagram
-  participant N as nix
-  participant R as Puller
-  participant S as S3 bucket
-  N->>R: narinfo for this store path
-  R-->>N: signed narinfo
-  N->>R: the NAR
-  R-->>N: redirect to a presigned URL
-  N->>S: fetch the NAR bytes
-```
+![Pull sequence: nix asks for narinfo, gets a signed one, asks for the NAR, gets a redirect, and fetches the bytes from the bucket.](img/pull.svg)
 
 The Puller signs narinfos with the cache's ed25519 keys, so nix verifies them
 like any other cache. It never proxies NAR bytes: it answers with a redirect to

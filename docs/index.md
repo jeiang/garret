@@ -15,15 +15,7 @@ points at it. Both run on one host over SQLite and an S3-compatible bucket.
 
 ## Topology
 
-```mermaid
-flowchart LR
-  builders["build machines"] -->|"push protocol, signed in"| pusher["Pusher"]
-  clients["any machine"] -->|"substituter protocol, anonymous"| puller["Puller"]
-  pusher --> db[("SQLite")]
-  puller --> db
-  puller -->|"presigned redirect"| s3[("S3 bucket")]
-  pusher --> s3
-```
+![Topology: build machines push to the Pusher, any machine pulls from the Puller, and both share one SQLite database and one S3 bucket.](img/topology.svg)
 
 The two services are separate because they face different audiences: the Pusher
 decides who may write, and the Puller serves reads to the world. They share one

@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 380" width="820" height="380" font-family="ui-sans-serif, system-ui, -apple-system, sans-serif" font-size="14">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#6e7681"/>
+    </marker>
+  </defs>
+
+  <g fill="none" stroke="#6e7681" stroke-width="1.5">
+    <rect x="60" y="16" width="140" height="36" rx="6"/>
+    <rect x="340" y="16" width="140" height="36" rx="6"/>
+    <rect x="620" y="16" width="140" height="36" rx="6"/>
+
+    <path d="M130,52 V360" stroke-dasharray="5 5" stroke-width="1"/>
+    <path d="M410,52 V360" stroke-dasharray="5 5" stroke-width="1"/>
+    <path d="M690,52 V360" stroke-dasharray="5 5" stroke-width="1"/>
+
+    <path d="M130,90 H410" marker-end="url(#arrow)"/>
+    <path d="M410,125 H130" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+    <path d="M130,175 H410" marker-end="url(#arrow)"/>
+    <path d="M410,255 H690" marker-end="url(#arrow)"/>
+    <path d="M410,335 H130" stroke-dasharray="5 5" marker-end="url(#arrow)"/>
+
+    <rect x="408" y="196" width="228" height="36" rx="6" stroke-dasharray="4 4"/>
+    <rect x="408" y="276" width="228" height="36" rx="6" stroke-dasharray="4 4"/>
+  </g>
+
+  <g fill="#6e7681" text-anchor="middle">
+    <text x="130" y="39">garret client</text>
+    <text x="410" y="39">Pusher</text>
+    <text x="690" y="39">S3 bucket</text>
+
+    <text x="270" y="84" font-size="12">which of these store paths do you lack?</text>
+    <text x="270" y="119" font-size="12">these N</text>
+    <text x="270" y="169" font-size="12">upload one compressed NAR</text>
+    <text x="550" y="247" font-size="12">write the blob</text>
+    <text x="270" y="329" font-size="12">created</text>
+
+    <text x="522" y="219" font-size="12">check store path and claimed hash</text>
+    <text x="522" y="299" font-size="12">write the object&#8217;s row</text>
+  </g>
+</svg>
