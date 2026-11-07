@@ -559,13 +559,11 @@ async fn store_upload(
         .increment(client_wait.as_millis() as u64);
     metrics::counter!("garret_upload_verify_wait_milliseconds_total")
         .increment(verify_wait.as_millis() as u64);
-    // Only an `Accepted` verdict may be signed (ADR-0010), and it carries
-    // the FileHash: the check hashed every compressed byte on its way past,
-    // off the request task. No verdict means the stream never reached its
-    // end: the store failed, and its error is the cause. A store that
-    // succeeded without one is a server bug.
-    let digest = match nar.into_outcome() {
-        Some(verify::Outcome::Accepted(file_hash)) => file_hash,
+    // Only an `Accepted` verdict may be signed (ADR-0010). No verdict means
+    // the stream never reached its end: the store failed, and its error is
+    // the cause. A store that succeeded without one is a server bug.
+    match nar.into_outcome() {
+        Some(verify::Outcome::Accepted) => {}
         Some(verify::Outcome::Failed(reason)) => return Err(anyhow::anyhow!(reason).into()),
         Some(verify::Outcome::Refused(reason)) => {
             return Err(Error::refused(reason));
@@ -574,8 +572,8 @@ async fn store_upload(
             stored?;
             return Err(anyhow::anyhow!("stored a NAR the check never accepted").into());
         }
-    };
-    let file_size = stored?;
+    }
+    let (digest, file_size) = stored?;
 
     // Server-computed over exactly the bytes stored — what nix checks the
     // redirected download against (ADR-0005).
