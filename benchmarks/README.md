@@ -36,12 +36,14 @@ the 20 pushers are not shed.
 
 The RSS criterion (peak pusher RSS < 2x the 256 MiB in-flight cap, i.e.
 512 MiB) held in every configuration, with zero failed requests and zero
-shed retries throughout. A second pass on the Mac agreed within 2% on
-every scenario. On artemis, a second pass of the matrix agreed within 9%
-on push, streams and RSS, but not on pull: the 1200-request scenario lasts
-about 30 ms on 8 cores, and the two unpinned configs came in 26–29% lower
-on the second pass (the 1-CPU configs agreed within 1%). Treat the
-unpinned artemis pull column as indicative only; for pull comparisons, run
+shed retries throughout. A second pass on the Mac agreed within 2% on push,
+the 1 MiB and 100 MiB streams, pull and RSS; the 2 GiB stream came in 5%
+higher and push p99 8% higher. On artemis, a second pass of the matrix
+agreed within 9% on push, streams and RSS, but not on pull: the
+1200-request scenario lasts about 30 ms on 8 cores, and the two unpinned
+configs came in 26–29% lower on the second pass (the 1-CPU configs agreed
+within 1%). Treat the unpinned artemis pull column as indicative only; for
+pull comparisons, run
 `GARRET_BENCH_ARGS="--passes 100 --no-giant" just bench-local` (40,000
 requests). Most such runs on artemis agree within about 2%, but about one
 in five came in 4–18% low, so compare the best of three.
