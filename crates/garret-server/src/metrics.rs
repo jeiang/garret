@@ -3,7 +3,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::Instant,
 };
 
@@ -109,51 +109,70 @@ pub async fn track_http(request: Request, next: Next) -> Response {
     };
 
     let status = status_index(response.status().as_u16());
-    handles.requests[method][status].increment(1);
-    handles.duration[method].record(started.elapsed());
+    handles.counter(method, status).increment(1);
+    handles.duration(method).record(started.elapsed());
     response
 }
 
-/// The resolved metric handles for one route template. Route templates are
-/// static and few, so each is resolved through the recorder once and reused:
-/// the steady state is one read-locked lookup and no allocation.
+/// The metric handles for one route template. Route templates are static and
+/// few, so the set is resolved once per route and reused: the steady state is
+/// one read-locked lookup, one `Arc` clone and no allocation.
+///
+/// Each handle is resolved on first *use*, not on first sight of the route:
+/// registering one puts a series in `/metrics`, so a route that only ever
+/// serves 200s must not grow zero-valued series for every other method and
+/// status class it could have produced.
 struct RouteHandles {
+    /// The route template, kept for the label value when a handle is resolved.
+    route: Arc<str>,
     /// `garret_http_requests_total`, indexed by method then status class.
-    requests: [[metrics::Counter; STATUS_CLASSES.len()]; METHODS.len()],
+    requests: [[OnceLock<metrics::Counter>; STATUS_CLASSES.len()]; METHODS.len()],
     /// `garret_http_request_duration_seconds`, indexed by method.
-    duration: [metrics::Histogram; METHODS.len()],
+    duration: [OnceLock<metrics::Histogram>; METHODS.len()],
     /// `garret_http_requests_in_flight` (unlabelled). One handle per route
     /// rather than one global, so a test's local recorder sees its own series;
     /// every handle still names the same series.
-    in_flight: metrics::Gauge,
+    in_flight: OnceLock<metrics::Gauge>,
 }
 
 impl RouteHandles {
-    fn new(route: &str) -> Self {
-        let requests = METHODS.map(|method| {
-            STATUS_CLASSES.map(|status| {
-                metrics::counter!(
-                    "garret_http_requests_total",
-                    "route" => route.to_owned(), "method" => method, "status" => status,
-                )
-            })
-        });
-        let duration = METHODS.map(|method| {
+    fn new(route: Arc<str>) -> Self {
+        Self {
+            route,
+            requests: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
+            duration: std::array::from_fn(|_| OnceLock::new()),
+            in_flight: OnceLock::new(),
+        }
+    }
+
+    fn counter(&self, method: usize, status: usize) -> &metrics::Counter {
+        self.requests[method][status].get_or_init(|| {
+            metrics::counter!(
+                "garret_http_requests_total",
+                "route" => self.route.to_string(),
+                "method" => METHODS[method],
+                "status" => STATUS_CLASSES[status],
+            )
+        })
+    }
+
+    fn duration(&self, method: usize) -> &metrics::Histogram {
+        self.duration[method].get_or_init(|| {
             metrics::histogram!(
                 "garret_http_request_duration_seconds",
-                "route" => route.to_owned(), "method" => method,
+                "route" => self.route.to_string(), "method" => METHODS[method],
             )
-        });
-        Self {
-            requests,
-            duration,
-            in_flight: metrics::gauge!("garret_http_requests_in_flight"),
-        }
+        })
+    }
+
+    fn in_flight(&self) -> &metrics::Gauge {
+        self.in_flight
+            .get_or_init(|| metrics::gauge!("garret_http_requests_in_flight"))
     }
 }
 
-/// Resolved handles per route template, filled on first sight. Route
-/// templates are static and few, so the map is bounded.
+/// Handles per route template, filled on first sight. Route templates are
+/// static and few, so the map is bounded.
 static ROUTES: LazyLock<RwLock<HashMap<Arc<str>, Arc<RouteHandles>>>> =
     LazyLock::new(RwLock::default);
 
@@ -168,11 +187,15 @@ fn route_handles(route: &str) -> Arc<RouteHandles> {
         }
     }
     let mut routes = ROUTES.write();
-    Arc::clone(
-        routes
-            .entry(Arc::from(route))
-            .or_insert_with(|| Arc::new(RouteHandles::new(route))),
-    )
+    // Another thread may have filled it while this one waited for the write
+    // lock; only the first gets to build the handles.
+    if let Some(handles) = routes.get(route) {
+        return Arc::clone(handles);
+    }
+    let key: Arc<str> = Arc::from(route);
+    let handles = Arc::new(RouteHandles::new(Arc::clone(&key)));
+    routes.insert(key, Arc::clone(&handles));
+    handles
 }
 
 /// Counts a request in `garret_http_requests_in_flight` while it lives, so a
@@ -181,14 +204,14 @@ struct InFlight(Arc<RouteHandles>);
 
 impl InFlight {
     fn enter(handles: &Arc<RouteHandles>) -> Self {
-        handles.in_flight.increment(1.0);
+        handles.in_flight().increment(1.0);
         Self(Arc::clone(handles))
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.in_flight.decrement(1.0);
+        self.0.in_flight().decrement(1.0);
     }
 }
 
@@ -300,6 +323,38 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("0123456789abcdef"), "{out}");
+    }
+
+    /// Only the combination that was served is registered: a route that has
+    /// only answered a GET with a 2xx must not export zero-valued series for
+    /// every other method and status class.
+    #[tokio::test]
+    async fn only_served_combinations_are_registered() {
+        use tower::ServiceExt;
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let app = Router::new()
+            .route("/only/{id}", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(track_http));
+        let request = axum::http::Request::get("/only/1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap();
+        let out = handle.render();
+        assert!(
+            out.contains(
+                r#"garret_http_requests_total{route="/only/{id}",method="GET",status="2xx"} 1"#
+            ),
+            "{out}"
+        );
+        for unserved in [
+            r#"route="/only/{id}",method="GET",status="5xx""#,
+            r#"route="/only/{id}",method="POST""#,
+            r#"route="/only/{id}",method="OTHER""#,
+        ] {
+            assert!(!out.contains(unserved), "{unserved} in {out}");
+        }
     }
 
     #[test]
