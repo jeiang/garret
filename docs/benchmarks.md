@@ -44,10 +44,12 @@ The Pusher runs the default limits — a 256 MiB in-flight cap, 16 MiB parts, 4
 parts in flight — except `max_concurrent_uploads`, raised from the default 16 to
 32 so the 20 pushers are not shed.
 
-On macOS, versitygw's `CompleteMultipartUpload` copies the parts instead of
-using `copy_file_range`, so a versitygw run's single-stream 100 MiB and 2 GiB
-results come out lower than the Garage-era numbers above; on Linux it uses
-`copy_file_range`.
+versitygw's `CompleteMultipartUpload` assembles the parts into the final object,
+which Garage does not, so single-stream multipart results include that
+server-side work. Measured on both hosts, completion took about 0.7–0.8 s per
+run against Garage's 0.2 s, and the 100 MiB stream came out 10–40% lower than
+on Garage (macOS 485–582 vs 815–829 MiB/s, Ryzen server 756–768 vs 866–883
+MiB/s). `copy_file_range` did not close the gap on the Ryzen server.
 
 ## Pass criteria
 
