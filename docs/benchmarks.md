@@ -46,8 +46,8 @@ parts in flight — except `max_concurrent_uploads`, raised from the default 16 
 
 versitygw's `CompleteMultipartUpload` assembles the parts into the final object,
 which Garage does not, so single-stream multipart results include that
-server-side work. Measured on both hosts, completion took about 0.7–0.8 s per
-run against Garage's 0.2 s, and the 100 MiB stream came out 10–40% lower than
+server-side work. Summed over one full run, completion took 0.7–2.0 s against
+Garage's 0.1–0.2 s on both hosts, and the 100 MiB stream came out 10–40% lower than
 on Garage (macOS 485–582 vs 815–829 MiB/s, Ryzen server 756–768 vs 866–883
 MiB/s). `copy_file_range` did not close the gap on the Ryzen server.
 
