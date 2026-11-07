@@ -1,5 +1,6 @@
 # Prometheus-format rules for Garret, loadable by Prometheus or vmalert.
-# Metric names: docs/spec/08-observability.md. The scrape job distinguishes
+# Metric names are the garret_* series exported at /metrics; see
+# docs/operations.md. The scrape job distinguishes
 # the Pusher from the Puller, so rules group by `job` and `instance`.
 groups:
   - name: garret-recording

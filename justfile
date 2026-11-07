@@ -12,6 +12,11 @@ check:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo fmt --check
 
+# Build the documentation book and the agent artifacts into docs/book
+docs:
+	mdbook build docs
+	python3 scripts/gen-llms.py docs docs/book
+
 # End-to-end gate: push a real store path and substitute it back out
 e2e:
 	nix develop --command scripts/e2e.sh

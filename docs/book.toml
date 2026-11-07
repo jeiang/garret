@@ -1,0 +1,10 @@
+[book]
+title = "garret"
+language = "en"
+src = "."
+
+[build]
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/jeiang/garret"
