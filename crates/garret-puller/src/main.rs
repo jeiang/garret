@@ -142,12 +142,21 @@ const BUMP_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// their next hit.
 const BUMP_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Most distinct hashes one flush window may queue. A cache with more stale
+/// objects than this drops the overflow: the row stays stale, so its next hit
+/// queues it again after the flush.
+const BUMP_QUEUE_MAX: usize = 100_000;
+
 /// Last-accessed bumps waiting for the next flush (spec 02). Only hits on
-/// stale rows are queued, so it is bounded by the object count.
+/// stale rows are queued, so it is bounded by the object count — and capped at
+/// [`BUMP_QUEUE_MAX`], so a large cache cannot grow it without bound between
+/// flushes.
 struct Bumps {
     pending: Mutex<HashSet<String>>,
     /// Seconds a row's `last_accessed_at` counts as fresh.
     debounce: i64,
+    /// Distinct hashes the queue may hold ([`BUMP_QUEUE_MAX`] outside tests).
+    max: usize,
 }
 
 impl Bumps {
@@ -155,6 +164,7 @@ impl Bumps {
         Self {
             pending: Mutex::default(),
             debounce,
+            max: BUMP_QUEUE_MAX,
         }
     }
 
@@ -168,6 +178,10 @@ impl Bumps {
         let mut pending = self.pending.lock();
         // Not a bare insert: that would allocate the owned key on every repeat hit.
         if !pending.contains(hash) {
+            if pending.len() >= self.max {
+                metrics::counter!("garret_bump_dropped_total").increment(1);
+                return;
+            }
             pending.insert(hash.to_owned());
         }
         metrics::gauge!("garret_bump_queue_depth").set(pending.len() as f64);
@@ -925,6 +939,33 @@ mod tests {
         assert_eq!(cache.get("c", later), None);
         assert_eq!(cache.get("d", later).as_deref(), Some("ud"));
         assert_eq!(cache.get("e", later).as_deref(), Some("ue"));
+    }
+
+    /// The queue is capped: overflow is dropped, and a dropped hash is queued
+    /// again by its next hit once the flush has run.
+    #[test]
+    fn the_bump_queue_is_capped_and_a_dropped_hit_requeues_later() {
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let hashes = ["a".repeat(32), "b".repeat(32), "c".repeat(32)];
+        for hash in &hashes {
+            db::insert_object(&mut conn, &object(hash), 1000).unwrap();
+        }
+        let bumps = Bumps {
+            pending: Mutex::default(),
+            debounce: DAY,
+            max: 2,
+        };
+        let now = 1000 + 2 * DAY;
+        for hash in &hashes {
+            bumps.hit(hash, 1000, now);
+        }
+        assert_eq!(bumps.pending.lock().len(), 2);
+
+        assert_eq!(bumps.flush(&mut conn, now).unwrap(), 2);
+        // The dropped hash's row is still stale, so its next hit queues it.
+        bumps.hit(&hashes[2], 1000, now);
+        assert_eq!(bumps.pending.lock().len(), 1);
     }
 
     /// Flushes `state`'s queued bumps on its pull connection; how many it wrote.
