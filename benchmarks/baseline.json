@@ -1,71 +1,80 @@
 {
   "meta": {
     "arch": "aarch64",
+    "corpus_version": 2,
     "cpus": 11,
     "label": "macos-aarch64",
     "os": "macos",
     "seed": 20250806,
-    "timestamp_unix": 1790218652,
+    "timestamp_unix": 1794054357,
     "version": "0.1.0"
   },
-  "pull": {
-    "concurrency": 20,
-    "failed": 0,
-    "keepalive": true,
-    "narinfo_p50_ms": 0.426,
-    "narinfo_p99_ms": 1.525,
-    "passes": 3,
-    "redirect_p50_ms": 0.492,
-    "redirect_p99_ms": 2.268,
-    "requests": 1200,
-    "requests_per_sec": 36301.02589421754,
-    "wall_seconds": 0.033056917,
-    "zero_failures": true
-  },
+  "pull": [
+    {
+      "concurrency": 20,
+      "failed": 0,
+      "keepalive": true,
+      "narinfo_p50_ms": 0.349,
+      "narinfo_p99_ms": 1.516,
+      "passes": 3,
+      "redirect_p50_ms": 0.411,
+      "redirect_p99_ms": 2.221,
+      "requests": 1200,
+      "requests_per_sec": 45713.85034428244,
+      "wall_seconds": 0.02625025,
+      "zero_failures": true
+    }
+  ],
   "push": {
     "concurrency": 20,
     "corpus_bytes": 668784240,
     "corpus_entries": 200,
     "dropped_retries": 0,
     "failed": 0,
-    "max_ms": 427,
-    "median_ms": 72,
-    "nar_mib_per_sec": 477.12901708142914,
-    "p99_ms": 340,
-    "p99_slowdown": 160.0,
+    "max_ms": 209,
+    "median_ms": 46,
+    "nar_mib_per_sec": 734.048322348558,
+    "p99_ms": 170,
+    "p99_slowdown": 108.0,
     "pushed": 200,
     "shed_retries": 0,
-    "uncontended_median_ms": 3,
-    "wall_seconds": 1.336750292,
-    "wire_bytes": 155053914,
-    "wire_mib_per_sec": 110.61971433634328,
+    "uncontended_median_ms": 2,
+    "wall_seconds": 0.868883333,
+    "wire_bytes": 155238785,
+    "wire_mib_per_sec": 170.38794109843033,
     "zero_failures": true
   },
   "stream": [
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.012821167,
-      "mib_per_sec": 77.99602017507455,
+      "median_seconds": 0.004175334,
+      "mib_per_sec": 239.50179793999712,
       "reps": 3,
+      "shed_retries": 0,
       "size_bytes": 1048576
     },
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 0.380146542,
-      "mib_per_sec": 263.05645047798436,
+      "median_seconds": 0.117392125,
+      "mib_per_sec": 851.8458968180362,
       "reps": 3,
+      "shed_retries": 0,
       "size_bytes": 104857600
     },
     {
+      "dropped_retries": 0,
       "failed": 0,
-      "median_seconds": 5.719559375,
-      "mib_per_sec": 358.0695409775338,
+      "median_seconds": 2.35351075,
+      "mib_per_sec": 870.1893543507291,
       "reps": 1,
+      "shed_retries": 0,
       "size_bytes": 2147483648
     }
   ],
   "pusher_rss": {
-    "peak_kib": 222704,
-    "final_kib": 222704
+    "peak_kib": 157680,
+    "final_kib": 97712
   }
 }
