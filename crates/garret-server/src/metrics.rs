@@ -1,11 +1,7 @@
 //! Prometheus metrics on a dedicated internal listener (spec 08-observability).
 //! The public listener never exposes them.
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock},
-    time::Instant,
-};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::{
@@ -16,7 +12,6 @@ use axum::{
     routing::get,
 };
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
-use parking_lot::RwLock;
 
 /// Histogram of waits for a SQLite connection's lock, labelled by `conn`.
 pub const DB_LOCK_WAIT_SECONDS: &str = "garret_db_lock_wait_seconds";
@@ -85,134 +80,74 @@ pub(crate) fn router(handle: PrometheusHandle) -> Router {
         .route("/healthz", get(|| async { "ok" }))
 }
 
-/// The bounded label values [`track_http`] emits, in index order: the method
-/// label and the status class. Anything else collapses to the last entry, so
-/// a client cannot mint series with extension methods or odd codes.
-const METHODS: [&str; 6] = ["GET", "HEAD", "POST", "PUT", "DELETE", "OTHER"];
-const STATUS_CLASSES: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
-
 /// Per-request metrics with bounded labels only: the matched route template,
 /// never the concrete path (a store path hash as a label would explode series).
 pub async fn track_http(request: Request, next: Next) -> Response {
     let route = request
         .extensions()
         .get::<MatchedPath>()
-        .map(|p| p.as_str())
-        .unwrap_or("unmatched");
-    let method = method_index(request.method());
-    let handles = route_handles(route);
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".into());
+    let method = method_label(request.method());
 
     let started = Instant::now();
     let response = {
-        let _in_flight = InFlight::enter(&handles);
+        let _in_flight = InFlight::enter();
         next.run(request).await
     };
 
-    let status = status_index(response.status().as_u16());
-    handles.requests[method][status].increment(1);
-    handles.duration[method].record(started.elapsed());
-    response
-}
-
-/// The resolved metric handles for one route template. Route templates are
-/// static and few, so each is resolved through the recorder once and reused:
-/// the steady state is one read-locked lookup and no allocation.
-struct RouteHandles {
-    /// `garret_http_requests_total`, indexed by method then status class.
-    requests: [[metrics::Counter; STATUS_CLASSES.len()]; METHODS.len()],
-    /// `garret_http_request_duration_seconds`, indexed by method.
-    duration: [metrics::Histogram; METHODS.len()],
-    /// `garret_http_requests_in_flight` (unlabelled). One handle per route
-    /// rather than one global, so a test's local recorder sees its own series;
-    /// every handle still names the same series.
-    in_flight: metrics::Gauge,
-}
-
-impl RouteHandles {
-    fn new(route: &str) -> Self {
-        let requests = METHODS.map(|method| {
-            STATUS_CLASSES.map(|status| {
-                metrics::counter!(
-                    "garret_http_requests_total",
-                    "route" => route.to_owned(), "method" => method, "status" => status,
-                )
-            })
-        });
-        let duration = METHODS.map(|method| {
-            metrics::histogram!(
-                "garret_http_request_duration_seconds",
-                "route" => route.to_owned(), "method" => method,
-            )
-        });
-        Self {
-            requests,
-            duration,
-            in_flight: metrics::gauge!("garret_http_requests_in_flight"),
-        }
-    }
-}
-
-/// Resolved handles per route template, filled on first sight. Route
-/// templates are static and few, so the map is bounded.
-static ROUTES: LazyLock<RwLock<HashMap<Arc<str>, Arc<RouteHandles>>>> =
-    LazyLock::new(RwLock::default);
-
-/// The handles for `route`, resolved on first sight. The fast path is a
-/// read-locked lookup by `&str` and an `Arc` clone: no allocation, no
-/// recorder lookup.
-fn route_handles(route: &str) -> Arc<RouteHandles> {
-    {
-        let routes = ROUTES.read();
-        if let Some(handles) = routes.get(route) {
-            return Arc::clone(handles);
-        }
-    }
-    let mut routes = ROUTES.write();
-    Arc::clone(
-        routes
-            .entry(Arc::from(route))
-            .or_insert_with(|| Arc::new(RouteHandles::new(route))),
+    let status = status_class(response.status().as_u16());
+    metrics::counter!(
+        "garret_http_requests_total",
+        "route" => route.clone(), "method" => method, "status" => status,
     )
+    .increment(1);
+    metrics::histogram!(
+        "garret_http_request_duration_seconds",
+        "route" => route, "method" => method,
+    )
+    .record(started.elapsed());
+    response
 }
 
 /// Counts a request in `garret_http_requests_in_flight` while it lives, so a
 /// handler future dropped mid-request (client disconnect) still gives it back.
-struct InFlight(Arc<RouteHandles>);
+struct InFlight;
 
 impl InFlight {
-    fn enter(handles: &Arc<RouteHandles>) -> Self {
-        handles.in_flight.increment(1.0);
-        Self(Arc::clone(handles))
+    fn enter() -> Self {
+        metrics::gauge!("garret_http_requests_in_flight").increment(1.0);
+        Self
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.in_flight.decrement(1.0);
+        metrics::gauge!("garret_http_requests_in_flight").decrement(1.0);
     }
 }
 
 /// Status *class*, not code — one series per class keeps cardinality bounded.
-fn status_index(status: u16) -> usize {
+fn status_class(status: u16) -> &'static str {
     match status {
-        100..=199 => 0,
-        200..=299 => 1,
-        300..=399 => 2,
-        400..=499 => 3,
-        _ => 4,
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
     }
 }
 
 /// Bounded method label: anything but the standard five collapses to `OTHER`,
 /// so a client sending arbitrary extension methods cannot mint series.
-fn method_index(method: &axum::http::Method) -> usize {
+fn method_label(method: &axum::http::Method) -> &'static str {
     match *method {
-        axum::http::Method::GET => 0,
-        axum::http::Method::HEAD => 1,
-        axum::http::Method::POST => 2,
-        axum::http::Method::PUT => 3,
-        axum::http::Method::DELETE => 4,
-        _ => 5,
+        axum::http::Method::GET => "GET",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        _ => "OTHER",
     }
 }
 
@@ -274,28 +209,16 @@ mod tests {
                 axum::routing::any(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
             )
             .layer(axum::middleware::from_fn(track_http));
-        let request = || {
-            axum::http::Request::builder()
-                .method(axum::http::Method::from_bytes(b"BREW").unwrap())
-                .uri("/item/0123456789abcdef")
-                .body(axum::body::Body::empty())
-                .unwrap()
-        };
-        app.clone().oneshot(request()).await.unwrap();
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::from_bytes(b"BREW").unwrap())
+            .uri("/item/0123456789abcdef")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        app.oneshot(request).await.unwrap();
         let out = handle.render();
         assert!(
             out.contains(
                 r#"garret_http_requests_total{route="/item/{id}",method="OTHER",status="5xx"} 1"#
-            ),
-            "{out}"
-        );
-        // The second request reuses the cached handles, so it lands on the
-        // same series rather than minting one of its own.
-        app.oneshot(request()).await.unwrap();
-        let out = handle.render();
-        assert!(
-            out.contains(
-                r#"garret_http_requests_total{route="/item/{id}",method="OTHER",status="5xx"} 2"#
             ),
             "{out}"
         );
