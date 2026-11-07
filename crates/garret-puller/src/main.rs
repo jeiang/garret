@@ -2,7 +2,7 @@
 //! signatures) and redirects NAR requests to presigned S3 URLs (ADR-0005).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -48,6 +48,7 @@ struct AppState {
     db: OnceLock<Db>,
     storage: Storage,
     presign_ttl: Duration,
+    presigns: PresignCache,
     bumps: Bumps,
     db_read_budget: Duration,
     presign_budget: Duration,
@@ -60,6 +61,76 @@ impl AppState {
     fn db(&self) -> Option<&Db> {
         self.db.get()
     }
+}
+
+/// How many presigned URLs the cache holds before it makes room. Each entry is
+/// a key, a URL and an instant — under a kilobyte — so this bounds the cache at
+/// tens of megabytes however many objects the cache serves.
+const PRESIGN_CACHE_MAX: usize = 100_000;
+
+/// Presigned NAR URLs, reused while at least half their lifetime remains.
+///
+/// SigV4 signing is 19-31% of the Puller's CPU under pull load, and the same
+/// object is redirected again and again. Reuse is safe for the client: a
+/// redirect never hands out a URL with less than half of `presign_ttl` left,
+/// so a client that starts fetching right after the redirect still has half
+/// the window to finish.
+struct PresignCache {
+    ttl: Duration,
+    /// Distinct keys the cache may hold ([`PRESIGN_CACHE_MAX`] outside tests).
+    max: usize,
+    entries: Mutex<HashMap<String, Presigned>>,
+}
+
+struct Presigned {
+    url: String,
+    /// When the URL was signed; its expiry is `signed_at + ttl`.
+    signed_at: Instant,
+}
+
+impl PresignCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            max: PRESIGN_CACHE_MAX,
+            entries: Mutex::default(),
+        }
+    }
+
+    /// The cached URL for `key`, if it still has at least half its lifetime
+    /// left at `now`.
+    fn get(&self, key: &str, now: Instant) -> Option<String> {
+        let entries = self.entries.lock();
+        let entry = entries.get(key)?;
+        reusable(entry.signed_at, now, self.ttl).then(|| entry.url.clone())
+    }
+
+    /// Caches `url` for `key`, signed at `now`.
+    fn insert(&self, key: String, url: String, now: Instant) {
+        let mut entries = self.entries.lock();
+        if entries.len() >= self.max && !entries.contains_key(&key) {
+            // Full: drop what could not be reused anyway. If nothing could be
+            // dropped, everything in it is live and it is cleared: the next
+            // redirect then re-signs, which is only what it did before.
+            entries.retain(|_, entry| reusable(entry.signed_at, now, self.ttl));
+            if entries.len() >= self.max {
+                entries.clear();
+            }
+        }
+        entries.insert(
+            key,
+            Presigned {
+                url,
+                signed_at: now,
+            },
+        );
+    }
+}
+
+/// Whether a URL signed at `signed_at` for `ttl` still has at least half its
+/// lifetime left at `now`.
+fn reusable(signed_at: Instant, now: Instant, ttl: Duration) -> bool {
+    now.duration_since(signed_at) * 2 <= ttl
 }
 
 /// How often queued last-accessed bumps are written. LRU needs only day
@@ -319,6 +390,7 @@ async fn main() -> Result<()> {
         db: OnceLock::new(),
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
+        presigns: PresignCache::new(Duration::from_secs(cfg.presign_ttl_secs)),
         bumps: Bumps::new(cfg.bump_debounce_secs),
         db_read_budget: Duration::from_millis(cfg.db_read_budget_ms),
         presign_budget: Duration::from_millis(cfg.presign_budget_ms),
@@ -554,25 +626,35 @@ async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
         Ok(false) => return Outcome::Miss,
         Err(degraded) => return Outcome::Degraded(degraded),
     }
-    let started = Instant::now();
-    match tokio::time::timeout(
-        state.presign_budget,
-        state
-            .storage
-            .presigned_get(&storage::key_for(hash), state.presign_ttl),
-    )
-    .await
-    {
-        Ok(Ok(url)) => {
-            metrics::histogram!("garret_presign_duration_seconds").record(started.elapsed());
-            Outcome::Hit(Redirect::temporary(&url).into_response())
+    let key = storage::key_for(hash);
+    let url = match state.presigns.get(&key, Instant::now()) {
+        Some(url) => {
+            metrics::counter!("garret_presign_cache_hits_total").increment(1);
+            url
         }
-        Ok(Err(e)) => {
-            tracing::error!("presigning {hash}: {e:#}");
-            Outcome::Degraded(Degraded::PresignError)
+        None => {
+            let started = Instant::now();
+            let signed = tokio::time::timeout(
+                state.presign_budget,
+                state.storage.presigned_get(&key, state.presign_ttl),
+            )
+            .await;
+            match signed {
+                Ok(Ok(url)) => {
+                    metrics::histogram!("garret_presign_duration_seconds")
+                        .record(started.elapsed());
+                    state.presigns.insert(key, url.clone(), started);
+                    url
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("presigning {hash}: {e:#}");
+                    return Outcome::Degraded(Degraded::PresignError);
+                }
+                Err(_elapsed) => return Outcome::Degraded(Degraded::PresignTimeout),
+            }
         }
-        Err(_elapsed) => Outcome::Degraded(Degraded::PresignTimeout),
-    }
+    };
+    Outcome::Hit(Redirect::temporary(&url).into_response())
 }
 
 async fn require_browse_oidc(
@@ -737,6 +819,53 @@ mod tests {
 
     const DAY: i64 = 86400;
 
+    /// A URL is reused while at least half its lifetime is left, so every
+    /// redirect hands out one valid for at least `ttl / 2`.
+    #[test]
+    fn a_presigned_url_is_reused_until_half_its_lifetime_is_left() {
+        let cache = PresignCache::new(Duration::from_secs(3600));
+        let signed = Instant::now();
+        let at = |secs| signed + Duration::from_secs(secs);
+        cache.insert("nar/a.nar.zst".into(), "https://bucket/a".into(), signed);
+        assert_eq!(
+            cache.get("nar/a.nar.zst", at(0)).as_deref(),
+            Some("https://bucket/a")
+        );
+        assert_eq!(
+            cache.get("nar/a.nar.zst", at(1800)).as_deref(),
+            Some("https://bucket/a")
+        );
+        assert_eq!(cache.get("nar/a.nar.zst", at(1801)), None);
+        assert_eq!(cache.get("nar/b.nar.zst", at(0)), None);
+    }
+
+    /// The cache is bounded: full, it drops what it can no longer reuse, and
+    /// clears itself when everything in it is still live.
+    #[test]
+    fn the_presign_cache_is_bounded() {
+        let ttl = Duration::from_secs(3600);
+        let cache = PresignCache {
+            ttl,
+            max: 2,
+            entries: Mutex::default(),
+        };
+        let signed = Instant::now();
+        let later = signed + Duration::from_secs(1801);
+        cache.insert("a".into(), "ua".into(), signed);
+        cache.insert("b".into(), "ub".into(), signed);
+        // Full of live URLs: cleared rather than grown.
+        cache.insert("c".into(), "uc".into(), signed);
+        assert_eq!(cache.entries.lock().len(), 1);
+
+        // Full again, with one entry past reuse: that one goes, the live one stays.
+        cache.insert("d".into(), "ud".into(), later);
+        cache.insert("e".into(), "ue".into(), later);
+        assert_eq!(cache.entries.lock().len(), 2);
+        assert_eq!(cache.get("c", later), None);
+        assert_eq!(cache.get("d", later).as_deref(), Some("ud"));
+        assert_eq!(cache.get("e", later).as_deref(), Some("ue"));
+    }
+
     /// Flushes `state`'s queued bumps on its pull connection; how many it wrote.
     async fn flush(state: &AppState) -> usize {
         let mut conn = state.db().unwrap().pull.lock().await;
@@ -874,6 +1003,7 @@ mod tests {
             db: OnceLock::new(),
             storage,
             presign_ttl: Duration::from_secs(1),
+            presigns: PresignCache::new(Duration::from_secs(1)),
             bumps: Bumps::new(DAY),
             db_read_budget: Duration::from_secs(1),
             presign_budget: Duration::from_secs(1),
