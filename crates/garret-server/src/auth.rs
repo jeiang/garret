@@ -92,13 +92,19 @@ type Attempt = Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>;
 
 struct Issuer {
     cfg: IssuerConfig,
+    /// Built once, when the issuer is: `Validation` owns the audience
+    /// `HashSet` and the required-claim list, so rebuilding it per request
+    /// allocated on every one.
+    validation: Validation,
     keys: RwLock<KeyCache>,
     refresh: Mutex<RefreshState>,
 }
 
 #[derive(Default)]
 struct KeyCache {
-    by_kid: HashMap<String, DecodingKey>,
+    /// Shared, so a refresh that swaps the map leaves verifications already
+    /// in flight holding a key that stays valid.
+    by_kid: HashMap<String, Arc<DecodingKey>>,
     /// Last successful fetch + `KEY_TTL`; `None` until the first one.
     expires_at: Option<Instant>,
 }
@@ -130,8 +136,10 @@ impl Authenticator {
             issuers: issuers
                 .into_iter()
                 .map(|cfg| {
+                    let validation = validation_for(&cfg);
                     Arc::new(Issuer {
                         cfg,
+                        validation,
                         keys: RwLock::default(),
                         refresh: Mutex::default(),
                     })
@@ -183,10 +191,14 @@ impl Authenticator {
     }
 
     async fn verify(&self, issuer: &Arc<Issuer>, token: &str) -> Result<Subject, Refusal> {
-        let kid = jsonwebtoken::decode_header(token)
+        // One header parse: the kid picks the key. `decode` below parses the
+        // token again internally; there is no API to hand it this one.
+        let header = jsonwebtoken::decode_header(token)
             .context("malformed token header")
-            .and_then(|h| h.kid.ok_or_else(|| anyhow!("token has no kid")))
             .map_err(|e| Refusal::new(Outcome::Malformed, e))?;
+        let kid = header
+            .kid
+            .ok_or_else(|| Refusal::new(Outcome::Malformed, anyhow!("token has no kid")))?;
 
         let (key, expired) = issuer.cached_key(&kid);
         let key = match key {
@@ -213,8 +225,7 @@ impl Authenticator {
             }
         };
 
-        let validation = validation_for(&issuer.cfg);
-        let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
+        let claims = jsonwebtoken::decode::<Claims>(token, &key, &issuer.validation)
             .context("token failed validation")
             .map_err(|e| Refusal::new(Outcome::Invalid, e))?
             .claims;
@@ -378,7 +389,7 @@ fn loggable(e: &anyhow::Error) -> String {
 async fn fetch_keys(
     http: &reqwest::Client,
     cfg: &IssuerConfig,
-) -> Result<HashMap<String, DecodingKey>> {
+) -> Result<HashMap<String, Arc<DecodingKey>>> {
     let url = jwks_url(http, cfg).await?;
     let body = if is_remote_url(&url) {
         check_remote_url(&url)?;
@@ -405,7 +416,7 @@ async fn fetch_keys(
         .filter_map(|jwk| {
             let kid = jwk.common.key_id.clone()?;
             match DecodingKey::from_jwk(jwk) {
-                Ok(key) => Some((kid, key)),
+                Ok(key) => Some((kid, Arc::new(key))),
                 Err(e) => {
                     tracing::warn!("skipping unusable JWK {kid} from {url}: {e}");
                     None
@@ -441,10 +452,10 @@ async fn jwks_url(http: &reqwest::Client, cfg: &IssuerConfig) -> Result<String> 
 
 impl Issuer {
     /// The key for `kid`, if cached, and whether the cached set has expired.
-    fn cached_key(&self, kid: &str) -> (Option<DecodingKey>, bool) {
+    fn cached_key(&self, kid: &str) -> (Option<Arc<DecodingKey>>, bool) {
         let cache = self.keys.read();
         let expired = cache.expires_at.is_none_or(|t| Instant::now() >= t);
-        (cache.by_kid.get(kid).cloned(), expired)
+        (cache.by_kid.get(kid).map(Arc::clone), expired)
     }
 
     /// Joins the in-flight JWKS fetch or starts one; `None` while the floor
@@ -994,7 +1005,7 @@ mod tests {
         let mut cache = auth.issuers[0].keys.write();
         cache
             .by_kid
-            .insert(kid.into(), DecodingKey::from_secret(b"k"));
+            .insert(kid.into(), Arc::new(DecodingKey::from_secret(b"k")));
         cache.expires_at = Some(expires_at);
     }
 
