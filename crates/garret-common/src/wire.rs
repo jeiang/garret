@@ -35,7 +35,8 @@ pub fn with_hash(route: &str, hash: &str) -> String {
 }
 
 const NARINFO_SUFFIX: &str = ".narinfo";
-const NAR_SUFFIX: &str = ".nar.zst";
+/// The suffix of a NAR's blob key, and of the narinfo `URL:` that names it.
+pub const NAR_SUFFIX: &str = ".nar.zst";
 
 /// `<hash>.narinfo`: the narinfo's file name at the cache root.
 pub fn narinfo_file(hash: &str) -> String {

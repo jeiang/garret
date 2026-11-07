@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
+use garret_common::wire;
 use std::fmt::Write as _;
 
 use crate::db::Object;
@@ -135,6 +136,23 @@ pub fn verify(obj: &Object, store_dir: &str, keys: &[SigningKeyFile]) -> bool {
         .any(|sig| keys.iter().any(|k| k.verifies(sig, &fp)))
 }
 
+/// Appends `n` in decimal to `out`, without `write!`'s formatting machinery:
+/// two sizes per narinfo, on the hot path.
+fn push_u64(out: &mut String, mut n: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    // ASCII digits by construction.
+    out.push_str(std::str::from_utf8(&digits[start..]).expect("ascii digits"));
+}
+
 /// Renders the narinfo body served by the Puller.
 pub fn render(obj: &Object) -> String {
     let mut out = String::with_capacity(
@@ -143,16 +161,24 @@ pub fn render(obj: &Object) -> String {
     );
     // Writing to a String cannot fail.
     let _ = writeln!(out, "StorePath: {}", obj.store_path);
-    let _ = writeln!(
-        out,
-        "URL: {}",
-        garret_common::wire::nar_url(&obj.store_path_hash)
-    );
+    // The URL is `nar/<hash>.nar.zst`, written straight into the buffer: this
+    // is the hot path, and a temporary String here is one allocation and copy
+    // per narinfo.
+    out.push_str("URL: nar/");
+    out.push_str(&obj.store_path_hash);
+    out.push_str(wire::NAR_SUFFIX);
+    out.push('\n');
     out.push_str("Compression: zstd\n");
     let _ = writeln!(out, "FileHash: {}", obj.file_hash);
-    let _ = writeln!(out, "FileSize: {}", obj.file_size);
+    // Sizes are non-negative: the Pusher checks a claimed NarSize against the
+    // NAR it received, and FileSize is the blob it wrote.
+    out.push_str("FileSize: ");
+    push_u64(&mut out, obj.file_size as u64);
+    out.push('\n');
     let _ = writeln!(out, "NarHash: {}", obj.nar_hash);
-    let _ = writeln!(out, "NarSize: {}", obj.nar_size);
+    out.push_str("NarSize: ");
+    push_u64(&mut out, obj.nar_size as u64);
+    out.push('\n');
     out.push_str("References: ");
     for (i, r) in obj.references.iter().enumerate() {
         if i > 0 {
@@ -269,6 +295,15 @@ mod tests {
     #[test]
     fn unsigned_object_is_refused() {
         assert!(sign(&object(), "/nix/store", &[]).is_err());
+    }
+
+    #[test]
+    fn decimal_sizes_match_the_formatting_machinery() {
+        for n in [0u64, 1, 9, 10, 99, 1024, 4_000_000_000, u64::MAX] {
+            let mut out = String::new();
+            push_u64(&mut out, n);
+            assert_eq!(out, n.to_string(), "{n}");
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! signatures) and redirects NAR requests to presigned S3 URLs (ADR-0005).
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -48,6 +48,7 @@ struct AppState {
     db: OnceLock<Db>,
     storage: Storage,
     presign_ttl: Duration,
+    presigns: PresignCache,
     bumps: Bumps,
     db_read_budget: Duration,
     presign_budget: Duration,
@@ -62,6 +63,76 @@ impl AppState {
     }
 }
 
+/// How many presigned URLs the cache holds before it makes room. Each entry is
+/// a key, a URL and an instant — under a kilobyte — so this bounds the cache at
+/// tens of megabytes however many objects the cache serves.
+const PRESIGN_CACHE_MAX: usize = 100_000;
+
+/// Presigned NAR URLs, reused while at least half their lifetime remains.
+///
+/// SigV4 signing is 19-31% of the Puller's CPU under pull load, and the same
+/// object is redirected again and again. Reuse is safe for the client: a
+/// redirect never hands out a URL with less than half of `presign_ttl` left,
+/// so a client that starts fetching right after the redirect still has half
+/// the window to finish.
+struct PresignCache {
+    ttl: Duration,
+    /// Distinct keys the cache may hold ([`PRESIGN_CACHE_MAX`] outside tests).
+    max: usize,
+    entries: Mutex<HashMap<String, Presigned>>,
+}
+
+struct Presigned {
+    url: String,
+    /// When the URL was signed; its expiry is `signed_at + ttl`.
+    signed_at: Instant,
+}
+
+impl PresignCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            max: PRESIGN_CACHE_MAX,
+            entries: Mutex::default(),
+        }
+    }
+
+    /// The cached URL for `key`, if it still has at least half its lifetime
+    /// left at `now`.
+    fn get(&self, key: &str, now: Instant) -> Option<String> {
+        let entries = self.entries.lock();
+        let entry = entries.get(key)?;
+        reusable(entry.signed_at, now, self.ttl).then(|| entry.url.clone())
+    }
+
+    /// Caches `url` for `key`, signed at `now`.
+    fn insert(&self, key: String, url: String, now: Instant) {
+        let mut entries = self.entries.lock();
+        if entries.len() >= self.max && !entries.contains_key(&key) {
+            // Full: drop what could not be reused anyway. If nothing could be
+            // dropped, everything in it is live and it is cleared: the next
+            // redirect then re-signs, which is only what it did before.
+            entries.retain(|_, entry| reusable(entry.signed_at, now, self.ttl));
+            if entries.len() >= self.max {
+                entries.clear();
+            }
+        }
+        entries.insert(
+            key,
+            Presigned {
+                url,
+                signed_at: now,
+            },
+        );
+    }
+}
+
+/// Whether a URL signed at `signed_at` for `ttl` still has at least half its
+/// lifetime left at `now`.
+fn reusable(signed_at: Instant, now: Instant, ttl: Duration) -> bool {
+    now.duration_since(signed_at) * 2 <= ttl
+}
+
 /// How often queued last-accessed bumps are written. LRU needs only day
 /// granularity; this just batches a burst of hits into one transaction.
 const BUMP_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -71,12 +142,21 @@ const BUMP_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// their next hit.
 const BUMP_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Most distinct hashes one flush window may queue. A cache with more stale
+/// objects than this drops the overflow: the row stays stale, so its next hit
+/// queues it again after the flush.
+const BUMP_QUEUE_MAX: usize = 100_000;
+
 /// Last-accessed bumps waiting for the next flush (spec 02). Only hits on
-/// stale rows are queued, so it is bounded by the object count.
+/// stale rows are queued, so it is bounded by the object count — and capped at
+/// [`BUMP_QUEUE_MAX`], so a large cache cannot grow it without bound between
+/// flushes.
 struct Bumps {
     pending: Mutex<HashSet<String>>,
     /// Seconds a row's `last_accessed_at` counts as fresh.
     debounce: i64,
+    /// Distinct hashes the queue may hold ([`BUMP_QUEUE_MAX`] outside tests).
+    max: usize,
 }
 
 impl Bumps {
@@ -84,6 +164,7 @@ impl Bumps {
         Self {
             pending: Mutex::default(),
             debounce,
+            max: BUMP_QUEUE_MAX,
         }
     }
 
@@ -97,6 +178,10 @@ impl Bumps {
         let mut pending = self.pending.lock();
         // Not a bare insert: that would allocate the owned key on every repeat hit.
         if !pending.contains(hash) {
+            if pending.len() >= self.max {
+                metrics::counter!("garret_bump_dropped_total").increment(1);
+                return;
+            }
             pending.insert(hash.to_owned());
         }
         metrics::gauge!("garret_bump_queue_depth").set(pending.len() as f64);
@@ -308,8 +393,25 @@ fn browse_routes(issuer: Option<&IssuerConfig>) -> Result<Router<Arc<AppState>>>
         )))
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Blocking threads. Pull reads serialize on one SQLite connection, so the
+/// pool only needs room for the one read that holds it, a few queued behind it,
+/// and one browse query: hundreds of threads waiting on the same mutex add
+/// futex wakeups without adding concurrency.
+const MAX_BLOCKING_THREADS: usize = 8;
+
+fn main() -> Result<()> {
+    // Explicit, rather than #[tokio::main], for the blocking-pool bound. The
+    // worker count keeps the default (one per core). A read that finds no free
+    // blocking thread waits in the pool's queue, and its budget still trips:
+    // db_read's timeout wraps the join handle, not the read itself.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let garret_server::runtime::Started {
         config: cfg,
         listener,
@@ -319,6 +421,7 @@ async fn main() -> Result<()> {
         db: OnceLock::new(),
         storage: Storage::new(&cfg.s3).await?,
         presign_ttl: Duration::from_secs(cfg.presign_ttl_secs),
+        presigns: PresignCache::new(Duration::from_secs(cfg.presign_ttl_secs)),
         bumps: Bumps::new(cfg.bump_debounce_secs),
         db_read_budget: Duration::from_millis(cfg.db_read_budget_ms),
         presign_budget: Duration::from_millis(cfg.presign_budget_ms),
@@ -554,25 +657,35 @@ async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
         Ok(false) => return Outcome::Miss,
         Err(degraded) => return Outcome::Degraded(degraded),
     }
-    let started = Instant::now();
-    match tokio::time::timeout(
-        state.presign_budget,
-        state
-            .storage
-            .presigned_get(&storage::key_for(hash), state.presign_ttl),
-    )
-    .await
-    {
-        Ok(Ok(url)) => {
-            metrics::histogram!("garret_presign_duration_seconds").record(started.elapsed());
-            Outcome::Hit(Redirect::temporary(&url).into_response())
+    let key = storage::key_for(hash);
+    let url = match state.presigns.get(&key, Instant::now()) {
+        Some(url) => {
+            metrics::counter!("garret_presign_cache_hits_total").increment(1);
+            url
         }
-        Ok(Err(e)) => {
-            tracing::error!("presigning {hash}: {e:#}");
-            Outcome::Degraded(Degraded::PresignError)
+        None => {
+            let started = Instant::now();
+            let signed = tokio::time::timeout(
+                state.presign_budget,
+                state.storage.presigned_get(&key, state.presign_ttl),
+            )
+            .await;
+            match signed {
+                Ok(Ok(url)) => {
+                    metrics::histogram!("garret_presign_duration_seconds")
+                        .record(started.elapsed());
+                    state.presigns.insert(key, url.clone(), started);
+                    url
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("presigning {hash}: {e:#}");
+                    return Outcome::Degraded(Degraded::PresignError);
+                }
+                Err(_elapsed) => return Outcome::Degraded(Degraded::PresignTimeout),
+            }
         }
-        Err(_elapsed) => Outcome::Degraded(Degraded::PresignTimeout),
-    }
+    };
+    Outcome::Hit(Redirect::temporary(&url).into_response())
 }
 
 async fn require_browse_oidc(
@@ -735,7 +848,126 @@ mod tests {
         );
     }
 
+    /// A saturated blocking pool must degrade a read, not hang it: the budget
+    /// wraps the join handle, so a read that never gets a thread still trips.
+    #[test]
+    fn a_read_that_finds_no_blocking_thread_still_trips_its_budget() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let conn = conn();
+            let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+            let (release, gate) = std::sync::mpsc::channel();
+            let wedged = tokio::task::spawn_blocking({
+                let conn = conn.clone();
+                move || {
+                    let _held = conn.blocking_lock();
+                    holding_tx.send(()).unwrap();
+                    let _ = gate.recv_timeout(Duration::from_secs(5));
+                }
+            });
+            holding_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the wedged task should take the only blocking thread");
+
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let got = db_read(conn, Duration::from_millis(25), {
+                let ran = ran.clone();
+                move |_| {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await;
+            assert_eq!(got, Err(Degraded::DbTimeout));
+            assert!(
+                !ran.load(std::sync::atomic::Ordering::SeqCst),
+                "the read ran despite there being no blocking thread"
+            );
+            let _ = release.send(());
+            wedged.await.unwrap();
+        });
+    }
+
     const DAY: i64 = 86400;
+
+    /// A URL is reused while at least half its lifetime is left, so every
+    /// redirect hands out one valid for at least `ttl / 2`.
+    #[test]
+    fn a_presigned_url_is_reused_until_half_its_lifetime_is_left() {
+        let cache = PresignCache::new(Duration::from_secs(3600));
+        let signed = Instant::now();
+        let at = |secs| signed + Duration::from_secs(secs);
+        cache.insert("nar/a.nar.zst".into(), "https://bucket/a".into(), signed);
+        assert_eq!(
+            cache.get("nar/a.nar.zst", at(0)).as_deref(),
+            Some("https://bucket/a")
+        );
+        assert_eq!(
+            cache.get("nar/a.nar.zst", at(1800)).as_deref(),
+            Some("https://bucket/a")
+        );
+        assert_eq!(cache.get("nar/a.nar.zst", at(1801)), None);
+        assert_eq!(cache.get("nar/b.nar.zst", at(0)), None);
+    }
+
+    /// The cache is bounded: full, it drops what it can no longer reuse, and
+    /// clears itself when everything in it is still live.
+    #[test]
+    fn the_presign_cache_is_bounded() {
+        let ttl = Duration::from_secs(3600);
+        let cache = PresignCache {
+            ttl,
+            max: 2,
+            entries: Mutex::default(),
+        };
+        let signed = Instant::now();
+        let later = signed + Duration::from_secs(1801);
+        cache.insert("a".into(), "ua".into(), signed);
+        cache.insert("b".into(), "ub".into(), signed);
+        // Full of live URLs: cleared rather than grown.
+        cache.insert("c".into(), "uc".into(), signed);
+        assert_eq!(cache.entries.lock().len(), 1);
+
+        // Full again, with one entry past reuse: that one goes, the live one stays.
+        cache.insert("d".into(), "ud".into(), later);
+        cache.insert("e".into(), "ue".into(), later);
+        assert_eq!(cache.entries.lock().len(), 2);
+        assert_eq!(cache.get("c", later), None);
+        assert_eq!(cache.get("d", later).as_deref(), Some("ud"));
+        assert_eq!(cache.get("e", later).as_deref(), Some("ue"));
+    }
+
+    /// The queue is capped: overflow is dropped, and a dropped hash is queued
+    /// again by its next hit once the flush has run.
+    #[test]
+    fn the_bump_queue_is_capped_and_a_dropped_hit_requeues_later() {
+        let mut conn = db::open(":memory:", true).unwrap();
+        db::migrate(&conn).unwrap();
+        let hashes = ["a".repeat(32), "b".repeat(32), "c".repeat(32)];
+        for hash in &hashes {
+            db::insert_object(&mut conn, &object(hash), 1000).unwrap();
+        }
+        let bumps = Bumps {
+            pending: Mutex::default(),
+            debounce: DAY,
+            max: 2,
+        };
+        let now = 1000 + 2 * DAY;
+        for hash in &hashes {
+            bumps.hit(hash, 1000, now);
+        }
+        assert_eq!(bumps.pending.lock().len(), 2);
+
+        assert_eq!(bumps.flush(&mut conn, now).unwrap(), 2);
+        // The dropped hash's row is still stale, so its next hit queues it.
+        bumps.hit(&hashes[2], 1000, now);
+        assert_eq!(bumps.pending.lock().len(), 1);
+    }
 
     /// Flushes `state`'s queued bumps on its pull connection; how many it wrote.
     async fn flush(state: &AppState) -> usize {
@@ -874,6 +1106,7 @@ mod tests {
             db: OnceLock::new(),
             storage,
             presign_ttl: Duration::from_secs(1),
+            presigns: PresignCache::new(Duration::from_secs(1)),
             bumps: Bumps::new(DAY),
             db_read_budget: Duration::from_secs(1),
             presign_budget: Duration::from_secs(1),

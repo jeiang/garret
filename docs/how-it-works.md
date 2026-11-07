@@ -38,7 +38,10 @@ retrying after a dropped connection, produce the same result.
 The Puller signs narinfos with the cache's ed25519 keys, so nix verifies them
 like any other cache. It never proxies NAR bytes: it answers with a redirect to
 a URL that grants one read for a limited time, and the client fetches the bytes
-from the bucket directly.
+from the bucket directly. Presigned URLs are cached in-process and reused while
+at least half their configured lifetime (`presignTtlSeconds`) remains, so a
+repeated pull of one object does not re-sign, and no client is ever handed a URL
+with less than half its lifetime left.
 
 That keeps the Puller small and fast, and it means the bucket must be reachable
 by the machines that substitute. It also means a pull that cannot reach the
