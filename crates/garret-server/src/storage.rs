@@ -16,7 +16,6 @@ use aws_sdk_s3::{
 };
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
-use sha2::{Digest, Sha256};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
@@ -287,13 +286,13 @@ pub async fn next_chunk<S: Stream + Unpin>(
 }
 
 /// The upload body as consumed so far. It owns the read cursor (an overshoot
-/// `carry` left by a split chunk), the running hash and the byte count, so
-/// FileHash and FileSize (spec 03) always describe the same bytes: exactly
-/// those appended to a part.
+/// `carry` left by a split chunk) and the byte count, so FileSize (spec 03)
+/// describes exactly the bytes appended to a part. The FileHash is the
+/// verifier's: it sees the same bytes on their way past, off the request
+/// task.
 struct BodyReader<S> {
     body: S,
     carry: Option<Bytes>,
-    hasher: Sha256,
     /// Bytes appended to parts so far.
     received: u64,
     started: Instant,
@@ -309,7 +308,6 @@ where
         Self {
             body,
             carry: None,
-            hasher: Sha256::new(),
             received: 0,
             started: Instant::now(),
             idle,
@@ -317,7 +315,7 @@ where
     }
 
     /// The next chunk not yet appended: the carry first, so leftover bytes
-    /// are never skipped, then the body. Neither hashed nor counted here.
+    /// are never skipped, then the body. Neither counted nor hashed here.
     async fn next(&mut self, phase: &'static str) -> Result<Option<Bytes>> {
         if let Some(left) = self.carry.take() {
             return Ok(Some(left));
@@ -335,10 +333,8 @@ where
         }
     }
 
-    /// Hashes and counts `bytes` as they go into `part`, while still
-    /// cache-hot.
+    /// Counts `bytes` as they go into `part`.
     fn append(&mut self, part: &mut BytesMut, bytes: &[u8]) {
-        self.hasher.update(bytes);
         part.extend_from_slice(bytes);
         self.received += bytes.len() as u64;
     }
@@ -377,8 +373,9 @@ where
         Ok(false)
     }
 
-    fn finish(self) -> (Vec<u8>, i64) {
-        (self.hasher.finalize().to_vec(), self.received as i64)
+    /// The length of exactly the bytes appended to parts.
+    fn finish(self) -> i64 {
+        self.received as i64
     }
 }
 
@@ -463,8 +460,9 @@ impl Storage {
         Ok(())
     }
 
-    /// Streams a body to S3, hashing the bytes as they pass (spec 03-storage).
-    /// Returns the sha256 of exactly what was stored, and its length.
+    /// Streams a body to S3 (spec 03-storage). Returns the length of exactly
+    /// what was stored; the caller's verifier hashes the same bytes for the
+    /// FileHash.
     ///
     /// One part is buffered at a time and a global permit is taken **before**
     /// each read, so the reader can never race ahead of S3 and server memory
@@ -482,7 +480,7 @@ impl Storage {
         body: S,
         limits: &UploadLimits,
         first_part_hint: usize,
-    ) -> Result<(Vec<u8>, i64)>
+    ) -> Result<i64>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
@@ -507,7 +505,7 @@ impl Storage {
         limits: &UploadLimits,
         first_part_hint: usize,
         part_wait: &mut Duration,
-    ) -> Result<(Vec<u8>, i64)>
+    ) -> Result<i64>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
@@ -930,7 +928,7 @@ mod tests {
     /// Feeds `chunks` through part fills and returns the part sizes produced.
     /// S4 requires parts 1..N-1 to be identical in size, so this is the check
     /// that matters most: only the final part may be short.
-    /// Also checks that the hash and length cover every byte exactly once.
+    /// Also checks that the length covers every byte exactly once.
     fn parts_of(chunks: Vec<&'static [u8]>, part_size: usize) -> Vec<usize> {
         let whole: Vec<u8> = chunks.concat();
         // Tokio, not a bare executor: reads carry the body idle timeout.
@@ -952,10 +950,7 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(
-                reader.finish(),
-                (Sha256::digest(&whole).to_vec(), whole.len() as i64)
-            );
+            assert_eq!(reader.finish(), whole.len() as i64);
             sizes
         })
     }
@@ -1137,9 +1132,8 @@ mod tests {
         .expect("uploads wedged on the shared part budget")
         .unwrap();
 
-        let digest = Sha256::digest(&body).to_vec();
-        for (hash, len) in stored {
-            assert_eq!((hash, len), (digest.clone(), body.len() as i64));
+        for len in stored {
+            assert_eq!(len, body.len() as i64);
         }
     }
 
@@ -1171,7 +1165,7 @@ mod tests {
         .await
         .expect("a small upload waited for a whole part")
         .unwrap();
-        assert_eq!(stored, (Sha256::digest(&body).to_vec(), 1000));
+        assert_eq!(stored, 1000);
         drop(held);
         assert_eq!(limits.in_flight_bytes(), 0);
     }
@@ -1199,11 +1193,12 @@ mod tests {
         assert_eq!(limits.in_flight_bytes(), 0);
     }
 
-    /// FileHash and FileSize (spec 03) describe exactly the stored bytes when
-    /// chunks straddle the first part, later part boundaries and the hint,
-    /// and when one chunk spans several parts.
+    /// FileSize (spec 03) describes exactly the stored bytes when chunks
+    /// straddle the first part, later part boundaries and the hint, and when
+    /// one chunk spans several parts. (The FileHash, over the same bytes, is
+    /// the verifier's: see `verify`.)
     #[tokio::test]
-    async fn hash_and_length_cover_the_stored_bytes_across_boundaries() {
+    async fn length_covers_the_stored_bytes_across_boundaries() {
         let storage = fake_s3().await;
         let limits = UploadLimits::new(1024, 2, 8192, IDLE);
         let body: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
@@ -1224,7 +1219,7 @@ mod tests {
                 .put_streaming(&key_for("straddle"), chunked(&body, sizes), &limits, 1024)
                 .await
                 .unwrap();
-            assert_eq!(stored, (Sha256::digest(&body).to_vec(), 5000));
+            assert_eq!(stored, 5000);
         }
         // A body ending exactly at its hint, then an empty chunk: the probe
         // past the hint skips it and the body is accepted whole.
@@ -1238,7 +1233,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(stored, (Sha256::digest(small).to_vec(), 500));
+        assert_eq!(stored, 500);
     }
 
     /// A body that fills its hint and then goes quiet stalls in the probe

@@ -62,7 +62,10 @@ const OFFLOAD_BATCHES: usize = 4;
 struct Checker {
     decoder: Decoder<'static>,
     scratch: Box<[u8]>,
+    /// NarHash over the decompressed NAR.
     hasher: Sha256,
+    /// FileHash over the compressed bytes, exactly as they are stored.
+    file_hasher: Sha256,
     nar_size: i64,
     /// Compressed bytes received so far, capped at `max_compressed`.
     compressed: usize,
@@ -81,6 +84,7 @@ impl Checker {
             decoder,
             scratch: vec![0; SCRATCH].into_boxed_slice(),
             hasher: Sha256::new(),
+            file_hasher: Sha256::new(),
             nar_size: 0,
             compressed: 0,
             max_compressed: max_compressed_len(claimed_size),
@@ -91,6 +95,9 @@ impl Checker {
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Result<(), String> {
+        // Every byte the check sees is a byte on its way to S3, so the
+        // FileHash is computed here rather than on the request task.
+        self.file_hasher.update(chunk);
         // Counted before decoding: zero-output input (skippable frames) would
         // otherwise pass the NarSize check while still being stored.
         self.compressed = self.compressed.saturating_add(chunk.len());
@@ -133,7 +140,9 @@ impl Checker {
         }
     }
 
-    fn finish(&mut self) -> Result<(), String> {
+    /// Checks the claim and returns the FileHash: the SHA-256 of every
+    /// compressed byte fed, which is exactly what was stored.
+    fn finish(&mut self) -> Result<Vec<u8>, String> {
         if !self.frame_done {
             return Err("NAR stream ended mid-frame".into());
         }
@@ -150,7 +159,7 @@ impl Checker {
                 self.claimed_hash
             ));
         }
-        Ok(())
+        Ok(self.file_hasher.finalize_reset().to_vec())
     }
 }
 
@@ -161,14 +170,16 @@ enum Engine {
     Offload {
         /// Closed at end of stream, which tells the thread to finish.
         tx: Option<PollSender<Vec<Bytes>>>,
-        verdict: oneshot::Receiver<Result<(), String>>,
+        /// The check's result: the FileHash, or why it was refused.
+        verdict: oneshot::Receiver<Result<Vec<u8>, String>>,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// End of stream, and the NAR matched its claim.
-    Accepted,
+    /// End of stream, and the NAR matched its claim. Carries the SHA-256 of
+    /// the compressed bytes: the FileHash nix checks the download against.
+    Accepted(Vec<u8>),
     /// The NAR does not match its claim: the caller's 400.
     Refused(String),
     /// The check itself failed (its thread panicked or was dropped): a
@@ -254,7 +265,10 @@ impl<S> VerifiedNar<S> {
                 // Dropping `rx` here closes the queue: the request task
                 // stops reading and collects this verdict.
                 drop(rx);
-                let verdict = verdict.and_then(|()| checker.finish());
+                let verdict = match verdict {
+                    Ok(()) => checker.finish(),
+                    Err(reason) => Err(reason),
+                };
                 let _ = verdict_tx.send(verdict);
             });
             Engine::Offload {
@@ -311,8 +325,8 @@ impl<S> VerifiedNar<S> {
             }
         };
         match verdict {
-            Ok(Ok(())) => {
-                self.outcome = Some(Outcome::Accepted);
+            Ok(Ok(file_hash)) => {
+                self.outcome = Some(Outcome::Accepted(file_hash));
                 Poll::Ready(None)
             }
             Ok(Err(reason)) => self.refuse(reason),
@@ -357,8 +371,8 @@ where
                     Engine::Offload { .. } => unreachable!("inline poll on an offloaded check"),
                 };
                 match finished {
-                    Ok(()) => {
-                        self.outcome = Some(Outcome::Accepted);
+                    Ok(file_hash) => {
+                        self.outcome = Some(Outcome::Accepted(file_hash));
                         Poll::Ready(None)
                     }
                     Err(reason) => self.refuse(reason),
@@ -523,6 +537,21 @@ mod tests {
         (nar, compressed, hash, 300_000 * 4)
     }
 
+    /// Incompressible NAR bytes (splitmix64), so zstd cannot shrink a body
+    /// below the size a test needs.
+    fn random_nar(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                (z ^ (z >> 31)) as u8
+            })
+            .collect()
+    }
+
     /// Streams `compressed` through the verifier in small chunks; returns
     /// the bytes that came out and how the stream ended.
     ///
@@ -531,7 +560,7 @@ mod tests {
         let inline = run_on(compressed, hash, size, false).await;
         let offloaded = run_on(compressed, hash, size, true).await;
         assert_eq!(inline.1, offloaded.1, "the engines disagree");
-        if inline.1 == Some(Outcome::Accepted) {
+        if matches!(inline.1, Some(Outcome::Accepted(_))) {
             assert_eq!(inline.0, offloaded.0);
         }
         inline
@@ -572,7 +601,7 @@ mod tests {
     async fn an_honest_nar_passes_through_untouched() {
         let (_, compressed, hash, size) = nar();
         let (passed, outcome) = run(&compressed, &hash, size).await;
-        assert_eq!(outcome, Some(Outcome::Accepted));
+        assert!(matches!(outcome, Some(Outcome::Accepted(_))));
         assert_eq!(passed, compressed);
     }
 
@@ -585,8 +614,57 @@ mod tests {
         let compressed = zstd::encode_all(nar.as_slice(), 3).unwrap();
         let hash = garret_common::sha256_nix32(&Sha256::digest(&nar));
         let (passed, outcome) = run(&compressed, &hash, nar.len() as i64).await;
-        assert_eq!(outcome, Some(Outcome::Accepted));
+        assert!(matches!(outcome, Some(Outcome::Accepted(_))));
         assert_eq!(passed, compressed);
+    }
+
+    /// The FileHash is the SHA-256 of exactly the compressed bytes, whatever
+    /// the chunk boundaries: it becomes the narinfo's `FileHash`, which nix
+    /// checks the download against (ADR-0005).
+    #[tokio::test]
+    async fn the_file_hash_covers_the_compressed_bytes_across_chunk_boundaries() {
+        let nar = random_nar(512 * 1024);
+        let compressed = zstd::encode_all(nar.as_slice(), 1).unwrap();
+        let hash = garret_common::sha256_nix32(&Sha256::digest(&nar));
+        let size = nar.len() as i64;
+        let want = Sha256::digest(&compressed).to_vec();
+        // Sizes that straddle decoder output buffers, batch edges, and the
+        // whole body in one chunk.
+        for sizes in [
+            &[1usize, 7, 4096, 3][..],
+            &[200_000, 1][..],
+            &[BATCH_BYTES - 1, 2][..],
+        ] {
+            for offload in [false, true] {
+                let mut at = 0;
+                let mut chunks = Vec::new();
+                let mut i = 0;
+                while at < compressed.len() {
+                    let n = sizes[i % sizes.len()].min(compressed.len() - at);
+                    chunks.push(Ok::<_, std::io::Error>(Bytes::copy_from_slice(
+                        &compressed[at..at + n],
+                    )));
+                    at += n;
+                    i += 1;
+                }
+                let mut nar =
+                    VerifiedNar::with_offload(futures::stream::iter(chunks), &hash, size, offload)
+                        .unwrap();
+                while let Some(item) = nar.next().await {
+                    item.unwrap();
+                }
+                let Some(Outcome::Accepted(file_hash)) = nar.into_outcome() else {
+                    panic!("not accepted, offload: {offload}, sizes: {sizes:?}");
+                };
+                assert_eq!(file_hash, want, "offload: {offload}, sizes: {sizes:?}");
+                // The narinfo spelling is unchanged: sha256 nix-base32 of the
+                // compressed body, exactly as the old inline hash produced.
+                assert_eq!(
+                    garret_common::sha256_nix32(&file_hash),
+                    garret_common::sha256_nix32(&want)
+                );
+            }
+        }
     }
 
     /// A NAR large enough to span several batches of tiny chunks and to fill
@@ -594,16 +672,8 @@ mod tests {
     /// every byte, and a corrupted one is still refused.
     #[tokio::test]
     async fn a_nar_spanning_several_batches_still_verifies() {
-        // Pseudo-random (splitmix64), so zstd cannot shrink it below a batch.
-        let mut state = 0x9E37_79B9_7F4A_7C15u64;
-        let mut nar = Vec::with_capacity(6 * 1024 * 1024);
-        for _ in 0..6 * 1024 * 1024 {
-            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            nar.push((z ^ (z >> 31)) as u8);
-        }
+        // Pseudo-random, so zstd cannot shrink it below a batch.
+        let nar = random_nar(6 * 1024 * 1024);
         let compressed = zstd::encode_all(nar.as_slice(), 1).unwrap();
         assert!(
             compressed.len() > 2 * BATCH_BYTES,
@@ -629,7 +699,10 @@ mod tests {
         while let Some(item) = verified.next().await {
             passed.extend_from_slice(&item.unwrap());
         }
-        assert_eq!(verified.into_outcome(), Some(Outcome::Accepted));
+        assert!(matches!(
+            verified.into_outcome(),
+            Some(Outcome::Accepted(_))
+        ));
         assert_eq!(passed, compressed);
 
         // One flipped byte in the NAR, with the original claim: refused.
@@ -765,7 +838,7 @@ mod tests {
             item.unwrap();
         }
         let (client_wait, verify_wait) = nar.waits();
-        assert_eq!(nar.into_outcome(), Some(Outcome::Accepted));
+        assert!(matches!(nar.into_outcome(), Some(Outcome::Accepted(_))));
         assert!(
             client_wait >= STALL / 2,
             "client wait {client_wait:?} is under half the stall"
