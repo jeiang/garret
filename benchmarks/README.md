@@ -66,8 +66,8 @@ connection's async lock and then hand off to the blocking pool while
 holding it, serializing the hand-off. In 40,000-request runs with no
 limits, pull fell from 64.2k to 54.7k req/s (narinfo p50 0.234 → 0.31 ms).
 The fix takes the lock on the blocking thread again (ADR 0007): 60.6k to
-61.6k req/s, against 62.8k to 63.4k for the pre-refactor `ffa297d` in the
-same interleaved session.
+61.6k req/s, against 55.8k to 63.4k for the pre-refactor `ffa297d` in the
+same interleaved session (one of its three runs was a low outlier).
 
 **Why `max_ms` is reported, and the re-run protocol.** Roughly half of
 1-CPU push runs catch a Garage artifact: a single push held open for
