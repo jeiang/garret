@@ -10,18 +10,14 @@ bucket.
 
 ## Install
 
-Add the cache to `nix.conf`:
-
-```
-extra-substituters = https://cache.jeiang.dev
-extra-trusted-public-keys = cache.jeiang.dev-1:owXJK5/UX9NSf1lhmDDT3QTxMtbVk9YfHhjvOXyPhpA=
-```
-
-Then install the client:
-
 ```
 nix profile install github:jeiang/garret#garret
 ```
+
+Garret is self-hosted: you run the Pusher and the Puller on your own host.
+[Installation](https://garret.docs.jeiang.dev/install.html) covers the client
+and pointing nix at your cache; [Deployment](https://garret.docs.jeiang.dev/deployment.html)
+covers the server.
 
 ## Quickstart
 
