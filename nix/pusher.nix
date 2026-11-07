@@ -279,6 +279,11 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
+      # Upload part buffers are freed on whichever thread finishes the part;
+      # glibc's per-thread arenas then keep that memory. Two arenas cut peak
+      # RSS by about a third with no measured throughput cost. Pusher only:
+      # the same setting lowered the Puller's request rate.
+      environment.MALLOC_ARENA_MAX = "2";
 
       serviceConfig = common.daemonServiceConfig // {
         ExecStart = "${cfg.package}/bin/garret-pusher ${configFile}";
