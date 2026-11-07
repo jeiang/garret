@@ -182,7 +182,7 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .filter(|h| !h.is_empty())
 }
 
-/// One blob from [`Storage::list_blobs`].
+/// One blob from [`BlobLister::next_page`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blob {
     /// The store-path hash its key encodes ([`hash_for`]).
@@ -193,23 +193,181 @@ pub struct Blob {
     pub size: i64,
 }
 
-/// Store path hashes of blobs with no DB row, past both guards: an upload in
-/// the in-flight set, or younger than `grace` — a row lands only after its
-/// blob completes, so a rowless blob might just be mid-push. Shared by the
-/// GC orphan sweep and `garret-admin fsck`'s read-only mirror-image check.
-pub fn orphan_hashes<'a>(
-    blobs: &'a [Blob],
-    known: &std::collections::HashSet<String>,
-    in_flight: &crate::inflight::InFlight,
-    grace: Duration,
-) -> Vec<&'a str> {
-    blobs
-        .iter()
-        .filter(|blob| {
-            !known.contains(&blob.hash) && !in_flight.contains(&blob.hash) && blob.age >= grace
-        })
-        .map(|blob| blob.hash.as_str())
-        .collect()
+/// A blob with no row is an orphan candidate, unless an upload owns the path
+/// or the blob is younger than `grace`: a row lands only after its blob
+/// completes, so a rowless blob may just be mid-push. Shared by the GC orphan
+/// sweep and `garret-admin fsck`'s read-only mirror-image check.
+pub fn is_orphan(blob: &Blob, in_flight: &crate::inflight::InFlight, grace: Duration) -> bool {
+    !in_flight.contains(&blob.hash) && blob.age >= grace
+}
+
+/// A window over the object rows, pulled in `store_path_hash` order as the
+/// bucket listing advances. The sweep never materializes the table and never
+/// holds the connection across an S3 await: the caller fetches one page
+/// ([`crate::db::objects_after`]) whenever [`RowWindow::needs_through`] says
+/// the window does not reach the listing yet.
+#[derive(Default)]
+pub struct RowWindow {
+    rows: std::collections::VecDeque<crate::db::ObjectBrief>,
+    /// The last key fetched; `None` before the first page.
+    last: Option<String>,
+    /// The last page was short, so the table has no more rows.
+    done: bool,
+}
+
+impl RowWindow {
+    /// An empty window: no rows fetched yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The cursor for the next fetch: rows after this key.
+    pub fn cursor(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+
+    /// True when rows up to and including `hash` may not all be in the window
+    /// yet, so the caller must fetch another page.
+    pub fn needs_through(&self, hash: &str) -> bool {
+        !self.done && self.last.as_deref().is_none_or(|last| last < hash)
+    }
+
+    /// True when the table may have rows that were never fetched.
+    pub fn more(&self) -> bool {
+        !self.done
+    }
+
+    /// Appends a fetched page; a short page means the table is exhausted.
+    pub fn extend(&mut self, page: Vec<crate::db::ObjectBrief>) {
+        let more = page.len() == crate::db::ROW_PAGE;
+        if let Some(last) = page.last() {
+            self.last = Some(last.store_path_hash.clone());
+        }
+        self.rows.extend(page);
+        self.done = !more;
+    }
+
+    /// Pops the next row when it sorts before `hash`: a row with no blob.
+    pub fn pop_before(&mut self, hash: &str) -> Option<crate::db::ObjectBrief> {
+        match self.rows.front() {
+            Some(row) if row.store_path_hash.as_str() < hash => self.rows.pop_front(),
+            _ => None,
+        }
+    }
+
+    /// Pops the row whose key is `hash`, if the window holds it.
+    pub fn pop_equal(&mut self, hash: &str) -> Option<crate::db::ObjectBrief> {
+        match self.rows.front() {
+            Some(row) if row.store_path_hash == hash => self.rows.pop_front(),
+            _ => None,
+        }
+    }
+
+    /// Pops every remaining row, in order.
+    pub fn drain(&mut self) -> impl Iterator<Item = crate::db::ObjectBrief> + '_ {
+        self.rows.drain(..)
+    }
+}
+
+/// One page of the sorted merge: every blob classified against the rows that
+/// sort with it.
+#[derive(Debug, Default)]
+pub struct Merged<'a> {
+    /// Blobs with no row; [`is_orphan`] applies the remaining guards.
+    pub orphans: Vec<&'a Blob>,
+    /// Blobs with their row.
+    pub pairs: Vec<(&'a Blob, crate::db::ObjectBrief)>,
+    /// Rows with no blob.
+    pub dangling: Vec<crate::db::ObjectBrief>,
+}
+
+/// Merges one page of blobs against the row window, advancing it. Rows before
+/// the page's first blob are dangling too; rows past its last blob stay for
+/// the next page. The caller must have fetched rows through the page's last
+/// key ([`RowWindow::needs_through`]).
+pub fn merge_page<'a>(page: &'a [Blob], rows: &mut RowWindow) -> Merged<'a> {
+    let mut merged = Merged::default();
+    for blob in page {
+        while let Some(row) = rows.pop_before(&blob.hash) {
+            merged.dangling.push(row);
+        }
+        match rows.pop_equal(&blob.hash) {
+            Some(row) => merged.pairs.push((blob, row)),
+            None => merged.orphans.push(blob),
+        }
+    }
+    merged
+}
+
+/// Pages through the bucket's `nar/` listing in key order.
+///
+/// The merge against the object rows assumes `ListObjectsV2` returns keys in
+/// UTF-8 byte order. S3 does, and `nar/<hash>.nar.zst` keys preserve hash
+/// order, so a page that breaks it — an implementation that does not sort —
+/// fails the walk instead of misclassifying every key after it.
+pub struct BlobLister<'a> {
+    storage: &'a Storage,
+    token: Option<String>,
+    last_key: Option<String>,
+    done: bool,
+}
+
+impl BlobLister<'_> {
+    /// The next page of blobs, or `None` once the bucket is listed. Keys
+    /// outside the `nar/<hash>.nar.zst` layout are skipped, but still checked
+    /// for order.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<Blob>>> {
+        if self.done {
+            return Ok(None);
+        }
+        let page = timed(
+            "list",
+            self.storage
+                .client
+                .list_objects_v2()
+                .bucket(&self.storage.bucket)
+                .prefix("nar/")
+                .set_continuation_token(self.token.take())
+                .send(),
+        )
+        .await
+        .context("listing blobs")?;
+
+        let mut blobs = Vec::new();
+        for object in page.contents() {
+            let Some(key) = object.key() else { continue };
+            if let Some(last) = &self.last_key
+                && key <= last.as_str()
+            {
+                bail!(
+                    "bucket listing is not sorted: {key} came after {last}; the orphan \
+                     sweep and fsck merge the listing against the database and need \
+                     ListObjectsV2 to return keys in lexicographic order"
+                );
+            }
+            self.last_key = Some(key.to_owned());
+            let Some(hash) = hash_for(key) else { continue };
+            let size = object
+                .size()
+                .with_context(|| format!("listing blobs: no size for {key}"))?;
+            blobs.push(Blob {
+                hash: hash.to_owned(),
+                age: age(object.last_modified()),
+                size,
+            });
+        }
+
+        self.token = page.next_continuation_token().map(str::to_owned);
+        if self.token.is_none() {
+            // A truncated page with no token would silently end the listing,
+            // and every row past it would read as dangling.
+            if page.is_truncated() == Some(true) {
+                bail!("listing blobs: truncated page without a continuation token");
+            }
+            self.done = true;
+        }
+        Ok(Some(blobs))
+    }
 }
 
 /// Time since an S3 timestamp; zero when it is missing or in the future.
@@ -674,44 +832,17 @@ impl Storage {
         }
     }
 
-    /// Every blob under `nar/`, with its age and size. Paginated — the
-    /// bucket outgrows one response long before the cache is interesting.
-    /// Keys outside the `nar/<hash>.nar.zst` layout are skipped.
-    pub async fn list_blobs(&self) -> Result<Vec<Blob>> {
-        let mut out = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let page = timed(
-                "list",
-                self.client
-                    .list_objects_v2()
-                    .bucket(&self.bucket)
-                    .prefix("nar/")
-                    .set_continuation_token(token.take())
-                    .send(),
-            )
-            .await
-            .context("listing blobs")?;
-
-            for object in page.contents() {
-                let Some(key) = object.key() else { continue };
-                let Some(hash) = hash_for(key) else { continue };
-                let size = object
-                    .size()
-                    .with_context(|| format!("listing blobs: no size for {key}"))?;
-                out.push(Blob {
-                    hash: hash.to_owned(),
-                    age: age(object.last_modified()),
-                    size,
-                });
-            }
-
-            token = page.next_continuation_token().map(str::to_owned);
-            if token.is_none() {
-                break;
-            }
+    /// Every blob under `nar/`, a page at a time, in the bucket's key order.
+    /// Paginated — the bucket outgrows one response long before the cache is
+    /// interesting — and order-checked, because the sweep and fsck merge the
+    /// listing against the object rows instead of materializing either side.
+    pub fn list_blobs(&self) -> BlobLister<'_> {
+        BlobLister {
+            storage: self,
+            token: None,
+            last_key: None,
+            done: false,
         }
-        Ok(out)
     }
 
     /// Batched at 1,000 keys — the S3 limit for a single `DeleteObjects`.
@@ -846,27 +977,102 @@ mod tests {
 
     const IDLE: Duration = Duration::from_secs(60);
 
-    #[test]
-    fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
-        let grace = Duration::from_secs(86400);
-        let blob = |hash: &str, age_secs| Blob {
+    fn blob(hash: &str, age_secs: u64) -> Blob {
+        Blob {
             hash: hash.into(),
             age: Duration::from_secs(age_secs),
             size: 1,
-        };
-        let blobs = vec![
-            blob("known", 90000),
-            blob("uploading", 90000),
-            blob("young", 10),
-            blob("stale", 90000),
-        ];
-        let known: std::collections::HashSet<String> = ["known".to_string()].into();
+        }
+    }
+
+    fn row(hash: &str) -> crate::db::ObjectBrief {
+        crate::db::ObjectBrief {
+            store_path_hash: hash.into(),
+            name: "thing".into(),
+            created_at: 1,
+            file_size: 1,
+        }
+    }
+
+    #[test]
+    fn is_orphan_excludes_in_flight_and_young_blobs() {
+        let grace = Duration::from_secs(86400);
         let in_flight = crate::inflight::InFlight::new();
         let _claim = in_flight.claim("uploading").unwrap();
 
+        assert!(!is_orphan(&blob("uploading", 90000), &in_flight, grace));
+        assert!(!is_orphan(&blob("young", 10), &in_flight, grace));
+        assert!(is_orphan(&blob("stale", 90000), &in_flight, grace));
+    }
+
+    /// The walk pages both sides: every key is classified once, across page
+    /// boundaries on either side, and the row window only ever holds what the
+    /// listing has reached.
+    #[test]
+    fn the_merge_walk_pages_both_sides_across_boundaries() {
+        let key = |i: usize| format!("{i:032x}");
+        // A blob with no row every 7th key, a row with no blob every 11th.
+        let has_blob = |i: usize| !i.is_multiple_of(11);
+        let has_row = |i: usize| !i.is_multiple_of(7);
+        let total = 3000;
+
+        let rows: Vec<_> = (0..total)
+            .filter(|i| has_row(*i))
+            .map(|i| row(&key(i)))
+            .collect();
+        let blobs: Vec<_> = (0..total)
+            .filter(|i| has_blob(*i))
+            .map(|i| blob(&key(i), 90000))
+            .collect();
+
+        let mut window = RowWindow::new();
+        let mut fetched = 0;
+        let mut merged = Merged::default();
+        for page in blobs.chunks(64) {
+            let last = page.last().unwrap();
+            while window.needs_through(&last.hash) {
+                let end = (fetched + crate::db::ROW_PAGE).min(rows.len());
+                window.extend(rows[fetched..end].to_vec());
+                fetched = end;
+            }
+            let page = merge_page(page, &mut window);
+            merged.orphans.extend(page.orphans);
+            merged.pairs.extend(page.pairs);
+            merged.dangling.extend(page.dangling);
+        }
+        while window.more() {
+            let end = (fetched + crate::db::ROW_PAGE).min(rows.len());
+            window.extend(rows[fetched..end].to_vec());
+            fetched = end;
+        }
+        merged.dangling.extend(window.drain());
+
+        let expected = |kept: &dyn Fn(usize) -> bool| -> Vec<String> {
+            (0..total).filter(|i| kept(*i)).map(key).collect()
+        };
         assert_eq!(
-            orphan_hashes(&blobs, &known, &in_flight, grace),
-            vec!["stale"]
+            merged
+                .orphans
+                .iter()
+                .map(|b| b.hash.clone())
+                .collect::<Vec<_>>(),
+            expected(&|i| has_blob(i) && !has_row(i))
+        );
+        assert_eq!(
+            merged
+                .dangling
+                .iter()
+                .map(|r| r.store_path_hash.clone())
+                .collect::<Vec<_>>(),
+            expected(&|i| has_row(i) && !has_blob(i))
+        );
+        assert_eq!(
+            merged
+                .pairs
+                .iter()
+                .map(|(_, r)| r.store_path_hash.clone())
+                .collect::<Vec<_>>(),
+            expected(&|i| has_row(i) && has_blob(i))
         );
     }
 

@@ -203,34 +203,62 @@ impl Gc {
 
     async fn sweep(&self) -> Result<usize> {
         let grace = self.orphan_grace();
-        let known = db_run(&self.conn, |conn| db::all_hashes(conn)).await?;
-        let blobs = self.storage.list_blobs().await?;
         // Before the orphans are claimed: the abort skips in-flight paths.
         let aborted = self
             .storage
             .abort_stale_multiparts(grace, &self.in_flight)
             .await?;
 
-        // Each orphan is claimed from a final row check until its blob delete
-        // returns (spec 05). A path claimed elsewhere is skipped, and one
-        // whose row landed since `known` was read is no orphan.
-        let deletion = {
+        // One sorted pass over the bucket listing and the object rows, a page
+        // of each at a time: a blob with no row is an orphan. Neither side is
+        // ever fully materialized, and the connection is never held across an
+        // S3 await.
+        let mut lister = self.storage.list_blobs();
+        let mut rows = storage::RowWindow::new();
+        let mut deletion = Deletion::default();
+        while let Some(page) = lister.next_page().await? {
+            let Some(last) = page.last() else { continue };
+            while rows.needs_through(&last.hash) {
+                let cursor = rows.cursor().map(str::to_owned);
+                rows.extend(
+                    db_run(&self.conn, move |conn| {
+                        db::objects_after(conn, cursor.as_deref())
+                    })
+                    .await?,
+                );
+            }
+            let orphans: Vec<String> = storage::merge_page(&page, &mut rows)
+                .orphans
+                .into_iter()
+                .filter(|blob| storage::is_orphan(blob, &self.in_flight, grace))
+                .map(|blob| blob.hash.clone())
+                .collect();
+            if orphans.is_empty() {
+                continue;
+            }
+
+            // Each orphan is claimed from a final row check until its blob
+            // delete returns (spec 05). A path claimed elsewhere is skipped,
+            // and one whose row landed since the merge read it is no orphan.
             let in_flight = self.in_flight.clone();
-            db_run(&self.conn, move |conn| {
-                let mut deletion = Deletion::default();
-                for hash in storage::orphan_hashes(&blobs, &known, &in_flight, grace) {
-                    let Ok(claim) = in_flight.claim_delete(hash) else {
+            let claims = db_run(&self.conn, move |conn| {
+                let mut claims = Vec::new();
+                for hash in orphans {
+                    let Ok(claim) = in_flight.claim_delete(&hash) else {
                         continue;
                     };
-                    if db::exists(conn, hash)? {
+                    if db::exists(conn, &hash)? {
                         continue;
                     }
-                    deletion.hold(claim);
+                    claims.push(claim);
                 }
-                Ok(deletion)
+                Ok(claims)
             })
-            .await?
-        };
+            .await?;
+            for claim in claims {
+                deletion.hold(claim);
+            }
+        }
         let count = deletion.len();
         deletion.finish(&self.storage).await?;
 
@@ -421,6 +449,121 @@ mod tests {
         (storage, held_rx, release_tx)
     }
 
+    /// What S3 answers a `ListMultipartUploads` with no uploads.
+    const NO_UPLOADS: &str = r#"<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Bucket>test</Bucket><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"#;
+
+    /// An S3 stand-in whose bucket lists `keys` in the order given, `per_page`
+    /// at a time with continuation tokens, and records the body of every
+    /// `DeleteObjects`.
+    async fn paged_s3(keys: Vec<String>, per_page: usize) -> (Storage, Arc<Mutex<Vec<String>>>) {
+        let keys = Arc::new(keys);
+        let deletes = Arc::new(Mutex::new(Vec::new()));
+        let storage = fake_s3(axum::Router::new().fallback({
+            let deletes = deletes.clone();
+            move |uri: axum::http::Uri, body: axum::body::Bytes| {
+                let query = uri.query().unwrap_or_default().to_owned();
+                let (keys, deletes) = (keys.clone(), deletes.clone());
+                async move {
+                    if query.contains("uploads") {
+                        return NO_UPLOADS.to_owned();
+                    }
+                    if query.contains("list-type=2") {
+                        let start = query
+                            .split("continuation-token=p")
+                            .nth(1)
+                            .and_then(|t| t.split('&').next())
+                            .and_then(|t| t.parse().ok())
+                            .unwrap_or(0);
+                        let end = (start + per_page).min(keys.len());
+                        let contents: String = keys[start..end]
+                            .iter()
+                            .map(|key| {
+                                format!(
+                                    "<Contents><Key>{key}</Key>\
+                                     <LastModified>2000-01-01T00:00:00.000Z</LastModified>\
+                                     <Size>1</Size></Contents>"
+                                )
+                            })
+                            .collect();
+                        let next = (end < keys.len()).then(|| format!("p{end}"));
+                        let truncated = next.is_some();
+                        let token = next
+                            .map(|t| format!("<NextContinuationToken>{t}</NextContinuationToken>"))
+                            .unwrap_or_default();
+                        return format!(
+                            r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test</Name><Prefix>nar/</Prefix><KeyCount>{}</KeyCount><MaxKeys>{per_page}</MaxKeys><IsTruncated>{truncated}</IsTruncated>{token}{contents}</ListBucketResult>"#,
+                            end - start,
+                        );
+                    }
+                    deletes.lock().push(String::from_utf8_lossy(&body).into_owned());
+                    S3_DELETED.to_owned()
+                }
+            }
+        }))
+        .await;
+        (storage, deletes)
+    }
+
+    /// Orphans, known blobs and a dangling row interleave across listing
+    /// pages: only the orphans are deleted, and no key is lost or repeated at
+    /// a page boundary.
+    #[tokio::test]
+    async fn a_sweep_merges_across_listing_pages() {
+        let [a, b, c, d, e] = ["a", "b", "c", "d", "e"].map(|c| c.repeat(32));
+        // Bucket: a, b | c, d, e. Rows: a and c (known), e (dangling).
+        let keys = [&a, &b, &c, &d, &e]
+            .map(|hash| storage::key_for(hash))
+            .to_vec();
+        let (storage, deletes) = paged_s3(keys, 2).await;
+        let mut conn = open_db();
+        for hash in [&a, &c, &e] {
+            db::insert_object(&mut conn, &object(hash).sized(1), 0).unwrap();
+        }
+        let gc = Gc::new(
+            Arc::new(Mutex::new(conn)),
+            storage,
+            InFlight::new(),
+            gc_config(100),
+        );
+
+        assert_eq!(gc.sweep_orphans().await.unwrap(), 2, "orphans are b and d");
+        let deletes = deletes.lock();
+        assert_eq!(deletes.len(), 1, "one batched delete");
+        for orphan in [&b, &d] {
+            assert!(deletes[0].contains(&storage::key_for(orphan)));
+        }
+        for known in [&a, &c] {
+            assert!(
+                !deletes[0].contains(&storage::key_for(known)),
+                "a known blob was deleted"
+            );
+        }
+        let conn = gc.conn.lock();
+        assert!(db::exists(&conn, &e).unwrap(), "a dangling row was deleted");
+    }
+
+    /// A listing that is not in key order would make the merge misclassify
+    /// every key after the break, so the sweep fails instead of deleting.
+    #[tokio::test]
+    async fn a_listing_out_of_key_order_fails_the_sweep() {
+        let [a, b] = ["a", "b"].map(|c| c.repeat(32));
+        let keys = vec![storage::key_for(&b), storage::key_for(&a)];
+        let (storage, deletes) = paged_s3(keys, 2).await;
+        let gc = Gc::new(
+            Arc::new(Mutex::new(open_db())),
+            storage,
+            InFlight::new(),
+            gc_config(100),
+        );
+
+        let err = format!("{:#}", gc.sweep_orphans().await.unwrap_err());
+        assert!(err.contains("not sorted"), "unexpected error: {err}");
+        assert!(
+            deletes.lock().is_empty(),
+            "a misordered listing still deleted blobs"
+        );
+    }
+
     #[tokio::test]
     async fn an_orphan_stays_claimed_until_its_blob_is_deleted() {
         // Between the orphan check and the blob delete, an upload re-pushing
@@ -454,8 +597,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_orphan_whose_row_lands_mid_sweep_is_kept() {
-        // An upload of the path completes, row and all, after the sweep read
-        // the rows but before it claims the path: its blob is no orphan.
+        // An upload of the path completes, row and all, after the bucket
+        // listed the blob but before the sweep reads the rows: its blob is no
+        // orphan.
         let o = "o".repeat(32);
         let conn = open_db();
         let conn = Arc::new(Mutex::new(conn));

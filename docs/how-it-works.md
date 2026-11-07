@@ -55,6 +55,12 @@ The cost of that choice is that two store paths with nearly identical contents
 are stored twice. The benefit is that every object is one blob, so reads,
 deletes and repairs are single operations.
 
+The bucket must return `ListObjectsV2` keys in lexicographic order, which every
+S3 implementation does. The orphan sweep and `garret-admin fsck` merge that
+listing against the object rows in one sorted pass, a page of each at a time, so
+neither the bucket nor the table is ever fully materialized; a listing that is
+not sorted fails the pass instead of misclassifying every key after the break.
+
 ## Metadata
 
 One SQLite database in WAL mode, shared by both services. The Pusher performs

@@ -599,12 +599,31 @@ impl ObjectBrief {
     }
 }
 
-/// Every object row — exactly what `garret-admin fsck` needs to classify
-/// rows, without an N+1 fetch through [`get_object`] per hash.
-pub fn all_objects_brief(conn: &Connection) -> Result<Vec<ObjectBrief>> {
-    let mut stmt = conn.prepare(&format!("SELECT {OBJECT_BRIEF_COLUMNS} FROM objects"))?;
+/// Rows per page for the sorted merge against the bucket listing: one page is
+/// held in memory at a time, and the connection is released between pages.
+pub const ROW_PAGE: usize = 1000;
+
+/// One page of object rows in `store_path_hash` order, after `after` (from
+/// the start when `None`) — exactly what `garret-admin fsck` needs to
+/// classify rows, without an N+1 fetch through [`get_object`] per hash.
+/// Keyset pagination, not `OFFSET`: the sweep walks the table once, and a row
+/// deleted mid-walk must not shift the next page.
+///
+/// `store_path_hash` is the primary key with the default BINARY collation, so
+/// this order is byte order — the same order `ListObjectsV2` returns the
+/// `nar/<hash>.nar.zst` keys in.
+pub fn objects_after(conn: &Connection, after: Option<&str>) -> Result<Vec<ObjectBrief>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {OBJECT_BRIEF_COLUMNS} FROM objects
+         WHERE store_path_hash > ?1
+         ORDER BY store_path_hash
+         LIMIT ?2"
+    ))?;
     Ok(stmt
-        .query_map([], ObjectBrief::from_row)?
+        .query_map(
+            params![after.unwrap_or(""), ROW_PAGE as i64],
+            ObjectBrief::from_row,
+        )?
         .collect::<rusqlite::Result<_>>()?)
 }
 
@@ -1269,9 +1288,31 @@ mod tests {
         insert_object(&mut conn, &object(&a), 100).unwrap();
         insert_object(&mut conn, &object(&b), 200).unwrap();
 
-        let mut rows = all_objects_brief(&conn).unwrap();
-        rows.sort_by(|x, y| x.store_path_hash.cmp(&y.store_path_hash));
+        let rows = objects_after(&conn, None).unwrap();
         assert_eq!(rows, vec![brief(&a, 100), brief(&b, 200)]);
+    }
+
+    /// The sweep pages the rows by key: a page is what follows its cursor,
+    /// and the cursor a page returns resumes after its last row.
+    #[test]
+    fn brief_listing_pages_by_key() {
+        let mut conn = db();
+        let hashes = ["a", "b", "c"].map(|c| c.repeat(32));
+        for hash in &hashes {
+            insert_object(&mut conn, &object(hash), 100).unwrap();
+        }
+
+        let first = objects_after(&conn, None).unwrap();
+        assert_eq!(first.len(), 3);
+        assert!(
+            objects_after(&conn, Some(&first[2].store_path_hash))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            objects_after(&conn, Some(&first[0].store_path_hash)).unwrap(),
+            vec![brief(&hashes[1], 100), brief(&hashes[2], 100)]
+        );
     }
 
     /// The listing of a row the `object` fixture inserted at `created_at`.
