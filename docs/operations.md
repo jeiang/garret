@@ -175,6 +175,20 @@ Alert rules and a Grafana dashboard ship in `contrib/monitoring/`. The rules
 assume each service is scraped under a job name starting with `garret`; if yours
 differ, edit the `GarretDown` selector.
 
+Uploads also report where their time went, as three unlabelled counters in
+milliseconds, each recorded once per upload (failed ones included):
+
+- `garret_upload_client_wait_milliseconds_total` — waiting on the client's
+  body.
+- `garret_upload_verify_wait_milliseconds_total` — waiting for the NAR check
+  to keep up, including the wait for its verdict.
+- `garret_upload_s3_part_wait_milliseconds_total` — waiting for S3 part
+  uploads to drain.
+
+Divide each by the number of uploads over the same window for a per-upload
+average. A client wait that dominates points at the network, a verify wait at
+CPU, and a part wait at S3.
+
 The Puller makes no S3 API calls. Its only S3 traffic is the `/ready/deep` read
 of a presigned URL, which is why revoked or rotated credentials fail that probe
 while narinfo and NAR redirects keep working.

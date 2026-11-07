@@ -187,6 +187,11 @@ Size the Pusher's `MemoryMax` at no less than `2 × maxInFlightBytes +
 maxConcurrentUploads × 8 MiB + ~1 MiB × maxConcurrentUploads`, plus headroom for
 the process. The defaults need about 700 MiB.
 
+The Pusher unit sets `MALLOC_ARENA_MAX=2`. Without it, glibc keeps freed upload
+buffers in per-thread arenas, and peak RSS on an 8-core host was about 1.5×
+higher at the same throughput. The Puller unit leaves the glibc default: the
+same setting lowered its request rate by about 7%.
+
 ## Scheduled fsck
 
 `fsck.calendar` takes a systemd `OnCalendar` expression and adds

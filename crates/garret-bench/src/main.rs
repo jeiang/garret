@@ -3,7 +3,8 @@
 //! Speaks the real protocol: negotiation-free PUTs with the length-prefixed
 //! preamble, zstd, and 429 backoff. It builds bodies itself rather than
 //! dumping NARs from a store, because the point is to load the server under a
-//! reproducible corpus, not to exercise nix.
+//! reproducible corpus, not to exercise nix. Bodies are prepared before the
+//! timed phase, so a run measures the server rather than the bench client.
 //!
 //! Three scenarios (spec 09), one per subcommand plus `all`:
 //! - `push`   — the headline: N concurrent pushers over the corpus.
@@ -16,7 +17,7 @@ mod corpus;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -90,8 +91,9 @@ struct PushArgs {
     /// Concurrent pushers — the headline scenario is 20
     #[arg(long, default_value_t = 20)]
     concurrency: usize,
-    /// Include the multi-GB tail entry (held in memory whole here; the
-    /// `stream` scenario covers the giant blob without the allocation)
+    /// Include the multi-GB tail entry. Its body is prepared with the rest of
+    /// the corpus and held whole, so the run needs ~2 GiB more memory; the
+    /// `stream` scenario covers the giant blob without the allocation
     #[arg(long)]
     with_giant: bool,
     #[arg(long, default_value_t = 3)]
@@ -133,9 +135,14 @@ struct PullArgs {
     no_pull_keepalive: bool,
 }
 
+/// Bumped whenever the harness measures different work, so results are never
+/// compared across methodologies. 2: push bodies are generated, hashed and
+/// compressed before the timed phase; v1 timed all of that per request.
+const HARNESS_VERSION: u32 = 2;
+
 /// Where the numbers came from. `label` is the comparison key: the diff
 /// script refuses to silently compare across labels, and refuses outright
-/// across corpus versions.
+/// across corpus or harness versions.
 #[derive(Debug, Serialize)]
 struct Meta {
     os: &'static str,
@@ -144,6 +151,7 @@ struct Meta {
     label: String,
     seed: u64,
     corpus_version: u32,
+    harness_version: u32,
     version: &'static str,
     timestamp_unix: i64,
 }
@@ -249,6 +257,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)),
         seed: cli.seed,
         corpus_version: corpus::VERSION,
+        harness_version: HARNESS_VERSION,
         version: env!("CARGO_PKG_VERSION"),
         timestamp_unix: timestamp,
     };
@@ -343,26 +352,33 @@ async fn run_push(
         cli.seed
     );
 
-    // Retries are counted per phase: the baseline's must not show up in the
-    // loaded results.
-    let baseline_counters = Counters::default();
-
     // Baseline first, one at a time, over the same corpus under different
     // keys: same sizes and compressibility, so the medians are comparable and
     // nothing is skipped as already-present.
     let baseline_entries = corpus::rekey(&corpus::generate(cli.seed, cli.count, false));
+
+    // Every body — NAR generation, NarHash, zstd — is built before either
+    // timed phase: that work is this client's CPU, and timing it 20-way
+    // concurrent would measure the bench machine as much as the server. The
+    // bodies are held whole, so the run's footprint is the compressed corpus
+    // (~150 MiB by default; `--with-giant` adds ~2 GiB).
+    let preparing = Instant::now();
+    let bodies = prepare_all(&entries, args.zstd_level)?;
+    let baseline_bodies = prepare_all(&baseline_entries, args.zstd_level)?;
+    println!(
+        "prepared {} bodies in {:.2}s",
+        bodies.len() + baseline_bodies.len(),
+        preparing.elapsed().as_secs_f64()
+    );
+
+    // Retries are counted per phase: the baseline's must not show up in the
+    // loaded results.
+    let baseline_counters = Counters::default();
+
     let mut baseline = Vec::new();
-    for entry in &baseline_entries {
+    for (entry, body) in baseline_entries.iter().zip(&baseline_bodies) {
         let started = Instant::now();
-        push(
-            http,
-            &cli.endpoint,
-            token,
-            entry,
-            args.zstd_level,
-            &baseline_counters,
-        )
-        .await?;
+        push_prepared(http, &cli.endpoint, token, entry, body, &baseline_counters).await?;
         // Floored at 1 ms: the ratio below divides by this.
         baseline.push((started.elapsed().as_millis() as u64).max(1));
     }
@@ -377,29 +393,29 @@ async fn run_push(
     let counters = Arc::new(Counters::default());
     let started = Instant::now();
 
-    let latencies: Vec<(usize, Option<Duration>)> = stream::iter(entries.into_iter().enumerate())
-        .map(|(index, entry)| {
-            let (http, endpoint, token, counters) = (
-                http.clone(),
-                cli.endpoint.clone(),
-                token.to_owned(),
-                counters.clone(),
-            );
-            let zstd_level = args.zstd_level;
-            async move {
-                let started = Instant::now();
-                match push(&http, &endpoint, &token, &entry, zstd_level, &counters).await {
-                    Ok(()) => (index, Some(started.elapsed())),
-                    Err(e) => {
-                        eprintln!("push {} failed: {e:#}", entry.name);
-                        (index, None)
+    let latencies: Vec<(usize, Option<Duration>)> =
+        stream::iter(entries.into_iter().zip(bodies).enumerate())
+            .map(|(index, (entry, body))| {
+                let (http, endpoint, token, counters) = (
+                    http.clone(),
+                    cli.endpoint.clone(),
+                    token.to_owned(),
+                    counters.clone(),
+                );
+                async move {
+                    let started = Instant::now();
+                    match push_prepared(&http, &endpoint, &token, &entry, &body, &counters).await {
+                        Ok(()) => (index, Some(started.elapsed())),
+                        Err(e) => {
+                            eprintln!("push {} failed: {e:#}", entry.name);
+                            (index, None)
+                        }
                     }
                 }
-            }
-        })
-        .buffer_unordered(args.concurrency)
-        .collect()
-        .await;
+            })
+            .buffer_unordered(args.concurrency)
+            .collect()
+            .await;
 
     let wall = started.elapsed();
     let wire_bytes = counters.wire.load(Ordering::Relaxed);
@@ -644,21 +660,69 @@ fn nar_hash(chunks: impl IntoIterator<Item = impl AsRef<[u8]>>) -> String {
     format!("sha256-{}", B64.encode(hasher.finalize()))
 }
 
-async fn push(
+/// One push body built ahead of the timed phase: the framed preamble plus the
+/// compressed NAR, ready to clone into a request.
+struct Prepared {
+    body: bytes::Bytes,
+}
+
+/// Builds a body — NAR generation, NarHash, zstd — for [`push_prepared`].
+fn prepare(entry: &corpus::Entry, level: i32) -> Result<Prepared> {
+    let nar = entry.body();
+    let mut body = preamble_for(entry, nar_hash([&nar])).to_framed()?;
+    body.extend(zstd::encode_all(nar.as_slice(), level).context("compressing")?);
+    Ok(Prepared {
+        body: bytes::Bytes::from(body),
+    })
+}
+
+/// Prepares every entry's body in parallel, one worker per core, and returns
+/// them in `entries` order. The caller starts its timer afterwards.
+fn prepare_all(entries: &[corpus::Entry], level: i32) -> Result<Vec<Prepared>> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(entries.len().max(1));
+    let next = AtomicUsize::new(0);
+    let mut done = std::thread::scope(|scope| -> Result<Vec<(usize, Prepared)>> {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| -> Result<Vec<(usize, Prepared)>> {
+                    let mut out = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(entry) = entries.get(index) else {
+                            break;
+                        };
+                        out.push((index, prepare(entry, level)?));
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        let mut all = Vec::with_capacity(entries.len());
+        for handle in handles {
+            all.extend(handle.join().expect("preparation thread panicked")?);
+        }
+        Ok(all)
+    })?;
+    done.sort_unstable_by_key(|(index, _)| *index);
+    Ok(done.into_iter().map(|(_, body)| body).collect())
+}
+
+/// One PUT of a body prepared by [`prepare`]. The caller times only this, so
+/// the upload and its retries are all that is measured.
+async fn push_prepared(
     http: &reqwest::Client,
     endpoint: &str,
     token: &str,
     entry: &corpus::Entry,
-    level: i32,
+    prepared: &Prepared,
     counters: &Counters,
 ) -> Result<()> {
-    let nar = entry.body();
-    let mut body = preamble_for(entry, nar_hash([&nar])).to_framed()?;
-    body.extend(zstd::encode_all(nar.as_slice(), level).context("compressing")?);
     counters
         .wire
-        .fetch_add(body.len() as u64, Ordering::Relaxed);
-    let body = bytes::Bytes::from(body);
+        .fetch_add(prepared.body.len() as u64, Ordering::Relaxed);
+    let body = prepared.body.clone();
     put_with_retry(
         http,
         &upload_url(endpoint, entry),
@@ -796,5 +860,18 @@ mod tests {
             .flatten()
             .collect();
         assert_eq!(zstd::decode_all(&frame[..]).unwrap(), chunks.concat());
+    }
+
+    /// The prepared bodies are zipped back against the entries they came from,
+    /// so a reordering or a dropped body would silently upload the wrong
+    /// bytes under a store path.
+    #[test]
+    fn prepare_all_returns_bodies_in_entry_order() {
+        let entries = corpus::generate(11, 5, false);
+        let prepared = prepare_all(&entries, 3).unwrap();
+        assert_eq!(prepared.len(), entries.len());
+        for (entry, body) in entries.iter().zip(&prepared) {
+            assert_eq!(body.body, prepare(entry, 3).unwrap().body);
+        }
     }
 }

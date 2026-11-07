@@ -13,6 +13,11 @@ test-support = ["dep:aws-lc-rs"]
 parking_lot = "0.12"
 bytes = "1"
 futures = "0.3"
+# The part body is an http-body 1 stream the AWS SDK reads directly, and its
+# CRC32 is computed here so the SDK sends a plain checksum header instead of
+# switching the request to aws-chunked with a trailer.
+http-body = "1"
+crc32fast = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }

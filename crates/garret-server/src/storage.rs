@@ -1,20 +1,24 @@
 //! S3 blob storage (MEGA S4 in production, versitygw locally). Spec 03-storage.
 
 use std::{
+    convert::Infallible,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use aws_sdk_s3::{
     Client,
     config::Credentials,
     error::SdkError,
     presigning::PresigningConfig,
-    primitives::ByteStream,
+    primitives::{ByteStream, SdkBody},
     types::{CompletedMultipartUpload, CompletedPart, Delete, ObjectIdentifier},
 };
-use bytes::{Bytes, BytesMut};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -182,7 +186,7 @@ pub fn hash_for(key: &str) -> Option<&str> {
         .filter(|h| !h.is_empty())
 }
 
-/// One blob from [`Storage::list_blobs`].
+/// One blob from [`BlobLister::next_page`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blob {
     /// The store-path hash its key encodes ([`hash_for`]).
@@ -193,23 +197,181 @@ pub struct Blob {
     pub size: i64,
 }
 
-/// Store path hashes of blobs with no DB row, past both guards: an upload in
-/// the in-flight set, or younger than `grace` — a row lands only after its
-/// blob completes, so a rowless blob might just be mid-push. Shared by the
-/// GC orphan sweep and `garret-admin fsck`'s read-only mirror-image check.
-pub fn orphan_hashes<'a>(
-    blobs: &'a [Blob],
-    known: &std::collections::HashSet<String>,
-    in_flight: &crate::inflight::InFlight,
-    grace: Duration,
-) -> Vec<&'a str> {
-    blobs
-        .iter()
-        .filter(|blob| {
-            !known.contains(&blob.hash) && !in_flight.contains(&blob.hash) && blob.age >= grace
-        })
-        .map(|blob| blob.hash.as_str())
-        .collect()
+/// A blob with no row is an orphan candidate, unless an upload owns the path
+/// or the blob is younger than `grace`: a row lands only after its blob
+/// completes, so a rowless blob may just be mid-push. Shared by the GC orphan
+/// sweep and `garret-admin fsck`'s read-only mirror-image check.
+pub fn is_orphan(blob: &Blob, in_flight: &crate::inflight::InFlight, grace: Duration) -> bool {
+    !in_flight.contains(&blob.hash) && blob.age >= grace
+}
+
+/// A window over the object rows, pulled in `store_path_hash` order as the
+/// bucket listing advances. The sweep never materializes the table and never
+/// holds the connection across an S3 await: the caller fetches one page
+/// ([`crate::db::objects_after`]) whenever [`RowWindow::needs_through`] says
+/// the window does not reach the listing yet.
+#[derive(Default)]
+pub struct RowWindow {
+    rows: std::collections::VecDeque<crate::db::ObjectBrief>,
+    /// The last key fetched; `None` before the first page.
+    last: Option<String>,
+    /// The last page was short, so the table has no more rows.
+    done: bool,
+}
+
+impl RowWindow {
+    /// An empty window: no rows fetched yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The cursor for the next fetch: rows after this key.
+    pub fn cursor(&self) -> Option<&str> {
+        self.last.as_deref()
+    }
+
+    /// True when rows up to and including `hash` may not all be in the window
+    /// yet, so the caller must fetch another page.
+    pub fn needs_through(&self, hash: &str) -> bool {
+        !self.done && self.last.as_deref().is_none_or(|last| last < hash)
+    }
+
+    /// True when the table may have rows that were never fetched.
+    pub fn more(&self) -> bool {
+        !self.done
+    }
+
+    /// Appends a fetched page; a short page means the table is exhausted.
+    pub fn extend(&mut self, page: Vec<crate::db::ObjectBrief>) {
+        let more = page.len() == crate::db::ROW_PAGE;
+        if let Some(last) = page.last() {
+            self.last = Some(last.store_path_hash.clone());
+        }
+        self.rows.extend(page);
+        self.done = !more;
+    }
+
+    /// Pops the next row when it sorts before `hash`: a row with no blob.
+    pub fn pop_before(&mut self, hash: &str) -> Option<crate::db::ObjectBrief> {
+        match self.rows.front() {
+            Some(row) if row.store_path_hash.as_str() < hash => self.rows.pop_front(),
+            _ => None,
+        }
+    }
+
+    /// Pops the row whose key is `hash`, if the window holds it.
+    pub fn pop_equal(&mut self, hash: &str) -> Option<crate::db::ObjectBrief> {
+        match self.rows.front() {
+            Some(row) if row.store_path_hash == hash => self.rows.pop_front(),
+            _ => None,
+        }
+    }
+
+    /// Pops every remaining row, in order.
+    pub fn drain(&mut self) -> impl Iterator<Item = crate::db::ObjectBrief> + '_ {
+        self.rows.drain(..)
+    }
+}
+
+/// One page of the sorted merge: every blob classified against the rows that
+/// sort with it.
+#[derive(Debug, Default)]
+pub struct Merged<'a> {
+    /// Blobs with no row; [`is_orphan`] applies the remaining guards.
+    pub orphans: Vec<&'a Blob>,
+    /// Blobs with their row.
+    pub pairs: Vec<(&'a Blob, crate::db::ObjectBrief)>,
+    /// Rows with no blob.
+    pub dangling: Vec<crate::db::ObjectBrief>,
+}
+
+/// Merges one page of blobs against the row window, advancing it. Rows before
+/// the page's first blob are dangling too; rows past its last blob stay for
+/// the next page. The caller must have fetched rows through the page's last
+/// key ([`RowWindow::needs_through`]).
+pub fn merge_page<'a>(page: &'a [Blob], rows: &mut RowWindow) -> Merged<'a> {
+    let mut merged = Merged::default();
+    for blob in page {
+        while let Some(row) = rows.pop_before(&blob.hash) {
+            merged.dangling.push(row);
+        }
+        match rows.pop_equal(&blob.hash) {
+            Some(row) => merged.pairs.push((blob, row)),
+            None => merged.orphans.push(blob),
+        }
+    }
+    merged
+}
+
+/// Pages through the bucket's `nar/` listing in key order.
+///
+/// The merge against the object rows assumes `ListObjectsV2` returns keys in
+/// UTF-8 byte order. S3 does, and `nar/<hash>.nar.zst` keys preserve hash
+/// order, so a page that breaks it — an implementation that does not sort —
+/// fails the walk instead of misclassifying every key after it.
+pub struct BlobLister<'a> {
+    storage: &'a Storage,
+    token: Option<String>,
+    last_key: Option<String>,
+    done: bool,
+}
+
+impl BlobLister<'_> {
+    /// The next page of blobs, or `None` once the bucket is listed. Keys
+    /// outside the `nar/<hash>.nar.zst` layout are skipped, but still checked
+    /// for order.
+    pub async fn next_page(&mut self) -> Result<Option<Vec<Blob>>> {
+        if self.done {
+            return Ok(None);
+        }
+        let page = timed(
+            "list",
+            self.storage
+                .client
+                .list_objects_v2()
+                .bucket(&self.storage.bucket)
+                .prefix("nar/")
+                .set_continuation_token(self.token.take())
+                .send(),
+        )
+        .await
+        .context("listing blobs")?;
+
+        let mut blobs = Vec::new();
+        for object in page.contents() {
+            let Some(key) = object.key() else { continue };
+            if let Some(last) = &self.last_key
+                && key <= last.as_str()
+            {
+                bail!(
+                    "bucket listing is not sorted: {key} came after {last}; the orphan \
+                     sweep and fsck merge the listing against the database and need \
+                     ListObjectsV2 to return keys in lexicographic order"
+                );
+            }
+            self.last_key = Some(key.to_owned());
+            let Some(hash) = hash_for(key) else { continue };
+            let size = object
+                .size()
+                .with_context(|| format!("listing blobs: no size for {key}"))?;
+            blobs.push(Blob {
+                hash: hash.to_owned(),
+                age: age(object.last_modified()),
+                size,
+            });
+        }
+
+        self.token = page.next_continuation_token().map(str::to_owned);
+        if self.token.is_none() {
+            // A truncated page with no token would silently end the listing,
+            // and every row past it would read as dangling.
+            if page.is_truncated() == Some(true) {
+                bail!("listing blobs: truncated page without a continuation token");
+            }
+            self.done = true;
+        }
+        Ok(Some(blobs))
+    }
 }
 
 /// Time since an S3 timestamp; zero when it is missing or in the future.
@@ -286,6 +448,91 @@ pub async fn next_chunk<S: Stream + Unpin>(
     })
 }
 
+/// One part's bytes: the body chunks that make it up, in order, and their
+/// exact total. A chunk is a `Bytes` slice of the request body, so a part is
+/// never copied into a contiguous buffer — the SDK streams the chunks as they
+/// are. `len` is what S3's uniform-part-size rule and `Content-Length` need.
+#[derive(Debug, Default)]
+struct Part {
+    chunks: Vec<Bytes>,
+    len: usize,
+}
+
+impl Part {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The part as one buffer. Only the single-`PutObject` path needs this
+    /// (a body below one part), and it is free when hyper delivered the body
+    /// in one chunk.
+    fn into_bytes(mut self) -> Bytes {
+        match self.chunks.len() {
+            0 => Bytes::new(),
+            1 => self.chunks.pop().expect("one chunk"),
+            _ => {
+                let mut buf = Vec::with_capacity(self.len);
+                for chunk in &self.chunks {
+                    buf.extend_from_slice(chunk);
+                }
+                Bytes::from(buf)
+            }
+        }
+    }
+}
+
+/// A part's chunks as an `http_body::Body`, so the SDK reads them straight
+/// out of the request buffers. `remaining` is the exact size hint the SDK
+/// turns into `Content-Length`.
+struct Chunks {
+    chunks: std::vec::IntoIter<Bytes>,
+    remaining: u64,
+}
+
+impl http_body::Body for Chunks {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+        let this = self.get_mut();
+        Poll::Ready(this.chunks.next().map(|chunk| {
+            this.remaining -= chunk.len() as u64;
+            Ok(http_body::Frame::data(chunk))
+        }))
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
+}
+
+/// The part as a retryable streaming SDK body. Rebuilding it only clones the
+/// chunk list (refcount bumps), so an SDK retry re-sends the same bytes — the
+/// guarantee `ByteStream::from(Bytes)` gives for the contiguous paths.
+fn part_body(chunks: Vec<Bytes>, len: usize) -> SdkBody {
+    SdkBody::retryable(move || {
+        SdkBody::from_body_1_x(Chunks {
+            chunks: chunks.clone().into_iter(),
+            remaining: len as u64,
+        })
+    })
+}
+
+/// CRC32 of a part, base64-encoded the way S3's `x-amz-checksum-crc32`
+/// header wants it. Computing it here, rather than letting the SDK checksum a
+/// streaming body, keeps the request from switching to aws-chunked encoding
+/// with a trailer.
+fn checksum_crc32(chunks: &[Bytes]) -> String {
+    let mut hasher = crc32fast::Hasher::new();
+    for chunk in chunks {
+        hasher.update(chunk);
+    }
+    B64.encode(hasher.finalize().to_be_bytes())
+}
+
 /// The upload body as consumed so far. It owns the read cursor (an overshoot
 /// `carry` left by a split chunk), the running hash and the byte count, so
 /// FileHash and FileSize (spec 03) always describe the same bytes: exactly
@@ -336,31 +583,39 @@ where
     }
 
     /// Hashes and counts `bytes` as they go into `part`, while still
-    /// cache-hot.
-    fn append(&mut self, part: &mut BytesMut, bytes: &[u8]) {
-        self.hasher.update(bytes);
-        part.extend_from_slice(bytes);
+    /// cache-hot. The chunk is moved, not copied: it is a slice of hyper's
+    /// read buffer and stays one.
+    fn append(&mut self, part: &mut Part, bytes: Bytes) {
+        self.hasher.update(&bytes);
         self.received += bytes.len() as u64;
+        part.len += bytes.len();
+        part.chunks.push(bytes);
     }
 
-    /// Appends body bytes to `part` until it holds `cap` bytes or the body
+    /// Appends body chunks to `part` until it holds `cap` bytes or the body
     /// ends, keeping any overshoot as the carry. `part` must have been
-    /// allocated with room for `cap` against a permit: a part slot accounts
-    /// for the part's only buffer.
-    async fn fill(&mut self, part: &mut BytesMut, cap: usize, phase: &'static str) -> Result<()> {
-        while part.len() < cap {
-            let Some(chunk) = self.next(phase).await? else {
+    /// reserved against a permit: a part slot accounts for the whole part.
+    async fn fill(&mut self, part: &mut Part, cap: usize, phase: &'static str) -> Result<()> {
+        while part.len < cap {
+            let Some(mut chunk) = self.next(phase).await? else {
                 break;
             };
-            // A chunk can span several parts, so it is split: a part over
-            // part_size would abort the upload.
-            let room = cap - part.len();
+            // Empty chunks carry nothing and would only add a frame to the
+            // SDK body; the old buffer copy skipped them implicitly.
+            if chunk.is_empty() {
+                continue;
+            }
+            // A chunk can span several parts, so it is split at the part
+            // boundary: a part over part_size would abort the upload. The
+            // split is a `Bytes` slice, so neither half is copied.
+            let room = cap - part.len;
             if chunk.len() > room {
-                self.append(part, &chunk[..room]);
-                self.carry = Some(chunk.slice(room..));
+                let head = chunk.split_to(room);
+                self.append(part, head);
+                self.carry = Some(chunk);
                 break;
             }
-            self.append(part, &chunk);
+            self.append(part, chunk);
         }
         Ok(())
     }
@@ -382,10 +637,16 @@ where
     }
 }
 
-async fn collect(in_flight: &mut JoinSet<Result<CompletedPart>>) -> Result<CompletedPart> {
-    in_flight
-        .join_next()
-        .await
+/// Takes the next finished part, adding the wait for it to `waited`: S3 part
+/// backpressure and the final drain both show up here.
+async fn collect(
+    in_flight: &mut JoinSet<Result<CompletedPart>>,
+    waited: &mut Duration,
+) -> Result<CompletedPart> {
+    let started = Instant::now();
+    let joined = in_flight.join_next().await;
+    *waited += started.elapsed();
+    joined
         .context("no part upload was in flight")?
         .context("part upload task failed")?
 }
@@ -460,10 +721,11 @@ impl Storage {
     /// Streams a body to S3, hashing the bytes as they pass (spec 03-storage).
     /// Returns the sha256 of exactly what was stored, and its length.
     ///
-    /// One part is buffered at a time and a global permit is taken **before**
-    /// each read, so the reader can never race ahead of S3 and server memory
-    /// stays bounded by configuration rather than by client behaviour. Parts
-    /// upload on their own tasks while the next one is read.
+    /// One part is held at a time — as the request body's own chunks, never a
+    /// copy of them — and a global permit is taken **before** each read, so
+    /// the reader can never race ahead of S3 and server memory stays bounded
+    /// by configuration rather than by client behaviour. Parts upload on their
+    /// own tasks while the next one is read.
     ///
     /// `first_part_hint` is the most bytes the body is expected to hold. The
     /// first buffer reserves only that much (capped at a part), so a small NAR
@@ -481,17 +743,42 @@ impl Storage {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
+        let mut part_wait = Duration::ZERO;
+        let stored = self
+            .put_streaming_inner(key, body, limits, first_part_hint, &mut part_wait)
+            .await;
+        // Once per upload, failed ones included: the wait is what tells a
+        // slow store apart from a slow client. Milliseconds, not seconds:
+        // the metrics crate's counters take integers only, and a sub-second
+        // upload would otherwise record nothing.
+        metrics::counter!("garret_upload_s3_part_wait_milliseconds_total")
+            .increment(part_wait.as_millis() as u64);
+        stored
+    }
+
+    async fn put_streaming_inner<S, E>(
+        &self,
+        key: &str,
+        body: S,
+        limits: &UploadLimits,
+        first_part_hint: usize,
+        part_wait: &mut Duration,
+    ) -> Result<(Vec<u8>, i64)>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
         let mut reader = BodyReader::new(body, limits.body_idle);
 
         // First part decides the shape: if the whole body fits, one PutObject.
         let reserve = first_part_hint.clamp(1, limits.part_size);
         let permit = limits.acquire(reserve).await?;
-        let mut first = BytesMut::with_capacity(reserve);
+        let mut first = Part::default();
         reader.fill(&mut first, reserve, "first_part").await?;
         // The hint is a hard cap for a body that is not a whole part: more
         // data means the body exceeds what the caller will accept, so fail
         // rather than wait for more memory while holding a partial permit.
-        if first.len() == reserve
+        if first.len == reserve
             && reserve < limits.part_size
             && reader.has_more("first_part").await?
         {
@@ -499,9 +786,8 @@ impl Storage {
                 "upload body exceeds the {reserve}-byte limit for its size"
             ))));
         }
-        let first = first.freeze();
-        if first.len() < limits.part_size {
-            self.put(key, first).await?;
+        if first.len < limits.part_size {
+            self.put(key, first.into_bytes()).await?;
             drop(permit);
             return Ok(reader.finish());
         }
@@ -524,14 +810,17 @@ impl Storage {
         let mut parts = JoinSet::new();
         parts.spawn(self.upload_part(key, &upload_id, 1, first, permit));
         match self
-            .multipart_body(key, &upload_id, &mut parts, &mut reader, limits)
+            .multipart_body(key, &upload_id, &mut parts, &mut reader, limits, part_wait)
             .await
         {
             Ok(()) => Ok(reader.finish()),
             Err(e) => {
-                // Stop the parts still uploading first: one landing after the
-                // abort would re-create what the abort freed.
-                parts.shutdown().await;
+                // Let the parts already sent finish first: one landing after
+                // the abort would re-create what the abort freed. Cancelling
+                // the task is not enough, because S3 keeps processing a request
+                // whose body it has. Each part is bounded by the operation
+                // timeout, so this wait is too.
+                while parts.join_next().await.is_some() {}
                 metrics::counter!("garret_s3_multipart_aborted_total").increment(1);
                 if let Err(abort) = timed(
                     "abort_mpu",
@@ -564,6 +853,7 @@ impl Storage {
         in_flight: &mut JoinSet<Result<CompletedPart>>,
         reader: &mut BodyReader<S>,
         limits: &UploadLimits,
+        part_wait: &mut Duration,
     ) -> Result<()>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -576,10 +866,10 @@ impl Storage {
             // Room, then permit, then read: a part is never buffered before it
             // can be sent, so one NAR holds at most max_parts_in_flight slots.
             while in_flight.len() >= limits.max_parts_in_flight {
-                completed.push(collect(in_flight).await?);
+                completed.push(collect(in_flight, part_wait).await?);
             }
             let permit = limits.acquire(limits.part_size).await?;
-            let mut part = BytesMut::with_capacity(limits.part_size);
+            let mut part = Part::default();
             reader
                 .fill(&mut part, limits.part_size, "multipart")
                 .await?;
@@ -587,8 +877,7 @@ impl Storage {
                 drop(permit);
                 break;
             }
-            let part = part.freeze();
-            let is_final = part.len() < limits.part_size;
+            let is_final = part.len < limits.part_size;
 
             part_number += 1;
             in_flight.spawn(self.upload_part(key, upload_id, part_number, part, permit));
@@ -598,7 +887,7 @@ impl Storage {
         }
 
         while !in_flight.is_empty() {
-            completed.push(collect(in_flight).await?);
+            completed.push(collect(in_flight, part_wait).await?);
         }
 
         completed.sort_by_key(|p| p.part_number());
@@ -628,7 +917,7 @@ impl Storage {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        body: Bytes,
+        body: Part,
         permit: Reservation,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
         let (client, bucket, key, upload_id, sign_payload) = (
@@ -639,15 +928,29 @@ impl Storage {
             self.sign_payload,
         );
         async move {
-            let bytes = body.len() as u64;
+            let len = body.len;
             let started = Instant::now();
+            // The SDK would otherwise checksum a streaming body in a trailer,
+            // which switches the request to aws-chunked encoding; a checksum
+            // header is what the store expects and what spec 03 promises.
+            let crc32 = checksum_crc32(&body.chunks);
+            // SigV4 payload signing hashes the whole body, so that mode keeps
+            // the contiguous copy; the default path streams the chunks as
+            // they arrived.
+            let payload = if sign_payload {
+                ByteStream::from(body.into_bytes())
+            } else {
+                ByteStream::from(part_body(body.chunks, len))
+            };
             let part = client
                 .upload_part()
                 .bucket(&bucket)
                 .key(&key)
                 .upload_id(&upload_id)
                 .part_number(part_number)
-                .body(ByteStream::from(body))
+                .body(payload)
+                .content_length(len as i64)
+                .checksum_crc32(crc32)
                 .customize()
                 // S4 forbids re-uploading a part, so the SDK must not retry
                 // one: the caller aborts the whole multipart (spec 03-storage).
@@ -665,7 +968,7 @@ impl Storage {
             drop(permit);
 
             metrics::counter!("garret_s3_parts_total").increment(1);
-            metrics::counter!("garret_s3_bytes_uploaded_total").increment(bytes);
+            metrics::counter!("garret_s3_bytes_uploaded_total").increment(len as u64);
             metrics::histogram!("garret_s3_part_duration_seconds").record(started.elapsed());
             Ok(CompletedPart::builder()
                 .part_number(part_number)
@@ -674,44 +977,17 @@ impl Storage {
         }
     }
 
-    /// Every blob under `nar/`, with its age and size. Paginated — the
-    /// bucket outgrows one response long before the cache is interesting.
-    /// Keys outside the `nar/<hash>.nar.zst` layout are skipped.
-    pub async fn list_blobs(&self) -> Result<Vec<Blob>> {
-        let mut out = Vec::new();
-        let mut token: Option<String> = None;
-        loop {
-            let page = timed(
-                "list",
-                self.client
-                    .list_objects_v2()
-                    .bucket(&self.bucket)
-                    .prefix("nar/")
-                    .set_continuation_token(token.take())
-                    .send(),
-            )
-            .await
-            .context("listing blobs")?;
-
-            for object in page.contents() {
-                let Some(key) = object.key() else { continue };
-                let Some(hash) = hash_for(key) else { continue };
-                let size = object
-                    .size()
-                    .with_context(|| format!("listing blobs: no size for {key}"))?;
-                out.push(Blob {
-                    hash: hash.to_owned(),
-                    age: age(object.last_modified()),
-                    size,
-                });
-            }
-
-            token = page.next_continuation_token().map(str::to_owned);
-            if token.is_none() {
-                break;
-            }
+    /// Every blob under `nar/`, a page at a time, in the bucket's key order.
+    /// Paginated — the bucket outgrows one response long before the cache is
+    /// interesting — and order-checked, because the sweep and fsck merge the
+    /// listing against the object rows instead of materializing either side.
+    pub fn list_blobs(&self) -> BlobLister<'_> {
+        BlobLister {
+            storage: self,
+            token: None,
+            last_key: None,
+            done: false,
         }
-        Ok(out)
     }
 
     /// Batched at 1,000 keys — the S3 limit for a single `DeleteObjects`.
@@ -846,27 +1122,102 @@ mod tests {
 
     const IDLE: Duration = Duration::from_secs(60);
 
-    #[test]
-    fn orphan_hashes_excludes_known_in_flight_and_young_blobs() {
-        let grace = Duration::from_secs(86400);
-        let blob = |hash: &str, age_secs| Blob {
+    fn blob(hash: &str, age_secs: u64) -> Blob {
+        Blob {
             hash: hash.into(),
             age: Duration::from_secs(age_secs),
             size: 1,
-        };
-        let blobs = vec![
-            blob("known", 90000),
-            blob("uploading", 90000),
-            blob("young", 10),
-            blob("stale", 90000),
-        ];
-        let known: std::collections::HashSet<String> = ["known".to_string()].into();
+        }
+    }
+
+    fn row(hash: &str) -> crate::db::ObjectBrief {
+        crate::db::ObjectBrief {
+            store_path_hash: hash.into(),
+            name: "thing".into(),
+            created_at: 1,
+            file_size: 1,
+        }
+    }
+
+    #[test]
+    fn is_orphan_excludes_in_flight_and_young_blobs() {
+        let grace = Duration::from_secs(86400);
         let in_flight = crate::inflight::InFlight::new();
         let _claim = in_flight.claim("uploading").unwrap();
 
+        assert!(!is_orphan(&blob("uploading", 90000), &in_flight, grace));
+        assert!(!is_orphan(&blob("young", 10), &in_flight, grace));
+        assert!(is_orphan(&blob("stale", 90000), &in_flight, grace));
+    }
+
+    /// The walk pages both sides: every key is classified once, across page
+    /// boundaries on either side, and the row window only ever holds what the
+    /// listing has reached.
+    #[test]
+    fn the_merge_walk_pages_both_sides_across_boundaries() {
+        let key = |i: usize| format!("{i:032x}");
+        // A blob with no row every 7th key, a row with no blob every 11th.
+        let has_blob = |i: usize| !i.is_multiple_of(11);
+        let has_row = |i: usize| !i.is_multiple_of(7);
+        let total = 3000;
+
+        let rows: Vec<_> = (0..total)
+            .filter(|i| has_row(*i))
+            .map(|i| row(&key(i)))
+            .collect();
+        let blobs: Vec<_> = (0..total)
+            .filter(|i| has_blob(*i))
+            .map(|i| blob(&key(i), 90000))
+            .collect();
+
+        let mut window = RowWindow::new();
+        let mut fetched = 0;
+        let mut merged = Merged::default();
+        for page in blobs.chunks(64) {
+            let last = page.last().unwrap();
+            while window.needs_through(&last.hash) {
+                let end = (fetched + crate::db::ROW_PAGE).min(rows.len());
+                window.extend(rows[fetched..end].to_vec());
+                fetched = end;
+            }
+            let page = merge_page(page, &mut window);
+            merged.orphans.extend(page.orphans);
+            merged.pairs.extend(page.pairs);
+            merged.dangling.extend(page.dangling);
+        }
+        while window.more() {
+            let end = (fetched + crate::db::ROW_PAGE).min(rows.len());
+            window.extend(rows[fetched..end].to_vec());
+            fetched = end;
+        }
+        merged.dangling.extend(window.drain());
+
+        let expected = |kept: &dyn Fn(usize) -> bool| -> Vec<String> {
+            (0..total).filter(|i| kept(*i)).map(key).collect()
+        };
         assert_eq!(
-            orphan_hashes(&blobs, &known, &in_flight, grace),
-            vec!["stale"]
+            merged
+                .orphans
+                .iter()
+                .map(|b| b.hash.clone())
+                .collect::<Vec<_>>(),
+            expected(&|i| has_blob(i) && !has_row(i))
+        );
+        assert_eq!(
+            merged
+                .dangling
+                .iter()
+                .map(|r| r.store_path_hash.clone())
+                .collect::<Vec<_>>(),
+            expected(&|i| has_row(i) && !has_blob(i))
+        );
+        assert_eq!(
+            merged
+                .pairs
+                .iter()
+                .map(|(_, r)| r.store_path_hash.clone())
+                .collect::<Vec<_>>(),
+            expected(&|i| has_row(i) && has_blob(i))
         );
     }
 
@@ -878,12 +1229,12 @@ mod tests {
     }
 
     /// One `fill` of a fresh `cap`-sized part, as `multipart_body` does it.
-    async fn read_part<S, E>(reader: &mut BodyReader<S>, cap: usize) -> Result<BytesMut>
+    async fn read_part<S, E>(reader: &mut BodyReader<S>, cap: usize) -> Result<Part>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: std::fmt::Display,
     {
-        let mut part = BytesMut::with_capacity(cap);
+        let mut part = Part::default();
         reader.fill(&mut part, cap, "multipart").await?;
         Ok(part)
     }
@@ -914,8 +1265,8 @@ mod tests {
                 if part.is_empty() {
                     break;
                 }
-                let short = part.len() < part_size;
-                sizes.push(part.len());
+                let short = part.len < part_size;
+                sizes.push(part.len);
                 if short {
                     break;
                 }
@@ -989,7 +1340,7 @@ mod tests {
         ])
         .chain(futures::stream::pending());
         let mut reader = BodyReader::new(body, Duration::from_millis(10));
-        assert_eq!(read_part(&mut reader, 10).await.unwrap().len(), 10);
+        assert_eq!(read_part(&mut reader, 10).await.unwrap().len, 10);
         let err = read_part(&mut reader, 1024).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("after 13 bytes"), "{msg}");
@@ -1005,7 +1356,7 @@ mod tests {
             Ok::<_, std::io::Error>(Bytes::from_static(b"ab"))
         }));
         let mut reader = BodyReader::new(body, IDLE);
-        assert_eq!(read_part(&mut reader, 1024).await.unwrap().len(), 8);
+        assert_eq!(read_part(&mut reader, 1024).await.unwrap().len, 8);
     }
 
     /// Just enough S3 on a loopback port. Every call succeeds, except that
@@ -1062,6 +1413,147 @@ mod tests {
         crate::testing::fake_s3(axum::Router::new().fallback(handle)).await
     }
 
+    /// What the fake S3 saw of one `UploadPart` request.
+    #[derive(Clone, Debug)]
+    struct SeenPart {
+        number: i32,
+        content_length: Option<String>,
+        crc32: Option<String>,
+        /// The request was aws-chunked: a trailer checksum instead of a
+        /// header, and a body wrapped in chunk framing.
+        chunked: bool,
+        body: Vec<u8>,
+    }
+
+    /// A fake S3 that records every `UploadPart`, so a test can check the
+    /// bytes, the length and the checksum that actually went on the wire.
+    async fn recording_s3(seen: Arc<std::sync::Mutex<Vec<SeenPart>>>) -> Storage {
+        use axum::{
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let seen = seen.clone();
+            async move {
+                let (parts, body) = req.into_parts();
+                let body = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let query = parts.uri.query().unwrap_or_default().to_owned();
+                let param = |name: &str| {
+                    query
+                        .split('&')
+                        .find_map(|p| p.strip_prefix(name)?.strip_prefix('='))
+                        .map(str::to_owned)
+                };
+                let xml = |body: String| ([("content-type", "application/xml")], body);
+                match parts.method {
+                    Method::POST
+                        if query
+                            .split('&')
+                            .any(|p| p.split('=').next() == Some("uploads")) =>
+                    {
+                        xml("<InitiateMultipartUploadResult><UploadId>u</UploadId>\
+                             </InitiateMultipartUploadResult>"
+                            .into())
+                        .into_response()
+                    }
+                    Method::POST => xml("<CompleteMultipartUploadResult/>".into()).into_response(),
+                    Method::PUT => {
+                        if let Some(number) = param("partNumber") {
+                            let header = |name: &str| {
+                                parts
+                                    .headers
+                                    .get(name)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_owned)
+                            };
+                            seen.lock().expect("seen lock").push(SeenPart {
+                                number: number.parse().expect("part number"),
+                                content_length: header("content-length"),
+                                crc32: header("x-amz-checksum-crc32"),
+                                chunked: header("content-encoding")
+                                    .is_some_and(|v| v.contains("aws-chunked"))
+                                    || header("x-amz-decoded-content-length").is_some(),
+                                body: body.to_vec(),
+                            });
+                        }
+                        [("etag", "\"e\"")].into_response()
+                    }
+                    _ => StatusCode::NO_CONTENT.into_response(),
+                }
+            }
+        });
+        crate::testing::fake_s3(app).await
+    }
+
+    /// A part is sent as the bytes that arrived, not a copy of them: chunk
+    /// boundaries that straddle part boundaries must still produce the exact
+    /// part bytes, the exact `Content-Length`, and a CRC32 header S3 can
+    /// verify over those bytes. A streaming body without that header would
+    /// make the SDK choose aws-chunked encoding with a trailer instead.
+    #[tokio::test]
+    async fn parts_are_sent_whole_with_their_crc32() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let storage = recording_s3(seen.clone()).await;
+        let part_size = 1024;
+        let limits = UploadLimits::new(part_size, 2, 4 * part_size as u64, IDLE);
+        let body: Vec<u8> = (0..2 * part_size + 300).map(|i| (i % 251) as u8).collect();
+        // Chunk boundaries at 700, 800, 1600, 2100: two fall inside a part.
+        let mut at = 0;
+        let chunks: Vec<_> = [700, 100, 800, 500, 248]
+            .iter()
+            .map(|&size| {
+                let chunk = Bytes::copy_from_slice(&body[at..at + size]);
+                at += size;
+                Ok::<_, std::io::Error>(chunk)
+            })
+            .collect();
+        assert_eq!(at, body.len());
+
+        let stored = storage
+            .put_streaming(
+                &key_for("parts"),
+                futures::stream::iter(chunks),
+                &limits,
+                part_size,
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored, (Sha256::digest(&body).to_vec(), body.len() as i64));
+
+        let mut parts = seen.lock().expect("seen lock").clone();
+        parts.sort_by_key(|p| p.number);
+        assert_eq!(parts.len(), 3, "two whole parts and the tail");
+        let mut sent = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            let start = index * part_size;
+            let end = (start + part_size).min(body.len());
+            assert_eq!(part.body, body[start..end], "part {} bytes", part.number);
+            let expected_len = (end - start).to_string();
+            assert_eq!(
+                part.content_length.as_deref(),
+                Some(expected_len.as_str()),
+                "part {} length",
+                part.number
+            );
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&part.body);
+            let expected_crc = B64.encode(hasher.finalize().to_be_bytes());
+            assert_eq!(
+                part.crc32.as_deref(),
+                Some(expected_crc.as_str()),
+                "part {} checksum",
+                part.number
+            );
+            assert!(!part.chunked, "part {} used aws-chunked", part.number);
+            sent.extend_from_slice(&part.body);
+        }
+        assert_eq!(sent, body, "the parts reassemble the body");
+    }
+
     /// An upload is charged its hint (rounded up to a unit) while it waits on
     /// the body, and gives it back when dropped mid-read.
     #[tokio::test]
@@ -1077,6 +1569,58 @@ mod tests {
         assert_eq!(limits.in_flight_bytes(), 200);
         drop(upload);
         assert_eq!(limits.in_flight_bytes(), 0);
+    }
+
+    /// A failed upload aborts its multipart only after the parts already
+    /// sent have finished: S3 completes a part request it is processing, and
+    /// one that lands after the abort re-creates the upload.
+    #[tokio::test]
+    async fn a_failed_multipart_aborts_after_its_parts_land() {
+        use axum::{
+            extract::Request,
+            http::{Method, StatusCode},
+            response::IntoResponse,
+        };
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = events.clone();
+        let app = axum::Router::new().fallback(move |req: Request| {
+            let log = log.clone();
+            async move {
+                let query = req.uri().query().unwrap_or_default().to_owned();
+                let method = req.method().clone();
+                let _ = axum::body::to_bytes(req.into_body(), usize::MAX).await;
+                match method {
+                    Method::POST if query.contains("uploads") => (
+                        [("content-type", "application/xml")],
+                        "<InitiateMultipartUploadResult><UploadId>u</UploadId>\
+                         </InitiateMultipartUploadResult>",
+                    )
+                        .into_response(),
+                    Method::PUT => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        log.lock().unwrap().push("part".into());
+                        [("etag", "\"e\"")].into_response()
+                    }
+                    Method::DELETE => {
+                        log.lock().unwrap().push("abort".into());
+                        StatusCode::NO_CONTENT.into_response()
+                    }
+                    _ => StatusCode::NO_CONTENT.into_response(),
+                }
+            }
+        });
+        let storage = crate::testing::fake_s3(app).await;
+        let limits = UploadLimits::new(1024, 4, 8192, IDLE);
+        // Two full parts, then the client body fails.
+        let body = futures::stream::iter([
+            Ok(Bytes::from(vec![1u8; 2048])),
+            Err(std::io::Error::other("client went away")),
+        ]);
+        let stored = storage
+            .put_streaming(&key_for("torn"), body, &limits, 4096)
+            .await;
+        assert!(stored.is_err());
+        assert_eq!(*events.lock().unwrap(), ["part", "part", "abort"]);
     }
 
     /// Uploads that together want more part slots than exist must still all

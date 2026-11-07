@@ -550,6 +550,15 @@ async fn store_upload(
             verify::max_compressed_len(object.nar_size),
         )
         .await;
+    // Where the upload's wall time went, split by who made it wait. Recorded
+    // once per upload, failed ones included. Milliseconds, not seconds: the
+    // metrics crate's counters take integers only, and a sub-second upload
+    // would otherwise record nothing.
+    let (client_wait, verify_wait) = nar.waits();
+    metrics::counter!("garret_upload_client_wait_milliseconds_total")
+        .increment(client_wait.as_millis() as u64);
+    metrics::counter!("garret_upload_verify_wait_milliseconds_total")
+        .increment(verify_wait.as_millis() as u64);
     // Only an `Accepted` verdict may be signed (ADR-0010). No verdict means
     // the stream never reached its end: the store failed, and its error is
     // the cause. A store that succeeded without one is a server bug.

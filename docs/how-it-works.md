@@ -38,7 +38,10 @@ retrying after a dropped connection, produce the same result.
 The Puller signs narinfos with the cache's ed25519 keys, so nix verifies them
 like any other cache. It never proxies NAR bytes: it answers with a redirect to
 a URL that grants one read for a limited time, and the client fetches the bytes
-from the bucket directly.
+from the bucket directly. Presigned URLs are cached in-process and reused while
+at least half their configured lifetime (`presignTtlSeconds`) remains, so a
+repeated pull of one object does not re-sign, and no client is ever handed a URL
+with less than half its lifetime left.
 
 That keeps the Puller small and fast, and it means the bucket must be reachable
 by the machines that substitute. It also means a pull that cannot reach the
@@ -54,6 +57,12 @@ something the cache already has.
 The cost of that choice is that two store paths with nearly identical contents
 are stored twice. The benefit is that every object is one blob, so reads,
 deletes and repairs are single operations.
+
+The bucket must return `ListObjectsV2` keys in lexicographic order, which every
+S3 implementation does. The orphan sweep and `garret-admin fsck` merge that
+listing against the object rows in one sorted pass, a page of each at a time, so
+neither the bucket nor the table is ever fully materialized; a listing that is
+not sorted fails the pass instead of misclassifying every key after the break.
 
 ## Metadata
 
