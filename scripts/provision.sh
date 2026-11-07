@@ -1,5 +1,5 @@
 # Shared provisioning for the e2e gate and the bench harness: a throwaway
-# Garage, a dev OIDC issuer, signing keys, service configs, and both services
+# versitygw, a dev OIDC issuer, signing keys, service configs, and both services
 # running. Sourced, not executed; the caller owns $root and the cleanup trap.
 # build_binaries sets $bin; everything that runs a garret binary comes after it.
 #
@@ -15,7 +15,7 @@ say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 # below. Parallel runs (git worktrees, agents sharing a machine) must not
 # collide: each run gets a random free block unless the caller pins
 # GARRET_E2E_PORT_BASE.
-port_count=6
+port_count=5
 
 port_in_use() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 
@@ -33,17 +33,17 @@ pick_port_base() {
 
 port_base=${GARRET_E2E_PORT_BASE:-$(pick_port_base)}
 s3_port=$port_base
-garage_rpc_port=$((port_base + 1))
-pusher_port=$((port_base + 2))
-puller_port=$((port_base + 3))
-pusher_metrics_port=$((port_base + 4))
-puller_metrics_port=$((port_base + 5))
+pusher_port=$((port_base + 1))
+puller_port=$((port_base + 2))
+pusher_metrics_port=$((port_base + 3))
+puller_metrics_port=$((port_base + 4))
 pusher_url="http://127.0.0.1:$pusher_port"
 puller_url="http://127.0.0.1:$puller_port"
 
-# A leftover Garage on the RPC port answers with a different RPC secret and the
-# failure looks like a handshake bug rather than a stale process. Fail clearly
-# instead. (With random ports this mostly guards a pinned GARRET_E2E_PORT_BASE.)
+# A leftover process on one of these ports answers with someone else's data,
+# and the failure looks like a bug in garret rather than a stale listener. Fail
+# clearly instead. (With random ports this mostly guards a pinned
+# GARRET_E2E_PORT_BASE.)
 require_free_ports() {
   local port
   for port in $(seq "$port_base" $((port_base + port_count - 1))); do
@@ -54,49 +54,44 @@ require_free_ports() {
   done
 }
 
-# Starts Garage, creates the bucket and key, and leaves the credentials in
-# $key_id/$key_secret and a ready-to-embed TOML fragment in $s3_block.
-# $1: bucket capacity for the layout (the e2e corpus fits in 1G; bench needs
-# room for the 2 GiB streaming blob and the corpus).
-start_garage() {
-  local capacity=$1
-  say "starting garage"
-  mkdir -p "$root"/garage/{meta,data}
-  cat > "$root/garage.toml" <<EOF
-metadata_dir = "$root/garage/meta"
-data_dir = "$root/garage/data"
-db_engine = "sqlite"
-replication_factor = 1
-rpc_bind_addr = "127.0.0.1:$garage_rpc_port"
-rpc_public_addr = "127.0.0.1:$garage_rpc_port"
-rpc_secret = "$(openssl rand -hex 32)"
-
-[s3_api]
-s3_region = "garage"
-api_bind_addr = "127.0.0.1:$s3_port"
-EOF
-  garage -c "$root/garage.toml" server &
-  until garage -c "$root/garage.toml" status >/dev/null 2>&1; do sleep 0.3; done
-
-  local node keyinfo
-  node=$(garage -c "$root/garage.toml" node id -q | cut -d@ -f1)
-  garage -c "$root/garage.toml" layout assign -z dc1 -c "$capacity" "$node" >/dev/null
-  garage -c "$root/garage.toml" layout apply --version 1 >/dev/null
-  garage -c "$root/garage.toml" bucket create garret >/dev/null
-  keyinfo=$(garage -c "$root/garage.toml" key create garret-key)
-  key_id=$(grep -o 'GK[0-9a-f]*' <<<"$keyinfo" | head -1)
-  key_secret=$(awk '/Secret key:/ {print $3}' <<<"$keyinfo")
-  garage -c "$root/garage.toml" bucket allow --read --write garret --key garret-key >/dev/null
+# Starts versitygw on the POSIX backend, creates the bucket, and leaves the
+# credentials in $key_id/$key_secret and a ready-to-embed TOML fragment in
+# $s3_block. The key is static: versitygw's root account comes from the
+# environment, so there is nothing to import.
+#
+# versitygw is a background job of the sourcing shell, so the caller's
+# `kill $(jobs -p)` trap takes it down with everything else.
+start_s3() {
+  say "starting versitygw"
+  mkdir -p "$root/vgw"
+  key_id=garretkey
+  key_secret=garretsecret
+  ROOT_ACCESS_KEY=$key_id ROOT_SECRET_KEY=$key_secret \
+    versitygw --port "127.0.0.1:$s3_port" --keep-alive posix "$root/vgw" \
+    >"$root/versitygw.log" 2>&1 &
 
   s3_block="
 [s3]
 bucket = \"garret\"
 endpoint_url = \"http://127.0.0.1:$s3_port\"
-region = \"garage\"
+region = \"us-east-1\"
 path_style = true
 access_key_id = \"$key_id\"
 secret_access_key = \"$key_secret\"
 "
+
+  # The bucket is also the readiness probe: versitygw answers only once it is
+  # listening, and a PUT is idempotent enough to retry.
+  local i
+  for i in $(seq 100); do
+    if curl -sf -o /dev/null --aws-sigv4 "aws:amz:us-east-1:s3" \
+      --user "$key_id:$key_secret" -X PUT "http://127.0.0.1:$s3_port/garret"; then
+      return 0
+    fi
+    sleep 0.3
+  done
+  echo "versitygw never came up (127.0.0.1:$s3_port); see $root/versitygw.log" >&2
+  exit 1
 }
 
 # Leaves the public key in $pubkey and the secret at $root/signing.key.
@@ -242,7 +237,7 @@ wait_for() {
 #
 # GARRET_WRAP is a command prefix (e.g. "taskset -c 0" or a systemd-run
 # scope) applied to the garret services and the bench client — but not to
-# Garage or the builds: in real usage the S3 service is upstream of the
+# versitygw or the builds: in real usage the S3 service is upstream of the
 # sandbox, so resource-limited benchmarks constrain garret alone.
 start_services() {
   # Deliberately backwards: the Pusher owns the schema, and the Puller must

@@ -1,7 +1,7 @@
 # Benchmarks
 
-Measured on garret itself, against a throwaway local Garage standing in for the
-object store. The numbers describe the cache, not the bucket.
+Measured on garret itself, against a throwaway local S3 server standing in for
+the object store. The numbers describe the cache, not the bucket.
 
 ## What is measured
 
@@ -22,11 +22,15 @@ real store contents.
 
 The Ryzen server limits apply to the garret services only: `taskset -c 0` for the CPU
 pin, and per-service systemd user scopes with `MemoryMax=896M MemorySwapMax=0`
-for the memory cap. Garage and the bench client stand in for out-of-sandbox
+for the memory cap. versitygw and the bench client stand in for out-of-sandbox
 components — the upstream S3 service and the pushing machines — and run
 unconstrained.
 
 ## Results
+
+The table below was measured with Garage as the local stand-in. `just
+bench-local` now provisions versitygw instead, and these numbers have not been
+re-measured against it.
 
 | Label | Environment | Push NAR MiB/s | Push median/p99/max ms | Stream 1M/100M/2G MiB/s | Pull req/s | narinfo p50/p99 ms | Peak pusher RSS | Zero failures |
 |---|---|---|---|---|---|---|---|---|
@@ -39,6 +43,11 @@ unconstrained.
 The Pusher runs the default limits — a 256 MiB in-flight cap, 16 MiB parts, 4
 parts in flight — except `max_concurrent_uploads`, raised from the default 16 to
 32 so the 20 pushers are not shed.
+
+On macOS, versitygw's `CompleteMultipartUpload` copies the parts instead of
+using `copy_file_range`, so a versitygw run's single-stream 100 MiB and 2 GiB
+results come out lower than the Garage-era numbers above; on Linux it uses
+`copy_file_range`.
 
 ## Pass criteria
 
@@ -65,20 +74,19 @@ requests. Most such runs agree within about 2%, but about one in five came in
 
 ## Why max is reported
 
-Roughly half of the 1-CPU push runs catch a Garage artifact: a single push held
-open for seconds — occasionally forever, with megabytes unread in Garage's
-socket receive queue — while every percentile stays normal, because with 200
-entries p99 is only the second-worst sample. It reproduces with Garage unpinned
+`max_ms` is the tell. A single push held open for seconds — occasionally
+forever, with megabytes unread in the S3 server's socket receive queue — leaves
+every percentile looking normal, because with 200 entries p99 is only the
+second-worst sample. A run whose `max_ms` is out of line with `p99_ms`, or whose
+wall time is far above the sum of latencies divided by concurrency, caught such
+a stall and should be re-run rather than checked in. The Garage-era runs above
+caught one in roughly half the 1-CPU passes; it reproduced with Garage unpinned
 on free cores and on tmpfs, with zero TCP retransmits and zero client retries,
-so it is a stand-in artifact rather than garret behaviour.
-
-`max_ms` is the tell. A run whose `max_ms` is out of line with `p99_ms`, or
-whose wall time is far above the sum of latencies divided by concurrency, caught
-the stall and should be re-run rather than checked in.
+so it was a stand-in artifact rather than garret behaviour.
 
 ## Reproducing
 
-`just bench-local` provisions a throwaway Garage and runs every scenario against
-it. `just bench-compare` diffs a fresh run against `baseline.json` and refuses
-to compare across labels or corpus versions; each environment keeps its own
-file. The checked-in result JSONs live in `benchmarks/`.
+`just bench-local` provisions a throwaway versitygw and runs every scenario
+against it. `just bench-compare` diffs a fresh run against `baseline.json` and
+refuses to compare across labels or corpus versions; each environment keeps its
+own file. The checked-in result JSONs live in `benchmarks/`.

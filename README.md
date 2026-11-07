@@ -44,7 +44,7 @@ It is built from `docs/` with mdbook; `just docs` builds it into `docs/book`.
 just build       # cargo build --workspace
 just test        # unit tests
 just check       # clippy (-D warnings) + rustfmt
-just e2e         # end-to-end gate against a throwaway Garage
+just e2e         # end-to-end gate against a throwaway versitygw
 just docs        # build the documentation book
 just bench-local # self-provisioned benchmark, all scenarios + RSS check
 just microbench  # in-process criterion benches

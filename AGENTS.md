@@ -10,7 +10,7 @@ the `garret` CLI, over SQLite + S3. Rust workspace under `crates/`.
 - `just check` — clippy (`-D warnings`, includes `missing_docs` on the lib
   crates) and rustfmt
 - `just docs` — build the documentation book into `docs/book`
-- `just e2e` — end-to-end gate against a throwaway Garage (runs inside
+- `just e2e` — end-to-end gate against a throwaway versitygw (runs inside
   `nix develop`)
 - `just bench-local` — self-provisioned benchmark run (all scenarios + RSS
   check); `just bench-compare` diffs against `benchmarks/baseline.json`;

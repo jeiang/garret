@@ -25,7 +25,7 @@ e2e:
 bench pusher="http://127.0.0.1:8080" puller="http://127.0.0.1:8081":
 	cargo run --release -p garret-bench -- all --endpoint {{pusher}} --puller-endpoint {{puller}} --json bench-results.json
 
-# Self-provisioned benchmark: throwaway Garage + services, all scenarios,
+# Self-provisioned benchmark: throwaway versitygw + services, all scenarios,
 # pusher RSS sampled against the spec's 2x in-flight-cap budget
 bench-local:
 	nix develop --command scripts/bench-local.sh

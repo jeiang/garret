@@ -25,7 +25,7 @@ Run from the repository root, inside the Nix development shell.
 | `just build` | Builds the workspace |
 | `just test` | Runs the unit tests |
 | `just check` | Clippy with warnings denied, and rustfmt |
-| `just e2e` | End-to-end gate against a throwaway Garage |
+| `just e2e` | End-to-end gate against a throwaway versitygw |
 | `just docs` | Builds this book into `docs/book` |
 | `just bench-local` | Self-provisioned benchmark run |
 | `just microbench` | In-process criterion benchmarks |

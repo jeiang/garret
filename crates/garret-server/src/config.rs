@@ -4,18 +4,18 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-/// The `[s3]` section: where blobs live (MEGA S4 in production, Garage
+/// The `[s3]` section: where blobs live (MEGA S4 in production, versitygw
 /// locally, spec 03-storage).
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct S3Config {
     /// Bucket holding the `nar/` blobs.
     pub bucket: String,
-    /// Non-AWS endpoint (S4, Garage). Absent means the AWS default.
+    /// Non-AWS endpoint (S4, versitygw). Absent means the AWS default.
     pub endpoint_url: Option<String>,
     /// Defaults to `us-east-1`, which S3-compatible stores accept.
     pub region: Option<String>,
-    /// Path-style addressing, on unless set — S4 and Garage both accept it,
+    /// Path-style addressing, on unless set — S4 and versitygw both accept it,
     /// and it avoids DNS games for dotted buckets.
     #[serde(default = "yes")]
     pub path_style: bool,

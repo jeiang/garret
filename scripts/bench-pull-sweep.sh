@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stepped-concurrency pull sweep (spec 09 / ticket 28): throwaway Garage +
+# Stepped-concurrency pull sweep (spec 09 / ticket 28): throwaway versitygw +
 # both services, corpus pushed once, then the pull scenario at c=20/100/300
 # with keep-alive on and off. Reported-only — no baseline, no latency gate;
 # the curve is what a human reads before reopening ticket 26. Heavier than
@@ -12,8 +12,7 @@ trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$root"' EXIT
 source "$(dirname "$0")/provision.sh"
 
 require_free_ports
-# Corpus (~750 MiB) plus its serial baseline; no 2 GiB streaming blob here.
-start_garage 5G
+start_s3
 make_signing_key
 mint_dev_tokens
 
