@@ -127,9 +127,9 @@ in
         type = types.nullOr (types.numbers.between 0.0 1.0);
         default = null;
         description = ''
-          Fraction of new traces sampled, 0.0..=1.0. A trace is sampled or
-          not as a whole, so a caller's decision is never overridden.
-          Null: 1.0.
+          Fraction of new traces sampled, 0.0..=1.0. Children keep their
+          parent's sampling decision, so a trace is sampled or not as a
+          whole and a caller's decision is never overridden. Null: 1.0.
         '';
       };
     };

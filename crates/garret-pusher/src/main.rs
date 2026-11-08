@@ -193,7 +193,8 @@ fn router(state: Arc<AppState>, discovery: String) -> Router {
 }
 
 /// How long a SIGTERM/SIGINT waits for in-flight uploads to finish. With
-/// [`ABORT_BUDGET`] it stays under systemd's default 90 s stop timeout.
+/// [`ABORT_BUDGET`] and the span flush (at most the exporter's 5 s timeout)
+/// it stays under systemd's default 90 s stop timeout: 60 + 20 + 5 = 85 s.
 const DRAIN: Duration = Duration::from_secs(60);
 /// How long aborting the uploads that outlived [`DRAIN`] may take.
 const ABORT_BUDGET: Duration = Duration::from_secs(20);

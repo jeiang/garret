@@ -107,8 +107,14 @@ impl Telemetry {
     /// thread inside the async runtime panics ("cannot drop a runtime in a
     /// context where blocking is not allowed"). Both happen on a plain
     /// thread instead.
-    pub fn shutdown(self) {
-        let Some(provider) = self.provider else {
+    pub fn shutdown(mut self) {
+        self.stop();
+    }
+
+    /// Shuts the provider down on a plain thread and forgets it, so the
+    /// `Drop` that follows has nothing left to do.
+    fn stop(&mut self) {
+        let Some(provider) = self.provider.take() else {
             return;
         };
         let flushed = std::thread::spawn(move || {
@@ -126,14 +132,25 @@ impl Telemetry {
     }
 }
 
+/// A service that fails to start after `runtime::start` returns drops this on
+/// an async worker thread (`admin::bind`, `db::open`, a signing key that will
+/// not load). Without this the blocking client would be dropped there and
+/// panic, hiding the real error.
+impl Drop for Telemetry {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// One server span per HTTP request, named `{method} {route}` as the OTel
 /// HTTP conventions ask, carrying the method, matched route, path and
 /// response status under their semantic-convention names.
 ///
 /// The matched route — not the concrete path — is the name, so a store hash
-/// never becomes a span name; unmatched requests (a 404) fall back to the
-/// path. A request carrying `traceparent`/`tracestate` is parented to the
-/// caller's span, so a push or a pull shows up inside the client's trace.
+/// never becomes a span name; unmatched requests (a 404) are named
+/// `{method} unmatched` and carry their path as `url.path`. A request
+/// carrying `traceparent`/`tracestate` is parented to the caller's span, so a
+/// push or a pull shows up inside the client's trace.
 pub async fn track_http(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -141,9 +158,12 @@ pub async fn track_http(request: Request, next: Next) -> Response {
         .extensions()
         .get::<MatchedPath>()
         .map(|path| path.as_str().to_owned());
+    // The matched route, not the concrete path: a store hash in a span name
+    // is one name per object, which is unbounded cardinality. Unmatched
+    // requests (a 404) get a fixed name and keep their path as `url.path`.
     let name = match &route {
         Some(route) => format!("{method} {route}"),
-        None => format!("{method} {path}"),
+        None => format!("{method} unmatched"),
     };
 
     // The caller's context is attached only while the span is created: that
@@ -154,7 +174,7 @@ pub async fn track_http(request: Request, next: Next) -> Response {
             propagator.extract(&HeaderCarrier(request.headers()))
         });
         let _guard = parent.attach();
-        tracing::info_span!(
+        tracing::debug_span!(
             "http.server.request",
             otel.name = name.as_str(),
             otel.kind = "server",

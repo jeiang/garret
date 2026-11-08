@@ -110,6 +110,13 @@ services.garret.pusher.telemetry = {
   endpoint = "http://127.0.0.1:4318";
   sampleRatio = 0.1;
 };
+
+services.garret.puller.telemetry = {
+  enable = true;
+  endpoint = "http://127.0.0.1:4318";
+  serviceName = "garret-puller";
+  sampleRatio = 0.1;
+};
 ```
 
 Spans go to `<endpoint>/v1/traces` over OTLP/HTTP. The service reaches the

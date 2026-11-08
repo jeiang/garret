@@ -674,7 +674,7 @@ async fn probe_read(state: &AppState, conn: Conn) -> Result<(), String> {
     }
 }
 
-#[tracing::instrument(name = "nar.redirect", level = "debug", skip_all, fields(narinfo.file = file))]
+#[tracing::instrument(name = "nar.redirect", level = "debug", skip_all, fields(nar.file = file))]
 async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
     let Some(hash) = wire::nar_file_hash(file).filter(|hash| is_store_hash(hash)) else {
         return Outcome::Junk;
@@ -767,7 +767,7 @@ fn default_limit() -> usize {
     wire::DEFAULT_LIMIT
 }
 
-#[tracing::instrument(name = "browse.query", level = "debug", skip_all, fields(endpoint))]
+#[tracing::instrument(name = "browse.query", level = "debug", skip_all, fields(endpoint = %endpoint))]
 async fn run_browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Option<T>> + Send + 'static,

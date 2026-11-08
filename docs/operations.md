@@ -233,14 +233,25 @@ byte:
 - `upload` and `blob.store` — the Pusher's push phases; `blob.bytes` is
   recorded once the Blob is stored.
 - `narinfo.serve` and `nar.redirect` — the Puller's two public paths.
+- `browse.query` — the Puller's authenticated browse queries, with the
+  endpoint they hit.
 - `db.call` and the `db.*` query spans — SQLite, with `db.lock_wait_ms`
   separating the wait for the connection from the query itself.
 - `s3.request` (per S3 call, `s3.operation` names it) under `s3.put`,
-  `s3.put_streaming`, `s3.presign`, `s3.delete` and the multipart calls.
+  `s3.put_streaming`, `s3.delete` and the multipart calls
+  (`create_mpu`, `upload_part`, `complete_mpu`, `abort_mpu`) and
+  `s3.abort_stale_multiparts`. `s3.presign` is a local signature, not an S3
+  request, so it has no `s3.request` under it.
 - `auth.verify` — token verification, with the issuer; the token itself is
   never recorded.
-- `gc.evict` and `gc.sweep` — eviction and orphan-sweep cycles.
+- `gc.evict` and `gc.sweep` — eviction and orphan-sweep cycles, the eviction
+  candidate loop under one `gc.evict.candidates` span.
+
+The Pusher's `negotiation` and `upload` spans carry the caller's OIDC subject
+as `issuer#sub` — the same identity the browse API and `garret-admin
+--pushed-by` show. It is exported to the collector, so treat the collector as
+holding deployment identities.
 
 Export failures — a collector that is down or unreachable — are logged and the
 spans are dropped. They never block a request: the batch processor exports on
-its own task, and shutdown flushes what it holds for at most five seconds.
+its own thread, and shutdown flushes what it holds for at most five seconds.

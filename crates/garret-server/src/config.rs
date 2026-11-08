@@ -298,9 +298,10 @@ pub struct TelemetryConfig {
     /// and the systemd units already use.
     #[serde(default)]
     pub service_name: Option<String>,
-    /// Fraction of new traces sampled, 0.0..=1.0. Parents keep their child's
-    /// sampling decision, so a trace is either whole or absent, never
-    /// half-recorded. Lower it on a busy cache to bound export volume.
+    /// Fraction of new traces sampled, 0.0..=1.0. Children keep their
+    /// parent's sampling decision, so a trace is either whole or absent,
+    /// never half-recorded. Lower it on a busy cache to bound export
+    /// volume.
     #[serde(default = "sample_ratio")]
     pub sample_ratio: f64,
 }
