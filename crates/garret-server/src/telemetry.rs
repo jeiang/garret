@@ -218,12 +218,12 @@ mod tests {
     /// Without `enabled = true` nothing is built: no exporter, no tracer.
     #[test]
     fn disabled_telemetry_builds_nothing() {
-        let absent = Telemetry::start(None, "garret-pusher").unwrap();
+        let absent = Telemetry::start(None, "pusher").unwrap();
         assert!(!absent.enabled());
-        assert!(absent.tracer("garret-pusher").is_none());
+        assert!(absent.tracer("pusher").is_none());
 
         let off: TelemetryConfig = toml::from_str("enabled = false").unwrap();
-        let off = Telemetry::start(Some(&off), "garret-pusher").unwrap();
+        let off = Telemetry::start(Some(&off), "pusher").unwrap();
         assert!(!off.enabled());
         off.shutdown();
     }
@@ -235,13 +235,13 @@ mod tests {
     fn enabled_telemetry_builds_a_tracer() {
         let on: TelemetryConfig =
             toml::from_str("enabled = true\nendpoint = \"http://127.0.0.1:4318\"").unwrap();
-        let telemetry = Telemetry::start(Some(&on), "garret-puller").unwrap();
+        let telemetry = Telemetry::start(Some(&on), "puller").unwrap();
         assert!(telemetry.enabled());
-        assert!(telemetry.tracer("garret-puller").is_some());
+        assert!(telemetry.tracer("puller").is_some());
         telemetry.shutdown();
 
         let bad: TelemetryConfig =
             toml::from_str("enabled = true\nendpoint = \"not a url\"").unwrap();
-        assert!(Telemetry::start(Some(&bad), "garret-puller").is_err());
+        assert!(Telemetry::start(Some(&bad), "puller").is_err());
     }
 }

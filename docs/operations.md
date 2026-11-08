@@ -202,7 +202,7 @@ turns it on:
 [telemetry]
 enabled = true
 endpoint = "http://127.0.0.1:4318"   # OTLP/HTTP base; spans go to /v1/traces
-service_name = "garret-pusher"        # default: the service's own name
+service_name = "pusher"               # default: pusher / puller
 sample_ratio = 1.0                    # 0.0..=1.0, default 1.0
 ```
 
@@ -210,7 +210,7 @@ sample_ratio = 1.0                    # 0.0..=1.0, default 1.0
 |---|---|
 | `telemetry.enabled` | `false` |
 | `telemetry.endpoint` | `http://127.0.0.1:4318` |
-| `telemetry.service_name` | `garret-pusher` / `garret-puller` |
+| `telemetry.service_name` | `pusher` / `puller` |
 | `telemetry.sample_ratio` | `1.0` |
 
 Spans are exported over OTLP/HTTP (protobuf) to any collector. With `enabled`

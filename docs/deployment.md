@@ -53,7 +53,7 @@ evaluation.
 | `fsck.extraArgs` | list of strings | `[]` |
 | `telemetry.enable` | bool | `false` |
 | `telemetry.endpoint` | string or null | `null`: `http://127.0.0.1:4318` |
-| `telemetry.serviceName` | string or null | `null`: `garret-pusher` |
+| `telemetry.serviceName` | string or null | `null`: `pusher` |
 | `telemetry.sampleRatio` | number or null | `null`: `1.0` |
 | `extraSettings` | TOML | `{}` |
 
@@ -90,7 +90,7 @@ Each entry in `oidc` takes `issuer`, `audience`, `extra_audiences`, `client_id`,
 | `browseOidc` | submodule or null | `null`: no browse API |
 | `telemetry.enable` | bool | `false` |
 | `telemetry.endpoint` | string or null | `null`: `http://127.0.0.1:4318` |
-| `telemetry.serviceName` | string or null | `null`: `garret-puller` |
+| `telemetry.serviceName` | string or null | `null`: `puller` |
 | `telemetry.sampleRatio` | number or null | `null`: `1.0` |
 | `extraSettings` | TOML | `{}` |
 
@@ -114,7 +114,6 @@ services.garret.pusher.telemetry = {
 services.garret.puller.telemetry = {
   enable = true;
   endpoint = "http://127.0.0.1:4318";
-  serviceName = "garret-puller";
   sampleRatio = 0.1;
 };
 ```
