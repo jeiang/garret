@@ -1,4 +1,7 @@
 //! Pusher: accepts NARs over the garret push protocol (spec 01-push-protocol).
+// The instrumented handler futures nest deeply enough that the default
+// layout recursion limit trips on them.
+#![recursion_limit = "256"]
 
 use std::{sync::Arc, time::Duration};
 
@@ -379,6 +382,11 @@ async fn require_oidc(
     }
 }
 
+#[tracing::instrument(
+    name = "negotiation",
+    skip_all,
+    fields(subject = subject.0.as_str(), batch = hashes.len(), missing = tracing::field::Empty)
+)]
 async fn missing_paths(
     State(state): State<Arc<AppState>>,
     axum::Extension(subject): axum::Extension<Subject>,
@@ -389,6 +397,7 @@ async fn missing_paths(
         db::missing(conn, &hashes, unix_now())
     })
     .await?;
+    tracing::Span::current().record("missing", missing.len());
     tracing::debug!(subject = %subject.0, batch, missing = missing.len(), "negotiation");
     metrics::histogram!("garret_negotiation_batch_size").record(batch as f64);
     metrics::counter!("garret_negotiation_missing_paths_total").increment(missing.len() as u64);
@@ -410,6 +419,11 @@ fn quiescing() -> Error {
     )
 }
 
+#[tracing::instrument(
+    name = "upload",
+    skip_all,
+    fields(object.hash = hash.as_str(), subject = subject.0.as_str(), blob.bytes = tracing::field::Empty)
+)]
 async fn upload(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -482,6 +496,7 @@ async fn upload(
 
     match &result {
         Ok(size) => {
+            tracing::Span::current().record("blob.bytes", *size);
             metrics::counter!("garret_uploads_accepted_total").increment(1);
             metrics::histogram!("garret_upload_bytes").record(*size as f64);
         }
@@ -499,6 +514,7 @@ async fn upload(
 }
 
 /// Returns the stored size. The body never lands in memory whole.
+#[tracing::instrument(name = "blob.store", skip_all, fields(object.hash = hash))]
 async fn store_upload(
     state: &AppState,
     hash: &str,

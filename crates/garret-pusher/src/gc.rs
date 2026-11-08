@@ -126,6 +126,7 @@ impl Gc {
         counted("pass", self.evict().await)
     }
 
+    #[tracing::instrument(name = "gc.evict", skip_all)]
     async fn evict(&self) -> Result<PassResult> {
         let started = Instant::now();
         let mut result = PassResult::default();
@@ -201,6 +202,7 @@ impl Gc {
         counted("sweep", self.sweep().await)
     }
 
+    #[tracing::instrument(name = "gc.sweep", skip_all)]
     async fn sweep(&self) -> Result<usize> {
         let grace = self.orphan_grace();
         // Before the orphans are claimed: the abort skips in-flight paths.

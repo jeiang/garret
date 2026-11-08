@@ -25,6 +25,15 @@ let
       endpoint_url = pusher.s3.endpointUrl;
       path_style = pusher.s3.pathStyle;
     };
+    telemetry = {
+      enabled = cfg.telemetry.enable;
+    } // lib.optionalAttrs (cfg.telemetry.endpoint != null) {
+      endpoint = cfg.telemetry.endpoint;
+    } // lib.optionalAttrs (cfg.telemetry.serviceName != null) {
+      service_name = cfg.telemetry.serviceName;
+    } // lib.optionalAttrs (cfg.telemetry.sampleRatio != null) {
+      sample_ratio = cfg.telemetry.sampleRatio;
+    };
   } // lib.optionalAttrs (cfg.browseOidc != null) { browse_oidc = cfg.browseOidc; };
 
   configFile = common.configFile "garret-puller.toml" settings cfg.extraSettings;
@@ -92,6 +101,35 @@ in
           presigns GETs, and a presigned URL carries exactly its key's
           authority. The Pusher's key works too, but hands the public-facing
           process write access to the bucket.
+        '';
+      };
+    };
+
+    telemetry = {
+      enable = mkEnableOption "OpenTelemetry span export to an OTLP/HTTP collector";
+
+      endpoint = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          OTLP/HTTP base URL; spans are posted to `<endpoint>/v1/traces`.
+          Null: `http://127.0.0.1:4318`, the collector's default receiver.
+        '';
+      };
+
+      serviceName = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "`service.name` on exported spans. Null: the service's own name.";
+      };
+
+      sampleRatio = mkOption {
+        type = types.nullOr (types.numbers.between 0.0 1.0);
+        default = null;
+        description = ''
+          Fraction of new traces sampled, 0.0..=1.0. A trace is sampled or
+          not as a whole, so a caller's decision is never overridden.
+          Null: 1.0.
         '';
       };
     };

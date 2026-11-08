@@ -192,3 +192,55 @@ CPU, and a part wait at S3.
 The Puller makes no S3 API calls. Its only S3 traffic is the `/ready/deep` read
 of a presigned URL, which is why revoked or rotated credentials fail that probe
 while narinfo and NAR redirects keep working.
+
+## Tracing
+
+Distributed tracing is optional and off by default. The `[telemetry]` section
+turns it on:
+
+```toml
+[telemetry]
+enabled = true
+endpoint = "http://127.0.0.1:4318"   # OTLP/HTTP base; spans go to /v1/traces
+service_name = "garret-pusher"        # default: the service's own name
+sample_ratio = 1.0                    # 0.0..=1.0, default 1.0
+```
+
+| Key | Default |
+|---|---|
+| `telemetry.enabled` | `false` |
+| `telemetry.endpoint` | `http://127.0.0.1:4318` |
+| `telemetry.service_name` | `garret-pusher` / `garret-puller` |
+| `telemetry.sample_ratio` | `1.0` |
+
+Spans are exported over OTLP/HTTP (protobuf) to any collector. With `enabled`
+unset or `false` there is no exporter, no background task and no propagator:
+the process behaves exactly as it does without the section. Sampling is
+`ParentBased(TraceIdRatioBased)`, so a trace is sampled or not as a whole and a
+caller's decision is never overridden halfway down.
+
+A request carrying W3C `traceparent`/`tracestate` headers joins the caller's
+trace, so a push or a pull can be followed from the client into the cache.
+
+What a trace contains, one span per request or operation — never per chunk or
+byte:
+
+- `{method} {route}` — one server span per HTTP request in both services, with
+  `http.request.method`, `http.route`, `url.path` and
+  `http.response.status_code`.
+- `negotiation` — the Pusher's missing-paths call, with the batch size and how
+  many paths were missing.
+- `upload` and `blob.store` — the Pusher's push phases; `blob.bytes` is
+  recorded once the Blob is stored.
+- `narinfo.serve` and `nar.redirect` — the Puller's two public paths.
+- `db.call` and the `db.*` query spans — SQLite, with `db.lock_wait_ms`
+  separating the wait for the connection from the query itself.
+- `s3.request` (per S3 call, `s3.operation` names it) under `s3.put`,
+  `s3.put_streaming`, `s3.presign`, `s3.delete` and the multipart calls.
+- `auth.verify` — token verification, with the issuer; the token itself is
+  never recorded.
+- `gc.evict` and `gc.sweep` — eviction and orphan-sweep cycles.
+
+Export failures — a collector that is down or unreachable — are logged and the
+spans are dropped. They never block a request: the batch processor exports on
+its own task, and shutdown flushes what it holds for at most five seconds.

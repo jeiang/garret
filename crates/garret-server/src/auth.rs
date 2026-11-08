@@ -182,6 +182,8 @@ impl Authenticator {
             .ok_or_else(|| Refusal::new(Outcome::UntrustedIssuer, anyhow!("untrusted issuer")))
     }
 
+    // `skip_all`: the token is a credential and must never reach a span.
+    #[tracing::instrument(name = "auth.verify", skip_all, fields(issuer = issuer.cfg.issuer.as_str()))]
     async fn verify(&self, issuer: &Arc<Issuer>, token: &str) -> Result<Subject, Refusal> {
         let kid = jsonwebtoken::decode_header(token)
             .context("malformed token header")

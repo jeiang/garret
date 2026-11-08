@@ -25,6 +25,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
+use tracing::Instrument as _;
 
 use crate::config::S3Config;
 
@@ -152,10 +153,19 @@ async fn timed<T, E>(
     fut: impl Future<Output = Result<T, SdkError<E>>>,
 ) -> Result<T, SdkError<E>> {
     let started = Instant::now();
-    let result = fut.await;
+    // One client span per S3 request, named for the operation in
+    // `s3.operation`; the span is the S3 wait a trace otherwise hides.
+    let span = tracing::info_span!(
+        "s3.request",
+        otel.kind = "client",
+        s3.operation = op,
+        otel.status_code = tracing::field::Empty,
+    );
+    let result = fut.instrument(span.clone()).await;
     metrics::histogram!("garret_s3_request_duration_seconds", "operation" => op)
         .record(started.elapsed());
     if let Err(e) = &result {
+        span.record("otel.status_code", "error");
         metrics::counter!("garret_s3_errors_total", "operation" => op, "kind" => error_kind(e))
             .increment(1);
     }
@@ -695,6 +705,7 @@ impl Storage {
 
     /// Single-request `PutObject` for bodies already in memory (at most one
     /// part; larger uploads go through [`Storage::put_streaming`]).
+    #[tracing::instrument(name = "s3.put", skip_all, fields(s3.key = key, blob.bytes = body.len()))]
     pub async fn put(&self, key: &str, body: Bytes) -> Result<()> {
         let bytes = body.len() as u64;
         let put = self
@@ -732,6 +743,7 @@ impl Storage {
     /// neither allocates nor holds a whole part slot. A body shorter than a
     /// part that outgrows the hint is refused: the buffer never exceeds the
     /// bytes charged to the permit.
+    #[tracing::instrument(name = "s3.put_streaming", skip_all, fields(s3.key = key, blob.bytes = tracing::field::Empty))]
     pub async fn put_streaming<S, E>(
         &self,
         key: &str,
@@ -753,6 +765,9 @@ impl Storage {
         // upload would otherwise record nothing.
         metrics::counter!("garret_upload_s3_part_wait_milliseconds_total")
             .increment(part_wait.as_millis() as u64);
+        if let Ok((_, size)) = &stored {
+            tracing::Span::current().record("blob.bytes", *size);
+        }
         stored
     }
 
@@ -920,6 +935,9 @@ impl Storage {
         body: Part,
         permit: Reservation,
     ) -> impl Future<Output = Result<CompletedPart>> + Send + 'static {
+        // The part uploads on its own task, where the caller's span is not
+        // current: carry it over so the part is a child of the Blob upload.
+        let span = tracing::Span::current();
         let (client, bucket, key, upload_id, sign_payload) = (
             self.client.clone(),
             self.bucket.clone(),
@@ -975,6 +993,7 @@ impl Storage {
                 .set_e_tag(output.e_tag)
                 .build())
         }
+        .instrument(span)
     }
 
     /// Every blob under `nar/`, a page at a time, in the bucket's key order.
@@ -998,6 +1017,7 @@ impl Storage {
     /// one (spec 05). A key reported as already absent (`NoSuchKey`, which
     /// some S3 implementations list under `Errors` where S3 lists it as
     /// deleted) is not a failure — absent is what the caller asked for.
+    #[tracing::instrument(name = "s3.delete", skip_all, fields(blobs = keys.len()))]
     pub async fn delete_objects(&self, keys: &[String]) -> Result<()> {
         let (mut failed, mut first_failure) = (0, None);
         for batch in keys.chunks(1000) {
@@ -1046,6 +1066,7 @@ impl Storage {
     /// Consulting the in-flight set is why GC lives inside the Pusher (spec 05).
     /// Paginated, like [`Storage::list_blobs`]: one listing returns at most
     /// 1,000 uploads.
+    #[tracing::instrument(name = "s3.abort_stale_multiparts", skip_all)]
     pub async fn abort_stale_multiparts(
         &self,
         grace: Duration,
@@ -1103,6 +1124,7 @@ impl Storage {
     }
 
     /// The Puller redirects here instead of proxying bytes (ADR-0005).
+    #[tracing::instrument(name = "s3.presign", skip_all, fields(s3.key = key))]
     pub async fn presigned_get(&self, key: &str, ttl: Duration) -> Result<String> {
         let req = self
             .client
