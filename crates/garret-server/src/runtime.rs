@@ -89,17 +89,17 @@ async fn bind(addr: &str, name: &str) -> Result<TcpListener> {
 }
 
 /// Logs to stdout at `RUST_LOG` (default `info`), with colour only on a
-/// terminal so journald gets plain text. With a tracer, the same spans are
+/// terminal so journald gets plain text. With a tracer, garret's own spans are
 /// also bridged to OpenTelemetry.
 fn init_tracing(tracer: Option<opentelemetry_sdk::trace::SdkTracer>) {
     use std::io::IsTerminal;
-    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     // Per layer, not global: the operation spans are `debug` so that with no
     // exporter they are never created — a registry span per request is a
     // measurable share of a sub-millisecond narinfo — while the OTel layer
-    // takes everything the moment a collector is configured.
+    // takes every garret span the moment a collector is configured.
     let fmt = tracing_subscriber::fmt::layer()
         .with_ansi(std::io::stdout().is_terminal())
         .with_filter(filter);
@@ -115,7 +115,20 @@ fn init_tracing(tracer: Option<opentelemetry_sdk::trace::SdkTracer>) {
                     .with_location(false)
                     .with_threads(false)
                     .with_tracked_inactivity(false)
-                    .with_filter(LevelFilter::TRACE),
+                    // Only garret's spans are exported. The SDK, hyper,
+                    // rustls and reqwest spans under `s3.request` are
+                    // dependency internals: they multiply one S3 call into
+                    // ~10 spans and say nothing `s3.request` does not.
+                    // Dependency WARN/ERROR events still pass and attach to
+                    // the active span; `RUST_LOG` keeps controlling the fmt
+                    // layer only, so it cannot widen what is exported.
+                    .with_filter(
+                        Targets::new()
+                            .with_target("garret_server", LevelFilter::TRACE)
+                            .with_target("garret_pusher", LevelFilter::TRACE)
+                            .with_target("garret_puller", LevelFilter::TRACE)
+                            .with_default(LevelFilter::WARN),
+                    ),
             )
             .init(),
         None => registry.init(),

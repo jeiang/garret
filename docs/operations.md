@@ -222,6 +222,14 @@ caller's decision is never overridden halfway down.
 A request carrying W3C `traceparent`/`tracestate` headers joins the caller's
 trace, so a push or a pull can be followed from the client into the cache.
 
+Only garret's own spans are exported. Spans from libraries — hyper, rustls,
+reqwest, h2 and the AWS SDK — are filtered out before they reach the exporter,
+so an S3 call is one `s3.request` span rather than the SDK's internal tree of
+a dozen. Dependency `WARN` and `ERROR` events still pass the filter and attach
+to the enclosing garret span, which is where a failed request should show its
+cause. `RUST_LOG` controls the log output only; it does not widen what is
+exported.
+
 What a trace contains, one span per request or operation — never per chunk or
 byte:
 
