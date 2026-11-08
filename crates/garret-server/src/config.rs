@@ -294,8 +294,7 @@ pub struct TelemetryConfig {
     #[serde(default = "otlp_endpoint")]
     pub endpoint: String,
     /// `service.name` on every exported span. Absent means the service's own
-    /// name (`garret-pusher`, `garret-puller`), which is what the metrics
-    /// and the systemd units already use.
+    /// name (`pusher`, `puller`), which is what the metrics already use.
     #[serde(default)]
     pub service_name: Option<String>,
     /// Fraction of new traces sampled, 0.0..=1.0. Children keep their
@@ -782,10 +781,10 @@ mod validate_tests {
         let t: TelemetryConfig = toml::from_str("enabled = true").unwrap();
         assert!(t.enabled);
         assert_eq!(t.endpoint, "http://127.0.0.1:4318");
-        assert_eq!(t.service_name("garret-pusher"), "garret-pusher");
+        assert_eq!(t.service_name("pusher"), "pusher");
         assert_eq!(t.sample_ratio, 1.0);
         let named: TelemetryConfig = toml::from_str("service_name = \"cache\"").unwrap();
-        assert_eq!(named.service_name("garret-puller"), "cache");
+        assert_eq!(named.service_name("puller"), "cache");
     }
 
     #[test]
