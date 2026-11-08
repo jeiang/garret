@@ -1,5 +1,5 @@
 //! Shared server internals: config, DB, S3 storage, narinfo/signing, auth,
-//! browse queries, runtime, metrics, in-flight claims.
+//! browse queries, runtime, metrics, telemetry, in-flight claims.
 #![warn(missing_docs)]
 
 pub mod auth;
@@ -11,6 +11,7 @@ pub mod metrics;
 pub mod narinfo;
 pub mod runtime;
 pub mod storage;
+pub mod telemetry;
 #[cfg(feature = "test-support")]
 pub mod testing;
 

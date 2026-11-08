@@ -415,6 +415,7 @@ async fn run() -> Result<()> {
     let garret_server::runtime::Started {
         config: cfg,
         listener,
+        telemetry,
     } = garret_server::runtime::start::<PullerConfig>("puller").await?;
 
     let state = Arc::new(AppState {
@@ -493,10 +494,18 @@ async fn run() -> Result<()> {
         .merge(pull_routes())
         .merge(browse_routes)
         .layer(axum::middleware::from_fn(garret_metrics::track_http))
+        // Outermost, so every request — a narinfo, a redirect, a 404 — gets
+        // one server span.
+        .layer(axum::middleware::from_fn(
+            garret_server::telemetry::track_http,
+        ))
         .with_state(state);
 
     garret_server::runtime::notify_ready();
-    garret_server::runtime::serve(listener, app, std::future::pending()).await?;
+    // SIGTERM/SIGINT stops accepting, drains, and lets the span exporter
+    // flush before the process exits.
+    garret_server::runtime::serve(listener, app, garret_server::runtime::stop_signal()).await?;
+    telemetry.shutdown();
     Ok(())
 }
 

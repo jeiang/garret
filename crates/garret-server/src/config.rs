@@ -277,6 +277,62 @@ fn orphan_grace() -> u64 {
     24 * 60 * 60
 }
 
+/// The `[telemetry]` section: OpenTelemetry span export over OTLP/HTTP
+/// (spec 08). Off unless `enabled`, and then the only thing it costs is a
+/// batch exporter task and one span per request or operation — no metrics,
+/// no logs, and nothing at all when the section is absent or disabled.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    /// Export spans to `endpoint`. Off means no exporter, no background task
+    /// and no propagator: the process behaves exactly as it did before.
+    #[serde(default)]
+    pub enabled: bool,
+    /// OTLP/HTTP base URL. Spans are posted to `<endpoint>/v1/traces`, the
+    /// collector's default receiver. Plain http is fine on a loopback or
+    /// link-local collector; use https across a network.
+    #[serde(default = "otlp_endpoint")]
+    pub endpoint: String,
+    /// `service.name` on every exported span. Absent means the service's own
+    /// name (`garret-pusher`, `garret-puller`), which is what the metrics
+    /// and the systemd units already use.
+    #[serde(default)]
+    pub service_name: Option<String>,
+    /// Fraction of new traces sampled, 0.0..=1.0. Parents keep their child's
+    /// sampling decision, so a trace is either whole or absent, never
+    /// half-recorded. Lower it on a busy cache to bound export volume.
+    #[serde(default = "sample_ratio")]
+    pub sample_ratio: f64,
+}
+
+impl TelemetryConfig {
+    /// The `service.name` to export under: the configured one, else the
+    /// service's own name.
+    pub fn service_name<'a>(&'a self, service: &'a str) -> &'a str {
+        self.service_name.as_deref().unwrap_or(service)
+    }
+
+    /// Rejects a sampling ratio that would sample nothing or more than
+    /// everything.
+    pub fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.sample_ratio) {
+            bail!(
+                "telemetry.sample_ratio must be between 0.0 and 1.0, got {}",
+                self.sample_ratio
+            );
+        }
+        Ok(())
+    }
+}
+
+fn otlp_endpoint() -> String {
+    "http://127.0.0.1:4318".into()
+}
+
+fn sample_ratio() -> f64 {
+    1.0
+}
+
 /// The Pusher's config file (the upload service; not exposed publicly).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -311,6 +367,9 @@ pub struct PusherConfig {
     /// Internal metrics listener (spec 08).
     #[serde(default = "pusher_metrics_listen")]
     pub metrics_listen: String,
+    /// OpenTelemetry span export (spec 08). Absent means no tracing export.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
 }
 
 impl ServiceConfig for PusherConfig {
@@ -382,6 +441,9 @@ impl ServiceConfig for PusherConfig {
         for issuer in &self.oidc {
             issuer.validate().context("oidc")?;
         }
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.validate()?;
+        }
         Ok(())
     }
 
@@ -391,6 +453,10 @@ impl ServiceConfig for PusherConfig {
 
     fn metrics_listen(&self) -> &str {
         &self.metrics_listen
+    }
+
+    fn telemetry(&self) -> Option<&TelemetryConfig> {
+        self.telemetry.as_ref()
     }
 }
 
@@ -433,6 +499,9 @@ pub struct PullerConfig {
     /// miss (ticket 25). Measured p99 is ~2.4 ms.
     #[serde(default = "presign_budget")]
     pub presign_budget_ms: u64,
+    /// OpenTelemetry span export (spec 08). Absent means no tracing export.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryConfig>,
 }
 
 impl ServiceConfig for PullerConfig {
@@ -463,6 +532,9 @@ impl ServiceConfig for PullerConfig {
         if let Some(issuer) = &self.browse_oidc {
             issuer.validate().context("browse_oidc")?;
         }
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.validate()?;
+        }
         Ok(())
     }
 
@@ -472,6 +544,10 @@ impl ServiceConfig for PullerConfig {
 
     fn metrics_listen(&self) -> &str {
         &self.metrics_listen
+    }
+
+    fn telemetry(&self) -> Option<&TelemetryConfig> {
+        self.telemetry.as_ref()
     }
 }
 
@@ -508,6 +584,8 @@ pub trait ServiceConfig: serde::de::DeserializeOwned {
     fn listen(&self) -> &str;
     /// Internal metrics listen address (spec 08).
     fn metrics_listen(&self) -> &str;
+    /// Span export settings (spec 08); `None` means none configured.
+    fn telemetry(&self) -> Option<&TelemetryConfig>;
 }
 
 /// Parses and validates a TOML config file. Unknown or misplaced keys are
@@ -658,6 +736,57 @@ mod validate_tests {
         c.validate().unwrap();
     }
 
+    /// A ratio outside 0..=1 would sample nothing or more than everything.
+    /// An absent section — or one with `enabled = false` — is the default and
+    /// must validate unchanged.
+    #[test]
+    fn telemetry_sample_ratio_is_a_fraction() {
+        let with = |ratio: &str| -> PusherConfig {
+            toml::from_str(&format!(
+                r#"
+                db_path = "/tmp/x.db"
+                signing_key_files = ["/tmp/k"]
+                [s3]
+                bucket = "b"
+                [[oidc]]
+                issuer = "https://i"
+                audience = "a"
+                [telemetry]
+                enabled = true
+                sample_ratio = {ratio}
+                "#
+            ))
+            .unwrap()
+        };
+        for ok in ["0.0", "0.5", "1.0"] {
+            with(ok).validate().unwrap();
+        }
+        for bad in ["-0.1", "1.1", "nan", "inf"] {
+            let e = with(bad).validate().unwrap_err().to_string();
+            assert!(e.contains("sample_ratio"), "{bad}: {e}");
+        }
+
+        // Absent, and present but disabled: both are valid and export nothing.
+        let mut c = cfg();
+        assert!(c.telemetry.is_none());
+        c.validate().unwrap();
+        c.telemetry = Some(toml::from_str("enabled = false").unwrap());
+        c.validate().unwrap();
+    }
+
+    /// The defaults are the collector's OTLP/HTTP receiver and the service's
+    /// own name, so enabling the section alone is enough to export.
+    #[test]
+    fn telemetry_defaults_point_at_a_local_collector() {
+        let t: TelemetryConfig = toml::from_str("enabled = true").unwrap();
+        assert!(t.enabled);
+        assert_eq!(t.endpoint, "http://127.0.0.1:4318");
+        assert_eq!(t.service_name("garret-pusher"), "garret-pusher");
+        assert_eq!(t.sample_ratio, 1.0);
+        let named: TelemetryConfig = toml::from_str("service_name = \"cache\"").unwrap();
+        assert_eq!(named.service_name("garret-puller"), "cache");
+    }
+
     #[test]
     fn remote_jwks_urls_must_be_https_or_loopback() {
         assert!(check_remote_url("https://id.example/jwks").is_ok());
@@ -739,6 +868,17 @@ mod puller_validate_tests {
             |c| c.s3.operation_timeout_secs = 0,
             "operation_timeout_secs",
         );
+    }
+
+    #[test]
+    fn telemetry_is_validated_for_the_puller_too() {
+        rejects(
+            |c| c.telemetry = Some(toml::from_str("sample_ratio = 2.0").unwrap()),
+            "sample_ratio",
+        );
+        let mut c = cfg();
+        c.telemetry = Some(toml::from_str("enabled = true").unwrap());
+        c.validate().unwrap();
     }
 
     #[test]

@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
     let garret_server::runtime::Started {
         config: cfg,
         listener,
+        telemetry,
     } = garret_server::runtime::start::<PusherConfig>("pusher").await?;
     // Bound before anything serves, like the listeners, so an unusable socket
     // path fails startup instead of leaving a half-up Pusher.
@@ -154,7 +155,11 @@ async fn main() -> Result<()> {
 
     // Every listener is bound and every background task spawned.
     garret_server::runtime::notify_ready();
-    serve_until_stopped(listener, app, storage).await
+    let served = serve_until_stopped(listener, app, storage).await;
+    // Last, once nothing is serving: whatever the batch processor still
+    // holds is flushed before the process exits.
+    telemetry.shutdown();
+    served
 }
 
 fn router(state: Arc<AppState>, discovery: String) -> Router {
@@ -173,6 +178,9 @@ fn router(state: Arc<AppState>, discovery: String) -> Router {
             }),
         )
         .layer(middleware::from_fn(garret_metrics::track_http))
+        // Outermost, so every request — including a 401 from `require_oidc`
+        // and an unmatched 404 — gets one server span.
+        .layer(middleware::from_fn(garret_server::telemetry::track_http))
         .with_state(state)
 }
 
@@ -192,7 +200,7 @@ async fn serve_until_stopped(
 ) -> Result<()> {
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let server = garret_server::runtime::serve(listener, app, async move {
-        stop_signal().await;
+        garret_server::runtime::stop_signal().await;
         tracing::info!("stopping: draining in-flight uploads for up to {DRAIN:?}");
         let _ = stop.send(());
     });
@@ -232,15 +240,6 @@ async fn serve_until_stopped(
         tracing::error!("multiparts still open after {ABORT_BUDGET:?}: left to the orphan sweep");
     }
     Ok(())
-}
-
-async fn stop_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
 }
 
 #[derive(Debug)]
