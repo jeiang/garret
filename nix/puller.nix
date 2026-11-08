@@ -120,7 +120,7 @@ in
       serviceName = mkOption {
         type = types.nullOr types.str;
         default = null;
-        description = "`service.name` on exported spans. Null: `puller`, the service's own name.";
+        description = "`service.name` on exported spans. Null: `garret-puller`, the service's own name with a `garret-` prefix.";
       };
 
       sampleRatio = mkOption {

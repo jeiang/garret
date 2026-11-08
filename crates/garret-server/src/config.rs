@@ -293,8 +293,9 @@ pub struct TelemetryConfig {
     /// link-local collector; use https across a network.
     #[serde(default = "otlp_endpoint")]
     pub endpoint: String,
-    /// `service.name` on every exported span. Absent means the service's own
-    /// name (`pusher`, `puller`), which is what the metrics already use.
+    /// `service.name` on every exported span. Absent means `garret-` plus the
+    /// service's own name (`garret-pusher`, `garret-puller`); the metrics use
+    /// the bare `component` label (`pusher`, `puller`).
     #[serde(default)]
     pub service_name: Option<String>,
     /// Fraction of new traces sampled, 0.0..=1.0. Children keep their
@@ -306,10 +307,13 @@ pub struct TelemetryConfig {
 }
 
 impl TelemetryConfig {
-    /// The `service.name` to export under: the configured one, else the
-    /// service's own name.
-    pub fn service_name<'a>(&'a self, service: &'a str) -> &'a str {
-        self.service_name.as_deref().unwrap_or(service)
+    /// The `service.name` to export under: the configured one, else `garret-`
+    /// plus the service's own name, so a cache's spans are distinguishable
+    /// from anything else reporting to the same collector.
+    pub fn service_name(&self, service: &str) -> String {
+        self.service_name
+            .clone()
+            .unwrap_or_else(|| format!("garret-{service}"))
     }
 
     /// Rejects a sampling ratio that would sample nothing or more than
@@ -774,14 +778,16 @@ mod validate_tests {
         c.validate().unwrap();
     }
 
-    /// The defaults are the collector's OTLP/HTTP receiver and the service's
-    /// own name, so enabling the section alone is enough to export.
+    /// The defaults are the collector's OTLP/HTTP receiver and a `garret-`
+    /// prefixed service name, so enabling the section alone is enough to
+    /// export.
     #[test]
     fn telemetry_defaults_point_at_a_local_collector() {
         let t: TelemetryConfig = toml::from_str("enabled = true").unwrap();
         assert!(t.enabled);
         assert_eq!(t.endpoint, "http://127.0.0.1:4318");
-        assert_eq!(t.service_name("pusher"), "pusher");
+        assert_eq!(t.service_name("pusher"), "garret-pusher");
+        assert_eq!(t.service_name("puller"), "garret-puller");
         assert_eq!(t.sample_ratio, 1.0);
         let named: TelemetryConfig = toml::from_str("service_name = \"cache\"").unwrap();
         assert_eq!(named.service_name("puller"), "cache");
