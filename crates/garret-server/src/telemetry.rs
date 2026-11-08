@@ -1,6 +1,6 @@
-//! Optional OpenTelemetry span export (spec 08): the `tracing` spans the
-//! services already emit, bridged to OTel spans and posted to a collector
-//! over OTLP/HTTP.
+//! Optional OpenTelemetry span export: the `tracing` spans the services
+//! already emit, bridged to OTel spans and posted to a collector over
+//! OTLP/HTTP.
 //!
 //! Nothing here runs unless `[telemetry] enabled = true`. With it off there is
 //! no exporter, no background task and no propagator, and the only cost is the
@@ -26,7 +26,7 @@ use tracing::Instrument;
 use crate::config::TelemetryConfig;
 
 /// How long one export attempt may take. The batch processor exports on its
-/// own task, so a collector that is down or slow delays spans at worst; it
+/// own thread, so a collector that is down or slow delays spans at worst; it
 /// never delays a request.
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -99,14 +99,29 @@ impl Telemetry {
             .map(|provider| provider.tracer(service.to_owned()))
     }
 
-    /// Flushes queued spans and stops the exporter task. Bounded by
+    /// Flushes queued spans and stops the exporter. Bounded by
     /// [`EXPORT_TIMEOUT`], so a dead collector cannot hold up shutdown.
-    pub fn shutdown(&self) {
-        let Some(provider) = &self.provider else {
+    ///
+    /// Takes `self`: the exporter owns a blocking `reqwest` client, which
+    /// carries a private runtime, and shutting it down or dropping it from a
+    /// thread inside the async runtime panics ("cannot drop a runtime in a
+    /// context where blocking is not allowed"). Both happen on a plain
+    /// thread instead.
+    pub fn shutdown(self) {
+        let Some(provider) = self.provider else {
             return;
         };
-        if let Err(e) = provider.shutdown() {
-            tracing::warn!("flushing spans on shutdown: {e}");
+        let flushed = std::thread::spawn(move || {
+            let flushed = provider.shutdown();
+            // Dropped here, on the same plain thread, for the reason above.
+            drop(provider);
+            flushed
+        })
+        .join();
+        match flushed {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("flushing spans on shutdown: {e}"),
+            Err(_) => tracing::warn!("the span exporter's flush thread panicked"),
         }
     }
 }
