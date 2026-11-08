@@ -10,7 +10,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 use crate::config::ServiceConfig;
 use crate::telemetry::Telemetry;
@@ -93,10 +93,17 @@ async fn bind(addr: &str, name: &str) -> Result<TcpListener> {
 /// also bridged to OpenTelemetry.
 fn init_tracing(tracer: Option<opentelemetry_sdk::trace::SdkTracer>) {
     use std::io::IsTerminal;
+    use tracing_subscriber::filter::LevelFilter;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let fmt = tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal());
-    let registry = tracing_subscriber::registry().with(filter).with(fmt);
+    // Per layer, not global: the operation spans are `debug` so that with no
+    // exporter they are never created — a registry span per request is a
+    // measurable share of a sub-millisecond narinfo — while the OTel layer
+    // takes everything the moment a collector is configured.
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::stdout().is_terminal())
+        .with_filter(filter);
+    let registry = tracing_subscriber::registry().with(fmt);
     match tracer {
         Some(tracer) => registry
             .with(
@@ -107,7 +114,8 @@ fn init_tracing(tracer: Option<opentelemetry_sdk::trace::SdkTracer>) {
                     // span's own fields carry what a trace needs.
                     .with_location(false)
                     .with_threads(false)
-                    .with_tracked_inactivity(false),
+                    .with_tracked_inactivity(false)
+                    .with_filter(LevelFilter::TRACE),
             )
             .init(),
         None => registry.init(),

@@ -43,7 +43,7 @@ where
     // `db.call` span is created here (a child of the request) and entered
     // there. The lock wait is recorded on it: it is the part of a database
     // call the query itself does not explain.
-    let span = tracing::info_span!("db.call", db.lock_wait_ms = tracing::field::Empty);
+    let span = tracing::debug_span!("db.call", db.lock_wait_ms = tracing::field::Empty);
     tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
         let waited = std::time::Instant::now();

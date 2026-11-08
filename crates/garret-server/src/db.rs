@@ -246,7 +246,7 @@ pub async fn open_when_ready(path: &str, timeout: std::time::Duration) -> Result
 /// would take a read lock first, and SQLite fails the later upgrade to a
 /// write lock with SQLITE_BUSY at once, without waiting out `busy_timeout`,
 /// whenever another connection (the Puller's bumps) holds the write lock.
-#[tracing::instrument(name = "db.insert_object", skip_all, fields(object.hash = obj.store_path_hash.as_str()))]
+#[tracing::instrument(name = "db.insert_object", level = "debug", skip_all, fields(object.hash = obj.store_path_hash.as_str()))]
 pub fn insert_object(conn: &mut Connection, obj: &Object, now: i64) -> Result<()> {
     let _timer = QueryTimer::start("insert_object");
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -317,7 +317,7 @@ pub fn get_object(conn: &Connection, hash: &str) -> Result<Option<Object>> {
 /// [`get_object`] plus the row's `last_accessed_at`, read by the same query,
 /// so the Puller decides whether a hit needs a bump without a second lookup
 /// and without a write (spec 02).
-#[tracing::instrument(name = "db.get_object", skip_all, fields(object.hash = hash))]
+#[tracing::instrument(name = "db.get_object", level = "debug", skip_all, fields(object.hash = hash))]
 pub fn get_object_and_last_accessed(
     conn: &Connection,
     hash: &str,
@@ -369,7 +369,7 @@ pub fn get_object_and_last_accessed(
 
 /// Whether the cache holds this store path hash — and, by the row ⇒ blob
 /// invariant, its blob.
-#[tracing::instrument(name = "db.exists", skip_all, fields(object.hash = hash))]
+#[tracing::instrument(name = "db.exists", level = "debug", skip_all, fields(object.hash = hash))]
 pub fn exists(conn: &Connection, hash: &str) -> Result<bool> {
     let _timer = QueryTimer::start("exists");
     Ok(conn
@@ -657,7 +657,7 @@ pub fn object_count(conn: &Connection) -> Result<i64> {
 /// the connection's busy timeout instead of partway through. Day granularity
 /// is enough for LRU, so a row touched in the last `stale_after` seconds is
 /// left alone.
-#[tracing::instrument(name = "db.bump_last_accessed", skip_all)]
+#[tracing::instrument(name = "db.bump_last_accessed", level = "debug", skip_all)]
 pub fn bump_last_accessed<S: AsRef<str>>(
     conn: &mut Connection,
     hashes: impl IntoIterator<Item = S>,
@@ -700,7 +700,7 @@ pub fn most_recently_accessed(conn: &Connection) -> Result<Option<String>> {
 /// makes `busy_timeout` apply, where a deferred read-to-write upgrade would
 /// fail at once under contention. Prune cannot interleave: both run on
 /// the Pusher's one writer connection, behind its mutex.
-#[tracing::instrument(name = "db.negotiate", skip_all, fields(batch = hashes.len()))]
+#[tracing::instrument(name = "db.negotiate", level = "debug", skip_all, fields(batch = hashes.len()))]
 pub fn missing(conn: &mut Connection, hashes: &[String], now: i64) -> Result<Vec<String>> {
     let _timer = QueryTimer::start("missing");
     let mut missing = Vec::new();

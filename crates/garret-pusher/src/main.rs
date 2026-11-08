@@ -155,6 +155,14 @@ async fn main() -> Result<()> {
 
     let storage = state.storage.clone();
     let app = router(state, discovery);
+    // Only with a collector attached: the middleware allocates a span name
+    // and extracts trace context on every request, which is pure cost when
+    // nothing exports.
+    let app = if telemetry.enabled() {
+        app.layer(middleware::from_fn(garret_server::telemetry::track_http))
+    } else {
+        app
+    };
 
     // Every listener is bound and every background task spawned.
     garret_server::runtime::notify_ready();
@@ -181,9 +189,6 @@ fn router(state: Arc<AppState>, discovery: String) -> Router {
             }),
         )
         .layer(middleware::from_fn(garret_metrics::track_http))
-        // Outermost, so every request — including a 401 from `require_oidc`
-        // and an unmatched 404 — gets one server span.
-        .layer(middleware::from_fn(garret_server::telemetry::track_http))
         .with_state(state)
 }
 
@@ -383,7 +388,7 @@ async fn require_oidc(
 }
 
 #[tracing::instrument(
-    name = "negotiation",
+    name = "negotiation", level = "debug",
     skip_all,
     fields(subject = subject.0.as_str(), batch = hashes.len(), missing = tracing::field::Empty)
 )]
@@ -420,7 +425,7 @@ fn quiescing() -> Error {
 }
 
 #[tracing::instrument(
-    name = "upload",
+    name = "upload", level = "debug",
     skip_all,
     fields(object.hash = hash.as_str(), subject = subject.0.as_str(), blob.bytes = tracing::field::Empty)
 )]
@@ -514,7 +519,7 @@ async fn upload(
 }
 
 /// Returns the stored size. The body never lands in memory whole.
-#[tracing::instrument(name = "blob.store", skip_all, fields(object.hash = hash))]
+#[tracing::instrument(name = "blob.store", level = "debug", skip_all, fields(object.hash = hash))]
 async fn store_upload(
     state: &AppState,
     hash: &str,

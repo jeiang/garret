@@ -199,6 +199,13 @@ Both server units are `Type=notify`: the binaries send `READY=1` once every
 listener is bound, so units ordered after them start only when the sockets
 accept connections.
 
+On `SIGTERM` or `SIGINT` both services stop accepting, let in-flight requests
+finish, and only then exit — the Pusher after up to 60 seconds of uploads, the
+Puller as soon as its open connections are idle. With tracing enabled, the
+last batch of spans is flushed on the way out. The units set no `KillMode` or
+`TimeoutStopSec`, so systemd's defaults apply: `SIGTERM` first, then `SIGKILL`
+after 90 seconds, which is longer than either drain.
+
 All three units share one sandbox: an empty capability bounding set,
 `NoNewPrivileges`, `ProtectSystem=strict` with only the unit's own state
 writable, `ProtectHome`, private `/tmp` and `/dev`, `MemoryDenyWriteExecute`,

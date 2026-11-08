@@ -280,7 +280,7 @@ where
         .record(waited);
     // A blocking thread does not inherit the async caller's span: enter it
     // there, so the query span is a child of the request that caused it.
-    let span = tracing::info_span!(
+    let span = tracing::debug_span!(
         "db.call",
         db.conn = which,
         db.lock_wait_ms = tracing::field::Empty,
@@ -307,7 +307,7 @@ where
     T: Send + 'static,
 {
     let deadline = Instant::now() + budget;
-    let span = tracing::info_span!(
+    let span = tracing::debug_span!(
         "db.call",
         db.conn = "pull",
         db.lock_wait_ms = tracing::field::Empty,
@@ -514,12 +514,17 @@ async fn run() -> Result<()> {
         .merge(pull_routes())
         .merge(browse_routes)
         .layer(axum::middleware::from_fn(garret_metrics::track_http))
-        // Outermost, so every request — a narinfo, a redirect, a 404 — gets
-        // one server span.
-        .layer(axum::middleware::from_fn(
+        .with_state(state);
+    // Only with a collector attached: the middleware allocates a span name
+    // and extracts trace context on every request, which is pure cost when
+    // nothing exports.
+    let app = if telemetry.enabled() {
+        app.layer(axum::middleware::from_fn(
             garret_server::telemetry::track_http,
         ))
-        .with_state(state);
+    } else {
+        app
+    };
 
     garret_server::runtime::notify_ready();
     // SIGTERM/SIGINT stops accepting, drains, and lets the span exporter
@@ -529,7 +534,7 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-#[tracing::instrument(name = "narinfo.serve", skip_all, fields(narinfo.file = file))]
+#[tracing::instrument(name = "narinfo.serve", level = "debug", skip_all, fields(narinfo.file = file))]
 async fn narinfo(state: &AppState, file: &str) -> Outcome {
     let Some(hash) = wire::narinfo_hash(file).filter(|hash| is_store_hash(hash)) else {
         return Outcome::Junk;
@@ -669,7 +674,7 @@ async fn probe_read(state: &AppState, conn: Conn) -> Result<(), String> {
     }
 }
 
-#[tracing::instrument(name = "nar.redirect", skip_all, fields(narinfo.file = file))]
+#[tracing::instrument(name = "nar.redirect", level = "debug", skip_all, fields(narinfo.file = file))]
 async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
     let Some(hash) = wire::nar_file_hash(file).filter(|hash| is_store_hash(hash)) else {
         return Outcome::Junk;
@@ -762,7 +767,7 @@ fn default_limit() -> usize {
     wire::DEFAULT_LIMIT
 }
 
-#[tracing::instrument(name = "browse.query", skip_all, fields(endpoint))]
+#[tracing::instrument(name = "browse.query", level = "debug", skip_all, fields(endpoint))]
 async fn run_browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Option<T>> + Send + 'static,

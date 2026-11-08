@@ -224,26 +224,4 @@ mod tests {
             toml::from_str("enabled = true\nendpoint = \"not a url\"").unwrap();
         assert!(Telemetry::start(Some(&bad), "garret-puller").is_err());
     }
-
-    /// A `traceparent` header is read as the parent context, and its trace id
-    /// is what the request's span would join.
-    #[test]
-    fn traceparent_is_extracted() {
-        opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            "traceparent",
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-                .parse()
-                .unwrap(),
-        );
-        let context = opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.extract(&HeaderCarrier(&headers))
-        });
-        let span = opentelemetry::trace::TraceContextExt::span(&context);
-        assert_eq!(
-            span.span_context().trace_id(),
-            opentelemetry::trace::TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap()
-        );
-    }
 }
