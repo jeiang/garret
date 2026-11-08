@@ -69,7 +69,7 @@ impl Telemetry {
         let provider = SdkTracerProvider::builder()
             .with_resource(
                 Resource::builder()
-                    .with_service_name(config.service_name(service).to_owned())
+                    .with_service_name(config.service_name(service))
                     .build(),
             )
             // ParentBased: a trace is sampled or not as a whole, so a caller's
