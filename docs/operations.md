@@ -192,3 +192,74 @@ CPU, and a part wait at S3.
 The Puller makes no S3 API calls. Its only S3 traffic is the `/ready/deep` read
 of a presigned URL, which is why revoked or rotated credentials fail that probe
 while narinfo and NAR redirects keep working.
+
+## Tracing
+
+Distributed tracing is optional and off by default. The `[telemetry]` section
+turns it on:
+
+```toml
+[telemetry]
+enabled = true
+endpoint = "http://127.0.0.1:4318"   # OTLP/HTTP base; spans go to /v1/traces
+service_name = "garret-pusher"        # default: the service's own name
+sample_ratio = 1.0                    # 0.0..=1.0, default 1.0
+```
+
+| Key | Default |
+|---|---|
+| `telemetry.enabled` | `false` |
+| `telemetry.endpoint` | `http://127.0.0.1:4318` |
+| `telemetry.service_name` | `garret-pusher` / `garret-puller` |
+| `telemetry.sample_ratio` | `1.0` |
+
+Spans are exported over OTLP/HTTP (protobuf) to any collector. With `enabled`
+unset or `false` there is no exporter, no background task and no propagator:
+the process behaves exactly as it does without the section. Sampling is
+`ParentBased(TraceIdRatioBased)`, so a trace is sampled or not as a whole and a
+caller's decision is never overridden halfway down.
+
+A request carrying W3C `traceparent`/`tracestate` headers joins the caller's
+trace, so a push or a pull can be followed from the client into the cache.
+
+Only garret's own spans are exported. Spans from libraries — hyper, rustls,
+reqwest, h2 and the AWS SDK — are filtered out before they reach the exporter,
+so an S3 call is one `s3.request` span rather than the SDK's internal tree of
+a dozen. Dependency `WARN` and `ERROR` events still pass the filter and attach
+to the enclosing garret span, which is where a failed request should show its
+cause. `RUST_LOG` controls the log output only; it does not widen what is
+exported.
+
+What a trace contains, one span per request or operation — never per chunk or
+byte:
+
+- `{method} {route}` — one server span per HTTP request in both services, with
+  `http.request.method`, `http.route`, `url.path` and
+  `http.response.status_code`.
+- `negotiation` — the Pusher's missing-paths call, with the batch size and how
+  many paths were missing.
+- `upload` and `blob.store` — the Pusher's push phases; `blob.bytes` is
+  recorded once the Blob is stored.
+- `narinfo.serve` and `nar.redirect` — the Puller's two public paths.
+- `browse.query` — the Puller's authenticated browse queries, with the
+  endpoint they hit.
+- `db.call` and the `db.*` query spans — SQLite, with `db.lock_wait_ms`
+  separating the wait for the connection from the query itself.
+- `s3.request` (per S3 call, `s3.operation` names it) under `s3.put`,
+  `s3.put_streaming`, `s3.delete` and the multipart calls
+  (`create_mpu`, `upload_part`, `complete_mpu`, `abort_mpu`) and
+  `s3.abort_stale_multiparts`. `s3.presign` is a local signature, not an S3
+  request, so it has no `s3.request` under it.
+- `auth.verify` — token verification, with the issuer; the token itself is
+  never recorded.
+- `gc.evict` and `gc.sweep` — eviction and orphan-sweep cycles, the eviction
+  candidate loop under one `gc.evict.candidates` span.
+
+The Pusher's `negotiation` and `upload` spans carry the caller's OIDC subject
+as `issuer#sub` — the same identity the browse API and `garret-admin
+--pushed-by` show. It is exported to the collector, so treat the collector as
+holding deployment identities.
+
+Export failures — a collector that is down or unreachable — are logged and the
+spans are dropped. They never block a request: the batch processor exports on
+its own thread, and shutdown flushes what it holds for at most five seconds.

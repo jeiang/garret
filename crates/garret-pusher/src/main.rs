@@ -1,4 +1,7 @@
 //! Pusher: accepts NARs over the garret push protocol (spec 01-push-protocol).
+// The instrumented handler futures nest deeply enough that the default
+// layout recursion limit trips on them.
+#![recursion_limit = "256"]
 
 use std::{sync::Arc, time::Duration};
 
@@ -45,6 +48,7 @@ async fn main() -> Result<()> {
     let garret_server::runtime::Started {
         config: cfg,
         listener,
+        telemetry,
     } = garret_server::runtime::start::<PusherConfig>("pusher").await?;
     // Bound before anything serves, like the listeners, so an unusable socket
     // path fails startup instead of leaving a half-up Pusher.
@@ -151,10 +155,22 @@ async fn main() -> Result<()> {
 
     let storage = state.storage.clone();
     let app = router(state, discovery);
+    // Only with a collector attached: the middleware allocates a span name
+    // and extracts trace context on every request, which is pure cost when
+    // nothing exports.
+    let app = if telemetry.enabled() {
+        app.layer(middleware::from_fn(garret_server::telemetry::track_http))
+    } else {
+        app
+    };
 
     // Every listener is bound and every background task spawned.
     garret_server::runtime::notify_ready();
-    serve_until_stopped(listener, app, storage).await
+    let served = serve_until_stopped(listener, app, storage).await;
+    // Last, once nothing is serving: whatever the batch processor still
+    // holds is flushed before the process exits.
+    telemetry.shutdown();
+    served
 }
 
 fn router(state: Arc<AppState>, discovery: String) -> Router {
@@ -177,7 +193,8 @@ fn router(state: Arc<AppState>, discovery: String) -> Router {
 }
 
 /// How long a SIGTERM/SIGINT waits for in-flight uploads to finish. With
-/// [`ABORT_BUDGET`] it stays under systemd's default 90 s stop timeout.
+/// [`ABORT_BUDGET`] and the span flush (at most the exporter's 5 s timeout)
+/// it stays under systemd's default 90 s stop timeout: 60 + 20 + 5 = 85 s.
 const DRAIN: Duration = Duration::from_secs(60);
 /// How long aborting the uploads that outlived [`DRAIN`] may take.
 const ABORT_BUDGET: Duration = Duration::from_secs(20);
@@ -192,7 +209,7 @@ async fn serve_until_stopped(
 ) -> Result<()> {
     let (stop, stopped) = tokio::sync::oneshot::channel();
     let server = garret_server::runtime::serve(listener, app, async move {
-        stop_signal().await;
+        garret_server::runtime::stop_signal().await;
         tracing::info!("stopping: draining in-flight uploads for up to {DRAIN:?}");
         let _ = stop.send(());
     });
@@ -232,15 +249,6 @@ async fn serve_until_stopped(
         tracing::error!("multiparts still open after {ABORT_BUDGET:?}: left to the orphan sweep");
     }
     Ok(())
-}
-
-async fn stop_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut term = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
 }
 
 #[derive(Debug)]
@@ -380,6 +388,11 @@ async fn require_oidc(
     }
 }
 
+#[tracing::instrument(
+    name = "negotiation", level = "debug",
+    skip_all,
+    fields(subject = subject.0.as_str(), batch = hashes.len(), missing = tracing::field::Empty)
+)]
 async fn missing_paths(
     State(state): State<Arc<AppState>>,
     axum::Extension(subject): axum::Extension<Subject>,
@@ -390,6 +403,7 @@ async fn missing_paths(
         db::missing(conn, &hashes, unix_now())
     })
     .await?;
+    tracing::Span::current().record("missing", missing.len());
     tracing::debug!(subject = %subject.0, batch, missing = missing.len(), "negotiation");
     metrics::histogram!("garret_negotiation_batch_size").record(batch as f64);
     metrics::counter!("garret_negotiation_missing_paths_total").increment(missing.len() as u64);
@@ -411,6 +425,11 @@ fn quiescing() -> Error {
     )
 }
 
+#[tracing::instrument(
+    name = "upload", level = "debug",
+    skip_all,
+    fields(object.hash = hash.as_str(), subject = subject.0.as_str(), blob.bytes = tracing::field::Empty)
+)]
 async fn upload(
     State(state): State<Arc<AppState>>,
     Path(hash): Path<String>,
@@ -483,6 +502,7 @@ async fn upload(
 
     match &result {
         Ok(size) => {
+            tracing::Span::current().record("blob.bytes", *size);
             metrics::counter!("garret_uploads_accepted_total").increment(1);
             metrics::histogram!("garret_upload_bytes").record(*size as f64);
         }
@@ -500,6 +520,7 @@ async fn upload(
 }
 
 /// Returns the stored size. The body never lands in memory whole.
+#[tracing::instrument(name = "blob.store", level = "debug", skip_all, fields(object.hash = hash))]
 async fn store_upload(
     state: &AppState,
     hash: &str,

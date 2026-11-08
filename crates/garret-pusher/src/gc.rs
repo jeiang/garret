@@ -17,8 +17,12 @@ use garret_server::{
 };
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use tracing::Instrument as _;
 
-use crate::{deletion::Deletion, state::db_run};
+use crate::{
+    deletion::Deletion,
+    state::{db_run, db_run_quiet},
+};
 
 /// Candidates are re-queried after each batch: deleting a root frees its
 /// dependencies, which the next query then surfaces.
@@ -126,6 +130,7 @@ impl Gc {
         counted("pass", self.evict().await)
     }
 
+    #[tracing::instrument(name = "gc.evict", level = "debug", skip_all)]
     async fn evict(&self) -> Result<PassResult> {
         let started = Instant::now();
         let mut result = PassResult::default();
@@ -151,27 +156,38 @@ impl Gc {
 
             let mut deletion = Deletion::default();
             let mut settled = false;
-            for (hash, _) in &candidates {
-                let Ok(claim) = self.in_flight.claim_delete(hash) else {
-                    continue;
-                };
-                settled = true;
-                // A candidate negotiated or referenced since the snapshot
-                // stays; the next query no longer returns it.
-                let owned = hash.clone();
-                let Some(freed) =
-                    db_run(&self.conn, move |conn| db::evict_object(conn, &owned, at)).await?
-                else {
-                    continue;
-                };
-                usage -= freed;
-                result.evicted += 1;
-                result.bytes_freed += freed;
-                deletion.hold(claim);
-                if usage <= low {
-                    break;
+            // One span for the whole candidate loop: a `db.call` per row
+            // would bury the trace under one span per evicted object.
+            let loop_span =
+                tracing::debug_span!("gc.evict.candidates", candidates = candidates.len(),);
+            let evicted = async {
+                for (hash, _) in &candidates {
+                    let Ok(claim) = self.in_flight.claim_delete(hash) else {
+                        continue;
+                    };
+                    settled = true;
+                    // A candidate negotiated or referenced since the snapshot
+                    // stays; the next query no longer returns it.
+                    let owned = hash.clone();
+                    let Some(freed) =
+                        db_run_quiet(&self.conn, move |conn| db::evict_object(conn, &owned, at))
+                            .await?
+                    else {
+                        continue;
+                    };
+                    usage -= freed;
+                    result.evicted += 1;
+                    result.bytes_freed += freed;
+                    deletion.hold(claim);
+                    if usage <= low {
+                        break;
+                    }
                 }
+                Ok::<(), anyhow::Error>(())
             }
+            .instrument(loop_span)
+            .await;
+            evicted?;
             deletion.finish(&self.storage).await?;
             if !settled {
                 // Every candidate is claimed by an upload or deletion; the
@@ -201,6 +217,7 @@ impl Gc {
         counted("sweep", self.sweep().await)
     }
 
+    #[tracing::instrument(name = "gc.sweep", level = "debug", skip_all)]
     async fn sweep(&self) -> Result<usize> {
         let grace = self.orphan_grace();
         // Before the orphans are claimed: the abort skips in-flight paths.

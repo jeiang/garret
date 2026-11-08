@@ -10,8 +10,10 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
+use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 use crate::config::ServiceConfig;
+use crate::telemetry::Telemetry;
 
 /// A client that has not sent complete request headers by then is dropped, so
 /// idle connections cannot pin sockets or tasks. Bodies have their own idle
@@ -24,19 +26,41 @@ pub struct Started<C> {
     pub config: C,
     /// The public listener, bound but not yet serving.
     pub listener: TcpListener,
+    /// The span exporter, if `[telemetry]` enabled it. [`Telemetry::shutdown`]
+    /// it once serving ends, or the last batch is lost.
+    pub telemetry: Telemetry,
 }
 
-/// The startup both services share: logging, the config named by the first
-/// argument (loaded and validated), the metrics recorder (installed first, so
-/// later startup work is recorded), then both listeners bound, each failure
-/// naming the address. The metrics listener serves from here on; the public
-/// one is the caller's to serve once the service is ready.
+/// The startup both services share: the config named by the first argument
+/// (loaded and validated), the telemetry exporter it asks for, logging, the
+/// metrics recorder (installed first, so later startup work is recorded), then
+/// both listeners bound, each failure naming the address. The metrics listener
+/// serves from here on; the public one is the caller's to serve once the
+/// service is ready.
 pub async fn start<C: ServiceConfig>(service: &str) -> Result<Started<C>> {
-    init_tracing();
     let path = std::env::args()
         .nth(1)
         .with_context(|| format!("usage: garret-{service} <config.toml>"))?;
-    let config: C = crate::config::load(&path)?;
+    // The config decides whether there is a telemetry layer at all, so it is
+    // loaded before the subscriber is installed. Failures still reach the log:
+    // the fmt subscriber goes up first, then the error is logged and returned.
+    let config: C = match crate::config::load(&path) {
+        Ok(config) => config,
+        Err(e) => {
+            init_tracing(None);
+            tracing::error!("{e:#}");
+            return Err(e);
+        }
+    };
+    let telemetry = match Telemetry::start(config.telemetry(), service) {
+        Ok(telemetry) => telemetry,
+        Err(e) => {
+            init_tracing(None);
+            tracing::error!("{e:#}");
+            return Err(e);
+        }
+    };
+    init_tracing(telemetry.tracer(service));
     let metrics = crate::metrics::install(service)?;
     let metrics_listener = bind(config.metrics_listen(), "metrics").await?;
     let listener = bind(config.listen(), service).await?;
@@ -46,7 +70,11 @@ pub async fn start<C: ServiceConfig>(service: &str) -> Result<Started<C>> {
             tracing::error!("metrics listener failed: {e:#}");
         }
     });
-    Ok(Started { config, listener })
+    Ok(Started {
+        config,
+        listener,
+        telemetry,
+    })
 }
 
 async fn bind(addr: &str, name: &str) -> Result<TcpListener> {
@@ -61,15 +89,50 @@ async fn bind(addr: &str, name: &str) -> Result<TcpListener> {
 }
 
 /// Logs to stdout at `RUST_LOG` (default `info`), with colour only on a
-/// terminal so journald gets plain text.
-fn init_tracing() {
+/// terminal so journald gets plain text. With a tracer, garret's own spans are
+/// also bridged to OpenTelemetry.
+fn init_tracing(tracer: Option<opentelemetry_sdk::trace::SdkTracer>) {
     use std::io::IsTerminal;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    // Per layer, not global: the operation spans are `debug` so that with no
+    // exporter they are never created — a registry span per request is a
+    // measurable share of a sub-millisecond narinfo — while the OTel layer
+    // takes every garret span the moment a collector is configured.
+    let fmt = tracing_subscriber::fmt::layer()
         .with_ansi(std::io::stdout().is_terminal())
-        .init();
+        .with_filter(filter);
+    let registry = tracing_subscriber::registry().with(fmt);
+    match tracer {
+        Some(tracer) => registry
+            .with(
+                tracing_opentelemetry::layer()
+                    .with_tracer(tracer)
+                    // Source location, thread ids and busy/idle timings are
+                    // noise in a request trace and cost work per span; the
+                    // span's own fields carry what a trace needs.
+                    .with_location(false)
+                    .with_threads(false)
+                    .with_tracked_inactivity(false)
+                    // Only garret's spans are exported. The SDK, hyper,
+                    // rustls and reqwest spans under `s3.request` are
+                    // dependency internals: they multiply one S3 call into
+                    // ~10 spans and say nothing `s3.request` does not.
+                    // Dependency WARN/ERROR events still pass and attach to
+                    // the active span; `RUST_LOG` keeps controlling the fmt
+                    // layer only, so it cannot widen what is exported.
+                    .with_filter(
+                        Targets::new()
+                            .with_target("garret_server", LevelFilter::TRACE)
+                            .with_target("garret_pusher", LevelFilter::TRACE)
+                            .with_target("garret_puller", LevelFilter::TRACE)
+                            .with_default(LevelFilter::WARN),
+                    ),
+            )
+            .init(),
+        None => registry.init(),
+    }
 }
 
 /// Serves `app` on `listener` until `shutdown` resolves, then waits for open
@@ -131,6 +194,17 @@ where
     drop(listener);
     graceful.shutdown().await;
     Ok(())
+}
+
+/// Resolves on SIGTERM or SIGINT, the signals systemd and a terminal send.
+/// Both services stop accepting on it and drain, then flush their spans.
+pub async fn stop_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 /// Tells systemd (`Type=notify`) the service is ready. A no-op outside

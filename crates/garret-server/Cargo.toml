@@ -20,10 +20,25 @@ http-body = "1"
 crc32fast = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
 axum = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Optional OTLP/HTTP span export. 0.31 is the release line whose HTTP client
+# is reqwest 0.12, the one already in the tree: 0.32 moved to reqwest 0.13
+# and would link a second reqwest, hyper and rustls.
+# `internal-logs` routes exporter failures through `tracing`, so a collector
+# that is down costs a log line, never a crash. No tonic transport:
+# HTTP/protobuf only.
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "internal-logs"] }
+# The stable batch processor, which owns an export thread. The blocking
+# reqwest client is the one that works off that thread: the async client
+# needs a tokio reactor, which the export thread does not have.
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots", "trace", "internal-logs"] }
+# The bridge from `tracing` spans to OTel spans. No `metrics` feature:
+# Prometheus already owns metrics here.
+tracing-opentelemetry = { version = "0.32", default-features = false }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-graceful", "service", "tokio"] }
 garret-common.workspace = true

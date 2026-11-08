@@ -30,6 +30,15 @@ let
       body_idle_timeout_secs = cfg.limits.bodyIdleTimeoutSeconds;
     };
     oidc = cfg.oidc;
+    telemetry = {
+      enabled = cfg.telemetry.enable;
+    } // lib.optionalAttrs (cfg.telemetry.endpoint != null) {
+      endpoint = cfg.telemetry.endpoint;
+    } // lib.optionalAttrs (cfg.telemetry.serviceName != null) {
+      service_name = cfg.telemetry.serviceName;
+    } // lib.optionalAttrs (cfg.telemetry.sampleRatio != null) {
+      sample_ratio = cfg.telemetry.sampleRatio;
+    };
   } // lib.optionalAttrs (cfg.quotaBytes != null) {
     gc = {
       quota_bytes = cfg.quotaBytes;
@@ -175,6 +184,35 @@ in
       partSize = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Multipart part size; also the single-PutObject threshold."; };
       maxPartsInFlight = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Concurrent parts per upload."; };
       bodyIdleTimeoutSeconds = mkOption { type = types.nullOr types.ints.positive; default = null; description = "Seconds an upload body may send nothing before it is abandoned."; };
+    };
+
+    telemetry = {
+      enable = mkEnableOption "OpenTelemetry span export to an OTLP/HTTP collector";
+
+      endpoint = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          OTLP/HTTP base URL; spans are posted to `<endpoint>/v1/traces`.
+          Null: `http://127.0.0.1:4318`, the collector's default receiver.
+        '';
+      };
+
+      serviceName = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "`service.name` on exported spans. Null: the service's own name.";
+      };
+
+      sampleRatio = mkOption {
+        type = types.nullOr (types.numbers.between 0.0 1.0);
+        default = null;
+        description = ''
+          Fraction of new traces sampled, 0.0..=1.0. Children keep their
+          parent's sampling decision, so a trace is sampled or not as a
+          whole and a caller's decision is never overridden. Null: 1.0.
+        '';
+      };
     };
 
     oidc = mkOption {

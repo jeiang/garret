@@ -275,11 +275,23 @@ where
 {
     let waited = Instant::now();
     let mut conn = conn.lock_owned().await;
+    let waited = waited.elapsed();
     metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => which)
-        .record(waited.elapsed());
-    tokio::task::spawn_blocking(move || run(&mut conn))
-        .await
-        .unwrap_or_else(|e| Err(anyhow::anyhow!("{which} database task failed: {e}")))
+        .record(waited);
+    // A blocking thread does not inherit the async caller's span: enter it
+    // there, so the query span is a child of the request that caused it.
+    let span = tracing::debug_span!(
+        "db.call",
+        db.conn = which,
+        db.lock_wait_ms = tracing::field::Empty,
+    );
+    span.record("db.lock_wait_ms", waited.as_millis() as u64);
+    tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        run(&mut conn)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("{which} database task failed: {e}")))
 }
 
 /// A pull-path database read under the configured budget (ticket 25, ADR
@@ -295,11 +307,19 @@ where
     T: Send + 'static,
 {
     let deadline = Instant::now() + budget;
+    let span = tracing::debug_span!(
+        "db.call",
+        db.conn = "pull",
+        db.lock_wait_ms = tracing::field::Empty,
+    );
     let task = tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
         let waited = Instant::now();
         let conn = conn.blocking_lock();
+        let waited = waited.elapsed();
         metrics::histogram!(garret_server::metrics::DB_LOCK_WAIT_SECONDS, "conn" => "pull")
-            .record(waited.elapsed());
+            .record(waited);
+        span.record("db.lock_wait_ms", waited.as_millis() as u64);
         if Instant::now() > deadline {
             anyhow::bail!("pull read abandoned: budget elapsed while queued");
         }
@@ -415,6 +435,7 @@ async fn run() -> Result<()> {
     let garret_server::runtime::Started {
         config: cfg,
         listener,
+        telemetry,
     } = garret_server::runtime::start::<PullerConfig>("puller").await?;
 
     let state = Arc::new(AppState {
@@ -494,12 +515,26 @@ async fn run() -> Result<()> {
         .merge(browse_routes)
         .layer(axum::middleware::from_fn(garret_metrics::track_http))
         .with_state(state);
+    // Only with a collector attached: the middleware allocates a span name
+    // and extracts trace context on every request, which is pure cost when
+    // nothing exports.
+    let app = if telemetry.enabled() {
+        app.layer(axum::middleware::from_fn(
+            garret_server::telemetry::track_http,
+        ))
+    } else {
+        app
+    };
 
     garret_server::runtime::notify_ready();
-    garret_server::runtime::serve(listener, app, std::future::pending()).await?;
+    // SIGTERM/SIGINT stops accepting, drains, and lets the span exporter
+    // flush before the process exits.
+    garret_server::runtime::serve(listener, app, garret_server::runtime::stop_signal()).await?;
+    telemetry.shutdown();
     Ok(())
 }
 
+#[tracing::instrument(name = "narinfo.serve", level = "debug", skip_all, fields(narinfo.file = file))]
 async fn narinfo(state: &AppState, file: &str) -> Outcome {
     let Some(hash) = wire::narinfo_hash(file).filter(|hash| is_store_hash(hash)) else {
         return Outcome::Junk;
@@ -639,6 +674,7 @@ async fn probe_read(state: &AppState, conn: Conn) -> Result<(), String> {
     }
 }
 
+#[tracing::instrument(name = "nar.redirect", level = "debug", skip_all, fields(nar.file = file))]
 async fn nar_redirect(state: &AppState, file: &str) -> Outcome {
     let Some(hash) = wire::nar_file_hash(file).filter(|hash| is_store_hash(hash)) else {
         return Outcome::Junk;
@@ -731,6 +767,7 @@ fn default_limit() -> usize {
     wire::DEFAULT_LIMIT
 }
 
+#[tracing::instrument(name = "browse.query", level = "debug", skip_all, fields(endpoint = %endpoint))]
 async fn run_browse<T, F>(state: &AppState, endpoint: &'static str, read: F) -> Response
 where
     F: FnOnce(&rusqlite::Connection) -> anyhow::Result<Option<T>> + Send + 'static,

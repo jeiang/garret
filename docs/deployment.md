@@ -51,6 +51,10 @@ evaluation.
 | `adminSocketPath` | string | `/run/garret/admin.sock` |
 | `fsck.calendar` | string or null | `null`: no scheduled fsck |
 | `fsck.extraArgs` | list of strings | `[]` |
+| `telemetry.enable` | bool | `false` |
+| `telemetry.endpoint` | string or null | `null`: `http://127.0.0.1:4318` |
+| `telemetry.serviceName` | string or null | `null`: `garret-pusher` |
+| `telemetry.sampleRatio` | number or null | `null`: `1.0` |
 | `extraSettings` | TOML | `{}` |
 
 An option marked `null` is left out of the generated config, so the binary
@@ -84,6 +88,10 @@ Each entry in `oidc` takes `issuer`, `audience`, `extra_audiences`, `client_id`,
 | `presignBudgetMs` | positive int or null | `null` |
 | `s3.credentialsFile` | path | required |
 | `browseOidc` | submodule or null | `null`: no browse API |
+| `telemetry.enable` | bool | `false` |
+| `telemetry.endpoint` | string or null | `null`: `http://127.0.0.1:4318` |
+| `telemetry.serviceName` | string or null | `null`: `garret-puller` |
+| `telemetry.sampleRatio` | number or null | `null`: `1.0` |
 | `extraSettings` | TOML | `{}` |
 
 `browseOidc` takes `issuer`, `audience`, `jwks_url` and `allowed_groups`. When
@@ -93,6 +101,27 @@ Any configured issuer is accepted there; it need not be Pocket ID.
 Give the Puller its own S3 key limited to `GetObject`. A presigned URL carries
 exactly the authority of the key that signed it, so the Pusher's key would hand
 write access to the public-facing process.
+
+`telemetry` is the same on both services and off by default:
+
+```nix
+services.garret.pusher.telemetry = {
+  enable = true;
+  endpoint = "http://127.0.0.1:4318";
+  sampleRatio = 0.1;
+};
+
+services.garret.puller.telemetry = {
+  enable = true;
+  endpoint = "http://127.0.0.1:4318";
+  serviceName = "garret-puller";
+  sampleRatio = 0.1;
+};
+```
+
+Spans go to `<endpoint>/v1/traces` over OTLP/HTTP. The service reaches the
+collector over the network, which the unit sandbox already allows. See
+[Operations](operations.md#tracing) for what is traced and what is not.
 
 ## Watcher options
 
@@ -176,6 +205,13 @@ Pusher's start step. A database put in place by hand must be owned by `garret`.
 Both server units are `Type=notify`: the binaries send `READY=1` once every
 listener is bound, so units ordered after them start only when the sockets
 accept connections.
+
+On `SIGTERM` or `SIGINT` both services stop accepting, let in-flight requests
+finish, and only then exit — the Pusher after up to 60 seconds of uploads, the
+Puller as soon as its open connections are idle. With tracing enabled, the
+last batch of spans is flushed on the way out. The units set no `KillMode` or
+`TimeoutStopSec`, so systemd's defaults apply: `SIGTERM` first, then `SIGKILL`
+after 90 seconds, which is longer than either drain.
 
 All three units share one sandbox: an empty capability bounding set,
 `NoNewPrivileges`, `ProtectSystem=strict` with only the unit's own state
