@@ -17,12 +17,15 @@ say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 # GARRET_E2E_PORT_BASE.
 port_count=5
 
-port_in_use() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
+# A connect probe, not lsof: unprivileged lsof cannot see other users' listeners.
+port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
 
 pick_port_base() {
   local base p
   while :; do
-    base=$(( (RANDOM % 40000) + 20000 ))
+    # Below the ephemeral ranges (Linux 32768+, macOS 49152+): the lsof check
+    # sees only listeners, not this run's own outgoing connections.
+    base=$(( (RANDOM % 12000) + 20000 ))
     for p in $(seq "$base" $((base + port_count - 1))); do
       port_in_use "$p" && continue 2
     done
