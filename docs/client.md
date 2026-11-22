@@ -207,6 +207,10 @@ been uploaded.
   cursor and the list are each replaced whole by a rename, so a kill mid-write
   cannot lose the backlog. A cursor or list that exists but cannot be read stops
   the watcher with an error naming it.
+- **Stopping.** On `SIGTERM` or `SIGINT` the daemon starts no new upload, lets
+  the ones in flight finish, and exits 0 without moving the cursor past the
+  batch it interrupted, so a drain pushes the rest. Wait for it to exit before
+  draining.
 - **Drain.** `--drain` pushes every path validated after the cursor plus the
   failed list, in batches of 500, then exits — non-zero, naming the paths, if
   any failed. Run it after stopping the daemon, which shares the cursor. With no
@@ -284,7 +288,10 @@ steps:
   - name: Push whatever the watcher has not
     if: always()
     run: |
-      kill "$(cat "$RUNNER_TEMP/garret-watch.pid")" || true
+      pid=$(cat "$RUNNER_TEMP/garret-watch.pid")
+      kill "$pid" || true
+      # It exits once its uploads in flight finish.
+      while kill -0 "$pid" 2>/dev/null; do sleep 1; done
       "$RUNNER_TEMP/garret/bin/garret" --config "$RUNNER_TEMP/garret.toml" watch-store --drain
 ```
 
