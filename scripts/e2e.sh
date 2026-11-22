@@ -496,8 +496,12 @@ for _ in $(seq 600); do
 done
 grep -qx "$drained" "$root/drain-cursor.failed" || {
   echo "the daemon's failed push is not on the failed list"; cat "$root/drain-watch.log"; exit 1; }
+# SIGTERM is a clean stop: CI's drain waits for it, and a watcher killed
+# mid-upload leaves the server a cancelled request.
 kill $drain_watch_pid
-wait $drain_watch_pid 2>/dev/null || true
+wait $drain_watch_pid || {
+  echo "watch-store did not exit 0 on SIGTERM"; cat "$root/drain-watch.log"; exit 1; }
+grep -q "store watcher stopped" "$root/drain-watch.log"
 # A drain that still cannot reach the Pusher fails and keeps the path.
 if "$bin"/garret --config "$root/client-drain-dead.toml" watch-store --drain \
   > "$root/drain-dead.out" 2>&1; then

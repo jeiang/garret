@@ -15,6 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, params};
 use tokio::net::UnixDatagram;
+use tokio_util::sync::CancellationToken;
 
 use garret_common::hash_of_store_path;
 
@@ -355,11 +356,26 @@ impl Watcher {
         }
     }
 
-    /// Runs until killed. The cursor always advances: one poison path must
-    /// never wedge the pipeline, so a failed push goes on the failed list and
-    /// the watcher moves on, retrying it on idle polls up to `max_attempts`
-    /// times, then loudly giving up until a restart or a drain (spec 06).
+    /// Runs until SIGTERM or SIGINT. The cursor always advances: one poison
+    /// path must never wedge the pipeline, so a failed push goes on the failed
+    /// list and the watcher moves on, retrying it on idle polls up to
+    /// `max_attempts` times, then loudly giving up until a restart or a drain
+    /// (spec 06).
+    ///
+    /// A signal starts no new upload but lets those in flight finish, then
+    /// exits without moving the cursor past the batch it interrupted, so the
+    /// drain that follows in CI pushes the rest.
     pub async fn run(&self, pusher: &Pusher, full_sync: bool) -> Result<()> {
+        let stop = CancellationToken::new();
+        tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                stop_signal().await;
+                tracing::info!("stopping once the uploads in flight finish");
+                stop.cancel();
+            }
+        });
+
         let conn = open_nix_db(&self.nix_db)?;
         let mut cursor = match read_cursor(&self.cursor_path)? {
             Some(cursor) => cursor,
@@ -390,15 +406,22 @@ impl Watcher {
 
         let mut failed = FailedList::load(&self.cursor_path)?;
 
-        loop {
+        while !stop.is_cancelled() {
             let batch = paths_after(&conn, cursor, BATCH_SIZE)?;
             let Some(newest) = batch.last().map(|entry| entry.id) else {
-                self.retry_failed(pusher, &mut failed).await?;
-                wait_for_wake(wake.as_ref(), self.poll_interval).await;
+                self.retry_failed(pusher, &mut failed, &stop).await?;
+                tokio::select! {
+                    _ = wait_for_wake(wake.as_ref(), self.poll_interval) => {}
+                    _ = stop.cancelled() => {}
+                }
                 continue;
             };
 
-            for path in push_batch(pusher, &self.filters.select(&batch)).await {
+            let batch_failed = push_batch(pusher, &self.filters.select(&batch), &stop).await;
+            if stop.is_cancelled() {
+                break;
+            }
+            for path in batch_failed {
                 log_failure(&path, failed.record_failure(&path), self.max_attempts);
             }
             failed.save()?;
@@ -409,17 +432,28 @@ impl Watcher {
             cursor = newest;
             write_cursor(&self.cursor_path, cursor)?;
         }
+        tracing::info!(cursor, "store watcher stopped");
+        Ok(())
     }
 
     /// One more try for each failed path with attempts left in this process,
-    /// in batches of `BATCH_SIZE`.
-    async fn retry_failed(&self, pusher: &Pusher, failed: &mut FailedList) -> Result<()> {
+    /// in batches of `BATCH_SIZE`. A chunk `stop` interrupts is left as it
+    /// was: its unstarted paths must stay on the list.
+    async fn retry_failed(
+        &self,
+        pusher: &Pusher,
+        failed: &mut FailedList,
+        stop: &CancellationToken,
+    ) -> Result<()> {
         let due = failed.due(self.max_attempts);
         if due.is_empty() {
             return Ok(());
         }
         for chunk in due.chunks(BATCH_SIZE) {
-            let still_failed = push_batch(pusher, chunk).await;
+            let still_failed = push_batch(pusher, chunk, stop).await;
+            if stop.is_cancelled() {
+                break;
+            }
             let pushed = failed.apply(chunk, still_failed, |path, spent| {
                 log_failure(path, spent, self.max_attempts)
             });
@@ -469,7 +503,7 @@ impl Watcher {
         tracing::info!(cursor, paths = todo.len(), "draining");
 
         for chunk in todo.chunks(BATCH_SIZE) {
-            let still_failed = push_batch(pusher, chunk).await;
+            let still_failed = push_batch(pusher, chunk, &CancellationToken::new()).await;
             failed.apply(chunk, still_failed, |path, _| {
                 tracing::error!(path, "push failed")
             });
@@ -482,14 +516,25 @@ impl Watcher {
 
 /// Pushes a batch of paths with one `nix path-info` and one Negotiation,
 /// returning the paths that failed (never an error: a failure puts paths on
-/// the failed list, it does not stop the watcher).
-async fn push_batch(pusher: &Pusher, paths: &[String]) -> Vec<String> {
+/// the failed list, it does not stop the watcher). Once `stop` is cancelled
+/// no new upload starts.
+async fn push_batch(pusher: &Pusher, paths: &[String], stop: &CancellationToken) -> Vec<String> {
     if paths.is_empty() {
         return Vec::new();
     }
     let (infos, mut failed) = describe(paths).await;
-    failed.extend(push_described(pusher, infos).await);
+    failed.extend(push_described(pusher, infos, stop).await);
     failed
+}
+
+/// Resolves on SIGTERM (CI's `kill`) or SIGINT.
+async fn stop_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("installing the SIGTERM handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
 }
 
 /// The Negotiation and uploads for described paths; the paths that failed.
@@ -502,7 +547,11 @@ async fn push_batch(pusher: &Pusher, paths: &[String]) -> Vec<String> {
 /// see it as an unreferenced old root (spec 05 `PUSH_GRACE`). Anything deeper
 /// is kept by its referrer's `object_refs` edges, so closure-wide
 /// Negotiations bought nothing but load.
-async fn push_described(pusher: &Pusher, infos: Vec<PathInfo>) -> Vec<String> {
+async fn push_described(
+    pusher: &Pusher,
+    infos: Vec<PathInfo>,
+    stop: &CancellationToken,
+) -> Vec<String> {
     if infos.is_empty() {
         return Vec::new();
     }
@@ -534,7 +583,7 @@ async fn push_described(pusher: &Pusher, infos: Vec<PathInfo>) -> Vec<String> {
         return Vec::new();
     }
     let (_, failed) = pusher
-        .push_tracked(to_push, &crate::push::Report::plain())
+        .push_tracked(to_push, &crate::push::Report::plain(), stop)
         .await;
     failed
 }
@@ -756,7 +805,12 @@ mod tests {
         let a = format!("/nix/store/{}-a", "a".repeat(32));
         let b = format!("/nix/store/{}-b", "b".repeat(32));
 
-        let failed = push_described(&pusher, vec![info(&a, &[]), info(&b, &[&a])]).await;
+        let failed = push_described(
+            &pusher,
+            vec![info(&a, &[]), info(&b, &[&a])],
+            &CancellationToken::new(),
+        )
+        .await;
         assert_eq!(failed, [a.clone(), b.clone()]);
 
         let dir = crate::testing::scratch_dir();

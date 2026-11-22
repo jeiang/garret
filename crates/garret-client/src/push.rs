@@ -27,7 +27,7 @@ use tokio::{
     process::Command,
     time::Instant,
 };
-use tokio_util::io::ReaderStream;
+use tokio_util::{io::ReaderStream, sync::CancellationToken};
 
 use crate::http::{ensure_success, error_detail};
 
@@ -646,18 +646,24 @@ impl Pusher {
     /// and the caller decides the exit code from `Summary::failed`. That way a
     /// `--json` consumer always receives the terminating `done` event.
     pub(crate) async fn push_all(&self, paths: Vec<PathInfo>, report: &Report) -> Summary {
-        self.push_tracked(paths, report).await.0
+        self.push_tracked(paths, report, &CancellationToken::new())
+            .await
+            .0
     }
 
     /// [`push_all`](Self::push_all), also naming the paths that failed — what
-    /// the Watcher puts on its failed list.
+    /// the Watcher puts on its failed list. Once `stop` is cancelled no new
+    /// upload starts, so paths not yet started are in neither the summary nor
+    /// the failed list.
     pub(crate) async fn push_tracked(
         &self,
         paths: Vec<PathInfo>,
         report: &Report,
+        stop: &CancellationToken,
     ) -> (Summary, Vec<String>) {
         let nar_bytes = nar_bytes(&paths);
         let outcomes = stream::iter(references_first(paths))
+            .take_while(|_| std::future::ready(!stop.is_cancelled()))
             .map(|info| async move {
                 let outcome = match self.push_one(&info, report).await {
                     Ok(outcome) => outcome,
@@ -1645,5 +1651,21 @@ mod tests {
             .unwrap();
         assert_eq!(summary, Summary::default());
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stopping watcher must not start uploads it would then abandon: the
+    /// unstarted paths are neither pushed nor reported failed.
+    #[tokio::test]
+    async fn a_cancelled_stop_starts_no_upload() {
+        use std::sync::atomic::Ordering;
+        let (endpoint, requests) = crate::testing::answering(201, "{}").await;
+        let (pusher, _) = crate::testing::pusher(endpoint);
+        let stop = CancellationToken::new();
+        stop.cancel();
+        let paths = vec![info(&format!("/nix/store/{}-x", "a".repeat(32)), &[])];
+        let (summary, failed) = pusher.push_tracked(paths, &Report::plain(), &stop).await;
+        assert_eq!((summary.pushed, summary.deduped, summary.failed), (0, 0, 0));
+        assert!(failed.is_empty());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 }
