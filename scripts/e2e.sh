@@ -692,7 +692,9 @@ echo "  waited out the stalled upload, pushed the root, and re-pushed the delete
 say "benchmark harness"
 # All three scenarios, wired end to end: push seeds the corpus (count 12),
 # stream exercises the single-stream path, pull reads the corpus back.
-"$bin"/garret-bench push --endpoint "$pusher_url" \
+# Per-request logs on stderr, so a stalled run shows the request it stalled on.
+bench_log=garret_bench=debug,hyper_util=debug
+RUST_LOG=$bench_log "$bin"/garret-bench push --endpoint "$pusher_url" \
   --concurrency 4 --count 12 --json "$root/bench.json" | tail -20
 python3 -c "
 import json
@@ -704,7 +706,7 @@ assert r['pushed'] == r['corpus_entries'], r
 assert r['p99_slowdown'] > 0, 'no slowdown measured: the baseline did not pair with the load run'
 assert r['nar_mib_per_sec'] > 0 and r['wire_bytes'] > 0, r
 "
-"$bin"/garret-bench stream --endpoint "$pusher_url" \
+RUST_LOG=$bench_log "$bin"/garret-bench stream --endpoint "$pusher_url" \
   --reps 1 --no-giant --json "$root/bench-stream.json" | tail -5
 python3 -c "
 import json
@@ -713,7 +715,7 @@ assert all(r['failed'] == 0 for r in runs), runs
 assert [r['size_bytes'] for r in runs] == [2**20, 100 * 2**20], runs
 print('  stream MiB/s:', [round(r['mib_per_sec'], 1) for r in runs])
 "
-"$bin"/garret-bench pull --puller-endpoint "$puller_url" \
+RUST_LOG=$bench_log "$bin"/garret-bench pull --puller-endpoint "$puller_url" \
   --count 12 --passes 1 --json "$root/bench-pull.json" | tail -5
 python3 -c "
 import json
@@ -722,7 +724,7 @@ assert r['zero_failures'], r
 assert r['requests'] == 24, r
 print('  pull narinfo p50:', r['narinfo_p50_ms'], 'ms, redirect p50:', r['redirect_p50_ms'], 'ms')
 "
-"$bin"/garret-bench push --endpoint "$pusher_url" \
+RUST_LOG=$bench_log "$bin"/garret-bench push --endpoint "$pusher_url" \
   --concurrency 2 --count 12 --json "$root/bench2.json" >/dev/null
 python3 -c "
 import json

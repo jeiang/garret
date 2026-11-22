@@ -246,6 +246,13 @@ struct Counters {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Silent unless asked: stdout is the report, and stderr stays clean.
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init();
+    }
     let timestamp = garret_common::unix_now();
     let meta = Meta {
         os: std::env::consts::OS,
@@ -382,6 +389,7 @@ async fn run_push(
         // Floored at 1 ms: the ratio below divides by this.
         baseline.push((started.elapsed().as_millis() as u64).max(1));
     }
+    tracing::debug!("baseline done; starting the loaded phase");
     let mut sorted_baseline = baseline.clone();
     sorted_baseline.sort_unstable();
     let uncontended_median = percentile(&sorted_baseline, 50.0);
@@ -416,6 +424,7 @@ async fn run_push(
             .buffer_unordered(args.concurrency)
             .collect()
             .await;
+    tracing::debug!("loaded phase done");
 
     let wall = started.elapsed();
     let wire_bytes = counters.wire.load(Ordering::Relaxed);
@@ -719,38 +728,57 @@ async fn push_prepared(
     prepared: &Prepared,
     counters: &Counters,
 ) -> Result<()> {
+    let body = prepared.body.clone();
     counters
         .wire
-        .fetch_add(prepared.body.len() as u64, Ordering::Relaxed);
-    let body = prepared.body.clone();
+        .fetch_add(body.len() as u64, Ordering::Relaxed);
+    // Sliced so the stall guard sees progress; Bytes slices share one buffer.
+    let make_body = || {
+        let body = body.clone();
+        Ok(stream::iter((0..body.len()).step_by(BODY_SLICE).map(
+            move |at| Ok(body.slice(at..body.len().min(at + BODY_SLICE))),
+        )))
+    };
     put_with_retry(
         http,
         &upload_url(endpoint, entry),
         token,
-        || Ok(body.clone().into()),
+        Some(body.len() as u64),
+        make_body,
         counters,
     )
     .await
 }
 
+const BODY_SLICE: usize = 64 * 1024;
+
+/// The client's default `upload_idle_secs`: an upload or its answer that
+/// makes no progress this long fails instead of hanging the run.
+const STALL: Duration = Duration::from_secs(5 * 60);
+
 /// PUTs `make_body()` to `url`, retrying 429s and dropped connections up to
 /// six attempts on a doubling schedule, and tallying each in `counters`.
-async fn put_with_retry(
+async fn put_with_retry<S>(
     http: &reqwest::Client,
     url: &str,
     token: &str,
-    mut make_body: impl FnMut() -> Result<reqwest::Body>,
+    content_length: Option<u64>,
+    mut make_body: impl FnMut() -> Result<S>,
     counters: &Counters,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+{
     let mut delay = Duration::from_millis(100);
     for attempt in 0..6 {
-        let retried = match http
-            .put(url)
-            .bearer_auth(token)
-            .body(make_body()?)
-            .send()
-            .await
-        {
+        let mut request = http.put(url).bearer_auth(token);
+        if let Some(len) = content_length {
+            request = request.header(reqwest::header::CONTENT_LENGTH, len);
+        }
+        tracing::debug!(url, attempt, "upload sending");
+        let sent = garret_client::push::send_watched(request, make_body()?, STALL).await;
+        tracing::debug!(url, attempt, status = ?sent.as_ref().map(|r| r.status()), "upload answered");
+        let retried = match sent {
             Ok(response) if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
                 &counters.shed
             }
@@ -764,7 +792,11 @@ async fn put_with_retry(
                 }
                 // Each entry has its own key, so another upload of it means the
                 // corpus is being pushed twice at once: not a push this run made.
-                return match response.json().await.context("parsing upload response")? {
+                return match tokio::time::timeout(STALL, response.json())
+                    .await
+                    .context("upload response stalled")?
+                    .context("parsing upload response")?
+                {
                     UploadAck::Created | UploadAck::Exists => Ok(()),
                     UploadAck::InProgress => bail!("another upload of this path is in progress"),
                 };
@@ -774,7 +806,7 @@ async fn put_with_retry(
             // writing sometimes gets the RST before the response and sees a
             // broken pipe instead. Idempotent by negotiation, so retried on
             // the same schedule as an explicit shed.
-            Err(e) if garret_client::push::connection_dropped(&e) => &counters.dropped,
+            Err(e) if garret_client::push::connection_dropped(e.as_ref()) => &counters.dropped,
             Err(e) => return Err(e).context("sending the upload"),
         };
         retried.fetch_add(1, Ordering::Relaxed);
@@ -824,17 +856,18 @@ async fn push_streaming(
     counters: &Counters,
 ) -> Result<()> {
     // Rebuilt per attempt: a streamed body cannot be cloned.
-    let make_body = || -> Result<reqwest::Body> {
+    let make_body = || -> Result<_> {
         let framed = preamble_for(entry, nar_hash.to_owned()).to_framed()?;
         let chunks = std::iter::once(framed).chain(raw_zstd_frame(entry.chunks(RAW_BLOCK)));
-        Ok(reqwest::Body::wrap_stream(stream::iter(
+        Ok(stream::iter(
             chunks.map(|c| Ok::<_, std::io::Error>(bytes::Bytes::from(c))),
-        )))
+        ))
     };
     put_with_retry(
         http,
         &upload_url(endpoint, entry),
         token,
+        None,
         make_body,
         counters,
     )

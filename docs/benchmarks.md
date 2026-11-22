@@ -69,6 +69,10 @@ A run passes when it has zero failed requests and zero shed retries. The memory
 criterion is that peak Pusher RSS stays below twice the 256 MiB in-flight cap,
 that is 512 MiB. It held in every configuration above.
 
+An upload, or its response, that makes no progress for 5 minutes counts as a
+failed request rather than holding up the run. Set `RUST_LOG` (for example
+`garret_bench=debug,hyper_util=debug`) to log each request to stderr.
+
 `just bench-local` enforces the peak. Final RSS is recorded in the JSON for
 comparison and is not gated.
 
