@@ -21,11 +21,14 @@ concurrency:
 permissions:
   contents: read
 
+# Every job has a timeout-minutes of roughly 2-3x its slowest cold run, so a
+# hang fails in minutes instead of holding a runner for GitHub's 6-hour default.
 jobs:
   # ----------------------------------------------------------------- lint ---
   lint:
     name: lint and formatting
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -61,6 +64,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]  # macos-latest is aarch64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -109,6 +113,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
@@ -167,6 +172,7 @@ jobs:
   nixos:
     name: NixOS module test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [build]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -194,6 +200,8 @@ jobs:
   push:
     name: push to garret
     runs-on: ubuntu-latest
+    # A cold cache uploads the whole dev toolchain.
+    timeout-minutes: 30
     needs: [lint, build, test, e2e, nixos]
     # Only what lands on main or a release tag is cached, so pull requests
     # never push. Manual dispatch is allowed too: only collaborators can
