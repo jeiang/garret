@@ -156,6 +156,9 @@ jobs:
         # Provisions a throwaway versitygw, pushes real store paths through the
         # real client, and substitutes them back with signature verification.
         # GARRET_BIN keeps it from compiling the workspace all over again.
+        # A passing run takes under a minute; a hung background wait would
+        # otherwise hold the runner for GitHub's 6-hour default.
+        timeout-minutes: 15
         env:
           GARRET_BIN: ${{ github.workspace }}/result/bin
         run: nix develop --command scripts/e2e.sh

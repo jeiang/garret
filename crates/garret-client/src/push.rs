@@ -873,7 +873,7 @@ impl Progress {
 /// the whole body transfer rather than detecting a stall. Progress is instead
 /// read off the body stream, which hyper only polls for more once the socket
 /// has taken what it had.
-async fn send_watched(
+pub async fn send_watched(
     request: reqwest::RequestBuilder,
     body: impl futures::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
     idle: Duration,
